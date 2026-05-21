@@ -1,0 +1,14 @@
+pre-commit:
+  parallel: true
+  commands:
+    rustfmt:
+      glob: "*.rs"
+      run: cargo fmt --all -- --check
+    clippy:
+      glob: "*.rs"
+      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+commit-msg:
+  commands:
+    cog-verify:
+      run: cog verify --file {1}
