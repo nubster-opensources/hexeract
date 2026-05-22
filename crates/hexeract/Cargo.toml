@@ -4,8 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 description = "The 6-dimension Rust messaging framework"
 keywords = ["messaging", "mediator", "cqrs", "outbox", "sagas"]
 categories = ["asynchronous", "network-programming"]
+
+[lints]
+workspace = true

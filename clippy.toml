@@ -1,0 +1,17 @@
+msrv = "1.88"
+
+doc-valid-idents = [
+    "..",
+    "Hexeract",
+    "Encelade",
+    "Nubster",
+    "LightShuttle",
+    "OpenTelemetry",
+    "PostgreSQL",
+    "MySQL",
+    "SQLite",
+    "RabbitMQ",
+    "NATS",
+    "Kafka",
+    "GitHub",
+]

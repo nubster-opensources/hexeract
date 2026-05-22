@@ -48,11 +48,7 @@ impl InMemoryUserRepo {
 impl CommandHandler<CreateUser> for InMemoryUserRepo {
     type Error = UserServiceError;
 
-    async fn handle(
-        &self,
-        cmd: CreateUser,
-        ctx: &HandlerContext,
-    ) -> Result<Uuid, Self::Error> {
+    async fn handle(&self, cmd: CreateUser, ctx: &HandlerContext) -> Result<Uuid, Self::Error> {
         if cmd.email.is_empty() {
             return Err(UserServiceError::EmptyEmail);
         }
@@ -64,10 +60,7 @@ impl CommandHandler<CreateUser> for InMemoryUserRepo {
             email = %cmd.email,
             "user created"
         );
-        self.created
-            .lock()
-            .expect("poisoned")
-            .push((id, cmd.email));
+        self.created.lock().expect("poisoned").push((id, cmd.email));
         Ok(id)
     }
 }
@@ -91,7 +84,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ctx2 = HandlerContext::new(MessageId::new(), CorrelationId::new());
     let err = repo
-        .handle(CreateUser { email: String::new() }, &ctx2)
+        .handle(
+            CreateUser {
+                email: String::new(),
+            },
+            &ctx2,
+        )
         .await
         .expect_err("empty email should be rejected");
     println!("expected failure: {err}");

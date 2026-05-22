@@ -1,16 +1,43 @@
 [workspace]
+resolver = "2"
 members = [
     "crates/hexeract-core",
     "crates/hexeract-macros",
     "crates/hexeract-mediator",
     "crates/hexeract",
 ]
-resolver = "2"
 
 [workspace.package]
 version = "0.0.1"
-edition = "2021"
+edition = "2024"
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/nubster-opensources/hexeract"
-authors = ["Pierrick Fonquerne <pierrick.fonquerne@gmail.com>"]
-rust-version = "1.84"
+homepage = "https://github.com/nubster-opensources/hexeract"
+authors = ["Encelade Technologies"]
+keywords = ["messaging", "mediator", "cqrs", "outbox", "sagas"]
+categories = ["asynchronous", "network-programming"]
+
+[workspace.dependencies]
+uuid = { version = "1", features = ["v4"] }
+thiserror = "2"
+tokio-util = { version = "0.7", default-features = false }
+tracing = "0.1"
+trait-variant = "0.1"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
