@@ -107,10 +107,7 @@ impl Next {
     /// Middlewares are executed in the order they appear in the slice: the
     /// first one wraps the second, which wraps the third, and so on.
     #[must_use]
-    pub fn new(
-        middlewares: Vec<Arc<dyn DynMiddleware>>,
-        terminal: Arc<dyn Terminal>,
-    ) -> Self {
+    pub fn new(middlewares: Vec<Arc<dyn DynMiddleware>>, terminal: Arc<dyn Terminal>) -> Self {
         Self {
             chain: middlewares.into(),
             terminal,

@@ -71,8 +71,8 @@ mod tests {
     fn cancellation_propagates_from_parent() {
         let parent = CancellationToken::new();
         let child = parent.child_token();
-        let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new())
-            .with_cancellation(child);
+        let ctx =
+            HandlerContext::new(MessageId::new(), CorrelationId::new()).with_cancellation(child);
 
         assert!(!ctx.is_cancelled());
         parent.cancel();

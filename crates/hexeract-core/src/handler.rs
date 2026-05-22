@@ -44,11 +44,7 @@ pub trait CommandHandler<C: Command>: Send + Sync + 'static {
     type Error: Into<HexeractError> + Send + Sync + 'static;
 
     /// Handles the command and produces its output.
-    async fn handle(
-        &self,
-        command: C,
-        ctx: &HandlerContext,
-    ) -> Result<C::Output, Self::Error>;
+    async fn handle(&self, command: C, ctx: &HandlerContext) -> Result<C::Output, Self::Error>;
 }
 
 /// Asynchronous handler for a [`Query`].
@@ -58,11 +54,7 @@ pub trait QueryHandler<Q: Query>: Send + Sync + 'static {
     type Error: Into<HexeractError> + Send + Sync + 'static;
 
     /// Handles the query and produces its output.
-    async fn handle(
-        &self,
-        query: Q,
-        ctx: &HandlerContext,
-    ) -> Result<Q::Output, Self::Error>;
+    async fn handle(&self, query: Q, ctx: &HandlerContext) -> Result<Q::Output, Self::Error>;
 }
 
 #[cfg(test)]
@@ -151,15 +143,17 @@ mod tests {
         };
         let ctx = fresh_ctx();
         let err = repo
-            .handle(CreateUser { email: String::new() }, &ctx)
+            .handle(
+                CreateUser {
+                    email: String::new(),
+                },
+                &ctx,
+            )
             .await
             .expect_err("empty email must fail");
         assert!(matches!(err, UserError::InvalidEmail));
         let framework_err: HexeractError = err.into();
-        assert!(matches!(
-            framework_err,
-            HexeractError::HandlerFailed { .. }
-        ));
+        assert!(matches!(framework_err, HexeractError::HandlerFailed { .. }));
     }
 
     #[tokio::test]
@@ -186,14 +180,7 @@ mod tests {
         let cloned = Arc::clone(&repo);
         let result = tokio::spawn(async move {
             let ctx = fresh_ctx();
-            cloned
-                .handle(
-                    CreateUser {
-                        email: "ok".into(),
-                    },
-                    &ctx,
-                )
-                .await
+            cloned.handle(CreateUser { email: "ok".into() }, &ctx).await
         })
         .await
         .expect("task panicked");
@@ -307,23 +294,11 @@ mod tests {
 
         let t1 = tokio::spawn(async move {
             let ctx = fresh_ctx();
-            h1.handle(
-                CreateUser {
-                    email: "u1".into(),
-                },
-                &ctx,
-            )
-            .await
+            h1.handle(CreateUser { email: "u1".into() }, &ctx).await
         });
         let t2 = tokio::spawn(async move {
             let ctx = fresh_ctx();
-            h2.handle(
-                CreateUser {
-                    email: "u2".into(),
-                },
-                &ctx,
-            )
-            .await
+            h2.handle(CreateUser { email: "u2".into() }, &ctx).await
         });
 
         let (r1, r2) = tokio::join!(t1, t2);
@@ -373,12 +348,7 @@ mod tests {
     async fn query_handler_future_is_send() {
         let handler = UserFinder;
         let ctx = fresh_ctx();
-        let future = handler.handle(
-            FindUser {
-                id: Uuid::new_v4(),
-            },
-            &ctx,
-        );
+        let future = handler.handle(FindUser { id: Uuid::new_v4() }, &ctx);
         assert_send(&future);
         let _ = future.await;
     }
@@ -389,14 +359,7 @@ mod tests {
         let cloned = Arc::clone(&handler);
         let result = tokio::spawn(async move {
             let ctx = fresh_ctx();
-            cloned
-                .handle(
-                    FindUser {
-                        id: Uuid::new_v4(),
-                    },
-                    &ctx,
-                )
-                .await
+            cloned.handle(FindUser { id: Uuid::new_v4() }, &ctx).await
         })
         .await
         .expect("task panicked");
@@ -420,18 +383,10 @@ mod tests {
         let handler = FailingQuery;
         let ctx = fresh_ctx();
         let err = handler
-            .handle(
-                FindUser {
-                    id: Uuid::new_v4(),
-                },
-                &ctx,
-            )
+            .handle(FindUser { id: Uuid::new_v4() }, &ctx)
             .await
             .expect_err("must fail");
         let framework_err: HexeractError = err.into();
-        assert!(matches!(
-            framework_err,
-            HexeractError::HandlerFailed { .. }
-        ));
+        assert!(matches!(framework_err, HexeractError::HandlerFailed { .. }));
     }
 }
