@@ -49,7 +49,7 @@ To stay focused, the following are explicitly out of scope:
 ## Audience
 
 - **Rust backend teams** building microservices who want a cohesive messaging toolkit instead of stacking incompatible crates.
-- **Ex-.NET migrants** looking for a cohesive messaging SDK in Rust.
+- **Developers migrating to Rust** looking for a cohesive messaging SDK.
 - **Polyglot teams** with part of their stack moving to Rust and the need to stay interoperable on a shared bus alongside their Node, Python or Go services.
 
 ## Contributing
