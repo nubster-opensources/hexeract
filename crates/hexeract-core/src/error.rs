@@ -1,0 +1,67 @@
+use std::time::Duration;
+use thiserror::Error;
+
+/// Top-level error type for the Hexeract framework.
+///
+/// This enum is marked `#[non_exhaustive]` so that new variants can be added
+/// in minor versions without breaking downstream `match` arms.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum HexeractError {
+    /// No handler was registered for the given command or query type.
+    #[error("no handler registered for `{command_type}`")]
+    HandlerNotFound { command_type: &'static str },
+
+    /// A handler returned an error. The original error is preserved as source.
+    #[error("handler failed: {source}")]
+    HandlerFailed {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// A dispatch exceeded its configured deadline.
+    #[error("dispatch timed out after {elapsed:?}")]
+    Timeout { elapsed: Duration },
+
+    /// A generic dispatch-level error with a human-readable message.
+    #[error("dispatch error: {0}")]
+    Dispatch(String),
+}
+
+impl HexeractError {
+    /// Wraps any `Send + Sync` error as a [`HexeractError::HandlerFailed`].
+    pub fn handler_failed(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::HandlerFailed {
+            source: Box::new(source),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handler_not_found_display() {
+        let err = HexeractError::HandlerNotFound {
+            command_type: "RegisterUser",
+        };
+        assert_eq!(err.to_string(), "no handler registered for `RegisterUser`");
+    }
+
+    #[test]
+    fn timeout_display_shows_duration() {
+        let err = HexeractError::Timeout {
+            elapsed: Duration::from_secs(5),
+        };
+        assert!(err.to_string().contains("5s"));
+    }
+
+    #[test]
+    fn handler_failed_preserves_source() {
+        let original = std::io::Error::new(std::io::ErrorKind::NotFound, "file missing");
+        let err = HexeractError::handler_failed(original);
+        assert!(err.to_string().contains("handler failed"));
+        assert!(std::error::Error::source(&err).is_some());
+    }
+}
