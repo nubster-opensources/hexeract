@@ -15,6 +15,7 @@ uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 tokio-util = { version = "0.7", default-features = false }
 tracing = "0.1"
+trait-variant = "0.1"
 serde = { version = "1", features = ["derive"], optional = true }
 
 [features]
