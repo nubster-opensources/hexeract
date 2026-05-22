@@ -15,6 +15,7 @@ uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 tokio-util = { version = "0.7", default-features = false }
 tracing = "0.1"
+trait-variant = "0.1"
 serde = { version = "1", features = ["derive"], optional = true }
 
 [features]
@@ -22,4 +23,7 @@ default = []
 serde = ["dep:serde", "uuid/serde"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }
+tracing-subscriber = "0.3"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
