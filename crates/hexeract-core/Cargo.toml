@@ -1,0 +1,11 @@
+[package]
+name = "hexeract-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Core traits and types for the Hexeract messaging framework"
+keywords = ["messaging", "mediator", "cqrs", "command", "handler"]
+categories = ["asynchronous", "network-programming"]
