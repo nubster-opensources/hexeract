@@ -9,13 +9,6 @@ use crate::query::Query;
 /// handler receives an immutable reference to itself, the command value and
 /// a [`HandlerContext`] carrying tracing and cancellation information.
 ///
-/// The handler returns the [`Command::Output`] type, or a custom
-/// `Self::Error` that converts into [`HexeractError`].
-///
-/// The trait is decorated with `#[trait_variant::make(Send)]` so that the
-/// returned futures are `Send` and can be moved across threads by the tokio
-/// scheduler.
-///
 /// # Example
 ///
 /// ```
@@ -30,9 +23,7 @@ use crate::query::Query;
 ///     type Output = Uuid;
 /// }
 ///
-/// struct UserRepository {
-///     /* connection pool, etc. */
-/// }
+/// struct UserRepository;
 ///
 /// impl CommandHandler<CreateUser> for UserRepository {
 ///     type Error = HexeractError;
@@ -61,9 +52,6 @@ pub trait CommandHandler<C: Command>: Send + Sync + 'static {
 }
 
 /// Asynchronous handler for a [`Query`].
-///
-/// See [`CommandHandler`] for the equivalent contract; only the input type
-/// changes.
 #[trait_variant::make(Send)]
 pub trait QueryHandler<Q: Query>: Send + Sync + 'static {
     /// The handler-defined error type, convertible into [`HexeractError`].
@@ -85,15 +73,11 @@ mod tests {
     use std::time::Duration;
     use uuid::Uuid;
 
-    // ===== Shared fixtures =====
-
     fn fresh_ctx() -> HandlerContext {
         HandlerContext::new(MessageId::new(), CorrelationId::new())
     }
 
     fn assert_send<T: Send>(_: &T) {}
-
-    // ===== Command + Output type complexe =====
 
     #[derive(Debug, PartialEq, Eq, Clone)]
     struct UserCreated {
@@ -178,8 +162,6 @@ mod tests {
         ));
     }
 
-    // ===== Send-bound + tokio::spawn =====
-
     #[tokio::test]
     async fn handler_future_is_send() {
         let repo = UserRepo {
@@ -218,8 +200,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // ===== type Error = HexeractError direct (Into identity) =====
-
     struct DirectErrorHandler;
     impl CommandHandler<CreateUser> for DirectErrorHandler {
         type Error = HexeractError;
@@ -247,8 +227,6 @@ mod tests {
             .expect_err("must fail");
         assert!(matches!(err, HexeractError::Dispatch(_)));
     }
-
-    // ===== Context introspection =====
 
     struct EchoIdsHandler;
     struct EchoIds;
@@ -281,8 +259,6 @@ mod tests {
         assert_eq!(got_msg, message_id);
         assert_eq!(got_corr, correlation_id);
     }
-
-    // ===== Cancellation propagation =====
 
     struct SleepHandler;
     struct SleepFor(u64);
@@ -321,14 +297,6 @@ mod tests {
         assert!(matches!(result, Err(HexeractError::Dispatch(ref m)) if m == "cancelled"));
     }
 
-    // ===== Trait object via Arc<ConcreteHandler> =====
-    //
-    // Async traits with `async fn` are not dyn-safe in stable Rust without
-    // explicit boxing. The mediator (issue #6) will provide an `ErasedHandler`
-    // wrapper for type-erased storage. Here we validate that handlers can be
-    // shared via `Arc` across tasks, which is the actual storage shape inside
-    // the mediator registry.
-
     #[tokio::test]
     async fn handler_is_shareable_via_arc() {
         let handler: Arc<UserRepo> = Arc::new(UserRepo {
@@ -362,8 +330,6 @@ mod tests {
         assert!(r1.unwrap().is_ok());
         assert!(r2.unwrap().is_ok());
     }
-
-    // ===== QueryHandler symmetric coverage =====
 
     #[derive(Debug)]
     struct UserSummary {

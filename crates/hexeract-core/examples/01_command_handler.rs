@@ -1,11 +1,6 @@
-//! End-to-end example of a stateful [`CommandHandler`] in `hexeract-core`.
+//! End-to-end example of a stateful [`CommandHandler`].
 //!
-//! Run with: `cargo run --example 01_command_handler -p hexeract-core`
-//!
-//! This example does not depend on the mediator (issue #6) yet: we instantiate
-//! the handler directly and invoke `handle` with a manually-built
-//! [`HandlerContext`]. Once the mediator is available, the dispatch becomes
-//! `mediator.send(cmd).await`.
+//! Run with `cargo run --example 01_command_handler -p hexeract-core`.
 
 use hexeract_core::{
     Command, CommandHandler, CorrelationId, HandlerContext, HexeractError, MessageId,
