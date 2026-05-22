@@ -9,3 +9,17 @@ rust-version.workspace = true
 description = "Core traits and types for the Hexeract messaging framework"
 keywords = ["messaging", "mediator", "cqrs", "command", "handler"]
 categories = ["asynchronous", "network-programming"]
+
+[dependencies]
+uuid = { version = "1", features = ["v4"] }
+thiserror = "2"
+tokio-util = { version = "0.7", default-features = false }
+tracing = "0.1"
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+default = []
+serde = ["dep:serde", "uuid/serde"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
