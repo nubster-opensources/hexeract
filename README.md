@@ -1,12 +1,12 @@
 # Hexeract
 
-> Rust messaging framework, Wolverine-style: Mediator, Bus, Outbox, Sagas, Scheduler, Request/Reply.
+> The 6-dimension Rust messaging framework: Mediator, Bus, Outbox, Sagas, Scheduler, Request/Reply.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Status](https://img.shields.io/badge/status-pre--alpha-orange)](#status)
 [![Made with Rust](https://img.shields.io/badge/made%20with-Rust-orange?logo=rust)](https://www.rust-lang.org/)
 
-Hexeract is a server-side messaging framework written in Rust. It unifies in-process mediator handlers, external message bus transports, transactional outbox and inbox, long-running sagas, scheduled messages and request/reply RPC in a single coherent SDK. The framework relies on Rust's type system and procedural macros to provide compile-time guarantees in place of the runtime reflection used by .NET frameworks such as Wolverine.
+Hexeract is a server-side messaging framework written in Rust. It unifies in-process mediator handlers, external message bus transports, transactional outbox and inbox, long-running sagas, scheduled messages and request/reply RPC in a single coherent SDK. The framework relies on Rust's type system and procedural macros to provide compile-time guarantees in place of runtime reflection.
 
 Hexeract is sponsored by [Encelade Technologies](https://encelade.tech).
 
@@ -49,7 +49,7 @@ To stay focused, the following are explicitly out of scope:
 ## Audience
 
 - **Rust backend teams** building microservices who want a cohesive messaging toolkit instead of stacking incompatible crates.
-- **Ex-.NET migrants** who valued Wolverine and look for its Rust counterpart.
+- **Ex-.NET migrants** looking for a cohesive messaging SDK in Rust.
 - **Polyglot teams** with part of their stack moving to Rust and the need to stay interoperable on a shared bus alongside their Node, Python or Go services.
 
 ## Contributing
