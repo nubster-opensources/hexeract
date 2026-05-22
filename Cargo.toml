@@ -1,0 +1,16 @@
+[workspace]
+members = [
+    "crates/hexeract-core",
+    "crates/hexeract-macros",
+    "crates/hexeract-mediator",
+    "crates/hexeract",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/nubster-opensources/hexeract"
+authors = ["Pierrick Fonquerne <pierrick.fonquerne@gmail.com>"]
+rust-version = "1.84"
