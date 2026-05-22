@@ -5,8 +5,11 @@
 //!
 //! This crate is a placeholder. The full implementation ships in v0.1.0.
 
+/// Contextual information propagated into every handler invocation.
 pub mod context;
+/// Unified framework error type.
 pub mod error;
+/// Unique identifier newtypes for messages and correlations.
 pub mod ids;
 
 pub use context::HandlerContext;

@@ -10,18 +10,25 @@ use thiserror::Error;
 pub enum HexeractError {
     /// No handler was registered for the given command or query type.
     #[error("no handler registered for `{command_type}`")]
-    HandlerNotFound { command_type: &'static str },
+    HandlerNotFound {
+        /// The fully-qualified type name of the unregistered command or query.
+        command_type: &'static str,
+    },
 
     /// A handler returned an error. The original error is preserved as source.
     #[error("handler failed: {source}")]
     HandlerFailed {
+        /// The original error returned by the handler.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// A dispatch exceeded its configured deadline.
     #[error("dispatch timed out after {elapsed:?}")]
-    Timeout { elapsed: Duration },
+    Timeout {
+        /// How long the dispatch ran before being cancelled.
+        elapsed: Duration,
+    },
 
     /// A generic dispatch-level error with a human-readable message.
     #[error("dispatch error: {0}")]
