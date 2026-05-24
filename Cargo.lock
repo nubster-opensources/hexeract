@@ -149,6 +149,23 @@ name = "hexeract-mediator"
 version = "0.0.1"
 
 [[package]]
+name = "hexeract-outbox"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "hexeract-outbox-postgres"
+version = "0.0.1"
+dependencies = [
+ "hexeract-outbox",
+]
+
+[[package]]
 name = "id-arena"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,18 @@
+[package]
+name = "hexeract-outbox-postgres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "PostgreSQL backend for the Hexeract outbox via deadpool_postgres"
+keywords = ["messaging", "outbox", "postgres", "deadpool", "transactional"]
+categories = ["asynchronous", "database"]
+
+[lints]
+workspace = true
+
+[dependencies]
+hexeract-outbox = { path = "../hexeract-outbox", version = "0.0.1" }
