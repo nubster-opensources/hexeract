@@ -26,6 +26,7 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 assert_cmd = "2"
 predicates = "3"
+criterion = { version = "0.5", features = ["async_tokio"] }
 uuid = { version = "1", features = ["v4", "v7"] }
 thiserror = "2"
 tokio-util = { version = "0.7", default-features = false }
