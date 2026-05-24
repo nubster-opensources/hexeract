@@ -1,0 +1,38 @@
+[package]
+name = "hexeract-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Hexeract unified command-line interface"
+readme = "../../README.md"
+exclude = ["/tests", "/examples", "/benches"]
+keywords = ["messaging", "cli", "outbox", "hexeract"]
+categories = ["command-line-utilities", "asynchronous"]
+
+[[bin]]
+name = "hexeract"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+hexeract-outbox = { path = "../hexeract-outbox", version = "0.0.1" }
+hexeract-outbox-postgres = { path = "../hexeract-outbox-postgres", version = "0.0.1" }
+clap = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
