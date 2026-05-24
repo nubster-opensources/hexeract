@@ -15,7 +15,7 @@ Hexeract is sponsored by [Encelade Technologies](https://encelade.tech).
 
 ## Status
 
-🚀 **v0.1.0 release imminent.** Outbox MVP feature-complete, release infrastructure being finalised. Available on crates.io once tagged.
+🚀 **v0.1.0 released on crates.io.** Outbox MVP shipped end to end against PostgreSQL via `deadpool_postgres`.
 
 | Feature | v0.1.0 |
 | --- | --- |

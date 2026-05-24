@@ -38,3 +38,8 @@ updates:
       include: "scope"
     labels:
       - "kind:chore"
+    ignore:
+      # dtolnay/rust-toolchain tags track the targeted Rust version
+      # (1.88 = Rust 1.88), not the action's own semver. Bumps are
+      # driven by the MSRV policy, not by dependabot.
+      - dependency-name: "dtolnay/rust-toolchain"
