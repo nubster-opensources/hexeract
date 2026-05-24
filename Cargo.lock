@@ -788,7 +788,9 @@ dependencies = [
 name = "hexeract-outbox-postgres"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "deadpool-postgres",
+ "hexeract-core",
  "hexeract-outbox",
  "serde",
  "serde_json",
@@ -796,7 +798,7 @@ dependencies = [
  "testcontainers-modules",
  "tokio",
  "tokio-postgres",
- "trait-variant",
+ "tokio-util",
  "uuid",
 ]
 
