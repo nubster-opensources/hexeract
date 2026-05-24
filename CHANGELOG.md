@@ -9,7 +9,7 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 ### Added
 - _Items in flight will be listed here until the next release._
 
-## [0.1.0] - TBD
+## [0.1.0] - 2026-05-24
 
 First public release. Ships the transactional outbox feature end to end against PostgreSQL via `deadpool_postgres`.
 

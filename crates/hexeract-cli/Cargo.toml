@@ -21,8 +21,8 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-hexeract-outbox = { path = "../hexeract-outbox", version = "0.0.1" }
-hexeract-outbox-postgres = { path = "../hexeract-outbox-postgres", version = "0.0.1" }
+hexeract-outbox = { path = "../hexeract-outbox", version = "0.1.0" }
+hexeract-outbox-postgres = { path = "../hexeract-outbox-postgres", version = "0.1.0" }
 clap = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
