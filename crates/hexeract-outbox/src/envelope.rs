@@ -97,6 +97,38 @@ impl OutboxEnvelope {
         Ok(envelope)
     }
 
+    /// Reconstruct a persisted envelope from its stored fields.
+    ///
+    /// Intended for backend implementations of
+    /// [`crate::OutboxStore`] that read rows back from the storage
+    /// layer. Application code should use [`Self::new`] or
+    /// [`Self::with_subject`] instead.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore(
+        event_id: Uuid,
+        event_type: String,
+        payload: Vec<u8>,
+        subject_id: Option<Uuid>,
+        created_at: SystemTime,
+        attempts: u32,
+        last_error: Option<String>,
+        next_retry_at: Option<SystemTime>,
+        delivered_at: Option<SystemTime>,
+    ) -> Self {
+        Self {
+            event_id,
+            event_type,
+            payload,
+            subject_id,
+            created_at,
+            attempts,
+            last_error,
+            next_retry_at,
+            delivered_at,
+        }
+    }
+
     /// Deserialize the payload back into the strongly-typed event.
     ///
     /// # Errors

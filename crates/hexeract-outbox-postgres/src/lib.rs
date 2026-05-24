@@ -8,8 +8,11 @@
 pub mod publisher;
 /// Canonical schema definition and helpers.
 pub mod schema;
+/// PostgreSQL implementation of the outbox store driven by the worker.
+pub mod store;
 
 pub use publisher::PgOutboxPublisher;
 pub use schema::POSTGRES_SCHEMA_SQL;
 pub use schema::ensure_schema;
 pub use schema::render_schema;
+pub use store::PgOutboxStore;
