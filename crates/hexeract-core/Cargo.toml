@@ -8,6 +8,8 @@ homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 description = "Core traits and types for the Hexeract messaging framework"
+readme = "../../README.md"
+exclude = ["/tests", "/examples", "/benches"]
 keywords = ["messaging", "mediator", "cqrs", "command", "handler"]
 categories = ["asynchronous", "network-programming"]
 

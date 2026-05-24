@@ -8,6 +8,8 @@ homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 description = "In-process mediator implementation for the Hexeract messaging framework"
+readme = "../../README.md"
+exclude = ["/tests", "/examples", "/benches"]
 keywords = ["messaging", "mediator", "cqrs", "dispatch"]
 categories = ["asynchronous", "network-programming"]
 
