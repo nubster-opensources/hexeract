@@ -46,7 +46,7 @@ impl PgOutboxPublisher {
     fn insert_sql(&self) -> String {
         format!(
             "INSERT INTO {} (event_id, event_type, payload, subject_id) \
-             VALUES ($1, $2, $3::jsonb, $4)",
+             VALUES ($1, $2, $3, $4)",
             self.table_name
         )
     }
@@ -56,10 +56,10 @@ impl PgOutboxPublisher {
         sql: &str,
         event_id: Uuid,
         event_type: &'static str,
-        payload: &str,
+        payload: &serde_json::Value,
         subject_id: Option<Uuid>,
     ) -> Result<(), OutboxError> {
-        tx.execute(sql, &[&event_id, &event_type, &payload, &subject_id])
+        tx.execute(sql, &[&event_id, &event_type, payload, &subject_id])
             .await
             .map_err(|e| OutboxError::Database(Box::new(e)))?;
         Ok(())
@@ -75,7 +75,7 @@ impl OutboxPublisher for PgOutboxPublisher {
         event: &E,
     ) -> Result<Uuid, OutboxError> {
         let event_id = Uuid::now_v7();
-        let payload = serde_json::to_string(event)?;
+        let payload = serde_json::to_value(event)?;
         let sql = self.insert_sql();
         Self::execute_insert(tx, &sql, event_id, E::EVENT_TYPE, &payload, None).await?;
         Ok(event_id)
@@ -88,7 +88,7 @@ impl OutboxPublisher for PgOutboxPublisher {
         event: &E,
     ) -> Result<Uuid, OutboxError> {
         let event_id = Uuid::now_v7();
-        let payload = serde_json::to_string(event)?;
+        let payload = serde_json::to_value(event)?;
         let sql = self.insert_sql();
         Self::execute_insert(
             tx,
@@ -114,7 +114,7 @@ impl OutboxPublisher for PgOutboxPublisher {
             .await
             .map_err(|e| OutboxError::Database(Box::new(e)))?;
 
-        let payload = serde_json::to_string(event)?;
+        let payload = serde_json::to_value(event)?;
         let sql = self.insert_sql();
         Self::execute_insert(&tx, &sql, event_id, E::EVENT_TYPE, &payload, None).await?;
 
@@ -162,6 +162,6 @@ mod tests {
         let sql = publisher.insert_sql();
         assert!(sql.contains("INSERT INTO audit_outbox"));
         assert!(sql.contains("event_id"));
-        assert!(sql.contains("$3::jsonb"));
+        assert!(sql.contains("VALUES ($1, $2, $3, $4)"));
     }
 }
