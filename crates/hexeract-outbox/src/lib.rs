@@ -16,7 +16,10 @@ pub mod envelope;
 pub mod error;
 /// Marker trait for domain events that flow through the outbox.
 pub mod event;
+/// Asynchronous handler contract dispatched by the worker.
+pub mod handler;
 
 pub use envelope::OutboxEnvelope;
 pub use error::OutboxError;
 pub use event::Event;
+pub use handler::Handler;
