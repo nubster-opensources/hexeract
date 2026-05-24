@@ -1,0 +1,42 @@
+name: Feature request
+description: Suggest a new capability or improvement for Hexeract
+title: "feat: "
+labels: ["kind:feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to suggest a feature. Concrete use cases beat abstract requests every time.
+
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use case
+      description: What problem are you trying to solve? What does your code look like today, and why is it painful?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed_api
+    attributes:
+      label: Proposed API or behaviour
+      description: A code snippet showing the API you would like to see. Even rough is better than nothing.
+      render: rust
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other crates, patterns or workarounds you have already evaluated.
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Links to discussions, related issues, prior art in other ecosystems, etc.
+    validations:
+      required: false
