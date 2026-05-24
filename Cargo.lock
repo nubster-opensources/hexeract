@@ -152,9 +152,12 @@ version = "0.0.1"
 name = "hexeract-outbox"
 version = "0.0.1"
 dependencies = [
+ "hexeract-core",
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
+ "trait-variant",
  "uuid",
 ]
 
