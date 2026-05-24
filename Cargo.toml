@@ -21,6 +21,7 @@ keywords = ["messaging", "mediator", "cqrs", "outbox", "sagas"]
 categories = ["asynchronous", "network-programming"]
 
 [workspace.dependencies]
+async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 tokio-util = { version = "0.7", default-features = false }

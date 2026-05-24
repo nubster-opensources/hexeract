@@ -771,11 +771,15 @@ version = "0.0.1"
 name = "hexeract-outbox"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "hexeract-core",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
  "trait-variant",
  "uuid",
 ]
