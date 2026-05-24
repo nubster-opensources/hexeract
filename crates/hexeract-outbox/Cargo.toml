@@ -8,6 +8,8 @@ homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 description = "Transactional outbox pattern primitives for the Hexeract messaging framework"
+readme = "../../README.md"
+exclude = ["/tests", "/examples", "/benches"]
 keywords = ["messaging", "outbox", "cqrs", "events", "transactional"]
 categories = ["asynchronous", "database"]
 

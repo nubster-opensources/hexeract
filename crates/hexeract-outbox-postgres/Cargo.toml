@@ -8,6 +8,8 @@ homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 description = "PostgreSQL backend for the Hexeract outbox via deadpool_postgres"
+readme = "../../README.md"
+exclude = ["/tests", "/examples", "/benches"]
 keywords = ["messaging", "outbox", "postgres", "deadpool", "transactional"]
 categories = ["asynchronous", "database"]
 

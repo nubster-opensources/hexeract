@@ -2,8 +2,11 @@
 
 > The 6-dimension Rust messaging framework: Mediator, Bus, Outbox, Sagas, Scheduler, Request/Reply.
 
+[![crates.io](https://img.shields.io/crates/v/hexeract-outbox.svg?label=crates.io)](https://crates.io/crates/hexeract-outbox)
+[![docs.rs](https://img.shields.io/docsrs/hexeract-outbox?label=docs.rs)](https://docs.rs/hexeract-outbox)
+[![CI](https://github.com/nubster-opensources/hexeract/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/nubster-opensources/hexeract/actions/workflows/ci.yml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](./docs/MSRV_POLICY.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Status](https://img.shields.io/badge/status-pre--alpha-orange)](#status)
 [![Made with Rust](https://img.shields.io/badge/made%20with-Rust-orange?logo=rust)](https://www.rust-lang.org/)
 
 Hexeract is a server-side messaging framework written in Rust. It unifies in-process mediator handlers, external message bus transports, transactional outbox and inbox, long-running sagas, scheduled messages and request/reply RPC in a single coherent SDK. The framework relies on Rust's type system and procedural macros to provide compile-time guarantees in place of runtime reflection.
@@ -12,17 +15,82 @@ Hexeract is sponsored by [Encelade Technologies](https://encelade.tech).
 
 ## Status
 
-🚧 **Pre-alpha, no usable release yet.**
+🚀 **v0.1.0 release imminent.** Outbox MVP feature-complete, release infrastructure being finalised. Available on crates.io once tagged.
 
-| Phase | State |
+| Feature | v0.1.0 |
 | --- | --- |
-| 1. Product vision and scope | ✅ Closed (2026-05-21) |
-| 2. Technical architecture | ⏳ In progress |
-| 3. Open source strategy | ⏳ Pending |
-| 4. Proof of concept (1 to 2 weeks spike) | ⏳ Pending |
-| 5. v0.1.0 public release | ⏳ Target Q4 2026 |
+| Transactional outbox (PostgreSQL) | ✅ |
+| Worker poll loop with `SKIP LOCKED` | ✅ |
+| Fluent builder API | ✅ |
+| `hexeract` CLI for schema management | ✅ |
+| Mediator | ⏳ v0.3.0 |
+| Bus (RabbitMQ, NATS, Kafka, SQS) | ⏳ v0.2.0 then v0.9.0 |
+| Sagas, Scheduler, Request and Reply | ⏳ later milestones |
 
-The repository is intentionally private during vision and architecture phases. It will be opened to the public once Phase 3 publishes the technical design. **Do not depend on it yet**, anything can change until v0.1.0.
+See the [CHANGELOG](./CHANGELOG.md) for the detailed history.
+
+## Quick start
+
+Add the PostgreSQL backend to your `Cargo.toml`:
+
+```toml
+[dependencies]
+hexeract-outbox = "0.1"
+hexeract-outbox-postgres = "0.1"
+```
+
+Declare a domain event, a handler and wire a worker:
+
+```rust
+use std::time::Duration;
+use hexeract_core::HandlerContext;
+use hexeract_outbox::{Event, Handler, OutboxError, OutboxPublisher};
+use hexeract_outbox_postgres::{PgOutboxPublisher, PgOutboxWorkerBuilder};
+use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UserRegistered { user_id: Uuid }
+
+impl Event for UserRegistered {
+    const EVENT_TYPE: &'static str = "users.registered";
+}
+
+struct AuditWriter;
+impl Handler<UserRegistered> for AuditWriter {
+    type Error = OutboxError;
+    async fn handle(&self, event: UserRegistered, _ctx: &HandlerContext) -> Result<(), Self::Error> {
+        // ... write to audit storage ...
+        Ok(())
+    }
+}
+
+# async fn run(pool: deadpool_postgres::Pool) -> Result<(), Box<dyn std::error::Error>> {
+let publisher = PgOutboxPublisher::new(pool.clone(), "audit_outbox")?;
+
+let worker = PgOutboxWorkerBuilder::new(pool.clone())
+    .table_name("audit_outbox")
+    .register_handler::<UserRegistered, _>(AuditWriter)
+    .poll_interval(Duration::from_millis(50))
+    .build()?;
+
+let cancel = CancellationToken::new();
+let join = tokio::spawn(worker.run(cancel.clone()));
+
+// inside a business use case:
+let mut client = pool.get().await?;
+let mut tx = client.transaction().await?;
+let event_id = publisher.publish_in_tx(&mut tx, &UserRegistered { user_id: Uuid::new_v4() }).await?;
+tx.commit().await?;
+println!("published event {event_id}");
+
+cancel.cancel();
+join.await??;
+# Ok(()) }
+```
+
+See [`docs/getting-started.md`](./docs/getting-started.md) and the runnable [`examples/`](./crates/hexeract-outbox-postgres/examples/) for the full integration walkthrough.
 
 ## Why Hexeract
 
@@ -54,7 +122,9 @@ To stay focused, the following are explicitly out of scope:
 
 ## Contributing
 
-Hexeract is in pre-alpha and its public API is unstable. The repository is currently private to keep the design conversation focused. Once Phase 2 finalises the architecture, the repo will be opened and a `CONTRIBUTING.md` will document the contribution model.
+Contributions are welcome. Please read [`CONTRIBUTING.md`](./CONTRIBUTING.md) first for the workflow and conventions, and [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md) for the community guidelines. For vulnerability reports, see [`SECURITY.md`](./SECURITY.md). For open-ended questions and design conversations, use [GitHub Discussions](https://github.com/nubster-opensources/hexeract/discussions).
+
+Stability and versioning are documented in [`docs/SEMVER_POLICY.md`](./docs/SEMVER_POLICY.md) and [`docs/MSRV_POLICY.md`](./docs/MSRV_POLICY.md).
 
 ## License
 

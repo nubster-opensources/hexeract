@@ -8,6 +8,8 @@ homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 description = "The 6-dimension Rust messaging framework"
+readme = "../../README.md"
+exclude = ["/tests", "/examples", "/benches"]
 keywords = ["messaging", "mediator", "cqrs", "outbox", "sagas"]
 categories = ["asynchronous", "network-programming"]
 
