@@ -22,7 +22,7 @@ categories = ["asynchronous", "network-programming"]
 
 [workspace.dependencies]
 async-trait = "0.1"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v7"] }
 thiserror = "2"
 tokio-util = { version = "0.7", default-features = false }
 tracing = "0.1"

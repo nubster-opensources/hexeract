@@ -72,21 +72,22 @@ impl OutboxPublisher for PgOutboxPublisher {
     async fn publish_in_tx<E: Event>(
         &self,
         tx: &mut Self::Tx<'_>,
-        event_id: Uuid,
         event: &E,
-    ) -> Result<(), OutboxError> {
+    ) -> Result<Uuid, OutboxError> {
+        let event_id = Uuid::now_v7();
         let payload = serde_json::to_string(event)?;
         let sql = self.insert_sql();
-        Self::execute_insert(tx, &sql, event_id, E::EVENT_TYPE, &payload, None).await
+        Self::execute_insert(tx, &sql, event_id, E::EVENT_TYPE, &payload, None).await?;
+        Ok(event_id)
     }
 
     async fn publish_in_tx_with_subject<E: Event>(
         &self,
         tx: &mut Self::Tx<'_>,
-        event_id: Uuid,
         subject_id: Uuid,
         event: &E,
-    ) -> Result<(), OutboxError> {
+    ) -> Result<Uuid, OutboxError> {
+        let event_id = Uuid::now_v7();
         let payload = serde_json::to_string(event)?;
         let sql = self.insert_sql();
         Self::execute_insert(
@@ -97,10 +98,12 @@ impl OutboxPublisher for PgOutboxPublisher {
             &payload,
             Some(subject_id),
         )
-        .await
+        .await?;
+        Ok(event_id)
     }
 
-    async fn publish<E: Event>(&self, event_id: Uuid, event: &E) -> Result<(), OutboxError> {
+    async fn publish<E: Event>(&self, event: &E) -> Result<Uuid, OutboxError> {
+        let event_id = Uuid::now_v7();
         let mut client = self
             .pool
             .get()
@@ -118,7 +121,7 @@ impl OutboxPublisher for PgOutboxPublisher {
         tx.commit()
             .await
             .map_err(|e| OutboxError::Database(Box::new(e)))?;
-        Ok(())
+        Ok(event_id)
     }
 }
 
