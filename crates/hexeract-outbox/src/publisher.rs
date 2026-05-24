@@ -6,11 +6,14 @@ use crate::OutboxError;
 /// Contract for inserting events into the outbox storage.
 ///
 /// Implementors persist a fresh [`crate::OutboxEnvelope`] for each
-/// published event. The associated [`Self::Tx`] type lets the trait stay
-/// backend-agnostic: a PostgreSQL backend exposes a
-/// `deadpool_postgres::Transaction`, a future SQLite backend would expose
-/// its own handle. Callers reuse their existing business transaction so
-/// the outbox insert and the state mutation commit together.
+/// published event. The associated [`Self::Tx`] generic associated type
+/// lets the trait stay backend-agnostic while still allowing backends to
+/// expose lifetime-bound transaction handles (e.g.
+/// `deadpool_postgres::Transaction<'a>` borrows the connection it was
+/// opened from).
+///
+/// Callers reuse their existing business transaction so the outbox
+/// insert and the state mutation commit together.
 ///
 /// # Idempotency
 ///
@@ -24,7 +27,6 @@ use crate::OutboxError;
 /// ```
 /// use hexeract_outbox::{Event, OutboxPublisher, OutboxError};
 /// use serde::{Deserialize, Serialize};
-/// use std::future::Future;
 /// use uuid::Uuid;
 ///
 /// #[derive(Debug, Serialize, Deserialize)]
@@ -40,11 +42,11 @@ use crate::OutboxError;
 /// struct InMemoryPublisher;
 ///
 /// impl OutboxPublisher for InMemoryPublisher {
-///     type Tx = InMemoryTx;
+///     type Tx<'tx> = InMemoryTx;
 ///
 ///     async fn publish_in_tx<E: Event>(
 ///         &self,
-///         _tx: &mut Self::Tx,
+///         _tx: &mut Self::Tx<'_>,
 ///         _event_id: Uuid,
 ///         _event: &E,
 ///     ) -> Result<(), OutboxError> {
@@ -53,7 +55,7 @@ use crate::OutboxError;
 ///
 ///     async fn publish_in_tx_with_subject<E: Event>(
 ///         &self,
-///         _tx: &mut Self::Tx,
+///         _tx: &mut Self::Tx<'_>,
 ///         _event_id: Uuid,
 ///         _subject_id: Uuid,
 ///         _event: &E,
@@ -73,16 +75,20 @@ use crate::OutboxError;
 #[trait_variant::make(Send)]
 pub trait OutboxPublisher: Send + Sync + 'static {
     /// Backend-specific transaction handle borrowed by `publish_in_tx`.
-    type Tx: Send;
+    ///
+    /// Parameterized by the transaction's lifetime so backends can expose
+    /// types that borrow from the connection pool (e.g.
+    /// `deadpool_postgres::Transaction<'tx>`).
+    type Tx<'tx>: Send;
 
     /// Insert an event using an existing business transaction.
     ///
-    /// The transaction is borrowed mutably so the call enrolls the
+    /// The transaction is borrowed mutably so the call enrols the
     /// outbox insert in the caller's unit of work. The caller is
     /// responsible for committing or rolling back the transaction.
     async fn publish_in_tx<E: Event>(
         &self,
-        tx: &mut Self::Tx,
+        tx: &mut Self::Tx<'_>,
         event_id: Uuid,
         event: &E,
     ) -> Result<(), OutboxError>;
@@ -93,7 +99,7 @@ pub trait OutboxPublisher: Send + Sync + 'static {
     /// sharing the same aggregate identifier in insertion order.
     async fn publish_in_tx_with_subject<E: Event>(
         &self,
-        tx: &mut Self::Tx,
+        tx: &mut Self::Tx<'_>,
         event_id: Uuid,
         subject_id: Uuid,
         event: &E,
@@ -153,11 +159,11 @@ mod tests {
     }
 
     impl OutboxPublisher for MockPublisher {
-        type Tx = MockTx;
+        type Tx<'tx> = MockTx;
 
         async fn publish_in_tx<E: Event>(
             &self,
-            _tx: &mut Self::Tx,
+            _tx: &mut Self::Tx<'_>,
             event_id: Uuid,
             event: &E,
         ) -> Result<(), OutboxError> {
@@ -168,7 +174,7 @@ mod tests {
 
         async fn publish_in_tx_with_subject<E: Event>(
             &self,
-            _tx: &mut Self::Tx,
+            _tx: &mut Self::Tx<'_>,
             event_id: Uuid,
             subject_id: Uuid,
             event: &E,
