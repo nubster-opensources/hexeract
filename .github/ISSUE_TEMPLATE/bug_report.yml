@@ -1,0 +1,80 @@
+name: Bug report
+description: Report a defect in Hexeract
+title: "bug: "
+labels: ["kind:bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please fill the sections below as completely as you can; the more information we have, the faster we can help.
+
+  - type: input
+    id: version
+    attributes:
+      label: Hexeract crate(s) and version
+      description: e.g. `hexeract-outbox 0.1.0`, `hexeract-outbox-postgres 0.1.0`
+      placeholder: hexeract-outbox-postgres 0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: rust_version
+    attributes:
+      label: Rust toolchain
+      description: Output of `rustc --version`
+      placeholder: rustc 1.88.0 (stable)
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Ubuntu 24.04 / macOS 14.5 / Windows 11
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Minimal sequence of actions or a code snippet that triggers the issue.
+      placeholder: |
+        1. Configure `PgOutboxWorkerBuilder::new(pool).build()?`
+        2. Spawn the worker
+        3. Publish an event
+        4. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: Include error messages, panics or unexpected output.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or tracing output
+      description: Paste relevant `tracing` output, ideally at `debug` level on the `hexeract_outbox` target.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else worth knowing (custom backend, multi-worker setup, etc.).
+    validations:
+      required: false
