@@ -137,14 +137,10 @@ async fn publish_in_tx_inserts_a_row_in_the_calling_transaction() {
         user_id: Uuid::nil(),
         email: "alice@example.com".to_owned(),
     };
-    let event_id = Uuid::new_v4();
 
     let mut client = pool.get().await.unwrap();
     let mut tx = client.transaction().await.unwrap();
-    publisher
-        .publish_in_tx(&mut tx, event_id, &event)
-        .await
-        .unwrap();
+    let event_id = publisher.publish_in_tx(&mut tx, &event).await.unwrap();
     tx.commit().await.unwrap();
 
     let client = pool.get().await.unwrap();
@@ -174,13 +170,12 @@ async fn publish_in_tx_with_subject_records_subject_id() {
         user_id: Uuid::nil(),
         email: "bob@example.com".to_owned(),
     };
-    let event_id = Uuid::new_v4();
     let subject = Uuid::from_u128(424_242);
 
     let mut client = pool.get().await.unwrap();
     let mut tx = client.transaction().await.unwrap();
-    publisher
-        .publish_in_tx_with_subject(&mut tx, event_id, subject, &event)
+    let event_id = publisher
+        .publish_in_tx_with_subject(&mut tx, subject, &event)
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -207,8 +202,7 @@ async fn publish_without_tx_inserts_and_commits() {
         user_id: Uuid::nil(),
         email: "carol@example.com".to_owned(),
     };
-    let event_id = Uuid::new_v4();
-    publisher.publish(event_id, &event).await.unwrap();
+    let event_id = publisher.publish(&event).await.unwrap();
 
     assert_eq!(count_pending(&pool, event_id).await, 1);
 }
@@ -223,14 +217,10 @@ async fn rollback_in_business_tx_discards_the_outbox_insert() {
         user_id: Uuid::nil(),
         email: "dave@example.com".to_owned(),
     };
-    let event_id = Uuid::new_v4();
 
     let mut client = pool.get().await.unwrap();
     let mut tx = client.transaction().await.unwrap();
-    publisher
-        .publish_in_tx(&mut tx, event_id, &event)
-        .await
-        .unwrap();
+    let event_id = publisher.publish_in_tx(&mut tx, &event).await.unwrap();
     tx.rollback().await.unwrap();
 
     let client = pool.get().await.unwrap();
@@ -314,12 +304,11 @@ async fn worker_dispatches_published_event_and_marks_delivered() {
     let publisher = PgOutboxPublisher::new(pool.clone(), TABLE).unwrap();
     let store = PgOutboxStore::new(pool.clone(), TABLE).unwrap();
 
-    let event_id = Uuid::new_v4();
     let event = UserRegistered {
         user_id: Uuid::nil(),
         email: "alice@example.com".to_owned(),
     };
-    publisher.publish(event_id, &event).await.unwrap();
+    let event_id = publisher.publish(&event).await.unwrap();
 
     let seen = Arc::new(Mutex::new(Vec::new()));
     let handlers = registry_with(RecordingHandler {
@@ -344,12 +333,11 @@ async fn worker_marks_failed_and_increments_attempts_on_handler_error() {
     let publisher = PgOutboxPublisher::new(pool.clone(), TABLE).unwrap();
     let store = PgOutboxStore::new(pool.clone(), TABLE).unwrap();
 
-    let event_id = Uuid::new_v4();
     let event = UserRegistered {
         user_id: Uuid::nil(),
         email: "bob@example.com".to_owned(),
     };
-    publisher.publish(event_id, &event).await.unwrap();
+    let event_id = publisher.publish(&event).await.unwrap();
 
     let handlers = registry_with(FailingHandler);
     let config = OutboxWorkerConfig {
@@ -377,12 +365,11 @@ async fn worker_excludes_events_past_max_attempts() {
     let publisher = PgOutboxPublisher::new(pool.clone(), TABLE).unwrap();
     let store = PgOutboxStore::new(pool.clone(), TABLE).unwrap();
 
-    let event_id = Uuid::new_v4();
     let event = UserRegistered {
         user_id: Uuid::nil(),
         email: "carol@example.com".to_owned(),
     };
-    publisher.publish(event_id, &event).await.unwrap();
+    let event_id = publisher.publish(&event).await.unwrap();
 
     let client = pool.get().await.unwrap();
     client
@@ -422,12 +409,11 @@ async fn multi_worker_skip_locked_prevents_double_dispatch() {
     let event_count = 20;
     let mut ids = Vec::with_capacity(event_count);
     for i in 0..event_count {
-        let event_id = Uuid::new_v4();
         let event = UserRegistered {
             user_id: Uuid::from_u128(i as u128),
             email: format!("user{i}@example.com"),
         };
-        publisher.publish(event_id, &event).await.unwrap();
+        let event_id = publisher.publish(&event).await.unwrap();
         ids.push(event_id);
     }
 
@@ -511,7 +497,7 @@ async fn worker_stops_gracefully_on_cancellation() {
 
 #[tokio::test]
 #[ignore = "requires Docker daemon"]
-async fn duplicate_event_id_is_rejected_by_unique_constraint() {
+async fn successive_publish_calls_mint_distinct_event_ids() {
     let (_container, pool) = setup().await;
     let publisher = PgOutboxPublisher::new(pool.clone(), TABLE).unwrap();
 
@@ -519,9 +505,10 @@ async fn duplicate_event_id_is_rejected_by_unique_constraint() {
         user_id: Uuid::nil(),
         email: "erin@example.com".to_owned(),
     };
-    let event_id = Uuid::new_v4();
 
-    publisher.publish(event_id, &event).await.unwrap();
-    let err = publisher.publish(event_id, &event).await.unwrap_err();
-    assert!(matches!(err, hexeract_outbox::OutboxError::Database(_)));
+    let first = publisher.publish(&event).await.unwrap();
+    let second = publisher.publish(&event).await.unwrap();
+    assert_ne!(first, second);
+    assert_eq!(count_pending(&pool, first).await, 1);
+    assert_eq!(count_pending(&pool, second).await, 1);
 }

@@ -56,7 +56,9 @@ impl OutboxEnvelope {
     /// Build a fresh envelope from a domain event.
     ///
     /// The payload is serialized as JSON. The envelope starts with zero
-    /// attempts, no recorded error and no delivery timestamp.
+    /// attempts, no recorded error and no delivery timestamp. Backends
+    /// typically mint the `event_id` as a `UUIDv7` right before calling
+    /// this constructor.
     ///
     /// # Errors
     ///

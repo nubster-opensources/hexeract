@@ -146,20 +146,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .build()?;
     let worker_handle = tokio::spawn(worker.run(cancel.clone()));
 
-    let event_id = Uuid::new_v4();
     let event = UserRegistered {
         user_id: Uuid::new_v4(),
         email: "alice@example.com".to_owned(),
     };
 
     let start = Instant::now();
-    tracing::info!(event_id = %event_id, "publishing UserRegistered event in business transaction");
-    {
+    tracing::info!("publishing UserRegistered event in business transaction");
+    let event_id = {
         let mut client = ops_pool.get().await?;
         let mut tx = client.transaction().await?;
-        publisher.publish_in_tx(&mut tx, event_id, &event).await?;
+        let event_id = publisher.publish_in_tx(&mut tx, &event).await?;
         tx.commit().await?;
-    }
+        event_id
+    };
+    tracing::info!(event_id = %event_id, "event committed");
 
     tracing::info!("event committed, waiting for worker dispatch");
 
