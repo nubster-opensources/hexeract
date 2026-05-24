@@ -18,8 +18,11 @@ pub mod error;
 pub mod event;
 /// Asynchronous handler contract dispatched by the worker.
 pub mod handler;
+/// Backend-agnostic contract for inserting events into the outbox.
+pub mod publisher;
 
 pub use envelope::OutboxEnvelope;
 pub use error::OutboxError;
 pub use event::Event;
 pub use handler::Handler;
+pub use publisher::OutboxPublisher;
