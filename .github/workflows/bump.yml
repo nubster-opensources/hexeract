@@ -1,0 +1,45 @@
+name: Bump
+
+on:
+  workflow_dispatch:
+    inputs:
+      level:
+        description: "Bump level (patch / minor / major / explicit x.y.z)"
+        required: true
+        type: string
+        default: "patch"
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    name: Run release prep script
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@1.88.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bump
+
+      - name: Install cargo-release
+        run: cargo install --locked cargo-release
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Run release prep script
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./scripts/release.sh "${{ inputs.level }}"
