@@ -2,8 +2,9 @@
 //!
 //! This crate ships the backend-agnostic primitives the rest of the bus
 //! ecosystem composes on top of: the [`Message`] marker trait, the
-//! in-flight [`BusEnvelope`] carried across the wire, and the unified
-//! [`BusError`] type.
+//! in-flight [`BusEnvelope`] carried across the wire, the unified
+//! [`BusError`] type, and the backend-agnostic [`Transport`] publish
+//! contract.
 //!
 //! Backend implementations live in companion crates such as
 //! `hexeract-bus-rabbitmq`.
@@ -14,7 +15,10 @@ pub mod envelope;
 pub mod error;
 /// Marker trait for domain messages that flow through the bus.
 pub mod message;
+/// Backend-agnostic publish contract implemented by bus backends.
+pub mod transport;
 
 pub use envelope::BusEnvelope;
 pub use error::BusError;
 pub use message::Message;
+pub use transport::Transport;
