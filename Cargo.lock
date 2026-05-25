@@ -997,6 +997,17 @@ name = "hexeract"
 version = "0.1.0"
 
 [[package]]
+name = "hexeract-bus"
+version = "0.1.0"
+dependencies = [
+ "hexeract-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "hexeract-cli"
 version = "0.1.0"
 dependencies = [

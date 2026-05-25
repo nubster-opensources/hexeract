@@ -1,0 +1,28 @@
+[package]
+name = "hexeract-bus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Message bus primitives for the Hexeract messaging framework"
+readme = "../../README.md"
+exclude = ["/tests", "/examples", "/benches"]
+keywords = ["messaging", "bus", "broker", "amqp", "events"]
+categories = ["asynchronous", "network-programming"]
+
+[lints]
+workspace = true
+
+[dependencies]
+hexeract-core = { path = "../hexeract-core", version = "0.1.0" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true, features = ["serde", "v7"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
