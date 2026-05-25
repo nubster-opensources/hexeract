@@ -1,0 +1,4 @@
+# CODEOWNERS for Hexeract
+# Every path is owned by the BDFL. See docs/GOVERNANCE.md for details.
+
+* @pierrick-fonquerne
