@@ -8,7 +8,7 @@ use tokio_postgres::NoTls;
 /// their own migration tooling (sqlx-cli, refinery, dbmate, Flyway, ...)
 /// using the SQL exposed by `hexeract outbox patch`.
 #[derive(Args, Debug)]
-pub struct ApplyArgs {
+pub(crate) struct ApplyArgs {
     /// PostgreSQL connection URL (e.g. `postgres://user:pass@host:5432/db`).
     #[arg(long, env = "DATABASE_URL")]
     conn: String,
@@ -21,7 +21,7 @@ pub struct ApplyArgs {
 }
 
 impl ApplyArgs {
-    pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub(crate) async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
         if !self.yes_i_know {
             eprintln!("Refusing to apply DDL without --yes-i-know.");
             eprintln!();
