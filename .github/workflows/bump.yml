@@ -44,4 +44,7 @@ jobs:
       - name: Run release prep script
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: ./scripts/release.sh "${{ inputs.level }}"
+        # Invoked via `bash` explicitly so the runner does not depend on
+        # the executable bit, which is not always preserved when the
+        # script is committed from a Windows workstation.
+        run: bash scripts/release.sh "${{ inputs.level }}"
