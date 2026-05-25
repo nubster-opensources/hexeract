@@ -29,8 +29,16 @@ cargo test --workspace --all-features
 
 Until v0.1.0, all design decisions go through a `discussion/` thread on the repository before any pull request is opened. This includes the public traits, the transport abstraction, the outbox schema and the saga state machine.
 
+## Contributor License Agreement
+
+Contributions to this project are governed by the Encelade Technologies Contributor License Agreement, hosted at [github.com/nubster-opensources/cla](https://github.com/nubster-opensources/cla).
+
+On your first pull request, the CLA Assistant bot will automatically prompt you to sign the CLA. Once signed, your signature applies to all current and future contributions to any `nubster-opensources` project.
+
+The CLA is a license grant (not a copyright assignment): you keep the copyright on your contributions and grant Encelade Technologies a broad license to use, sub-license, and re-license them.
+
 ## License
 
-By contributing, you agree that your contributions are licensed under the [MIT license](./LICENSE).
+By contributing, you agree that your contributions are dual-licensed under the [MIT License](./LICENSE-MIT) and the [Apache License, Version 2.0](./LICENSE-APACHE), at the user's option.
 
 Copyright © Encelade Technologies.
