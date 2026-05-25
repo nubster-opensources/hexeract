@@ -29,7 +29,7 @@ Use this when you want full control over the pre-flight (run tests against your 
 Requirements (must be installed on your machine):
 
 - `bash`, `git`, `python3`, `gh`
-- `cargo` and the `cargo-release` subcommand: `cargo install cargo-release`
+- `cargo` and the `cargo-release` subcommand pinned to the latest version compatible with our MSRV (`cargo-release 1.1+` requires Rust 1.91+, so we stay on the 0.25 series): `cargo install --locked cargo-release@0.25.20`
 
 The script:
 
