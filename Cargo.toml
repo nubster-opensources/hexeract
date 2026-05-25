@@ -7,6 +7,7 @@ members = [
     "crates/hexeract",
     "crates/hexeract-outbox",
     "crates/hexeract-outbox-postgres",
+    "crates/hexeract-bus",
     "crates/hexeract-cli",
 ]
 
