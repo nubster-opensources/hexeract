@@ -32,7 +32,9 @@ jobs:
           key: bump
 
       - name: Install cargo-release
-        run: cargo install --locked cargo-release
+        # Pinned to the latest version that supports our MSRV (Rust 1.88).
+        # cargo-release 1.1+ requires Rust 1.91+.
+        run: cargo install --locked cargo-release@0.25.20
 
       - name: Configure git identity
         run: |
