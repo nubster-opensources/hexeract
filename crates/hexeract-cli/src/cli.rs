@@ -7,7 +7,7 @@ use crate::commands;
 #[derive(Parser, Debug)]
 #[command(name = "hexeract")]
 #[command(version, about, long_about = None)]
-pub struct Cli {
+pub(crate) struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
@@ -22,7 +22,7 @@ enum Commands {
 }
 
 impl Cli {
-    pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub(crate) async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
         match self.command {
             Commands::Outbox { action } => action.run().await,
         }

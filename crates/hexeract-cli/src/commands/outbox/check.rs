@@ -6,7 +6,7 @@ use tokio_postgres::NoTls;
 /// Returns exit code 0 on success, 1 when the table is missing or
 /// incomplete (with a remediation message printed to stderr).
 #[derive(Args, Debug)]
-pub struct CheckArgs {
+pub(crate) struct CheckArgs {
     /// PostgreSQL connection URL.
     #[arg(long, env = "DATABASE_URL")]
     conn: String,
@@ -29,7 +29,7 @@ const REQUIRED_COLUMNS: &[&str] = &[
 ];
 
 impl CheckArgs {
-    pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub(crate) async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
         let (client, connection) = tokio_postgres::connect(&self.conn, NoTls).await?;
         tokio::spawn(async move {
             if let Err(err) = connection.await {
