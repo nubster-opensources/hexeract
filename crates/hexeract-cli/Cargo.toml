@@ -21,10 +21,10 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-hexeract-bus = { path = "../hexeract-bus", version = "0.1.0" }
-hexeract-bus-rabbitmq = { path = "../hexeract-bus-rabbitmq", version = "0.1.0" }
-hexeract-outbox = { path = "../hexeract-outbox", version = "0.1.0" }
-hexeract-outbox-postgres = { path = "../hexeract-outbox-postgres", version = "0.1.0" }
+hexeract-bus = { path = "../hexeract-bus", version = "0.2.0" }
+hexeract-bus-rabbitmq = { path = "../hexeract-bus-rabbitmq", version = "0.2.0" }
+hexeract-outbox = { path = "../hexeract-outbox", version = "0.2.0" }
+hexeract-outbox-postgres = { path = "../hexeract-outbox-postgres", version = "0.2.0" }
 clap = { workspace = true }
 lapin = "4"
 serde = { workspace = true }

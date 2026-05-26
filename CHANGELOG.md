@@ -9,7 +9,7 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 ### Added
 - _Items in flight will be listed here until the next release._
 
-## [0.2.0] - Unreleased
+## [0.2.0] - 2026-05-26
 
 Second public release. Ships the Bus feature end to end against RabbitMQ via `lapin`, alongside topology types, a typed consumer worker with ack modes and retry policy, an end-to-end pub/sub example and a `hexeract bus` CLI namespace.
 
