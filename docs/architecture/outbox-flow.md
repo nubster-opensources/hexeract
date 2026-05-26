@@ -1,6 +1,6 @@
-# Outbox architecture
+# Outbox flow
 
-This document explains how the Hexeract Outbox is structured, what guarantees it provides and where the trade-offs live. Read [getting-started.md](getting-started.md) first if you have not yet wired the outbox into a service.
+This document explains how the Hexeract Outbox is structured, what guarantees it provides and where the trade-offs live. Read [outbox-quick-start.md](../getting-started/outbox-quick-start.md) first if you have not yet wired the outbox into a service.
 
 ## Concepts
 
@@ -20,43 +20,56 @@ This document explains how the Hexeract Outbox is structured, what guarantees it
 
 ## End-to-end flow
 
+### Publish side: enrol the event in the business transaction
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Business code
+    participant Pub as PgOutboxPublisher
+    participant DB as PostgreSQL
+
+    App->>DB: BEGIN (business tx)
+    App->>Pub: publish_in_tx(&mut tx, &event)
+    Pub->>Pub: event_id = Uuid::now_v7()
+    Pub->>Pub: payload = serde_json::to_vec(&event)
+    Pub->>DB: INSERT INTO outbox (event_id, event_type, payload, ...)
+    Pub-->>App: Ok(event_id)
+    App->>DB: COMMIT
+    Note over App,DB: If the business tx rolls back<br/>the outbox row is gone too
 ```
-   business code                       Hexeract                       backend
-   ────────────                        ────────                       ───────
-                                                                          │
-   open business tx                                                        │
-        │                                                                  │
-        │  publish_in_tx(&mut tx, &event)                                  │
-        ├─────────────────────────────────►                                │
-        │                                  │  Uuid::now_v7()               │
-        │                                  │  serde_json::to_string()      │
-        │                                  │  INSERT INTO outbox (...)     │
-        │                                  ├────────────────────────────► PostgreSQL
-        │ ◄─────── event_id ───────────────┤                                │
-        │                                                                  │
-   commit business tx                                                      │
-        │                                                                  │
-        ▼                                                                  │
-                                                                          │
-   ───── meanwhile, OutboxWorker poll cycle ─────                          │
-                                                                          │
-   acquire client                                                          │
-   begin tx                                                                │
-   SELECT ... WHERE delivered_at IS NULL                                   │
-                AND attempts < max_attempts                                │
-                AND (next_retry_at IS NULL OR next_retry_at <= NOW())     │
-                FOR UPDATE SKIP LOCKED LIMIT batch_size                    │
-        │                                                                  │
-        ▼ list of OutboxEnvelope                                           │
-                                                                          │
-   for each envelope:                                                      │
-       handler.handle(decoded_event, ctx)                                  │
-           ├─ Ok  ─► UPDATE ... SET delivered_at = NOW()                   │
-           └─ Err ─► UPDATE ... SET attempts = attempts + 1,               │
-                                    last_error = ?,                       │
-                                    next_retry_at = NOW() + retry_delay   │
-                                                                          │
-   commit poll tx                                                          │
+
+### Worker side: poll, dispatch, mark delivered or failed
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Worker as OutboxWorker
+    participant Store as PgOutboxStore
+    participant DB as PostgreSQL
+    participant Handler as Handler<E>
+
+    loop Every poll_interval
+        Worker->>Store: acquire() + begin()
+        Store->>DB: BEGIN
+        Worker->>Store: poll(batch_size, max_attempts)
+        Store->>DB: SELECT ... WHERE delivered_at IS NULL<br/>AND attempts < max_attempts<br/>AND (next_retry_at IS NULL OR next_retry_at <= NOW())<br/>FOR UPDATE SKIP LOCKED<br/>LIMIT batch_size
+        DB-->>Store: Vec<OutboxEnvelope>
+        loop For each envelope
+            Worker->>Handler: handle(decoded, ctx)
+            alt Ok
+                Handler-->>Worker: Ok(())
+                Worker->>Store: mark_delivered(event_id)
+                Store->>DB: UPDATE ... SET delivered_at = NOW()
+            else Err
+                Handler-->>Worker: Err(_)
+                Worker->>Store: mark_failed(event_id, error, next_retry_at)
+                Store->>DB: UPDATE ... SET attempts = attempts + 1,<br/>last_error = ?, next_retry_at = NOW() + retry_delay
+            end
+        end
+        Worker->>Store: commit()
+        Store->>DB: COMMIT
+    end
 ```
 
 ## Guarantees

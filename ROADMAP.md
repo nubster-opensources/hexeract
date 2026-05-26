@@ -15,7 +15,7 @@ Hexeract is a Wolverine-style messaging framework for Rust, combining in-process
 
 These boundaries are deliberate and non-negotiable. If a feature request crosses one of them, it belongs in another project.
 
-## v0.1.0: Outbox MVP — **DONE**
+## v0.1.0: Outbox MVP (DONE)
 
 **Goal.** A Rust service writes a domain event inside the same database transaction as its business state, and a background worker delivers that event reliably with retry and back-off.
 
@@ -33,7 +33,7 @@ These boundaries are deliberate and non-negotiable. If a feature request crosses
 
 Released as v0.1.0 on crates.io. The seven shipped crates are `hexeract-core`, `hexeract-outbox`, `hexeract-outbox-postgres`, `hexeract-macros`, `hexeract-mediator`, `hexeract-cli` and the `hexeract` facade.
 
-## v0.2.0: Bus RabbitMQ — **DONE**
+## v0.2.0: Bus RabbitMQ (DONE)
 
 **Goal.** A unified `Transport` trait with a first RabbitMQ implementation via `lapin`. Publish and ack semantics, JSON serialization, type-based routing, message envelopes carrying `message_id`, `correlation_id`, optional `reply_to` and free-form headers. Distant messaging is functional without persistence.
 

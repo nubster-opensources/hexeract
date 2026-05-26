@@ -8,7 +8,7 @@ project is still pre-stable.
 
 ### Benevolent Dictator For Life (BDFL)
 
-- **Pierrick Fonquerne** — CEO of Encelade Technologies and founder of
+- **Pierrick Fonquerne**, CEO of Encelade Technologies and founder of
   Nubster.
 
 The BDFL has the final say on:
