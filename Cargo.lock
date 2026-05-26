@@ -1547,7 +1547,9 @@ name = "hexeract-bus-rabbitmq"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "hexeract-bus",
+ "hexeract-core",
  "lapin",
  "serde",
  "serde_json",
@@ -1555,6 +1557,7 @@ dependencies = [
  "testcontainers-modules",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]

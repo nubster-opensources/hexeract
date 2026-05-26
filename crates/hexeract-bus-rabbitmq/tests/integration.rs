@@ -9,16 +9,22 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+
 use hexeract_bus::Binding;
 use hexeract_bus::Exchange;
 use hexeract_bus::ExchangeKind;
+use hexeract_bus::Handler;
 use hexeract_bus::Message;
 use hexeract_bus::Queue;
 use hexeract_bus::RoutingKey;
 use hexeract_bus::Transport;
 use hexeract_bus_rabbitmq::RabbitMqConnection;
 use hexeract_bus_rabbitmq::RabbitMqTransport;
+use hexeract_bus_rabbitmq::RabbitMqWorkerBuilder;
 use hexeract_bus_rabbitmq::ensure_topology;
+use hexeract_core::HandlerContext;
 use lapin::BasicProperties;
 use lapin::Connection;
 use lapin::ConnectionProperties;
@@ -29,8 +35,10 @@ use lapin::types::FieldTable;
 use lapin::types::ShortString;
 use serde::Deserialize;
 use serde::Serialize;
+use std::sync::Arc;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::rabbitmq::RabbitMq;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -239,4 +247,291 @@ async fn ensure_topology_declares_exchange_queue_and_binding() {
     let delivery = delivery.expect("binding must route the message into the queue");
     assert_eq!(delivery.exchange.as_str(), exchange.name);
     assert_eq!(delivery.routing_key.as_str(), routing_key.as_str());
+}
+
+#[derive(Debug, Default)]
+struct RecordingHandler {
+    seen: Arc<AtomicUsize>,
+}
+
+impl Handler<OrderPlaced> for RecordingHandler {
+    type Error = hexeract_bus::BusError;
+
+    async fn handle(
+        &self,
+        _message: OrderPlaced,
+        _ctx: &HandlerContext,
+    ) -> Result<(), Self::Error> {
+        self.seen.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct AlwaysFailingHandler {
+    attempts: Arc<AtomicUsize>,
+}
+
+impl Handler<OrderPlaced> for AlwaysFailingHandler {
+    type Error = hexeract_bus::BusError;
+
+    async fn handle(
+        &self,
+        _message: OrderPlaced,
+        _ctx: &HandlerContext,
+    ) -> Result<(), Self::Error> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        Err(hexeract_bus::BusError::Internal(
+            "deliberate test failure".to_owned(),
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct FailOnceHandler {
+    attempts: Arc<AtomicUsize>,
+}
+
+impl Handler<OrderPlaced> for FailOnceHandler {
+    type Error = hexeract_bus::BusError;
+
+    async fn handle(
+        &self,
+        _message: OrderPlaced,
+        _ctx: &HandlerContext,
+    ) -> Result<(), Self::Error> {
+        let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            Err(hexeract_bus::BusError::Internal(
+                "first attempt fails".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+async fn start_rabbit() -> (testcontainers::ContainerAsync<RabbitMq>, String) {
+    let container = RabbitMq::default()
+        .start()
+        .await
+        .expect("rabbitmq container must start");
+    let host = container
+        .get_host()
+        .await
+        .expect("rabbitmq container must expose a host");
+    let port = container
+        .get_host_port_ipv4(5672)
+        .await
+        .expect("rabbitmq container must expose AMQP port");
+    let uri = format!("amqp://{host}:{port}");
+    (container, uri)
+}
+
+async fn declare_temporary_queue(uri: &str, name: &str) {
+    let conn = Connection::connect(uri, ConnectionProperties::default())
+        .await
+        .expect("setup connection must open");
+    let channel = conn
+        .create_channel()
+        .await
+        .expect("setup channel must open");
+    channel
+        .queue_declare(
+            name.into(),
+            QueueDeclareOptions {
+                durable: false,
+                exclusive: false,
+                auto_delete: false,
+                ..QueueDeclareOptions::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .expect("queue declare must succeed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn worker_dispatches_envelope_and_acks_on_success() {
+    let (_container, uri) = start_rabbit().await;
+    let queue_name = "worker.happy";
+    declare_temporary_queue(&uri, queue_name).await;
+
+    let transport = RabbitMqTransport::new(&uri).await.unwrap();
+    transport
+        .publish(
+            queue_name,
+            &OrderPlaced {
+                order_id: Uuid::from_u128(1),
+            },
+        )
+        .await
+        .unwrap();
+
+    let seen = Arc::new(AtomicUsize::new(0));
+    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .register_handler::<OrderPlaced, _>(RecordingHandler {
+            seen: Arc::clone(&seen),
+        })
+        .build()
+        .unwrap();
+
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
+
+    for _ in 0..40 {
+        if seen.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+
+    cancel.cancel();
+    handle
+        .await
+        .expect("worker task joins")
+        .expect("worker run returns Ok");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn worker_retries_on_failure_then_succeeds() {
+    let (_container, uri) = start_rabbit().await;
+    let queue_name = "worker.retry";
+    declare_temporary_queue(&uri, queue_name).await;
+
+    let transport = RabbitMqTransport::new(&uri).await.unwrap();
+    transport
+        .publish(
+            queue_name,
+            &OrderPlaced {
+                order_id: Uuid::from_u128(2),
+            },
+        )
+        .await
+        .unwrap();
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .max_attempts(5)
+        .register_handler::<OrderPlaced, _>(FailOnceHandler {
+            attempts: Arc::clone(&attempts),
+        })
+        .build()
+        .unwrap();
+
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
+
+    for _ in 0..60 {
+        if attempts.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+    cancel.cancel();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn worker_routes_to_dead_letter_after_exhausting_attempts() {
+    let (_container, uri) = start_rabbit().await;
+    let queue_name = "worker.dlr.source";
+    let dlr_queue = "worker.dlr.parked";
+    declare_temporary_queue(&uri, queue_name).await;
+    declare_temporary_queue(&uri, dlr_queue).await;
+
+    let transport = RabbitMqTransport::new(&uri).await.unwrap();
+    transport
+        .publish(
+            queue_name,
+            &OrderPlaced {
+                order_id: Uuid::from_u128(3),
+            },
+        )
+        .await
+        .unwrap();
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .max_attempts(2)
+        .dead_letter_routing_key(dlr_queue)
+        .register_handler::<OrderPlaced, _>(AlwaysFailingHandler {
+            attempts: Arc::clone(&attempts),
+        })
+        .build()
+        .unwrap();
+
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
+
+    // Wait until DLR queue receives the parked message.
+    let probe = Connection::connect(&uri, ConnectionProperties::default())
+        .await
+        .unwrap();
+    let probe_channel = probe.create_channel().await.unwrap();
+    let mut parked = None;
+    for _ in 0..80 {
+        let candidate = probe_channel
+            .basic_get(dlr_queue.into(), BasicGetOptions::default())
+            .await
+            .unwrap();
+        if candidate.is_some() {
+            parked = candidate;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        parked.is_some(),
+        "DLR queue must receive the parked delivery"
+    );
+    assert!(
+        attempts.load(Ordering::SeqCst) >= 2,
+        "handler must have been called at least max_attempts times"
+    );
+
+    cancel.cancel();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn worker_returns_ok_on_cancellation_with_idle_queue() {
+    let (_container, uri) = start_rabbit().await;
+    let queue_name = "worker.cancel";
+    declare_temporary_queue(&uri, queue_name).await;
+
+    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .register_handler::<OrderPlaced, _>(RecordingHandler::default())
+        .build()
+        .unwrap();
+
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("worker stops within the timeout")
+        .expect("worker task joins")
+        .expect("worker run returns Ok on cancellation");
 }
