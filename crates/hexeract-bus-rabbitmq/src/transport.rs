@@ -181,7 +181,7 @@ impl Transport for RabbitMqTransport {
     }
 }
 
-fn exchange_kind_to_lapin(kind: ExchangeKind) -> lapin::ExchangeKind {
+pub(crate) fn exchange_kind_to_lapin(kind: ExchangeKind) -> lapin::ExchangeKind {
     // `ExchangeKind` is `#[non_exhaustive]`; unknown future variants
     // fall back to the AMQP `direct` kind. New variants should be
     // mapped explicitly when introduced.

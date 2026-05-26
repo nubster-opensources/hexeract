@@ -2,7 +2,7 @@
 //!
 //! This crate plugs the `hexeract-bus` [`hexeract_bus::Transport`]
 //! contract on top of [`lapin`], the de-facto async AMQP 0.9.1 client
-//! for Rust. It ships three building blocks:
+//! for Rust. It ships four building blocks:
 //!
 //! - [`RabbitMqConnection`]: a thin wrapper over [`lapin::Connection`]
 //!   that exposes a bounded reconnect loop.
@@ -12,6 +12,8 @@
 //! - [`RabbitMqTransport`]: the actual [`hexeract_bus::Transport`]
 //!   implementation. Constructed from an AMQP URI and either the
 //!   default exchange or a typed [`hexeract_bus::Exchange`].
+//! - The [`topology`] module: dev-convenience helpers that apply
+//!   `hexeract-bus` topology declarations on a running broker.
 //!
 //! Integration testing relies on `testcontainers` against a real
 //! RabbitMQ container; those tests are tagged `#[ignore]` and run via
@@ -21,10 +23,16 @@
 pub mod connection;
 /// Per-publisher pool of `lapin` channels.
 pub mod pool;
+/// Topology declaration helpers backed by lapin.
+pub mod topology;
 /// [`hexeract_bus::Transport`] implementation backed by RabbitMQ.
 pub mod transport;
 
 pub use connection::RabbitMqConnection;
 pub use pool::ChannelPool;
 pub use pool::PooledChannel;
+pub use topology::bind_queue;
+pub use topology::declare_exchange;
+pub use topology::declare_queue;
+pub use topology::ensure_topology;
 pub use transport::RabbitMqTransport;
