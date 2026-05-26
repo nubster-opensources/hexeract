@@ -52,9 +52,9 @@ pub trait Transport: Send + Sync + 'static {
     ///
     /// Mints a fresh [`crate::BusEnvelope`] and returns its
     /// `message_id` (`UUIDv7`). The `correlation_id` is minted by
-    /// the transport when the caller does not provide one; a later
-    /// milestone will let handlers propagate the inbound
-    /// `correlation_id` through an ambient context.
+    /// the transport. Callers that need to propagate a known
+    /// correlation identifier across a publish should use
+    /// [`Self::publish_with_correlation_id`] instead.
     ///
     /// # Errors
     ///
@@ -68,7 +68,10 @@ pub trait Transport: Send + Sync + 'static {
     ///
     /// Headers carry free-form metadata: W3C trace context
     /// (`traceparent`), tenancy (`tenant_id`) or backend-specific
-    /// hints exposed verbatim to the broker.
+    /// hints exposed verbatim to the broker. The `correlation_id`
+    /// is minted by the transport; combine with
+    /// [`Self::publish_with_correlation_id`] semantics when both a
+    /// caller-supplied correlation_id and custom headers are needed.
     ///
     /// # Errors
     ///
@@ -77,6 +80,30 @@ pub trait Transport: Send + Sync + 'static {
         &self,
         routing_key: &str,
         headers: HashMap<String, String>,
+        message: &M,
+    ) -> Result<Uuid, BusError>;
+
+    /// Publish `message` and propagate a caller-supplied `correlation_id`.
+    ///
+    /// Use this variant when the publish is part of a chain of
+    /// messages that must share a correlation identifier for
+    /// distributed tracing or request-reply patterns. Handlers
+    /// typically read the inbound `correlation_id` from their
+    /// [`hexeract_core::HandlerContext`] and forward it here when
+    /// they re-emit downstream messages.
+    ///
+    /// Returns the freshly minted `message_id` (`UUIDv7`) of the
+    /// outgoing envelope; the supplied `correlation_id` is carried
+    /// verbatim through the bus envelope and surfaces on the
+    /// consumer side.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`Self::publish`].
+    async fn publish_with_correlation_id<M: Message>(
+        &self,
+        routing_key: &str,
+        correlation_id: Uuid,
         message: &M,
     ) -> Result<Uuid, BusError>;
 }
@@ -156,6 +183,21 @@ mod tests {
                 .push((routing_key.to_owned(), envelope));
             Ok(message_id)
         }
+
+        async fn publish_with_correlation_id<M: Message>(
+            &self,
+            routing_key: &str,
+            correlation_id: Uuid,
+            message: &M,
+        ) -> Result<Uuid, BusError> {
+            let envelope = BusEnvelope::new(correlation_id, message)?;
+            let message_id = envelope.message_id;
+            self.recorded
+                .lock()
+                .unwrap()
+                .push((routing_key.to_owned(), envelope));
+            Ok(message_id)
+        }
     }
 
     fn sample_order() -> OrderPlaced {
@@ -208,6 +250,23 @@ mod tests {
 
         let recorded = transport.snapshot();
         assert_eq!(recorded[0].1.headers, headers);
+    }
+
+    #[tokio::test]
+    async fn publish_with_correlation_id_propagates_caller_supplied_value() {
+        let transport = MockTransport::new();
+        let correlation_id = Uuid::from_u128(0x42);
+
+        let message_id = transport
+            .publish_with_correlation_id("orders.placed", correlation_id, &sample_order())
+            .await
+            .expect("publish must succeed");
+
+        let recorded = transport.snapshot();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].1.correlation_id, correlation_id);
+        assert_eq!(recorded[0].1.message_id, message_id);
+        assert_ne!(recorded[0].1.message_id, correlation_id);
     }
 
     #[tokio::test]

@@ -179,6 +179,16 @@ impl Transport for RabbitMqTransport {
         let envelope = BusEnvelope::with_headers(Uuid::now_v7(), headers, message)?;
         self.publish_envelope(routing_key, &envelope).await
     }
+
+    async fn publish_with_correlation_id<M: Message>(
+        &self,
+        routing_key: &str,
+        correlation_id: Uuid,
+        message: &M,
+    ) -> Result<Uuid, BusError> {
+        let envelope = BusEnvelope::new(correlation_id, message)?;
+        self.publish_envelope(routing_key, &envelope).await
+    }
 }
 
 pub(crate) fn exchange_kind_to_lapin(kind: ExchangeKind) -> lapin::ExchangeKind {
