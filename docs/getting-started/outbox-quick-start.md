@@ -35,7 +35,7 @@ For local development you can apply the schema directly against a running databa
 hexeract outbox apply --conn "postgres://user:pass@localhost/db" --table audit_outbox --yes-i-know
 ```
 
-The schema is documented in [docs/outbox-postgres-schema.md](../outbox-postgres-schema.md).
+The schema is documented in [outbox-postgres-schema.md](../reference/outbox-postgres-schema.md).
 
 ## 3. Declare a domain event
 
@@ -161,7 +161,8 @@ async fn run_service(
 
 ## What next
 
-- [outbox-architecture.md](../outbox-architecture.md): how the publisher, worker and store cooperate, and what guarantees they provide.
-- [outbox-postgres-schema.md](../outbox-postgres-schema.md): canonical schema and migration tooling guidance.
-- [design/outbox-mvp-requirements.md](../design/outbox-mvp-requirements.md): the public requirements that drove v0.1.0.
+- [Outbox flow](../architecture/outbox-flow.md): how the publisher, worker and store cooperate, and what guarantees they provide.
+- [Outbox PostgreSQL schema](../reference/outbox-postgres-schema.md): canonical schema and migration tooling guidance.
+- [Outbox pattern concept](../concepts/outbox-pattern.md): the why, the guarantees, the trade-offs.
+- [Outbox MVP requirements (v0.1.0)](../design/outbox-mvp-requirements.md): the public requirements that drove v0.1.0.
 - The runnable [`examples/02_outbox_two_databases.rs`](../../crates/hexeract-outbox-postgres/examples/02_outbox_two_databases.rs) demonstrates the full flow against two isolated PostgreSQL containers.

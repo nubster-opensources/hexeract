@@ -174,7 +174,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_topology_returns_connection_error_on_unreachable_broker() {
         let connection_result = RabbitMqConnection::connect("amqp://127.0.0.1:1").await;
-        // The connect itself already fails — no usable connection to
+        // The connect itself already fails: no usable connection to
         // call ensure_topology on.
         let err = connection_result.expect_err("must fail to connect");
         assert!(matches!(err, BusError::Connection(_)));
