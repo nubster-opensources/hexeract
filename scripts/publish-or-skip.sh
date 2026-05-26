@@ -57,14 +57,20 @@ fi
 
 echo "Resolved $crate@$version (pkgid: $pkgid)"
 
-# Probe crates.io for this exact version.
+# Probe crates.io for this exact version. The crates.io API rejects
+# requests without an explicit User-Agent header (HTTP 403), so we set
+# a descriptive one identifying the release pipeline.
 url="https://crates.io/api/v1/crates/${crate}/${version}"
-status="$(curl -s -o /dev/null -w "%{http_code}" "$url")"
+user_agent="hexeract-release (https://github.com/nubster-opensources/hexeract)"
+status="$(curl -s -A "$user_agent" -o /dev/null -w "%{http_code}" "$url")"
 
 if [[ "$status" == "200" ]]; then
   echo "$crate@$version already published on crates.io, skipping"
   exit 0
 fi
 
+# Treat 404 as "not yet published". Anything else is unexpected and
+# worth surfacing in the log; we still attempt the publish so that
+# `cargo publish` itself gives the authoritative failure.
 echo "$crate@$version not on crates.io (HTTP $status), publishing..."
 cargo publish -p "$crate" "${extra_args[@]}" --token "$token"
