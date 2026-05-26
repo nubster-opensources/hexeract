@@ -18,11 +18,14 @@ workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hexeract-bus = { path = "../hexeract-bus", version = "0.1.0" }
+hexeract-core = { path = "../hexeract-core", version = "0.1.0" }
 lapin = "4"
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 

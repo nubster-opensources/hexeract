@@ -27,6 +27,8 @@ pub mod pool;
 pub mod topology;
 /// [`hexeract_bus::Transport`] implementation backed by RabbitMQ.
 pub mod transport;
+/// Consumer worker dispatching to typed handlers.
+pub mod worker;
 
 pub use connection::RabbitMqConnection;
 pub use pool::ChannelPool;
@@ -36,3 +38,7 @@ pub use topology::declare_exchange;
 pub use topology::declare_queue;
 pub use topology::ensure_topology;
 pub use transport::RabbitMqTransport;
+pub use worker::AckMode;
+pub use worker::RabbitMqWorker;
+pub use worker::RabbitMqWorkerBuilder;
+pub use worker::RabbitMqWorkerConfig;
