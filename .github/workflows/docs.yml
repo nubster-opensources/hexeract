@@ -11,6 +11,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTDOCFLAGS: "--cfg docsrs"
+  RUSTUP_TOOLCHAIN: nightly
 
 concurrency:
   group: "pages"
@@ -27,11 +28,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: "1.88.0"
+          toolchain: nightly
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: docs
+          key: docs-nightly
 
       - name: Build workspace rustdoc
         run: cargo doc --workspace --all-features --no-deps
