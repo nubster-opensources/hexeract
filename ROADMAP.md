@@ -33,18 +33,26 @@ These boundaries are deliberate and non-negotiable. If a feature request crosses
 
 Released as v0.1.0 on crates.io. The seven shipped crates are `hexeract-core`, `hexeract-outbox`, `hexeract-outbox-postgres`, `hexeract-macros`, `hexeract-mediator`, `hexeract-cli` and the `hexeract` facade.
 
-## v0.2.0: Bus RabbitMQ
+## v0.2.0: Bus RabbitMQ — **DONE**
 
-**Goal.** A unified `Transport` trait with a first RabbitMQ implementation via `lapin`. Publish, subscribe and ack semantics, JSON serialization, type-based routing, message envelopes carrying `MessageId`, `CorrelationId`, optional `reply_to` and free-form headers. Distant messaging is functional without persistence.
+**Goal.** A unified `Transport` trait with a first RabbitMQ implementation via `lapin`. Publish and ack semantics, JSON serialization, type-based routing, message envelopes carrying `message_id`, `correlation_id`, optional `reply_to` and free-form headers. Distant messaging is functional without persistence.
 
-**Crates:**
+**Crates shipped:**
 
-- `hexeract-bus`: backend-agnostic core (`Message`, `BusEnvelope`, `BusError`, `Transport`, `Handler<M>`, `ErasedHandler`, `TypedHandler`, topology types).
-- `hexeract-bus-rabbitmq`: lapin-backed `Transport`, topology declaration helpers, consumer worker with auto-ack and retry policy.
+- `hexeract-bus`: backend-agnostic core (`Message`, `BusEnvelope`, `BusError`, `Transport`, `Handler<M>`, `ErasedHandler`, `TypedHandler`, topology types `Exchange`, `Queue`, `Binding`, `RoutingKey`).
+- `hexeract-bus-rabbitmq`: lapin-backed `Transport`, `ChannelPool`, bounded reconnect loop, topology declaration helpers, consumer worker with `AckMode::Auto` / `AckMode::Manual` and a `max_attempts` + dead-letter routing-key retry policy.
 
-**CLI:**
+**CLI shipped:**
 
-- `hexeract bus declare`, `peek`, `purge` subcommands.
+- `hexeract bus declare --conn URL --topology FILE` applies a TOML topology.
+- `hexeract bus peek --conn URL --queue NAME [--count N]` dumps the first messages of a queue non-destructively.
+- `hexeract bus purge --conn URL --queue NAME --yes-i-know` drops every message from a queue (gated by the explicit safety flag).
+
+**Deliverables:**
+
+- End-to-end pub/sub example `crates/hexeract-bus-rabbitmq/examples/03_bus_pubsub.rs` spinning up a real RabbitMQ container via `testcontainers`.
+- Sample topology file at `crates/hexeract-cli/examples/topology.toml`.
+- Integration tests `#[ignore]`-gated and triggered by the existing `integration.yml` workflow.
 
 ## v0.3.0: Mediator Core
 
