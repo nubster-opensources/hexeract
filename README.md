@@ -16,21 +16,27 @@ Hexeract is sponsored by [Encelade Technologies](https://encelade.tech).
 
 ## Status
 
-🚀 **v0.1.0 released on crates.io.** Outbox MVP shipped end to end against PostgreSQL via `deadpool_postgres`.
+🚀 **v0.2.0: Bus RabbitMQ shipped.** Outbox MVP remains stable from v0.1.0, and the bus brings a unified `Transport` trait with a first RabbitMQ backend powered by `lapin`, a consumer worker with ack modes and retry policy, topology helpers, an end-to-end pub/sub example and a `hexeract bus` CLI namespace.
 
-| Feature | v0.1.0 |
-| --- | --- |
-| Transactional outbox (PostgreSQL) | ✅ |
-| Worker poll loop with `SKIP LOCKED` | ✅ |
-| Fluent builder API | ✅ |
-| `hexeract` CLI for schema management | ✅ |
-| Mediator | ⏳ v0.3.0 |
-| Bus (RabbitMQ, NATS, Kafka, SQS) | ⏳ v0.2.0 then v0.9.0 |
-| Sagas, Scheduler, Request and Reply | ⏳ later milestones |
+| Feature | v0.1.0 | v0.2.0 |
+| --- | --- | --- |
+| Transactional outbox (PostgreSQL) | ✅ | ✅ |
+| Worker poll loop with `SKIP LOCKED` | ✅ | ✅ |
+| Fluent builder API | ✅ | ✅ |
+| `hexeract outbox` CLI | ✅ | ✅ |
+| Bus core (`Message`, `BusEnvelope`, `Transport`, `Handler<M>`) | ⏳ | ✅ |
+| RabbitMQ backend (`lapin` connection pool, publish, consume, retry) | ⏳ | ✅ |
+| Topology types (`Exchange`, `Queue`, `Binding`, `RoutingKey`) | ⏳ | ✅ |
+| `hexeract bus declare / peek / purge` CLI | ⏳ | ✅ |
+| Mediator | ⏳ v0.3.0 | ⏳ v0.3.0 |
+| Polyglot bus (NATS, Kafka, SQS) | ⏳ v0.9.0 | ⏳ v0.9.0 |
+| Sagas, Scheduler, Request and Reply | ⏳ later | ⏳ later |
 
 See the [CHANGELOG](./CHANGELOG.md) for the detailed history.
 
 ## Quick start
+
+### Outbox (PostgreSQL)
 
 Add the PostgreSQL backend to your `Cargo.toml`:
 
@@ -92,6 +98,84 @@ join.await??;
 ```
 
 See [`docs/tutorial/getting-started.md`](./docs/tutorial/getting-started.md) and the runnable [`examples/`](./crates/hexeract-outbox-postgres/examples/) for the full integration walkthrough.
+
+### Bus (RabbitMQ)
+
+Add the RabbitMQ backend to your `Cargo.toml`:
+
+```toml
+[dependencies]
+hexeract-bus = "0.2"
+hexeract-bus-rabbitmq = "0.2"
+```
+
+Declare a domain message, a handler and wire a publisher plus a worker:
+
+```rust
+use hexeract_bus::{Handler, Message, Transport};
+use hexeract_bus_rabbitmq::{RabbitMqConnection, RabbitMqTransport, RabbitMqWorkerBuilder};
+use hexeract_core::HandlerContext;
+use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OrderPlaced { order_id: Uuid }
+
+impl Message for OrderPlaced {
+    const MESSAGE_TYPE: &'static str = "orders.placed";
+}
+
+struct Projector;
+impl Handler<OrderPlaced> for Projector {
+    type Error = hexeract_bus::BusError;
+    async fn handle(&self, msg: OrderPlaced, _ctx: &HandlerContext) -> Result<(), Self::Error> {
+        // ... project to read model, forward to downstream system, ...
+        let _ = msg.order_id;
+        Ok(())
+    }
+}
+
+# async fn run(uri: &str) -> Result<(), Box<dyn std::error::Error>> {
+let transport = RabbitMqTransport::new(uri).await?;
+let consumer_conn = RabbitMqConnection::connect(uri).await?;
+
+let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+    .queue("orders.received")
+    .register_handler::<OrderPlaced, _>(Projector)
+    .build()?;
+
+let cancel = CancellationToken::new();
+let join = tokio::spawn(worker.run(cancel.clone()));
+
+let message_id = transport
+    .publish("orders.received", &OrderPlaced { order_id: Uuid::new_v4() })
+    .await?;
+println!("published message {message_id}");
+
+cancel.cancel();
+join.await??;
+# Ok(()) }
+```
+
+> **In production**, declare your topology once at service startup (or out of band through the CLI). The `topology::ensure_topology` helper and the CLI live for dev convenience; do not call them on the hot path.
+
+The `hexeract bus` CLI provisions and inspects a broker without writing ad-hoc `lapin` scripts:
+
+```bash
+export HEXERACT_BUS_URL=amqp://guest:guest@localhost:5672
+
+# 1. Apply a typed topology described in TOML.
+hexeract bus declare --topology crates/hexeract-cli/examples/topology.toml
+
+# 2. Peek the first messages of a queue (non-destructive, requeues each delivery).
+hexeract bus peek --queue orders.received --count 5
+
+# 3. Drop every message in a queue (gated by an explicit safety flag).
+hexeract bus purge --queue orders.received --yes-i-know
+```
+
+See the runnable [`crates/hexeract-bus-rabbitmq/examples/03_bus_pubsub.rs`](./crates/hexeract-bus-rabbitmq/examples/03_bus_pubsub.rs) for an end-to-end pub/sub against a real RabbitMQ container, and [`crates/hexeract-cli/examples/topology.toml`](./crates/hexeract-cli/examples/topology.toml) for the topology file format consumed by `hexeract bus declare`.
 
 ## Why Hexeract
 

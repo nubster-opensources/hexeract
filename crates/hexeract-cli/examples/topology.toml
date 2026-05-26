@@ -1,0 +1,31 @@
+# Sample topology consumed by `hexeract bus declare --topology FILE`.
+#
+# Each `[[exchanges]]`, `[[queues]]` and `[[bindings]]` entry maps
+# one-to-one onto the `Exchange`, `Queue` and `Binding` values exposed
+# by `hexeract-bus`. The CLI re-runs the same validation as the typed
+# constructors (`Exchange::new`, `Queue::new`, `RoutingKey::new`,
+# `Binding::new`), so a malformed value here surfaces an
+# `InvalidTopology` error rather than reaching the broker.
+#
+# Run with:
+#
+#     hexeract bus declare \
+#       --conn amqp://guest:guest@localhost:5672 \
+#       --topology crates/hexeract-cli/examples/topology.toml
+
+[[exchanges]]
+name = "orders.exchange"
+kind = "topic"
+durable = true
+auto_delete = false
+
+[[queues]]
+name = "orders.received"
+durable = true
+exclusive = false
+auto_delete = false
+
+[[bindings]]
+queue = "orders.received"
+exchange = "orders.exchange"
+routing_key = "orders.*"
