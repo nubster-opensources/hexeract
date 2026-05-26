@@ -1526,7 +1526,16 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hexeract"
-version = "0.2.0"
+version = "0.2.1"
+dependencies = [
+ "hexeract-bus",
+ "hexeract-bus-rabbitmq",
+ "hexeract-core",
+ "hexeract-macros",
+ "hexeract-mediator",
+ "hexeract-outbox",
+ "hexeract-outbox-postgres",
+]
 
 [[package]]
 name = "hexeract-bus"
