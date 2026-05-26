@@ -8,6 +8,7 @@ members = [
     "crates/hexeract-outbox",
     "crates/hexeract-outbox-postgres",
     "crates/hexeract-bus",
+    "crates/hexeract-bus-rabbitmq",
     "crates/hexeract-cli",
 ]
 

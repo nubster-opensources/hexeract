@@ -1,0 +1,37 @@
+[package]
+name = "hexeract-bus-rabbitmq"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "RabbitMQ transport backend for the Hexeract messaging framework, powered by lapin"
+readme = "../../README.md"
+exclude = ["/tests", "/examples", "/benches"]
+keywords = ["messaging", "bus", "rabbitmq", "amqp", "lapin"]
+categories = ["asynchronous", "network-programming"]
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+hexeract-bus = { path = "../hexeract-bus", version = "0.1.0" }
+lapin = "4"
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+
+[dev-dependencies]
+serde = { workspace = true }
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["rabbitmq"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
