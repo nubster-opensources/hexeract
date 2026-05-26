@@ -34,6 +34,7 @@ serde = { workspace = true }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["rabbitmq"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true
