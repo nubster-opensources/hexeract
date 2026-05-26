@@ -38,21 +38,22 @@ See the [CHANGELOG](./CHANGELOG.md) for the detailed history.
 
 ### Outbox (PostgreSQL)
 
-Add the PostgreSQL backend to your `Cargo.toml`:
+Add the umbrella crate with the `outbox-postgres` feature to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-hexeract-outbox = "0.1"
-hexeract-outbox-postgres = "0.1"
+hexeract = { version = "0.2", features = ["outbox-postgres"] }
 ```
+
+> Power users who prefer a strict SemVer per crate can keep depending on `hexeract-outbox`, `hexeract-outbox-postgres`, `hexeract-bus`, `hexeract-bus-rabbitmq` etc. directly.
 
 Declare a domain event, a handler and wire a worker:
 
 ```rust
 use std::time::Duration;
-use hexeract_core::HandlerContext;
-use hexeract_outbox::{Event, Handler, OutboxError, OutboxPublisher};
-use hexeract_outbox_postgres::{PgOutboxPublisher, PgOutboxWorkerBuilder};
+use hexeract::core::HandlerContext;
+use hexeract::outbox::{Event, Handler, OutboxError, OutboxPublisher};
+use hexeract::outbox_postgres::{PgOutboxPublisher, PgOutboxWorkerBuilder};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -101,20 +102,19 @@ See [`docs/tutorial/getting-started.md`](./docs/tutorial/getting-started.md) and
 
 ### Bus (RabbitMQ)
 
-Add the RabbitMQ backend to your `Cargo.toml`:
+Add the umbrella crate with the `bus-rabbitmq` feature to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-hexeract-bus = "0.2"
-hexeract-bus-rabbitmq = "0.2"
+hexeract = { version = "0.2", features = ["bus-rabbitmq"] }
 ```
 
 Declare a domain message, a handler and wire a publisher plus a worker:
 
 ```rust
-use hexeract_bus::{Handler, Message, Transport};
-use hexeract_bus_rabbitmq::{RabbitMqConnection, RabbitMqTransport, RabbitMqWorkerBuilder};
-use hexeract_core::HandlerContext;
+use hexeract::bus::{Handler, Message, Transport};
+use hexeract::bus_rabbitmq::{RabbitMqConnection, RabbitMqTransport, RabbitMqWorkerBuilder};
+use hexeract::core::HandlerContext;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -128,7 +128,7 @@ impl Message for OrderPlaced {
 
 struct Projector;
 impl Handler<OrderPlaced> for Projector {
-    type Error = hexeract_bus::BusError;
+    type Error = hexeract::bus::BusError;
     async fn handle(&self, msg: OrderPlaced, _ctx: &HandlerContext) -> Result<(), Self::Error> {
         // ... project to read model, forward to downstream system, ...
         let _ = msg.order_id;

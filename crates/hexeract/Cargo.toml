@@ -1,13 +1,13 @@
 [package]
 name = "hexeract"
-version.workspace = true
+version = "0.2.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "The 6-dimension Rust messaging framework"
+description = "The 6-dimension Rust messaging framework: opt-in feature flags expose the outbox, bus, mediator and macros families."
 readme = "../../README.md"
 exclude = ["/tests", "/examples", "/benches"]
 keywords = ["messaging", "mediator", "cqrs", "outbox", "sagas"]
@@ -15,6 +15,33 @@ categories = ["asynchronous", "network-programming"]
 
 [lints]
 workspace = true
+
+[dependencies]
+hexeract-bus = { path = "../hexeract-bus", version = "0.2", optional = true }
+hexeract-bus-rabbitmq = { path = "../hexeract-bus-rabbitmq", version = "0.2", optional = true }
+hexeract-core = { path = "../hexeract-core", version = "0.2", optional = true }
+hexeract-macros = { path = "../hexeract-macros", version = "0.2", optional = true }
+hexeract-mediator = { path = "../hexeract-mediator", version = "0.2", optional = true }
+hexeract-outbox = { path = "../hexeract-outbox", version = "0.2", optional = true }
+hexeract-outbox-postgres = { path = "../hexeract-outbox-postgres", version = "0.2", optional = true }
+
+[features]
+default = []
+
+# Cross-cutting primitives. Pulled automatically by every feature that needs them.
+core = ["dep:hexeract-core"]
+
+# Outbox pattern: backend-agnostic core + PostgreSQL backend.
+outbox = ["core", "dep:hexeract-outbox"]
+outbox-postgres = ["outbox", "dep:hexeract-outbox-postgres"]
+
+# Bus pattern: backend-agnostic core + RabbitMQ backend.
+bus = ["core", "dep:hexeract-bus"]
+bus-rabbitmq = ["bus", "dep:hexeract-bus-rabbitmq"]
+
+# Mediator and procedural macros (placeholders shipped in v0.3.0).
+mediator = ["core", "dep:hexeract-mediator"]
+macros = ["dep:hexeract-macros"]
 
 [package.metadata.docs.rs]
 all-features = true
