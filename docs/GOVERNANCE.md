@@ -8,8 +8,7 @@ project is still pre-stable.
 
 ### Benevolent Dictator For Life (BDFL)
 
-- **Pierrick Fonquerne**, CEO of Nubster and founder of
-  Nubster.
+- **Pierrick Fonquerne**, Founder.
 
 The BDFL has the final say on:
 
