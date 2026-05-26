@@ -4,8 +4,10 @@
 //! ecosystem composes on top of: the [`Message`] marker trait, the
 //! in-flight [`BusEnvelope`] carried across the wire, the unified
 //! [`BusError`] type, the strongly-typed topology declarations
-//! ([`Exchange`], [`Queue`], [`Binding`], [`RoutingKey`]), and the
-//! backend-agnostic [`Transport`] publish contract.
+//! ([`Exchange`], [`Queue`], [`Binding`], [`RoutingKey`]), the
+//! backend-agnostic [`Transport`] publish contract and the
+//! consumer-side dispatch primitives ([`Handler`], [`ErasedHandler`],
+//! [`TypedHandler`]).
 //!
 //! Backend implementations live in companion crates such as
 //! `hexeract-bus-rabbitmq`.
@@ -14,6 +16,8 @@
 pub mod envelope;
 /// Errors raised by the bus primitives, transports and workers.
 pub mod error;
+/// Consumer-side dispatch primitives invoked by the bus worker.
+pub mod handler;
 /// Marker trait for domain messages that flow through the bus.
 pub mod message;
 /// Strongly-typed topology declarations shared by transports.
@@ -23,6 +27,10 @@ pub mod transport;
 
 pub use envelope::BusEnvelope;
 pub use error::BusError;
+pub use handler::BoxFuture;
+pub use handler::ErasedHandler;
+pub use handler::Handler;
+pub use handler::TypedHandler;
 pub use message::Message;
 pub use topology::Binding;
 pub use topology::Exchange;
