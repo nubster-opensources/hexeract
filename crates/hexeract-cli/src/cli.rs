@@ -19,12 +19,18 @@ enum Commands {
         #[command(subcommand)]
         action: commands::outbox::OutboxAction,
     },
+    /// Operate on the bus broker (RabbitMQ).
+    Bus {
+        #[command(subcommand)]
+        action: commands::bus::BusAction,
+    },
 }
 
 impl Cli {
     pub(crate) async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
         match self.command {
             Commands::Outbox { action } => action.run().await,
+            Commands::Bus { action } => action.run().await,
         }
     }
 }
