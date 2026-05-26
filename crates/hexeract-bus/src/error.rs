@@ -42,6 +42,14 @@ pub enum BusError {
         actual: String,
     },
 
+    /// A topology declaration (exchange, queue, binding or routing key)
+    /// failed validation.
+    #[error("invalid topology: {reason}")]
+    InvalidTopology {
+        /// Human-readable explanation of the rejection.
+        reason: String,
+    },
+
     /// An invariant of the bus machinery was violated.
     ///
     /// Signals a bug in the framework itself, not a recoverable error.
@@ -85,6 +93,14 @@ mod tests {
             message_type: "orders.placed".to_owned(),
         };
         assert!(error.to_string().contains("orders.placed"));
+    }
+
+    #[test]
+    fn invalid_topology_message_includes_reason() {
+        let error = BusError::InvalidTopology {
+            reason: "exchange name cannot be empty".to_owned(),
+        };
+        assert!(error.to_string().contains("exchange name cannot be empty"));
     }
 
     #[test]
