@@ -53,50 +53,67 @@ jobs:
             echo "Publishing for real to crates.io"
           fi
 
+      - name: Make publish-or-skip executable
+        run: chmod +x scripts/publish-or-skip.sh
+
       - name: Publish hexeract-core
-        run: cargo publish -p hexeract-core ${{ steps.mode.outputs.args }} --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+        run: ./scripts/publish-or-skip.sh hexeract-core ${{ steps.mode.outputs.args }} -- "${{ secrets.CARGO_REGISTRY_TOKEN }}"
 
       - name: Wait for index propagation
         if: steps.mode.outputs.is_dry == 'false'
         run: sleep 30
 
       - name: Publish hexeract-outbox
-        run: cargo publish -p hexeract-outbox ${{ steps.mode.outputs.args }} --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+        run: ./scripts/publish-or-skip.sh hexeract-outbox ${{ steps.mode.outputs.args }} -- "${{ secrets.CARGO_REGISTRY_TOKEN }}"
 
       - name: Wait for index propagation
         if: steps.mode.outputs.is_dry == 'false'
         run: sleep 30
 
       - name: Publish hexeract-outbox-postgres
-        run: cargo publish -p hexeract-outbox-postgres ${{ steps.mode.outputs.args }} --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+        run: ./scripts/publish-or-skip.sh hexeract-outbox-postgres ${{ steps.mode.outputs.args }} -- "${{ secrets.CARGO_REGISTRY_TOKEN }}"
 
       - name: Wait for index propagation
         if: steps.mode.outputs.is_dry == 'false'
         run: sleep 30
 
       - name: Publish hexeract-macros
-        run: cargo publish -p hexeract-macros ${{ steps.mode.outputs.args }} --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+        run: ./scripts/publish-or-skip.sh hexeract-macros ${{ steps.mode.outputs.args }} -- "${{ secrets.CARGO_REGISTRY_TOKEN }}"
 
       - name: Wait for index propagation
         if: steps.mode.outputs.is_dry == 'false'
         run: sleep 30
 
       - name: Publish hexeract-mediator
-        run: cargo publish -p hexeract-mediator ${{ steps.mode.outputs.args }} --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+        run: ./scripts/publish-or-skip.sh hexeract-mediator ${{ steps.mode.outputs.args }} -- "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+
+      - name: Wait for index propagation
+        if: steps.mode.outputs.is_dry == 'false'
+        run: sleep 30
+
+      - name: Publish hexeract-bus
+        run: ./scripts/publish-or-skip.sh hexeract-bus ${{ steps.mode.outputs.args }} -- "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+
+      - name: Wait for index propagation
+        if: steps.mode.outputs.is_dry == 'false'
+        run: sleep 30
+
+      - name: Publish hexeract-bus-rabbitmq
+        run: ./scripts/publish-or-skip.sh hexeract-bus-rabbitmq ${{ steps.mode.outputs.args }} -- "${{ secrets.CARGO_REGISTRY_TOKEN }}"
 
       - name: Wait for index propagation
         if: steps.mode.outputs.is_dry == 'false'
         run: sleep 30
 
       - name: Publish hexeract-cli
-        run: cargo publish -p hexeract-cli ${{ steps.mode.outputs.args }} --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+        run: ./scripts/publish-or-skip.sh hexeract-cli ${{ steps.mode.outputs.args }} -- "${{ secrets.CARGO_REGISTRY_TOKEN }}"
 
       - name: Wait for index propagation
         if: steps.mode.outputs.is_dry == 'false'
         run: sleep 30
 
       - name: Publish hexeract (facade)
-        run: cargo publish -p hexeract ${{ steps.mode.outputs.args }} --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+        run: ./scripts/publish-or-skip.sh hexeract ${{ steps.mode.outputs.args }} -- "${{ secrets.CARGO_REGISTRY_TOKEN }}"
 
   github-release:
     name: Create GitHub Release
