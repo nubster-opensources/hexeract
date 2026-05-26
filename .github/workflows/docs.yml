@@ -11,6 +11,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTDOCFLAGS: "--cfg docsrs"
+  RUSTUP_TOOLCHAIN: nightly
 
 concurrency:
   group: "pages"
