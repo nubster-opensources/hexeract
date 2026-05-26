@@ -15,7 +15,7 @@ The supported window will be widened once Hexeract reaches 1.0.
 
 If you find a security vulnerability in Hexeract, please **do not** open a public GitHub issue. Disclosure rules:
 
-1. Email a detailed report to **security@encelade.tech** with the subject prefix `[hexeract security]`.
+1. Email a detailed report to **security@nubster.com** with the subject prefix `[hexeract security]`.
 2. The report should include:
    - A description of the vulnerability and the attacker model.
    - Affected versions and crates.
@@ -28,7 +28,7 @@ If you find a security vulnerability in Hexeract, please **do not** open a publi
 
 ## Encrypted reporting
 
-If your report includes confidential proof-of-concept material, please encrypt it with the Encelade Technologies security GPG key. The fingerprint and public key are published at <https://encelade.tech/.well-known/security.txt> (once Encelade Technologies publishes them).
+If your report includes confidential proof-of-concept material, please encrypt it with the Nubster security GPG key. The fingerprint and public key are published at <https://nubster.com/.well-known/security.txt> (once Nubster publishes them).
 
 ## Out of scope
 

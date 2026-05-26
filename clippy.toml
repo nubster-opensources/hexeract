@@ -3,7 +3,6 @@ msrv = "1.88"
 doc-valid-idents = [
     "..",
     "Hexeract",
-    "Encelade",
     "Nubster",
     "LightShuttle",
     "OpenTelemetry",
