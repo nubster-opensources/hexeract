@@ -92,26 +92,31 @@ impl RabbitMqTransport {
             DEFAULT_RETRY_BASE_DELAY,
         )
         .await?;
-        let channel = connection.create_channel().await?;
+        let exchange_kind = exchange_kind_to_lapin(exchange.kind);
         let options = ExchangeDeclareOptions {
             durable: exchange.durable,
             auto_delete: exchange.auto_delete,
             ..ExchangeDeclareOptions::default()
         };
-        channel
-            .exchange_declare(
-                ShortString::from(exchange.name.as_str()),
-                exchange_kind_to_lapin(exchange.kind),
-                options,
-                FieldTable::default(),
-            )
+        let exchange_name = exchange.name;
+        connection
+            .with_channel(|channel| async move {
+                channel
+                    .exchange_declare(
+                        ShortString::from(exchange_name.as_str()),
+                        exchange_kind,
+                        options,
+                        FieldTable::default(),
+                    )
+                    .await
+                    .map_err(|err| BusError::Transport(Box::new(err)))?;
+                Ok(exchange_name)
+            })
             .await
-            .map_err(|err| BusError::Transport(Box::new(err)))?;
-        let pool = Arc::new(ChannelPool::new(connection, DEFAULT_POOL_MAX_SIZE));
-        Ok(Self {
-            pool,
-            exchange: exchange.name,
-        })
+            .map(|exchange_name| Self {
+                pool: Arc::new(ChannelPool::new(connection, DEFAULT_POOL_MAX_SIZE)),
+                exchange: exchange_name,
+            })
     }
 
     /// Build a transport from an already-established [`RabbitMqConnection`].

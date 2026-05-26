@@ -261,7 +261,7 @@ impl RabbitMqWorker {
         delivery: Delivery,
         attempts: &Arc<Mutex<HashMap<Uuid, u32>>>,
     ) -> Result<(), BusError> {
-        let envelope = match crate::worker::delivery_to_envelope(&delivery) {
+        let envelope = match delivery_to_envelope(&delivery.properties, &delivery.data) {
             Ok(env) => env,
             Err(err) => {
                 tracing::warn!(error = %err, "rabbitmq delivery decode failed");
@@ -280,7 +280,7 @@ impl RabbitMqWorker {
             }
         };
 
-        let ctx = build_handler_context(&delivery);
+        let ctx = build_handler_context(&delivery.properties);
         let outcome = match self.handlers.get(envelope.message_type.as_str()) {
             Some(handler) => handler.handle(&envelope, &ctx).await,
             None => Err(BusError::MissingHandler {
@@ -381,11 +381,13 @@ impl RabbitMqWorker {
     }
 }
 
-fn delivery_to_envelope(delivery: &Delivery) -> Result<hexeract_bus::BusEnvelope, BusError> {
+pub(crate) fn delivery_to_envelope(
+    props: &BasicProperties,
+    payload: &[u8],
+) -> Result<hexeract_bus::BusEnvelope, BusError> {
     use std::collections::HashMap as StdHashMap;
     use std::time::SystemTime;
 
-    let props = &delivery.properties;
     let message_id = props
         .message_id()
         .as_ref()
@@ -421,7 +423,7 @@ fn delivery_to_envelope(delivery: &Delivery) -> Result<hexeract_bus::BusEnvelope
     Ok(hexeract_bus::BusEnvelope::restore(
         message_id,
         message_type,
-        delivery.data.clone(),
+        payload.to_vec(),
         correlation_id,
         reply_to,
         headers,
@@ -429,15 +431,13 @@ fn delivery_to_envelope(delivery: &Delivery) -> Result<hexeract_bus::BusEnvelope
     ))
 }
 
-fn build_handler_context(delivery: &Delivery) -> HandlerContext {
-    let message_id = delivery
-        .properties
+pub(crate) fn build_handler_context(props: &BasicProperties) -> HandlerContext {
+    let message_id = props
         .message_id()
         .as_ref()
         .and_then(|s| Uuid::parse_str(s.as_str()).ok())
         .map_or_else(MessageId::new, MessageId::from);
-    let correlation_id = delivery
-        .properties
+    let correlation_id = props
         .correlation_id()
         .as_ref()
         .and_then(|s| Uuid::parse_str(s.as_str()).ok())
@@ -460,6 +460,83 @@ mod tests {
         assert_eq!(cfg.max_attempts, DEFAULT_MAX_ATTEMPTS);
         assert_eq!(cfg.prefetch, DEFAULT_PREFETCH);
         assert!(cfg.dead_letter_routing_key.is_none());
+    }
+
+    #[test]
+    fn delivery_to_envelope_extracts_message_id_from_amqp_properties() {
+        let message_id = Uuid::from_u128(0xABCD);
+        let correlation_id = Uuid::from_u128(0x1234);
+        let props = BasicProperties::default()
+            .with_message_id(message_id.to_string().into())
+            .with_correlation_id(correlation_id.to_string().into())
+            .with_type("orders.placed".into());
+
+        let envelope = delivery_to_envelope(&props, b"{\"order_id\":\"x\"}").expect("must decode");
+        assert_eq!(envelope.message_id, message_id);
+        assert_eq!(envelope.correlation_id, correlation_id);
+        assert_eq!(envelope.message_type, "orders.placed");
+    }
+
+    #[test]
+    fn delivery_to_envelope_mints_fresh_message_id_when_property_missing() {
+        let props = BasicProperties::default().with_type("orders.placed".into());
+
+        let envelope = delivery_to_envelope(&props, b"{}").expect("must decode");
+        assert_ne!(envelope.message_id, Uuid::nil());
+        assert_ne!(envelope.correlation_id, Uuid::nil());
+        assert_eq!(envelope.message_type, "orders.placed");
+    }
+
+    #[test]
+    fn delivery_to_envelope_returns_internal_when_type_property_missing() {
+        let props = BasicProperties::default();
+        let err = delivery_to_envelope(&props, b"{}")
+            .expect_err("missing `type` must surface as Internal");
+        match err {
+            BusError::Internal(message) => assert!(message.contains("type")),
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delivery_to_envelope_recovers_headers_and_reply_to() {
+        let mut headers = lapin::types::FieldTable::default();
+        headers.insert(
+            ShortString::from("tenant"),
+            lapin::types::AMQPValue::LongString("acme".into()),
+        );
+        let props = BasicProperties::default()
+            .with_type("orders.placed".into())
+            .with_reply_to(ShortString::from("orders.replies"))
+            .with_headers(headers);
+
+        let envelope = delivery_to_envelope(&props, b"{}").expect("must decode");
+        assert_eq!(
+            envelope.headers.get("tenant").map(String::as_str),
+            Some("acme")
+        );
+        assert_eq!(envelope.reply_to.as_deref(), Some("orders.replies"));
+    }
+
+    #[test]
+    fn build_handler_context_propagates_message_id_and_correlation_id() {
+        let message_id = Uuid::from_u128(0x42);
+        let correlation_id = Uuid::from_u128(0x7);
+        let props = BasicProperties::default()
+            .with_message_id(message_id.to_string().into())
+            .with_correlation_id(correlation_id.to_string().into());
+
+        let ctx = build_handler_context(&props);
+        assert_eq!(*ctx.message_id.as_uuid(), message_id);
+        assert_eq!(*ctx.correlation_id.as_uuid(), correlation_id);
+    }
+
+    #[test]
+    fn build_handler_context_mints_fresh_ids_when_properties_missing() {
+        let props = BasicProperties::default();
+        let ctx = build_handler_context(&props);
+        assert_ne!(*ctx.message_id.as_uuid(), Uuid::nil());
+        assert_ne!(*ctx.correlation_id.as_uuid(), Uuid::nil());
     }
 
     #[test]

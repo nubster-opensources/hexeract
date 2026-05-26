@@ -35,8 +35,9 @@ pub async fn declare_exchange(
     connection: &RabbitMqConnection,
     exchange: &Exchange,
 ) -> Result<(), BusError> {
-    let channel = connection.create_channel().await?;
-    declare_exchange_on(&channel, exchange).await
+    connection
+        .with_channel(|channel| async move { declare_exchange_on(&channel, exchange).await })
+        .await
 }
 
 /// Declare `queue` on the broker.
@@ -50,8 +51,9 @@ pub async fn declare_exchange(
 /// Returns [`BusError::Connection`] if the channel cannot be opened,
 /// or [`BusError::Transport`] if the broker rejects the declaration.
 pub async fn declare_queue(connection: &RabbitMqConnection, queue: &Queue) -> Result<(), BusError> {
-    let channel = connection.create_channel().await?;
-    declare_queue_on(&channel, queue).await
+    connection
+        .with_channel(|channel| async move { declare_queue_on(&channel, queue).await })
+        .await
 }
 
 /// Bind a queue to an exchange under a routing key.
@@ -68,8 +70,9 @@ pub async fn bind_queue(
     connection: &RabbitMqConnection,
     binding: &Binding,
 ) -> Result<(), BusError> {
-    let channel = connection.create_channel().await?;
-    bind_queue_on(&channel, binding).await
+    connection
+        .with_channel(|channel| async move { bind_queue_on(&channel, binding).await })
+        .await
 }
 
 /// Apply a complete topology in a single channel.
@@ -90,17 +93,20 @@ pub async fn ensure_topology(
     queues: &[Queue],
     bindings: &[Binding],
 ) -> Result<(), BusError> {
-    let channel = connection.create_channel().await?;
-    for exchange in exchanges {
-        declare_exchange_on(&channel, exchange).await?;
-    }
-    for queue in queues {
-        declare_queue_on(&channel, queue).await?;
-    }
-    for binding in bindings {
-        bind_queue_on(&channel, binding).await?;
-    }
-    Ok(())
+    connection
+        .with_channel(|channel| async move {
+            for exchange in exchanges {
+                declare_exchange_on(&channel, exchange).await?;
+            }
+            for queue in queues {
+                declare_queue_on(&channel, queue).await?;
+            }
+            for binding in bindings {
+                bind_queue_on(&channel, binding).await?;
+            }
+            Ok(())
+        })
+        .await
 }
 
 async fn declare_exchange_on(channel: &Channel, exchange: &Exchange) -> Result<(), BusError> {
