@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -92,6 +93,28 @@ impl RabbitMqConnection {
             .create_channel()
             .await
             .map_err(|err| BusError::Connection(Box::new(err)))
+    }
+
+    /// Open a short-lived channel, hand it to `f` and drop it when the
+    /// future completes.
+    ///
+    /// Useful for admin operations (topology declarations, one-shot
+    /// queries) that do not warrant adding a long-lived channel to a
+    /// [`crate::ChannelPool`]. The closure receives the channel by
+    /// value; the channel is closed by lapin on drop after the inner
+    /// future resolves.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`BusError::Connection`] if the channel cannot be
+    /// opened, or whatever error the closure returns.
+    pub async fn with_channel<F, Fut, T>(&self, f: F) -> Result<T, BusError>
+    where
+        F: FnOnce(Channel) -> Fut,
+        Fut: Future<Output = Result<T, BusError>>,
+    {
+        let channel = self.create_channel().await?;
+        f(channel).await
     }
 
     /// Borrow the underlying [`lapin::Connection`].
