@@ -12,7 +12,7 @@
 
 Hexeract is a server-side messaging framework written in Rust. It unifies in-process mediator handlers, external message bus transports, transactional outbox and inbox, long-running sagas, scheduled messages and request/reply RPC in a single coherent SDK. The framework relies on Rust's type system and procedural macros to provide compile-time guarantees in place of runtime reflection.
 
-Hexeract is sponsored by [Encelade Technologies](https://encelade.tech).
+Hexeract is sponsored by [Nubster](https://nubster.com).
 
 ## Status
 
@@ -226,4 +226,4 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for details, including the Contributor License Agreement (CLA).
 
-Copyright © Encelade Technologies.
+Copyright © Nubster.

@@ -1,6 +1,6 @@
 # Governance
 
-Hexeract is an Encelade Technologies open-source project. Its governance is
+Hexeract is an Nubster open-source project. Its governance is
 intentionally minimal so that decisions can be made quickly while the
 project is still pre-stable.
 
@@ -8,7 +8,7 @@ project is still pre-stable.
 
 ### Benevolent Dictator For Life (BDFL)
 
-- **Pierrick Fonquerne**, CEO of Encelade Technologies and founder of
+- **Pierrick Fonquerne**, CEO of Nubster and founder of
   Nubster.
 
 The BDFL has the final say on:

@@ -1,6 +1,6 @@
 # Roadmap
 
-Hexeract is pre-stable. This document captures the intended trajectory of the project up to v1.0, ordered by release. **No dates are committed.** The project is sponsored on a best-effort basis by Encelade Technologies, and releases ship when they are ready, not when a calendar says so.
+Hexeract is pre-stable. This document captures the intended trajectory of the project up to v1.0, ordered by release. **No dates are committed.** The project is sponsored on a best-effort basis by Nubster, and releases ship when they are ready, not when a calendar says so.
 
 The roadmap mirrors the [GitHub milestones](https://github.com/nubster-opensources/hexeract/milestones) one-for-one. Each section here is the public, prose form of a milestone; each milestone groups the issues that must close before the release ships. The full design notes for any given release live under `docs/design/`.
 
@@ -137,7 +137,7 @@ Released as v0.1.0 on crates.io. The seven shipped crates are `hexeract-core`, `
 
 **Scope:**
 
-- Dedicated documentation site, either standalone or as a section on the Encelade Technologies portal.
+- Dedicated documentation site, either standalone or as a section on the Nubster portal.
 - Onboarding tutorials per primary use case (web service, worker, CLI integration).
 - Throughput and latency benchmarks covering Outbox, Bus and Scheduler.
 - Full OpenTelemetry span coverage across the framework.
