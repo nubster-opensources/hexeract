@@ -46,7 +46,7 @@ First public release. Ships the transactional outbox feature end to end against 
 - CONTRIBUTING with trunk-based development conventions.
 - SECURITY policy and Code of Conduct (Contributor Covenant 2.1).
 - MSRV and semver policies.
-- docs/getting-started, docs/outbox-architecture and docs/outbox-postgres-schema.
+- docs/tutorial/getting-started, docs/outbox-architecture and docs/outbox-postgres-schema.
 
 ### Notes for upgraders
 
