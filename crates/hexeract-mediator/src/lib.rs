@@ -14,22 +14,25 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod erased;
+mod terminal;
 
 use std::any::{TypeId, type_name};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use hexeract_core::{
-    Command, CommandHandler, DynMiddleware, HexeractError, Middleware, Notification,
-    NotificationHandler, Query, QueryHandler,
+    Command, CommandHandler, CorrelationId, DynMiddleware, HandlerContext, HexeractError,
+    MessageEnvelope, MessageId, Middleware, Next, Notification, NotificationHandler, Query,
+    QueryHandler,
 };
 
 use crate::erased::{
-    ErasedCommandHandler, ErasedNotificationHandler, ErasedQueryHandler, TypedCommandHandler,
-    TypedNotificationHandler, TypedQueryHandler,
+    BoxAny, ErasedCommandHandler, ErasedNotificationHandler, ErasedQueryHandler,
+    TypedCommandHandler, TypedNotificationHandler, TypedQueryHandler,
 };
+use crate::terminal::{CommandTerminal, QueryTerminal};
 
 /// Errors raised by [`MediatorBuilder::build`] when the requested
 /// configuration is inconsistent. Handler failures at dispatch time keep
@@ -250,12 +253,31 @@ impl Mediator {
     /// Returns [`HexeractError::HandlerNotFound`] if no handler is
     /// registered for `C`, or the handler's own error converted into
     /// [`HexeractError`] when the handler itself fails.
-    #[expect(
-        clippy::unused_async,
-        reason = "skeleton stub awaiting dispatch implementation"
-    )]
-    pub async fn send<C: Command>(&self, _command: C) -> Result<C::Output, HexeractError> {
-        todo!()
+    pub async fn send<C: Command>(&self, command: C) -> Result<C::Output, HexeractError> {
+        let tid = TypeId::of::<C>();
+        let handler = self.inner.command_handlers.get(&tid).ok_or_else(|| {
+            HexeractError::HandlerNotFound {
+                command_type: type_name::<C>(),
+            }
+        })?;
+
+        let message_id = MessageId::new();
+        let correlation_id = CorrelationId::new();
+        let envelope = MessageEnvelope::for_command::<C>(message_id, correlation_id);
+        let ctx = HandlerContext::new(message_id, correlation_id);
+
+        let terminal = Arc::new(CommandTerminal {
+            handler: Arc::clone(handler),
+            payload: Mutex::new(Some(Box::new(command) as BoxAny)),
+        });
+
+        let next = Next::new(self.inner.middlewares.clone(), terminal);
+        let output = next.run(&envelope, &ctx).await?;
+
+        output
+            .downcast::<C::Output>()
+            .map(|boxed| *boxed)
+            .map_err(|_| HexeractError::Dispatch("command output downcast failed".into()))
     }
 
     /// Dispatches a [`Query`] to its registered handler and returns the
@@ -266,12 +288,33 @@ impl Mediator {
     /// Returns [`HexeractError::HandlerNotFound`] if no handler is
     /// registered for `Q`, or the handler's own error converted into
     /// [`HexeractError`] when the handler itself fails.
-    #[expect(
-        clippy::unused_async,
-        reason = "skeleton stub awaiting dispatch implementation"
-    )]
-    pub async fn query<Q: Query>(&self, _query: Q) -> Result<Q::Output, HexeractError> {
-        todo!()
+    pub async fn query<Q: Query>(&self, query: Q) -> Result<Q::Output, HexeractError> {
+        let tid = TypeId::of::<Q>();
+        let handler =
+            self.inner
+                .query_handlers
+                .get(&tid)
+                .ok_or_else(|| HexeractError::HandlerNotFound {
+                    command_type: type_name::<Q>(),
+                })?;
+
+        let message_id = MessageId::new();
+        let correlation_id = CorrelationId::new();
+        let envelope = MessageEnvelope::for_query::<Q>(message_id, correlation_id);
+        let ctx = HandlerContext::new(message_id, correlation_id);
+
+        let terminal = Arc::new(QueryTerminal {
+            handler: Arc::clone(handler),
+            payload: Mutex::new(Some(Box::new(query) as BoxAny)),
+        });
+
+        let next = Next::new(self.inner.middlewares.clone(), terminal);
+        let output = next.run(&envelope, &ctx).await?;
+
+        output
+            .downcast::<Q::Output>()
+            .map(|boxed| *boxed)
+            .map_err(|_| HexeractError::Dispatch("query output downcast failed".into()))
     }
 
     /// Publishes a [`Notification`] to every handler registered for `N`, in
@@ -295,10 +338,12 @@ mod tests {
     use super::*;
     use hexeract_core::HandlerContext;
 
-    struct Ping;
+    struct Ping {
+        value: u32,
+    }
 
     impl Command for Ping {
-        type Output = ();
+        type Output = u32;
     }
 
     struct PingHandler;
@@ -306,8 +351,8 @@ mod tests {
     impl CommandHandler<Ping> for PingHandler {
         type Error = HexeractError;
 
-        async fn handle(&self, _cmd: Ping, _ctx: &HandlerContext) -> Result<(), Self::Error> {
-            Ok(())
+        async fn handle(&self, cmd: Ping, _ctx: &HandlerContext) -> Result<u32, Self::Error> {
+            Ok(cmd.value * 2)
         }
     }
 
@@ -323,7 +368,7 @@ mod tests {
         type Error = HexeractError;
 
         async fn handle(&self, _q: GetCount, _ctx: &HandlerContext) -> Result<u32, Self::Error> {
-            Ok(0)
+            Ok(99)
         }
     }
 
@@ -359,6 +404,55 @@ mod tests {
             .build()
             .expect("build must succeed");
         let _clone = mediator.clone();
+    }
+
+    #[tokio::test]
+    async fn send_routes_to_command_handler_and_returns_output() {
+        let mediator = MediatorBuilder::new()
+            .register_command_handler::<Ping, _>(PingHandler)
+            .build()
+            .expect("build must succeed");
+        let out = mediator
+            .send(Ping { value: 21 })
+            .await
+            .expect("dispatch must succeed");
+        assert_eq!(out, 42);
+    }
+
+    #[tokio::test]
+    async fn send_returns_handler_not_found_when_unregistered() {
+        let mediator = MediatorBuilder::new().build().expect("empty build is ok");
+        let err = mediator
+            .send(Ping { value: 0 })
+            .await
+            .expect_err("missing handler must fail");
+        assert!(matches!(
+            err,
+            HexeractError::HandlerNotFound { command_type } if command_type.ends_with("::Ping")
+        ));
+    }
+
+    #[tokio::test]
+    async fn query_routes_to_query_handler_and_returns_output() {
+        let mediator = MediatorBuilder::new()
+            .register_query_handler::<GetCount, _>(CountHandler)
+            .build()
+            .expect("build must succeed");
+        let out = mediator.query(GetCount).await.expect("query must succeed");
+        assert_eq!(out, 99);
+    }
+
+    #[tokio::test]
+    async fn query_returns_handler_not_found_when_unregistered() {
+        let mediator = MediatorBuilder::new().build().expect("empty build is ok");
+        let err = mediator
+            .query(GetCount)
+            .await
+            .expect_err("missing handler must fail");
+        assert!(matches!(
+            err,
+            HexeractError::HandlerNotFound { command_type } if command_type.ends_with("::GetCount")
+        ));
     }
 
     #[test]
