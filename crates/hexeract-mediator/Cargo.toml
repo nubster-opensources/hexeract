@@ -16,6 +16,15 @@ categories = ["asynchronous", "network-programming"]
 [lints]
 workspace = true
 
+[dependencies]
+hexeract-core = { path = "../hexeract-core", version = "0.2" }
+thiserror = { workspace = true }
+trait-variant = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+uuid = { workspace = true }
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

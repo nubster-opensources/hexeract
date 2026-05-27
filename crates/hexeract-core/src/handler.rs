@@ -1,6 +1,7 @@
 use crate::command::Command;
 use crate::context::HandlerContext;
 use crate::error::HexeractError;
+use crate::notification::Notification;
 use crate::query::Query;
 
 /// Asynchronous handler for a [`Command`].
@@ -55,6 +56,21 @@ pub trait QueryHandler<Q: Query>: Send + Sync + 'static {
 
     /// Handles the query and produces its output.
     async fn handle(&self, query: Q, ctx: &HandlerContext) -> Result<Q::Output, Self::Error>;
+}
+
+/// Asynchronous handler for a [`Notification`].
+///
+/// Multiple handlers may be registered for the same notification type; the
+/// mediator delivers the notification to each of them. A handler failure does
+/// not interrupt the fan-out: every registered handler is invoked regardless
+/// of sibling outcomes.
+#[trait_variant::make(Send)]
+pub trait NotificationHandler<N: Notification>: Send + Sync + 'static {
+    /// The handler-defined error type, convertible into [`HexeractError`].
+    type Error: Into<HexeractError> + Send + Sync + 'static;
+
+    /// Handles the notification.
+    async fn handle(&self, notification: N, ctx: &HandlerContext) -> Result<(), Self::Error>;
 }
 
 #[cfg(test)]
