@@ -27,6 +27,6 @@ pub use envelope::MessageEnvelope;
 pub use error::HexeractError;
 pub use handler::{CommandHandler, NotificationHandler, QueryHandler};
 pub use ids::{CorrelationId, MessageId};
-pub use middleware::{BoxOutput, Middleware, Next, Terminal};
+pub use middleware::{BoxOutput, DynMiddleware, Middleware, Next, Terminal};
 pub use notification::Notification;
 pub use query::Query;
