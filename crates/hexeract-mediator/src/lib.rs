@@ -13,6 +13,8 @@
 //! [`MediatorBuilder::with_middleware`] in the meantime.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+mod erased;
+
 use hexeract_core::{
     Command, CommandHandler, HexeractError, Middleware, Notification, NotificationHandler, Query,
     QueryHandler,
