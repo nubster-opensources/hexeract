@@ -32,7 +32,7 @@ use crate::erased::{
     BoxAny, ErasedCommandHandler, ErasedNotificationHandler, ErasedQueryHandler,
     TypedCommandHandler, TypedNotificationHandler, TypedQueryHandler,
 };
-use crate::terminal::{CommandTerminal, QueryTerminal};
+use crate::terminal::{CommandTerminal, NotificationTerminal, QueryTerminal};
 
 /// Errors raised by [`MediatorBuilder::build`] when the requested
 /// configuration is inconsistent. Handler failures at dispatch time keep
@@ -233,10 +233,6 @@ impl fmt::Debug for Mediator {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "fields consumed by send, query and publish in subsequent commits"
-)]
 struct MediatorInner {
     command_handlers: HashMap<TypeId, Arc<dyn ErasedCommandHandler>>,
     query_handlers: HashMap<TypeId, Arc<dyn ErasedQueryHandler>>,
@@ -320,16 +316,55 @@ impl Mediator {
     /// Publishes a [`Notification`] to every handler registered for `N`, in
     /// registration order. A notification with zero handlers is a no-op.
     ///
+    /// Every handler shares the same [`CorrelationId`] so traces can link
+    /// the fan-out to its source publish call, but each handler receives a
+    /// dedicated [`MessageId`].
+    ///
     /// # Errors
     ///
-    /// Every handler is invoked even if a previous one failed; failures
-    /// are aggregated into a single [`HexeractError::Dispatch`] message.
-    #[expect(
-        clippy::unused_async,
-        reason = "skeleton stub awaiting dispatch implementation"
-    )]
-    pub async fn publish<N: Notification>(&self, _notification: N) -> Result<(), HexeractError> {
-        todo!()
+    /// Every handler is invoked even if a previous one failed; failures are
+    /// aggregated into a single [`HexeractError::Dispatch`] message of the
+    /// form `"publish: N of M handlers failed: ..."`.
+    pub async fn publish<N: Notification>(&self, notification: N) -> Result<(), HexeractError> {
+        let tid = TypeId::of::<N>();
+        let Some(handlers) = self.inner.notification_handlers.get(&tid) else {
+            return Ok(());
+        };
+        if handlers.is_empty() {
+            return Ok(());
+        }
+
+        let correlation_id = CorrelationId::new();
+        let total = handlers.len();
+        let mut failures: Vec<String> = Vec::new();
+
+        for handler in handlers {
+            let message_id = MessageId::new();
+            let envelope = MessageEnvelope::for_notification::<N>(message_id, correlation_id);
+            let ctx = HandlerContext::new(message_id, correlation_id);
+
+            let payload = Box::new(notification.clone()) as BoxAny;
+            let terminal = Arc::new(NotificationTerminal {
+                handler: Arc::clone(handler),
+                payload: Mutex::new(Some(payload)),
+            });
+
+            let next = Next::new(self.inner.middlewares.clone(), terminal);
+            if let Err(err) = next.run(&envelope, &ctx).await {
+                failures.push(err.to_string());
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(HexeractError::Dispatch(format!(
+                "publish: {} of {} handlers failed: {}",
+                failures.len(),
+                total,
+                failures.join("; ")
+            )))
+        }
     }
 }
 
@@ -373,7 +408,9 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct UserCreated;
+    struct UserCreated {
+        id: u32,
+    }
 
     impl Notification for UserCreated {}
 
@@ -384,6 +421,37 @@ mod tests {
 
         async fn handle(&self, _n: UserCreated, _ctx: &HandlerContext) -> Result<(), Self::Error> {
             Ok(())
+        }
+    }
+
+    struct RecordingNotifHandler {
+        label: &'static str,
+        seen: Arc<Mutex<Vec<(&'static str, u32)>>>,
+    }
+
+    impl NotificationHandler<UserCreated> for RecordingNotifHandler {
+        type Error = HexeractError;
+
+        async fn handle(
+            &self,
+            notif: UserCreated,
+            _ctx: &HandlerContext,
+        ) -> Result<(), Self::Error> {
+            self.seen
+                .lock()
+                .expect("recorder mutex poisoned")
+                .push((self.label, notif.id));
+            Ok(())
+        }
+    }
+
+    struct FailingNotifHandler;
+
+    impl NotificationHandler<UserCreated> for FailingNotifHandler {
+        type Error = HexeractError;
+
+        async fn handle(&self, _n: UserCreated, _ctx: &HandlerContext) -> Result<(), Self::Error> {
+            Err(HexeractError::Dispatch("boom".into()))
         }
     }
 
@@ -453,6 +521,97 @@ mod tests {
             err,
             HexeractError::HandlerNotFound { command_type } if command_type.ends_with("::GetCount")
         ));
+    }
+
+    #[tokio::test]
+    async fn publish_fans_out_to_all_notification_handlers() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mediator = MediatorBuilder::new()
+            .register_notification_handler::<UserCreated, _>(RecordingNotifHandler {
+                label: "audit",
+                seen: Arc::clone(&seen),
+            })
+            .register_notification_handler::<UserCreated, _>(RecordingNotifHandler {
+                label: "email",
+                seen: Arc::clone(&seen),
+            })
+            .register_notification_handler::<UserCreated, _>(RecordingNotifHandler {
+                label: "search",
+                seen: Arc::clone(&seen),
+            })
+            .build()
+            .expect("build must succeed");
+
+        mediator
+            .publish(UserCreated { id: 7 })
+            .await
+            .expect("publish must succeed");
+
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![("audit", 7), ("email", 7), ("search", 7)],
+            "every handler must observe the notification once, in registration order"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_with_no_handlers_is_ok() {
+        let mediator = MediatorBuilder::new().build().expect("empty build is ok");
+        mediator
+            .publish(UserCreated { id: 1 })
+            .await
+            .expect("publish with zero handlers must succeed");
+    }
+
+    #[tokio::test]
+    async fn publish_invokes_all_handlers_even_when_one_fails() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mediator = MediatorBuilder::new()
+            .register_notification_handler::<UserCreated, _>(RecordingNotifHandler {
+                label: "first",
+                seen: Arc::clone(&seen),
+            })
+            .register_notification_handler::<UserCreated, _>(FailingNotifHandler)
+            .register_notification_handler::<UserCreated, _>(RecordingNotifHandler {
+                label: "third",
+                seen: Arc::clone(&seen),
+            })
+            .build()
+            .expect("build must succeed");
+
+        let err = mediator
+            .publish(UserCreated { id: 42 })
+            .await
+            .expect_err("at least one handler failed");
+
+        match err {
+            HexeractError::Dispatch(msg) => {
+                assert!(msg.starts_with("publish: 1 of 3 handlers failed"));
+                assert!(msg.contains("boom"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![("first", 42), ("third", 42)],
+            "siblings must run even after a failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_handler_stub_compiles() {
+        // The `AuditHandler` fixture is kept for symmetry with prior tests.
+        let mediator = MediatorBuilder::new()
+            .register_notification_handler::<UserCreated, _>(AuditHandler)
+            .build()
+            .expect("build must succeed");
+        mediator
+            .publish(UserCreated { id: 0 })
+            .await
+            .expect("audit handler must succeed");
     }
 
     #[test]

@@ -6,11 +6,6 @@
 //! can store every handler behind `Arc<dyn Erased...Handler>` while keeping
 //! the public dispatch API strongly typed.
 
-#![allow(
-    dead_code,
-    reason = "ErasedHandler::handle invoked by Mediator dispatch in commit 3 and 4"
-)]
-
 use std::any::{Any, type_name};
 use std::future::Future;
 use std::marker::PhantomData;

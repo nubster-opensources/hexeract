@@ -7,11 +7,6 @@
 //! Re-entry (a middleware that calls `next.run` twice) is detected and
 //! surfaced as `HexeractError::Dispatch`.
 
-#![allow(
-    dead_code,
-    reason = "NotificationTerminal consumed by Mediator::publish in the next commit"
-)]
-
 use std::sync::{Arc, Mutex};
 
 use hexeract_core::{HandlerContext, HexeractError, MessageEnvelope, Terminal};
