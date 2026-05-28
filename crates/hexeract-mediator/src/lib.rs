@@ -238,6 +238,12 @@ impl MediatorBuilder {
     /// auto-populate the registry, since stateful handlers cannot be
     /// constructed from metadata alone.
     ///
+    /// # Ordering
+    ///
+    /// Call this method on the builder before [`Self::build`], which
+    /// consumes the builder. It is safe to call multiple times: the
+    /// method takes `&self` and does not mutate state.
+    ///
     /// # Errors
     ///
     /// Returns [`HandlersVerificationError::Missing`] listing the handlers

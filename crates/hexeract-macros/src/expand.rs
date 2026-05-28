@@ -46,7 +46,7 @@ fn expand_impl(input: HandlerImpl) -> TokenStream {
                 msg: #message_ty,
                 ctx: &::hexeract_core::HandlerContext,
             ) -> ::core::result::Result<#return_inner, #error_ty> {
-                <Self>::handle(self, msg, ctx).await
+                self.handle(msg, ctx).await
             }
         }
 
