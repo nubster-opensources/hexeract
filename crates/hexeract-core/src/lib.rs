@@ -1,6 +1,13 @@
 //! Core traits and types for the Hexeract messaging framework.
 //!
-//! This crate is a placeholder. The full implementation ships in v0.1.0.
+//! This crate is the cross-cutting foundation that every other Hexeract
+//! crate depends on. It defines the marker traits for messages
+//! ([`Command`], [`Query`], [`Notification`]), the matching handler
+//! traits ([`CommandHandler`], [`QueryHandler`], [`NotificationHandler`]),
+//! the [`MessageEnvelope`] and [`HandlerContext`] passed alongside every
+//! dispatch, the [`Middleware`] / [`Next`] / [`Terminal`] pipeline
+//! primitives, the unified [`HexeractError`] type, and the
+//! [`HandlerRegistration`] metadata collected by the `#[handler]` macro.
 
 /// Marker trait for messages expressing the intent to mutate state.
 pub mod command;

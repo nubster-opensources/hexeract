@@ -1,8 +1,10 @@
 //! Hexeract command-line interface (`hexeract`).
 //!
 //! The binary exposes operations on the framework's runtime building
-//! blocks. Each feature ships its own command namespace; `outbox` is
-//! shipped in v0.1.0 with the `patch`, `apply` and `check` actions.
+//! blocks. Each feature ships its own command namespace:
+//!
+//! - `outbox` (shipped in v0.1.0) with `patch`, `apply` and `check` actions.
+//! - `bus` (shipped in v0.2.0) with `declare`, `peek` and `purge` actions.
 //!
 //! Run `hexeract --help` for the full command tree.
 

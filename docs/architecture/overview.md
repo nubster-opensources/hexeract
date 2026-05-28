@@ -6,9 +6,10 @@ Hexeract ships as a Cargo workspace. Each feature lives in its own crate so appl
 
 ```mermaid
 graph TD
-    core["hexeract-core<br/>ids · context · middleware"]
-    macros["hexeract-macros<br/>(v0.3 placeholder)"]
-    mediator["hexeract-mediator<br/>(v0.3 placeholder)"]
+    core["hexeract-core<br/>ids · context · middleware · registration"]
+    macros["hexeract-macros<br/>#[handler] proc-macro"]
+    mediator["hexeract-mediator<br/>CQRS dispatch"]
+    middleware["hexeract-middleware<br/>Tracing · Timeout"]
     facade["hexeract<br/>curated re-exports"]
 
     outbox["hexeract-outbox<br/>backend-agnostic core"]
@@ -30,7 +31,10 @@ graph TD
     facade --> outbox
     facade --> bus
     facade --> mediator
+    facade --> middleware
+    facade --> macros
     mediator --> core
+    middleware --> core
     macros --> core
 ```
 
@@ -44,8 +48,9 @@ graph TD
 | `hexeract-bus` | Bus pattern building blocks: `Message`, `BusEnvelope`, `Transport`, `Handler`, topology types. | Stable |
 | `hexeract-bus-rabbitmq` | RabbitMQ backend powered by `lapin`. `RabbitMqTransport`, `RabbitMqWorker`, topology helpers. | Stable |
 | `hexeract-cli` | Binary `hexeract`. Subcommands `outbox patch/apply/check` and `bus declare/peek/purge`. | Stable |
-| `hexeract-mediator` | In-process command/query dispatch. Placeholder for v0.3.0. | Planned |
-| `hexeract-macros` | `#[handler]` procedural macro. Placeholder for v0.3.0. | Planned |
+| `hexeract-mediator` | In-process CQRS dispatch: `MediatorBuilder`, `Mediator::send/query/publish`, fan-out fail-safe semantics. | Stable |
+| `hexeract-middleware` | Built-in middlewares: `TracingMiddleware` (span + structured events), `TimeoutMiddleware` (`tokio::time::timeout`). | Stable |
+| `hexeract-macros` | `#[handler]` attribute proc-macro: generates trait impls and submits to `inventory` for `verify_handlers`. | Stable |
 | `hexeract` | Curated facade re-exporting the stable surface. | Stable |
 
 ## Layering principles

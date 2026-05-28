@@ -42,7 +42,7 @@
 //! | `bus-rabbitmq` | RabbitMQ bus backend | [`hexeract_bus`] + [`hexeract_bus_rabbitmq`] |
 //! | `mediator` | In-process CQRS mediator | [`hexeract_mediator`] |
 //! | `middleware` | Built-in tracing and timeout middlewares | [`hexeract_middleware`] |
-//! | `macros` | Procedural macros (v0.3.0 placeholder) | [`hexeract_macros`] |
+//! | `macros` | `#[handler]` attribute macro for handler registration | [`hexeract_macros`] |
 //!
 //! Every feature transitively enables `core`, so a downstream user
 //! who picks `outbox-postgres` automatically has access to
@@ -85,7 +85,7 @@ pub use hexeract_bus as bus;
 #[cfg_attr(docsrs, doc(cfg(feature = "bus-rabbitmq")))]
 pub use hexeract_bus_rabbitmq as bus_rabbitmq;
 
-/// In-process mediator (placeholder shipped in v0.3.0).
+/// In-process CQRS mediator: command, query and notification dispatch.
 ///
 /// Re-export of [`hexeract_mediator`].
 #[cfg(feature = "mediator")]
@@ -99,7 +99,7 @@ pub use hexeract_mediator as mediator;
 #[cfg_attr(docsrs, doc(cfg(feature = "middleware")))]
 pub use hexeract_middleware as middleware;
 
-/// Procedural macros (placeholder shipped in v0.3.0).
+/// Procedural macros: the `#[handler]` attribute for handler registration.
 ///
 /// Re-export of [`hexeract_macros`].
 #[cfg(feature = "macros")]
