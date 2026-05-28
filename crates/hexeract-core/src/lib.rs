@@ -16,6 +16,8 @@ pub mod handler;
 pub mod ids;
 /// Middleware pipeline primitives.
 pub mod middleware;
+/// Marker trait for broadcast messages with fan-out semantics.
+pub mod notification;
 /// Marker trait for read-only messages asking for information.
 pub mod query;
 
@@ -23,7 +25,8 @@ pub use command::Command;
 pub use context::HandlerContext;
 pub use envelope::MessageEnvelope;
 pub use error::HexeractError;
-pub use handler::{CommandHandler, QueryHandler};
+pub use handler::{CommandHandler, NotificationHandler, QueryHandler};
 pub use ids::{CorrelationId, MessageId};
-pub use middleware::{BoxOutput, Middleware, Next, Terminal};
+pub use middleware::{BoxOutput, DynMiddleware, Middleware, Next, Terminal};
+pub use notification::Notification;
 pub use query::Query;

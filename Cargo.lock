@@ -1621,6 +1621,13 @@ dependencies = [
 [[package]]
 name = "hexeract-mediator"
 version = "0.2.0"
+dependencies = [
+ "hexeract-core",
+ "thiserror",
+ "tokio",
+ "trait-variant",
+ "uuid",
+]
 
 [[package]]
 name = "hexeract-outbox"

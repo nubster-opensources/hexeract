@@ -1,5 +1,6 @@
 use crate::command::Command;
 use crate::ids::{CorrelationId, MessageId};
+use crate::notification::Notification;
 use crate::query::Query;
 
 /// Metadata carried alongside every dispatch.
@@ -29,6 +30,22 @@ impl MessageEnvelope {
     pub fn for_query<Q: Query>(message_id: MessageId, correlation_id: CorrelationId) -> Self {
         Self {
             type_name: std::any::type_name::<Q>(),
+            message_id,
+            correlation_id,
+        }
+    }
+
+    /// Builds an envelope for a [`Notification`] dispatch. Each handler in a
+    /// fan-out receives its own envelope; callers typically share the
+    /// [`CorrelationId`] across the whole fan-out to preserve the causal link
+    /// in traces.
+    #[must_use]
+    pub fn for_notification<N: Notification>(
+        message_id: MessageId,
+        correlation_id: CorrelationId,
+    ) -> Self {
+        Self {
+            type_name: std::any::type_name::<N>(),
             message_id,
             correlation_id,
         }
@@ -65,6 +82,16 @@ mod tests {
     struct Pong;
     impl Query for Pong {
         type Output = ();
+    }
+
+    #[derive(Clone)]
+    struct Bell;
+    impl Notification for Bell {}
+
+    #[test]
+    fn for_notification_records_notification_type_name() {
+        let env = MessageEnvelope::for_notification::<Bell>(MessageId::new(), CorrelationId::new());
+        assert!(env.type_name().ends_with("::Bell"));
     }
 
     #[test]
