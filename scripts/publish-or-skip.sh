@@ -74,14 +74,21 @@ fi
 # `cargo publish` itself gives the authoritative failure.
 echo "$crate@$version not on crates.io (HTTP $status), publishing..."
 
-# Detect dry-run mode: `cargo publish --dry-run` resolves dependency
-# versions against the live crates.io index, which breaks the chain
-# as soon as one of our own crates references another crate that was
-# only dry-run-published in a previous step (never actually uploaded).
-# In dry-run mode we therefore fall back to `cargo package --no-verify`,
-# which validates the Cargo.toml metadata, the file list and the
-# generated tarball without resolving the registry. The token is not
-# needed because nothing is uploaded.
+# Detect dry-run mode. Cargo resolves inter-crate dependencies against
+# the live crates.io index even during `cargo publish --dry-run` and
+# `cargo package`, including with `--no-verify`. That makes per-crate
+# dry-run validation impossible for a multi-crate workspace where
+# every crate references the previous one through a `version = "..."`
+# requirement: the dependency target only exists on the local
+# filesystem, never on crates.io.
+#
+# Pragmatic approach: dry-run only the root crate (`hexeract-core`),
+# which has no internal dependencies. Every other crate gets a clear
+# skip message. The workspace-wide `cargo build --release` step in the
+# release workflow already proves that everything compiles together;
+# the remaining risk for the non-root crates is purely metadata
+# (license, readme, include patterns) which the live publish will
+# surface in real time, before reaching crates.io.
 is_dry_run=false
 for arg in "${extra_args[@]}"; do
   if [[ "$arg" == "--dry-run" ]]; then
@@ -91,8 +98,12 @@ for arg in "${extra_args[@]}"; do
 done
 
 if [[ "$is_dry_run" == true ]]; then
-  echo "$crate@$version: dry-run mode, running cargo package --no-verify"
-  cargo package -p "$crate" --allow-dirty --no-verify
+  if [[ "$crate" == "hexeract-core" ]]; then
+    echo "$crate@$version: dry-run mode, running cargo package --no-verify"
+    cargo package -p "$crate" --allow-dirty --no-verify
+  else
+    echo "$crate@$version: dry-run skipped (cargo cannot isolate multi-crate workspaces; live publish remains the source of truth for non-root crates)"
+  fi
   exit 0
 fi
 
