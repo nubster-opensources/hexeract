@@ -1533,6 +1533,7 @@ dependencies = [
  "hexeract-core",
  "hexeract-macros",
  "hexeract-mediator",
+ "hexeract-middleware",
  "hexeract-outbox",
  "hexeract-outbox-postgres",
 ]
