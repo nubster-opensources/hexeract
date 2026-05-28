@@ -1,6 +1,6 @@
 [package]
 name = "hexeract"
-version = "0.2.1"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -17,14 +17,14 @@ categories = ["asynchronous", "network-programming"]
 workspace = true
 
 [dependencies]
-hexeract-bus = { path = "../hexeract-bus", version = "0.2", optional = true }
-hexeract-bus-rabbitmq = { path = "../hexeract-bus-rabbitmq", version = "0.2", optional = true }
-hexeract-core = { path = "../hexeract-core", version = "0.2", optional = true }
-hexeract-macros = { path = "../hexeract-macros", version = "0.2", optional = true }
-hexeract-mediator = { path = "../hexeract-mediator", version = "0.2", optional = true }
+hexeract-bus = { path = "../hexeract-bus", version = "0.3", optional = true }
+hexeract-bus-rabbitmq = { path = "../hexeract-bus-rabbitmq", version = "0.3", optional = true }
+hexeract-core = { path = "../hexeract-core", version = "0.3", optional = true }
+hexeract-macros = { path = "../hexeract-macros", version = "0.3", optional = true }
+hexeract-mediator = { path = "../hexeract-mediator", version = "0.3", optional = true }
 hexeract-middleware = { path = "../hexeract-middleware", version = "0.3", optional = true }
-hexeract-outbox = { path = "../hexeract-outbox", version = "0.2", optional = true }
-hexeract-outbox-postgres = { path = "../hexeract-outbox-postgres", version = "0.2", optional = true }
+hexeract-outbox = { path = "../hexeract-outbox", version = "0.3", optional = true }
+hexeract-outbox-postgres = { path = "../hexeract-outbox-postgres", version = "0.3", optional = true }
 
 [features]
 default = []

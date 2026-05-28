@@ -25,8 +25,8 @@ quote = { workspace = true }
 syn = { workspace = true }
 
 [dev-dependencies]
-hexeract-core = { path = "../hexeract-core", version = "0.2" }
-hexeract-mediator = { path = "../hexeract-mediator", version = "0.2" }
+hexeract-core = { path = "../hexeract-core", version = "0.3" }
+hexeract-mediator = { path = "../hexeract-mediator", version = "0.3" }
 tokio = { workspace = true, features = ["macros", "rt"] }
 trybuild = { workspace = true }
 
