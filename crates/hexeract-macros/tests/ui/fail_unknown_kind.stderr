@@ -1,0 +1,13 @@
+error: unknown handler kind `event`; expected `command`, `query` or `notification`
+  --> tests/ui/fail_unknown_kind.rs:11:11
+   |
+11 | #[handler(event)]
+   |           ^^^^^
+
+warning: unused imports: `HandlerContext` and `HexeractError`
+ --> tests/ui/fail_unknown_kind.rs:1:30
+  |
+1 | use hexeract_core::{Command, HandlerContext, HexeractError};
+  |                              ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default

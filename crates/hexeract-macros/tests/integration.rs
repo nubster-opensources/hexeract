@@ -47,10 +47,7 @@ struct UserCreated {
 impl Notification for UserCreated {}
 
 #[handler(notification)]
-async fn audit_user_created(
-    _n: UserCreated,
-    _ctx: &HandlerContext,
-) -> Result<(), HexeractError> {
+async fn audit_user_created(_n: UserCreated, _ctx: &HandlerContext) -> Result<(), HexeractError> {
     Ok(())
 }
 
@@ -103,6 +100,14 @@ fn verify_handlers_reports_missing_when_a_handler_macro_is_unregistered() {
     let Err(HandlersVerificationError::Missing { missing }) = result else {
         panic!("expected Missing variant");
     };
-    assert!(missing.iter().any(|m| m.handler_type_name.contains("GetUserCount")));
-    assert!(missing.iter().any(|m| m.handler_type_name.contains("AuditUserCreated")));
+    assert!(
+        missing
+            .iter()
+            .any(|m| m.handler_type_name.contains("GetUserCount"))
+    );
+    assert!(
+        missing
+            .iter()
+            .any(|m| m.handler_type_name.contains("AuditUserCreated"))
+    );
 }

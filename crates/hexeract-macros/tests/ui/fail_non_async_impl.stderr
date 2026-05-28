@@ -1,0 +1,13 @@
+error: `handle` must be `async`
+  --> tests/ui/fail_non_async_impl.rs:13:5
+   |
+13 |     fn handle(&self, _c: Cmd, _ctx: &HandlerContext) -> Result<(), HexeractError> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `HandlerContext` and `HexeractError`
+ --> tests/ui/fail_non_async_impl.rs:1:30
+  |
+1 | use hexeract_core::{Command, HandlerContext, HexeractError};
+  |                              ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default

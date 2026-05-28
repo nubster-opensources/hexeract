@@ -247,13 +247,11 @@ impl MediatorBuilder {
         for reg in inventory::iter::<HandlerRegistration> {
             let message_type_name = (reg.message_type_name)();
             let present = match reg.kind {
-                HandlerKind::Command => {
-                    self.registered_command_types.contains(message_type_name)
-                }
+                HandlerKind::Command => self.registered_command_types.contains(message_type_name),
                 HandlerKind::Query => self.registered_query_types.contains(message_type_name),
-                HandlerKind::Notification => {
-                    self.registered_notification_types.contains(message_type_name)
-                }
+                HandlerKind::Notification => self
+                    .registered_notification_types
+                    .contains(message_type_name),
             };
             if !present {
                 missing.push(MissingHandler {

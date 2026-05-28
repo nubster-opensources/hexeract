@@ -75,7 +75,9 @@ pub(crate) fn parse_kind(attr: TokenStream) -> syn::Result<HandlerKindArg> {
         "notification" => Ok(HandlerKindArg::Notification),
         other => Err(syn::Error::new(
             ident.span(),
-            format!("unknown handler kind `{other}`; expected `command`, `query` or `notification`"),
+            format!(
+                "unknown handler kind `{other}`; expected `command`, `query` or `notification`"
+            ),
         )),
     }
 }
@@ -197,7 +199,10 @@ fn extract_free_signature(
 ) -> syn::Result<(Type, Type, Type)> {
     let mut inputs = sig.inputs.iter();
     let msg_arg = inputs.next().ok_or_else(|| {
-        syn::Error::new_spanned(sig, "function must take `msg: M` and `ctx: &HandlerContext`")
+        syn::Error::new_spanned(
+            sig,
+            "function must take `msg: M` and `ctx: &HandlerContext`",
+        )
     })?;
     let message_ty = typed_arg_type(msg_arg, "msg: M")?;
     let ctx_arg = inputs.next().ok_or_else(|| {
@@ -400,7 +405,11 @@ mod tests {
                 }
             }
         };
-        let err = expect_parse_err(HandlerKindArg::Command, item, "trait impls must be rejected");
+        let err = expect_parse_err(
+            HandlerKindArg::Command,
+            item,
+            "trait impls must be rejected",
+        );
         assert!(err.to_string().contains("bare inherent impl"));
     }
 
@@ -470,9 +479,6 @@ mod tests {
         let id = Ident::new("list", Span::call_site());
         assert_eq!(pascal_case_handler(&id).to_string(), "ListHandler");
         let id = Ident::new("send_audit_log", Span::call_site());
-        assert_eq!(
-            pascal_case_handler(&id).to_string(),
-            "SendAuditLogHandler"
-        );
+        assert_eq!(pascal_case_handler(&id).to_string(), "SendAuditLogHandler");
     }
 }

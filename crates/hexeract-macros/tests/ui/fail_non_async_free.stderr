@@ -1,0 +1,13 @@
+error: #[handler] free function must be `async`
+  --> tests/ui/fail_non_async_free.rs:10:1
+   |
+10 | fn list_things(_q: Q, _ctx: &HandlerContext) -> Result<u32, HexeractError> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `HandlerContext` and `HexeractError`
+ --> tests/ui/fail_non_async_free.rs:1:28
+  |
+1 | use hexeract_core::{Query, HandlerContext, HexeractError};
+  |                            ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
