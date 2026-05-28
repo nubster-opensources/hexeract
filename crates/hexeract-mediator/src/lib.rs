@@ -245,22 +245,21 @@ impl MediatorBuilder {
     pub fn verify_handlers(&self) -> Result<(), HandlersVerificationError> {
         let mut missing = Vec::new();
         for reg in inventory::iter::<HandlerRegistration> {
+            let message_type_name = (reg.message_type_name)();
             let present = match reg.kind {
                 HandlerKind::Command => {
-                    self.registered_command_types.contains(reg.message_type_name)
+                    self.registered_command_types.contains(message_type_name)
                 }
-                HandlerKind::Query => {
-                    self.registered_query_types.contains(reg.message_type_name)
+                HandlerKind::Query => self.registered_query_types.contains(message_type_name),
+                HandlerKind::Notification => {
+                    self.registered_notification_types.contains(message_type_name)
                 }
-                HandlerKind::Notification => self
-                    .registered_notification_types
-                    .contains(reg.message_type_name),
             };
             if !present {
                 missing.push(MissingHandler {
                     kind: reg.kind,
-                    message_type_name: reg.message_type_name,
-                    handler_type_name: reg.handler_type_name,
+                    message_type_name,
+                    handler_type_name: (reg.handler_type_name)(),
                 });
             }
         }
@@ -778,16 +777,32 @@ mod tests {
         assert!(Arc::ptr_eq(&mediator.inner, &clone.inner));
     }
 
+    fn verify_probe_cmd_name() -> &'static str {
+        "hexeract_mediator::tests::VerifyProbeCmd"
+    }
+
+    fn verify_probe_handler_name() -> &'static str {
+        "hexeract_mediator::tests::VerifyProbeHandler"
+    }
+
+    fn verify_probe_query_name() -> &'static str {
+        "hexeract_mediator::tests::VerifyProbeQuery"
+    }
+
+    fn verify_probe_query_handler_name() -> &'static str {
+        "hexeract_mediator::tests::VerifyProbeQueryHandler"
+    }
+
     inventory::submit!(HandlerRegistration {
         kind: HandlerKind::Command,
-        message_type_name: "hexeract_mediator::tests::VerifyProbeCmd",
-        handler_type_name: "hexeract_mediator::tests::VerifyProbeHandler",
+        message_type_name: verify_probe_cmd_name,
+        handler_type_name: verify_probe_handler_name,
     });
 
     inventory::submit!(HandlerRegistration {
         kind: HandlerKind::Query,
-        message_type_name: "hexeract_mediator::tests::VerifyProbeQuery",
-        handler_type_name: "hexeract_mediator::tests::VerifyProbeQueryHandler",
+        message_type_name: verify_probe_query_name,
+        handler_type_name: verify_probe_query_handler_name,
     });
 
     #[test]

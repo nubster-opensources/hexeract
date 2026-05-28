@@ -1,10 +1,5 @@
 //! Parsing the `#[handler(kind)]` attribute and the annotated item.
 
-#![allow(
-    dead_code,
-    reason = "fields are consumed by the expand pass in a follow-up commit"
-)]
-
 use proc_macro2::{Span, TokenStream};
 use syn::{
     FnArg, GenericArgument, Ident, ImplItem, ImplItemFn, ItemFn, ItemImpl, PathArguments,

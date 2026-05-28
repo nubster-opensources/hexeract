@@ -9,6 +9,7 @@ extern crate proc_macro;
 
 use proc_macro::TokenStream;
 
+mod expand;
 mod parse;
 
 /// Attribute macro that wires a handler into the Hexeract registry.
@@ -34,8 +35,8 @@ mod parse;
 /// stage only validates the input.
 #[proc_macro_attribute]
 pub fn handler(attr: TokenStream, item: TokenStream) -> TokenStream {
-    match try_handler(attr.into(), item.clone().into()) {
-        Ok(_parsed) => item,
+    match try_handler(attr.into(), item.into()) {
+        Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }
 }
@@ -43,7 +44,8 @@ pub fn handler(attr: TokenStream, item: TokenStream) -> TokenStream {
 fn try_handler(
     attr: proc_macro2::TokenStream,
     item: proc_macro2::TokenStream,
-) -> syn::Result<parse::HandlerItem> {
+) -> syn::Result<proc_macro2::TokenStream> {
     let kind = parse::parse_kind(attr)?;
-    parse::parse_handler_item(kind, item)
+    let parsed = parse::parse_handler_item(kind, item)?;
+    Ok(expand::expand(parsed))
 }
