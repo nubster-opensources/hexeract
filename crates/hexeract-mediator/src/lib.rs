@@ -7,10 +7,48 @@
 //! to the matching handler through a compile-time generic, while the internal
 //! registry erases the handler types behind a `TypeId` lookup table.
 //!
+//! Commands and queries are single-handler: registering a second handler for
+//! the same type is a build-time error. Notifications are multi-handler and
+//! fan out in registration order; failures are aggregated so siblings keep
+//! running even when one handler returns an error.
+//!
 //! The three built-in middlewares (`TracingMiddleware`, `LoggingMiddleware`,
 //! `TimeoutMiddleware`) ship in a follow-up release; users can still wire
 //! their own [`Middleware`] implementations through
 //! [`MediatorBuilder::with_middleware`] in the meantime.
+//!
+//! # Example
+//!
+//! ```
+//! use hexeract_core::{Command, CommandHandler, HandlerContext, HexeractError};
+//! use hexeract_mediator::MediatorBuilder;
+//!
+//! struct Greet { name: String }
+//!
+//! impl Command for Greet {
+//!     type Output = String;
+//! }
+//!
+//! struct GreetHandler;
+//!
+//! impl CommandHandler<Greet> for GreetHandler {
+//!     type Error = HexeractError;
+//!     async fn handle(&self, cmd: Greet, _ctx: &HandlerContext)
+//!         -> Result<String, Self::Error>
+//!     {
+//!         Ok(format!("hello {}", cmd.name))
+//!     }
+//! }
+//!
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let mediator = MediatorBuilder::new()
+//!     .register_command_handler::<Greet, _>(GreetHandler)
+//!     .build()?;
+//!
+//! let greeting = mediator.send(Greet { name: "world".into() }).await?;
+//! assert_eq!(greeting, "hello world");
+//! # Ok(()) }
+//! ```
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod erased;

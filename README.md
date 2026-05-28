@@ -177,6 +177,48 @@ hexeract bus purge --queue orders.received --yes-i-know
 
 See the runnable [`crates/hexeract-bus-rabbitmq/examples/03_bus_pubsub.rs`](./crates/hexeract-bus-rabbitmq/examples/03_bus_pubsub.rs) for an end-to-end pub/sub against a real RabbitMQ container, and [`crates/hexeract-cli/examples/topology.toml`](./crates/hexeract-cli/examples/topology.toml) for the topology file format consumed by `hexeract bus declare`.
 
+### Mediator (in-process)
+
+Add the umbrella crate with the `mediator` feature to your `Cargo.toml`:
+
+```toml
+[dependencies]
+hexeract = { version = "0.3", features = ["mediator"] }
+```
+
+Register a command handler and dispatch through the mediator:
+
+```rust
+use hexeract::core::{Command, CommandHandler, HandlerContext, HexeractError};
+use hexeract::mediator::MediatorBuilder;
+
+struct Greet { name: String }
+
+impl Command for Greet {
+    type Output = String;
+}
+
+struct GreetHandler;
+
+impl CommandHandler<Greet> for GreetHandler {
+    type Error = HexeractError;
+    async fn handle(&self, cmd: Greet, _ctx: &HandlerContext) -> Result<String, Self::Error> {
+        Ok(format!("hello {}", cmd.name))
+    }
+}
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let mediator = MediatorBuilder::new()
+    .register_command_handler::<Greet, _>(GreetHandler)
+    .build()?;
+
+let greeting = mediator.send(Greet { name: "world".into() }).await?;
+assert_eq!(greeting, "hello world");
+# Ok(()) }
+```
+
+Queries (`Mediator::query`) and notifications (`Mediator::publish`) follow the same pattern. Notifications fan out to every handler registered for the type in registration order; failures are aggregated so siblings keep running. Wire your own [`Middleware`] implementations through `MediatorBuilder::with_middleware` to add tracing, timeouts or any cross-cutting behavior around every dispatch.
+
 ## Why Hexeract
 
 Building event-driven services in Rust today means manually wiring a broker client, an outbox table, a job queue, a workflow library and a saga state machine together. Hexeract closes that gap with a single SDK that covers the full surface area while keeping each feature independently usable:
