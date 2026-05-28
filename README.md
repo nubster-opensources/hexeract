@@ -16,21 +16,23 @@ Hexeract is sponsored by [Nubster](https://nubster.com).
 
 ## Status
 
-🚀 **v0.2.0: Bus RabbitMQ shipped.** Outbox MVP remains stable from v0.1.0, and the bus brings a unified `Transport` trait with a first RabbitMQ backend powered by `lapin`, a consumer worker with ack modes and retry policy, topology helpers, an end-to-end pub/sub example and a `hexeract bus` CLI namespace.
+🚀 **v0.3.0: Mediator, middlewares and `#[handler]` macro shipped.** The in-process mediator dispatches commands, queries and notifications through a type-safe, reflection-free registry. Two built-in middlewares (`TracingMiddleware`, `TimeoutMiddleware`) cover observability and dispatch deadlines. The `#[handler]` attribute proc-macro generates trait implementations and emits link-time metadata for `MediatorBuilder::verify_handlers()` to catch missing registrations in CI. Outbox MVP and Bus RabbitMQ remain stable from v0.1.0 and v0.2.0.
 
-| Feature | v0.1.0 | v0.2.0 |
-| --- | --- | --- |
-| Transactional outbox (PostgreSQL) | ✅ | ✅ |
-| Worker poll loop with `SKIP LOCKED` | ✅ | ✅ |
-| Fluent builder API | ✅ | ✅ |
-| `hexeract outbox` CLI | ✅ | ✅ |
-| Bus core (`Message`, `BusEnvelope`, `Transport`, `Handler<M>`) | ⏳ | ✅ |
-| RabbitMQ backend (`lapin` connection pool, publish, consume, retry) | ⏳ | ✅ |
-| Topology types (`Exchange`, `Queue`, `Binding`, `RoutingKey`) | ⏳ | ✅ |
-| `hexeract bus declare / peek / purge` CLI | ⏳ | ✅ |
-| Mediator | ⏳ v0.3.0 | ⏳ v0.3.0 |
-| Polyglot bus (NATS, Kafka, SQS) | ⏳ v0.9.0 | ⏳ v0.9.0 |
-| Sagas, Scheduler, Request and Reply | ⏳ later | ⏳ later |
+| Feature | v0.1.0 | v0.2.0 | v0.3.0 |
+| --- | --- | --- | --- |
+| Transactional outbox (PostgreSQL) | ✅ | ✅ | ✅ |
+| Worker poll loop with `SKIP LOCKED` | ✅ | ✅ | ✅ |
+| Fluent builder API | ✅ | ✅ | ✅ |
+| `hexeract outbox` CLI | ✅ | ✅ | ✅ |
+| Bus core (`Message`, `BusEnvelope`, `Transport`, `Handler<M>`) | ⏳ | ✅ | ✅ |
+| RabbitMQ backend (`lapin` connection pool, publish, consume, retry) | ⏳ | ✅ | ✅ |
+| Topology types (`Exchange`, `Queue`, `Binding`, `RoutingKey`) | ⏳ | ✅ | ✅ |
+| `hexeract bus declare / peek / purge` CLI | ⏳ | ✅ | ✅ |
+| In-process CQRS mediator (`send`, `query`, `publish`) | ⏳ | ⏳ | ✅ |
+| Built-in `TracingMiddleware` and `TimeoutMiddleware` | ⏳ | ⏳ | ✅ |
+| `#[handler]` attribute macro with `verify_handlers()` | ⏳ | ⏳ | ✅ |
+| Polyglot bus (NATS, Kafka, SQS) | ⏳ v0.9.0 | ⏳ v0.9.0 | ⏳ v0.9.0 |
+| Sagas, Scheduler, Request and Reply | ⏳ later | ⏳ later | ⏳ later |
 
 See the [CHANGELOG](./CHANGELOG.md) for the detailed history.
 
@@ -42,7 +44,7 @@ Add the umbrella crate with the `outbox-postgres` feature to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-hexeract = { version = "0.2", features = ["outbox-postgres"] }
+hexeract = { version = "0.3", features = ["outbox-postgres"] }
 ```
 
 > Power users who prefer a strict SemVer per crate can keep depending on `hexeract-outbox`, `hexeract-outbox-postgres`, `hexeract-bus`, `hexeract-bus-rabbitmq` etc. directly.
@@ -106,7 +108,7 @@ Add the umbrella crate with the `bus-rabbitmq` feature to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-hexeract = { version = "0.2", features = ["bus-rabbitmq"] }
+hexeract = { version = "0.3", features = ["bus-rabbitmq"] }
 ```
 
 Declare a domain message, a handler and wire a publisher plus a worker:

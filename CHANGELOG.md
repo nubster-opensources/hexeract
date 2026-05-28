@@ -9,6 +9,58 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 ### Added
 - _Items in flight will be listed here until the next release._
 
+## [0.3.0] - 2026-05-28
+
+Third public release. Ships the in-process Mediator, two built-in middlewares (`TracingMiddleware`, `TimeoutMiddleware`), and the `#[handler]` attribute proc-macro with inventory-based discovery. Completes the v0.3.0 milestone (issues #6, #7, #8, #9).
+
+### Added
+
+- `hexeract-mediator` (new crate, first release):
+  - `MediatorBuilder` fluent builder with `register_command_handler<C, H>`, `register_query_handler<Q, H>`, `register_notification_handler<N, H>`, `with_middleware<M>`, `verify_handlers()` and `build()`.
+  - `Mediator` clone-cheap dispatcher (`Arc<MediatorInner>` internally) exposing `send::<C>`, `query::<Q>` and `publish::<N>`.
+  - Type-erased registry: `HashMap<TypeId, Arc<dyn Erased*Handler>>` per channel, with `Typed*Handler<M, H>` adapters that downcast the payload, await the typed handler, map the handler error through `Into<HexeractError>`, and re-box the output.
+  - Per-dispatch terminals (`CommandTerminal`, `QueryTerminal`, `NotificationTerminal`) with `Mutex<Option<BoxAny>>` for the move-from-`&self` problem and re-entry detection.
+  - Notification fan-out semantics: shared `CorrelationId` across handlers, per-handler `MessageId`, sequential dispatch, fail-safe (every handler runs even if a previous one failed), aggregated `HexeractError::Dispatch("publish: N of M handlers failed: ...")`.
+  - `MediatorBuildError::DuplicateHandler` reports the first accumulated registration conflict.
+  - `MediatorBuilder::verify_handlers()` cross-checks the `inventory`-collected `HandlerRegistration` entries against the registered handlers; returns `HandlersVerificationError::Missing { missing: Vec<MissingHandler> }` listing declared-but-unregistered handlers.
+- `hexeract-middleware` (new crate, first release):
+  - `TracingMiddleware` opens a `tracing::Span` per dispatch (`type_name`, `message_id`, `correlation_id` recorded), emits `entering` on entry, `completed` with `elapsed_ms` on success, `failed` with `error = %err` at `Level::ERROR` on failure. Configurable level via `with_level`; defaults to `INFO`. Hierarchical span inheritance from the calling task.
+  - `TimeoutMiddleware` wraps the inner pipeline in `tokio::time::timeout`, returning `HexeractError::Timeout { type_name, duration, .. }` on expiration.
+- `hexeract-macros`:
+  - `#[handler(command|query|notification)]` attribute macro:
+    - On an inherent `impl` block: infers the message type from the `async fn handle(&self, msg: M, ctx: &HandlerContext) -> Result<T, E>` signature and generates the matching trait impl.
+    - On a free `async fn`: generates a unit struct `<PascalCaseFnName>Handler` and the trait impl forwarding to the function.
+    - Submits a `HandlerRegistration` entry to `inventory` for `verify_handlers()` cross-checking.
+  - Comprehensive compile-fail diagnostics (8 trybuild ui snapshots): missing kind, unknown kind, trait impl, non-async, wrong arity, no Result return, notification with non-unit output.
+- `hexeract-core`:
+  - `HandlerKind { Command, Query, Notification }` enum.
+  - `HandlerRegistration { kind, message_type_name: fn() -> &'static str, handler_type_name: fn() -> &'static str }` (fn-pointer fields so `inventory::submit!` can stay const).
+  - `inventory::collect!(HandlerRegistration)` declaration.
+  - `HandlerRegistration::__private` module re-exports `inventory` for macro expansion.
+  - `HexeractError::Timeout` variant extended with `type_name: &'static str` and `duration: Duration` fields; marked `#[non_exhaustive]` at the variant level.
+  - `HexeractError::timeout(type_name, duration)` public constructor (required to build the `Timeout` variant from outside the crate).
+- `hexeract` umbrella crate:
+  - New feature flag `middleware = ["core", "dep:hexeract-middleware"]` re-exporting `hexeract_middleware` as `hexeract::middleware`.
+  - `mediator` and `macros` features now expose the full crates instead of placeholders.
+
+### Changed
+
+- `HexeractError::Timeout`: was `{ elapsed: Duration }`, now `{ type_name, duration, .. }`. Breaking for callers that pattern-matched the variant without `..`. Pre-1.0 minor-version bump.
+- `MediatorBuilder` now maintains three parallel `HashSet<&'static str>` of registered message type names (one per channel) to power `verify_handlers()` against `inventory` string-keyed metadata.
+
+### Documentation
+
+- 16 new documentation pages under `docs/`: a Mediator getting-started, three concepts pages (CQRS semantics, middleware pipeline, `#[handler]`), one architecture flow, three crate references (`hexeract-mediator`, `hexeract-middleware`, `hexeract-macros`), two migration guides (from MediatR, from Wolverine), five cookbook recipes (wire tracing+timeout, outbox+mediator, handler with state, notification fan-out, sanity-check handlers), plus an updated `docs/index.md`.
+- README extended with a `Mediator (in-process)` quick start; status badge raised from `pre-alpha` to `alpha`.
+- Crate-level rustdocs cleaned of obsolete `placeholder` mentions inherited from earlier v0.x phases.
+- `docs/architecture/overview.md` mermaid graph and crate roles table now reflect the v0.3.0 lineup (`hexeract-mediator`, `hexeract-middleware`, `hexeract-macros` all `Stable`).
+
+### Internal
+
+- New workspace dependencies: `inventory = "0.3"`, `tracing-test = "0.2"`, `trybuild = "1"`.
+- Workspace package version bumped from `0.2.0` to `0.3.0`; the `hexeract-middleware` and `hexeract` crates that previously held explicit overrides now inherit from `workspace.package.version`.
+- All inter-crate dependency requirements normalized to `version = "0.3"` (was a mix of `"0.2"` and `"0.2.0"`).
+
 ## [0.2.0] - 2026-05-26
 
 Second public release. Ships the Bus feature end to end against RabbitMQ via `lapin`, alongside topology types, a typed consumer worker with ack modes and retry policy, an end-to-end pub/sub example and a `hexeract bus` CLI namespace.
