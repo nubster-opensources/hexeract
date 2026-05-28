@@ -1,16 +1,49 @@
 //! Procedural macros for the Hexeract messaging framework.
 //!
-//! This crate is a placeholder. The full implementation ships in v0.1.0.
+//! Exposes the `#[handler]` attribute that generates `CommandHandler`,
+//! `QueryHandler` or `NotificationHandler` implementations and submits
+//! a `HandlerRegistration` entry to the `inventory` collector for
+//! `MediatorBuilder::verify_handlers`.
 
 extern crate proc_macro;
+
 use proc_macro::TokenStream;
 
-/// Placeholder for the `#[handler]` attribute macro.
+mod parse;
+
+/// Attribute macro that wires a handler into the Hexeract registry.
 ///
-/// The full implementation ships in v0.1.0 and will generate
-/// `CommandHandler` / `QueryHandler` implementations and auto-register
-/// the handler via `inventory`.
+/// # Syntax
+///
+/// ```ignore
+/// #[handler(command)]
+/// impl MyHandler {
+///     async fn handle(&self, cmd: CreateUser, ctx: &HandlerContext) -> Result<UserId, MyError> { ... }
+/// }
+///
+/// #[handler(query)]
+/// async fn list_users(q: ListUsers, ctx: &HandlerContext) -> Result<Vec<User>, MyError> { ... }
+///
+/// #[handler(notification)]
+/// async fn audit(n: UserCreated, ctx: &HandlerContext) -> Result<(), MyError> { ... }
+/// ```
+///
+/// The kind is mandatory and must be one of `command`, `query` or
+/// `notification`. The full expansion (trait impl plus
+/// `inventory::submit!`) ships in a follow-up commit; this scaffolding
+/// stage only validates the input.
 #[proc_macro_attribute]
-pub fn handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    item
+pub fn handler(attr: TokenStream, item: TokenStream) -> TokenStream {
+    match try_handler(attr.into(), item.clone().into()) {
+        Ok(_parsed) => item,
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+fn try_handler(
+    attr: proc_macro2::TokenStream,
+    item: proc_macro2::TokenStream,
+) -> syn::Result<parse::HandlerItem> {
+    let kind = parse::parse_kind(attr)?;
+    parse::parse_handler_item(kind, item)
 }
