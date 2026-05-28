@@ -29,7 +29,7 @@ The `Typed*Handler<M, H>` adapters wrap the user's typed handler `H: CommandHand
 ```text
 Mediator::send::<C>(command)
   └─> lookup TypeId::of::<C>() in command_handlers
-      ├─ miss → Err(HexeractError::HandlerNotFound)
+      ├─ miss → Err(HexeractError::HandlerNotFound { command_type })
       └─ hit  → continue
   ├─> mint MessageId + CorrelationId
   ├─> build MessageEnvelope::for_command::<C>(...)

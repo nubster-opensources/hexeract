@@ -75,7 +75,7 @@ Each `MissingHandler` exposes the fully-qualified type names captured by `std::a
 | Location | Trade-off |
 | --- | --- |
 | Unit test (recommended) | Fails before merge; no runtime cost in production |
-| Service startup, after `build` | Fails fast at deploy time; takes a few ms |
+| Service startup, before `build` | Fails fast at deploy time; takes a few ms |
 | Anywhere later in the program | Acceptable but pointless; `inventory` is link-time |
 
 The recommended pattern is the unit test plus an optional startup check for belt-and-suspenders.

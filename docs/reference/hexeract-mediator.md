@@ -60,7 +60,7 @@ pub enum MediatorBuildError {
 }
 ```
 
-Only one variant ships in v0.3.0; the enum is `#[non_exhaustive]`-friendly in spirit, future variants may be added.
+Only one variant ships in v0.3.0. The enum is not currently marked `#[non_exhaustive]`; that attribute is planned for v1.0 alongside the broader API freeze, so that adding future variants will remain a non-breaking change.
 
 ## `HandlersVerificationError`
 
