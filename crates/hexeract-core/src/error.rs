@@ -45,6 +45,18 @@ impl HexeractError {
             source: Box::new(source),
         }
     }
+
+    /// Builds a [`HexeractError::Timeout`] from the dispatched message type
+    /// name and the timeout that was exceeded. This is the only way to
+    /// construct the variant from outside this crate, since it is marked
+    /// `#[non_exhaustive]`.
+    #[must_use]
+    pub fn timeout(type_name: &'static str, duration: Duration) -> Self {
+        Self::Timeout {
+            type_name,
+            duration,
+        }
+    }
 }
 
 #[cfg(test)]
