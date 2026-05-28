@@ -40,7 +40,7 @@ outbox-postgres = ["outbox", "dep:hexeract-outbox-postgres"]
 bus = ["core", "dep:hexeract-bus"]
 bus-rabbitmq = ["bus", "dep:hexeract-bus-rabbitmq"]
 
-# Mediator and procedural macros (placeholders shipped in v0.3.0).
+# In-process CQRS mediator and the `#[handler]` attribute macro.
 mediator = ["core", "dep:hexeract-mediator"]
 macros = ["dep:hexeract-macros"]
 

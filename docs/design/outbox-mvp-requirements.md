@@ -113,7 +113,7 @@ The following capabilities were deliberately excluded from v0.1.0 to keep the MV
 - **Sagas**: long-running workflows with persisted state. Deferred to v0.8.
 - **Scheduler**: delayed and cron-scheduled messages. Deferred to v0.6.
 - **Request and Reply**: RPC-style synchronous calls on top of an asynchronous bus. Deferred to v0.7.
-- **Mediator in-process**: command and query dispatch through a typed registry. Partially landed in v0.0.1 placeholders, full release deferred to v0.3.
+- **Mediator in-process**: command and query dispatch through a typed registry. Shipped in v0.3.0.
 - **Exponential backoff**: failed rows are retried with a constant `retry_delay`. Backoff lands in v0.5.
 - **Dead-letter queue**: rows past `max_attempts` stop being polled; observability is via SQL.
 

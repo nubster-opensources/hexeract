@@ -7,7 +7,7 @@
 [![CI](https://github.com/nubster-opensources/hexeract/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/nubster-opensources/hexeract/actions/workflows/ci.yml)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](./docs/MSRV_POLICY.md)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![Status](https://img.shields.io/badge/status-pre--alpha-orange)](#status)
+[![Status](https://img.shields.io/badge/status-alpha-yellow)](#status)
 [![Made with Rust](https://img.shields.io/badge/made%20with-Rust-orange?logo=rust)](https://www.rust-lang.org/)
 
 Hexeract is a server-side messaging framework written in Rust. It unifies in-process mediator handlers, external message bus transports, transactional outbox and inbox, long-running sagas, scheduled messages and request/reply RPC in a single coherent SDK. The framework relies on Rust's type system and procedural macros to provide compile-time guarantees in place of runtime reflection.

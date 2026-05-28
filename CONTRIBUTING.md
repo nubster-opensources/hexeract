@@ -1,6 +1,6 @@
 # Contributing to Hexeract
 
-Hexeract is currently in **pre-alpha**. The repository is private during vision and architecture phases. The information below describes the conventions that will be applied once the project opens for contributions.
+Hexeract is currently in **alpha** (v0.3.x): Outbox, Bus and Mediator are shipped on crates.io, with Sagas, Scheduler and Request/Reply still ahead on the roadmap. The repository is public on [nubster-opensources/hexeract](https://github.com/nubster-opensources/hexeract) and contributions are welcome.
 
 ## Conventions
 
@@ -12,7 +12,7 @@ Hexeract follows the Nubster general coding standards documented in [nubster-doc
 - **No competitor mentions**, the source code, commit messages, pull requests and documentation never name competing tools.
 - **English on the public API, French on internal artifacts**, rustdoc comments and public types are written in English; commit messages, issues and project documentation are written in French.
 
-## Local setup (when the project opens)
+## Local setup
 
 ```bash
 # Pin the Rust toolchain via rustup
