@@ -24,10 +24,13 @@ pub enum HexeractError {
     },
 
     /// A dispatch exceeded its configured deadline.
-    #[error("dispatch timed out after {elapsed:?}")]
+    #[error("dispatch of `{type_name}` timed out after {duration:?}")]
+    #[non_exhaustive]
     Timeout {
-        /// How long the dispatch ran before being cancelled.
-        elapsed: Duration,
+        /// Fully-qualified type name of the message being dispatched.
+        type_name: &'static str,
+        /// Configured timeout that was exceeded.
+        duration: Duration,
     },
 
     /// A generic dispatch-level error with a human-readable message.
@@ -40,6 +43,18 @@ impl HexeractError {
     pub fn handler_failed(source: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self::HandlerFailed {
             source: Box::new(source),
+        }
+    }
+
+    /// Builds a [`HexeractError::Timeout`] from the dispatched message type
+    /// name and the timeout that was exceeded. This is the only way to
+    /// construct the variant from outside this crate, since it is marked
+    /// `#[non_exhaustive]`.
+    #[must_use]
+    pub fn timeout(type_name: &'static str, duration: Duration) -> Self {
+        Self::Timeout {
+            type_name,
+            duration,
         }
     }
 }
@@ -57,11 +72,14 @@ mod tests {
     }
 
     #[test]
-    fn timeout_display_shows_duration() {
+    fn timeout_display_shows_type_name_and_duration() {
         let err = HexeractError::Timeout {
-            elapsed: Duration::from_secs(5),
+            type_name: "my::RegisterUser",
+            duration: Duration::from_secs(5),
         };
-        assert!(err.to_string().contains("5s"));
+        let rendered = err.to_string();
+        assert!(rendered.contains("RegisterUser"));
+        assert!(rendered.contains("5s"));
     }
 
     #[test]
