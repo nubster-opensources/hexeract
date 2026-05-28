@@ -214,12 +214,16 @@ async fn middleware_handler_pipeline_end_to_end() {
     }
 
     let observed = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = Arc::new(Mutex::new(Vec::new()));
     let mediator = MediatorBuilder::new()
         .with_middleware(EnvelopeInspector {
             observed: Arc::clone(&observed),
         })
         .register_command_handler::<GreetUser, _>(GreetHandler)
         .register_query_handler::<GetAnswer, _>(AnswerHandler)
+        .register_notification_handler::<UserCreated, _>(RecordingNotifHandler {
+            seen: Arc::clone(&seen),
+        })
         .build()
         .expect("build must succeed");
 
@@ -230,12 +234,18 @@ async fn middleware_handler_pipeline_end_to_end() {
         .await
         .expect("send must succeed");
     let answer = mediator.query(GetAnswer).await.expect("query must succeed");
+    mediator
+        .publish(UserCreated { id: 7 })
+        .await
+        .expect("publish must succeed");
 
     assert_eq!(greeting, "hello pierrick");
     assert_eq!(answer, 42);
+    assert_eq!(*seen.lock().unwrap(), vec![7]);
 
     let observed = observed.lock().unwrap().clone();
-    assert_eq!(observed.len(), 2);
+    assert_eq!(observed.len(), 3);
     assert!(observed[0].ends_with("::GreetUser"));
     assert!(observed[1].ends_with("::GetAnswer"));
+    assert!(observed[2].ends_with("::UserCreated"));
 }

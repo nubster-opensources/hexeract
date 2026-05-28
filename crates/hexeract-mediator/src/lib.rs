@@ -201,7 +201,9 @@ impl MediatorBuilder {
     ///
     /// Returns the first accumulated [`MediatorBuildError`] when the
     /// configuration is inconsistent (for example a duplicate command or
-    /// query handler registration).
+    /// query handler registration). Only the first error is surfaced: if
+    /// several invalid registrations were performed, fix the reported one
+    /// and call [`Self::build`] again to see the next.
     pub fn build(self) -> Result<Mediator, MediatorBuildError> {
         if let Some(err) = self.errors.into_iter().next() {
             return Err(err);
