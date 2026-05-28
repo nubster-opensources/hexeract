@@ -20,6 +20,9 @@ pub mod middleware;
 pub mod notification;
 /// Marker trait for read-only messages asking for information.
 pub mod query;
+/// Handler registration metadata collected at link time by the
+/// `#[handler]` macro.
+pub mod registration;
 
 pub use command::Command;
 pub use context::HandlerContext;
@@ -30,3 +33,4 @@ pub use ids::{CorrelationId, MessageId};
 pub use middleware::{BoxOutput, DynMiddleware, Middleware, Next, Terminal};
 pub use notification::Notification;
 pub use query::Query;
+pub use registration::{HandlerKind, HandlerRegistration};
