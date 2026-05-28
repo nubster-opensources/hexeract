@@ -18,6 +18,7 @@ workspace = true
 
 [dependencies]
 hexeract-core = { path = "../hexeract-core", version = "0.2" }
+inventory = { workspace = true }
 thiserror = { workspace = true }
 trait-variant = { workspace = true }
 

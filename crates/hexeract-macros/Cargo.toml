@@ -24,6 +24,12 @@ proc-macro2 = { workspace = true }
 quote = { workspace = true }
 syn = { workspace = true }
 
+[dev-dependencies]
+hexeract-core = { path = "../hexeract-core", version = "0.2" }
+hexeract-mediator = { path = "../hexeract-mediator", version = "0.2" }
+tokio = { workspace = true, features = ["macros", "rt"] }
+trybuild = { workspace = true }
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
