@@ -73,4 +73,27 @@ fi
 # worth surfacing in the log; we still attempt the publish so that
 # `cargo publish` itself gives the authoritative failure.
 echo "$crate@$version not on crates.io (HTTP $status), publishing..."
+
+# Detect dry-run mode: `cargo publish --dry-run` resolves dependency
+# versions against the live crates.io index, which breaks the chain
+# as soon as one of our own crates references another crate that was
+# only dry-run-published in a previous step (never actually uploaded).
+# In dry-run mode we therefore fall back to `cargo package --no-verify`,
+# which validates the Cargo.toml metadata, the file list and the
+# generated tarball without resolving the registry. The token is not
+# needed because nothing is uploaded.
+is_dry_run=false
+for arg in "${extra_args[@]}"; do
+  if [[ "$arg" == "--dry-run" ]]; then
+    is_dry_run=true
+    break
+  fi
+done
+
+if [[ "$is_dry_run" == true ]]; then
+  echo "$crate@$version: dry-run mode, running cargo package --no-verify"
+  cargo package -p "$crate" --allow-dirty --no-verify
+  exit 0
+fi
+
 cargo publish -p "$crate" "${extra_args[@]}" --token "$token"
