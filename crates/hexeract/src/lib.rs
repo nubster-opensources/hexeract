@@ -40,7 +40,8 @@
 //! | `outbox-postgres` | PostgreSQL outbox backend | [`hexeract_outbox`] + [`hexeract_outbox_postgres`] |
 //! | `bus` | Backend-agnostic bus traits | [`hexeract_bus`] |
 //! | `bus-rabbitmq` | RabbitMQ bus backend | [`hexeract_bus`] + [`hexeract_bus_rabbitmq`] |
-//! | `mediator` | In-process mediator (v0.3.0 placeholder) | [`hexeract_mediator`] |
+//! | `mediator` | In-process CQRS mediator | [`hexeract_mediator`] |
+//! | `middleware` | Built-in tracing and timeout middlewares | [`hexeract_middleware`] |
 //! | `macros` | Procedural macros (v0.3.0 placeholder) | [`hexeract_macros`] |
 //!
 //! Every feature transitively enables `core`, so a downstream user
@@ -90,6 +91,13 @@ pub use hexeract_bus_rabbitmq as bus_rabbitmq;
 #[cfg(feature = "mediator")]
 #[cfg_attr(docsrs, doc(cfg(feature = "mediator")))]
 pub use hexeract_mediator as mediator;
+
+/// Built-in middlewares: tracing spans and dispatch timeouts.
+///
+/// Re-export of [`hexeract_middleware`].
+#[cfg(feature = "middleware")]
+#[cfg_attr(docsrs, doc(cfg(feature = "middleware")))]
+pub use hexeract_middleware as middleware;
 
 /// Procedural macros (placeholder shipped in v0.3.0).
 ///

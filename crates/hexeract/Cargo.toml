@@ -22,6 +22,7 @@ hexeract-bus-rabbitmq = { path = "../hexeract-bus-rabbitmq", version = "0.2", op
 hexeract-core = { path = "../hexeract-core", version = "0.2", optional = true }
 hexeract-macros = { path = "../hexeract-macros", version = "0.2", optional = true }
 hexeract-mediator = { path = "../hexeract-mediator", version = "0.2", optional = true }
+hexeract-middleware = { path = "../hexeract-middleware", version = "0.3", optional = true }
 hexeract-outbox = { path = "../hexeract-outbox", version = "0.2", optional = true }
 hexeract-outbox-postgres = { path = "../hexeract-outbox-postgres", version = "0.2", optional = true }
 
@@ -42,6 +43,9 @@ bus-rabbitmq = ["bus", "dep:hexeract-bus-rabbitmq"]
 # Mediator and procedural macros (placeholders shipped in v0.3.0).
 mediator = ["core", "dep:hexeract-mediator"]
 macros = ["dep:hexeract-macros"]
+
+# Built-in middlewares: tracing spans and dispatch timeouts.
+middleware = ["core", "dep:hexeract-middleware"]
 
 [package.metadata.docs.rs]
 all-features = true
