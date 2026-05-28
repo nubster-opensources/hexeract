@@ -55,15 +55,15 @@ mod erased;
 mod terminal;
 
 use std::any::{TypeId, type_name};
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use hexeract_core::{
-    Command, CommandHandler, CorrelationId, DynMiddleware, HandlerContext, HexeractError,
-    MessageEnvelope, MessageId, Middleware, Next, Notification, NotificationHandler, Query,
-    QueryHandler,
+    Command, CommandHandler, CorrelationId, DynMiddleware, HandlerContext, HandlerKind,
+    HandlerRegistration, HexeractError, MessageEnvelope, MessageId, Middleware, Next, Notification,
+    NotificationHandler, Query, QueryHandler,
 };
 
 use crate::erased::{
@@ -87,6 +87,30 @@ pub enum MediatorBuildError {
     },
 }
 
+/// One handler that was declared via the `#[handler]` attribute macro but
+/// never registered through [`MediatorBuilder`].
+#[derive(Debug, Clone)]
+pub struct MissingHandler {
+    /// Kind of handler that was expected.
+    pub kind: HandlerKind,
+    /// Fully-qualified type name of the message type.
+    pub message_type_name: &'static str,
+    /// Fully-qualified type name of the handler type.
+    pub handler_type_name: &'static str,
+}
+
+/// Errors raised by [`MediatorBuilder::verify_handlers`].
+#[derive(Debug, thiserror::Error)]
+pub enum HandlersVerificationError {
+    /// One or more handlers declared via the `#[handler]` macro were not
+    /// registered through the fluent builder.
+    #[error("{} handler(s) declared via #[handler] are missing from the registry", missing.len())]
+    Missing {
+        /// List of missing handlers, in inventory iteration order.
+        missing: Vec<MissingHandler>,
+    },
+}
+
 /// Fluent builder that wires handlers and middlewares into a [`Mediator`].
 ///
 /// # Example
@@ -103,6 +127,9 @@ pub struct MediatorBuilder {
     command_handlers: HashMap<TypeId, Arc<dyn ErasedCommandHandler>>,
     query_handlers: HashMap<TypeId, Arc<dyn ErasedQueryHandler>>,
     notification_handlers: HashMap<TypeId, Vec<Arc<dyn ErasedNotificationHandler>>>,
+    registered_command_types: HashSet<&'static str>,
+    registered_query_types: HashSet<&'static str>,
+    registered_notification_types: HashSet<&'static str>,
     middlewares: Vec<Arc<dyn DynMiddleware>>,
     errors: Vec<MediatorBuildError>,
 }
@@ -115,6 +142,9 @@ impl MediatorBuilder {
             command_handlers: HashMap::new(),
             query_handlers: HashMap::new(),
             notification_handlers: HashMap::new(),
+            registered_command_types: HashSet::new(),
+            registered_query_types: HashSet::new(),
+            registered_notification_types: HashSet::new(),
             middlewares: Vec::new(),
             errors: Vec::new(),
         }
@@ -134,6 +164,7 @@ impl MediatorBuilder {
         match self.command_handlers.entry(tid) {
             Entry::Vacant(slot) => {
                 slot.insert(Arc::new(TypedCommandHandler::<C, H>::new(handler)));
+                self.registered_command_types.insert(type_name::<C>());
             }
             Entry::Occupied(_) => {
                 self.errors.push(MediatorBuildError::DuplicateHandler {
@@ -158,6 +189,7 @@ impl MediatorBuilder {
         match self.query_handlers.entry(tid) {
             Entry::Vacant(slot) => {
                 slot.insert(Arc::new(TypedQueryHandler::<Q, H>::new(handler)));
+                self.registered_query_types.insert(type_name::<Q>());
             }
             Entry::Occupied(_) => {
                 self.errors.push(MediatorBuildError::DuplicateHandler {
@@ -183,6 +215,7 @@ impl MediatorBuilder {
             .entry(tid)
             .or_default()
             .push(Arc::new(TypedNotificationHandler::<N, H>::new(handler)));
+        self.registered_notification_types.insert(type_name::<N>());
         self
     }
 
@@ -192,6 +225,50 @@ impl MediatorBuilder {
     pub fn with_middleware<M: Middleware>(mut self, middleware: M) -> Self {
         self.middlewares.push(Arc::new(middleware));
         self
+    }
+
+    /// Verifies that every handler declared with the `#[handler]` attribute
+    /// macro from `hexeract-macros` was also registered through the fluent
+    /// builder.
+    ///
+    /// The macro emits a [`HandlerRegistration`] for every annotated item
+    /// via [`inventory`]; this method iterates the collected entries and
+    /// returns the set of declared-but-not-registered handlers. The check
+    /// is a sanity guard for typos and forgotten wirings; it does not
+    /// auto-populate the registry, since stateful handlers cannot be
+    /// constructed from metadata alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandlersVerificationError::Missing`] listing the handlers
+    /// that are visible to `inventory` but not present in the registry.
+    pub fn verify_handlers(&self) -> Result<(), HandlersVerificationError> {
+        let mut missing = Vec::new();
+        for reg in inventory::iter::<HandlerRegistration> {
+            let present = match reg.kind {
+                HandlerKind::Command => {
+                    self.registered_command_types.contains(reg.message_type_name)
+                }
+                HandlerKind::Query => {
+                    self.registered_query_types.contains(reg.message_type_name)
+                }
+                HandlerKind::Notification => self
+                    .registered_notification_types
+                    .contains(reg.message_type_name),
+            };
+            if !present {
+                missing.push(MissingHandler {
+                    kind: reg.kind,
+                    message_type_name: reg.message_type_name,
+                    handler_type_name: reg.handler_type_name,
+                });
+            }
+        }
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(HandlersVerificationError::Missing { missing })
+        }
     }
 
     /// Consumes the builder and produces an immutable, ready-to-use
@@ -240,7 +317,7 @@ impl fmt::Debug for MediatorBuilder {
             )
             .field("middlewares", &self.middlewares.len())
             .field("errors", &self.errors.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -699,5 +776,56 @@ mod tests {
             .expect("build must succeed");
         let clone = mediator.clone();
         assert!(Arc::ptr_eq(&mediator.inner, &clone.inner));
+    }
+
+    inventory::submit!(HandlerRegistration {
+        kind: HandlerKind::Command,
+        message_type_name: "hexeract_mediator::tests::VerifyProbeCmd",
+        handler_type_name: "hexeract_mediator::tests::VerifyProbeHandler",
+    });
+
+    inventory::submit!(HandlerRegistration {
+        kind: HandlerKind::Query,
+        message_type_name: "hexeract_mediator::tests::VerifyProbeQuery",
+        handler_type_name: "hexeract_mediator::tests::VerifyProbeQueryHandler",
+    });
+
+    #[test]
+    fn verify_handlers_reports_every_inventory_entry_when_builder_is_empty() {
+        let err = MediatorBuilder::new()
+            .verify_handlers()
+            .expect_err("empty builder must report all inventory entries as missing");
+        let HandlersVerificationError::Missing { missing } = err;
+        assert!(missing.iter().any(|m| {
+            m.kind == HandlerKind::Command
+                && m.message_type_name == "hexeract_mediator::tests::VerifyProbeCmd"
+        }));
+        assert!(missing.iter().any(|m| {
+            m.kind == HandlerKind::Query
+                && m.message_type_name == "hexeract_mediator::tests::VerifyProbeQuery"
+        }));
+    }
+
+    #[test]
+    fn verify_handlers_uses_message_type_name_strings_to_match_registrations() {
+        // The probe entries above name fictional types. We register handlers
+        // for `Ping` and `GetCount`, whose `type_name`s do not match, so
+        // verify_handlers should still report the probes as missing while
+        // never complaining about Ping or GetCount themselves.
+        let missing = MediatorBuilder::new()
+            .register_command_handler::<Ping, _>(PingHandler)
+            .register_query_handler::<GetCount, _>(CountHandler)
+            .verify_handlers()
+            .map_or_else(
+                |HandlersVerificationError::Missing { missing }| missing,
+                |()| Vec::new(),
+            );
+        assert!(
+            missing.iter().all(|m| {
+                m.message_type_name != type_name::<Ping>()
+                    && m.message_type_name != type_name::<GetCount>()
+            }),
+            "registered handlers must not appear as missing"
+        );
     }
 }

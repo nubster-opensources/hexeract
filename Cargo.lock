@@ -1625,6 +1625,7 @@ name = "hexeract-mediator"
 version = "0.2.0"
 dependencies = [
  "hexeract-core",
+ "inventory",
  "thiserror",
  "tokio",
  "trait-variant",
