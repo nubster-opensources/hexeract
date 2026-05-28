@@ -56,6 +56,10 @@ jobs:
       - name: Make publish-or-skip executable
         run: chmod +x scripts/publish-or-skip.sh
 
+      - name: Workspace build (dry-run only, catches cross-crate compile errors that `cargo package --no-verify` skips)
+        if: steps.mode.outputs.is_dry == 'true'
+        run: cargo build --workspace --all-features --release
+
       - name: Publish hexeract-core
         run: ./scripts/publish-or-skip.sh hexeract-core ${{ steps.mode.outputs.args }} -- "${{ secrets.CARGO_REGISTRY_TOKEN }}"
 
