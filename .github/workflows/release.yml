@@ -60,6 +60,13 @@ jobs:
         if: steps.mode.outputs.is_dry == 'true'
         run: cargo build --workspace --all-features --release
 
+      # Publication order respects the full dependency graph including
+      # dev-dependencies, which `cargo package` resolves against the
+      # crates.io index alongside runtime deps. In particular,
+      # `hexeract-macros` dev-depends on `hexeract-mediator` (for its
+      # integration test suite), so mediator and middleware must be
+      # published before macros even though macros has no runtime dep
+      # on either.
       - name: Publish hexeract-core
         run: ./scripts/publish-or-skip.sh hexeract-core ${{ steps.mode.outputs.args }} -- "${{ secrets.CARGO_REGISTRY_TOKEN }}"
 
@@ -81,8 +88,15 @@ jobs:
         if: steps.mode.outputs.is_dry == 'false'
         run: sleep 30
 
-      - name: Publish hexeract-macros
-        run: ./scripts/publish-or-skip.sh hexeract-macros ${{ steps.mode.outputs.args }} -- "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+      - name: Publish hexeract-bus
+        run: ./scripts/publish-or-skip.sh hexeract-bus ${{ steps.mode.outputs.args }} -- "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+
+      - name: Wait for index propagation
+        if: steps.mode.outputs.is_dry == 'false'
+        run: sleep 30
+
+      - name: Publish hexeract-bus-rabbitmq
+        run: ./scripts/publish-or-skip.sh hexeract-bus-rabbitmq ${{ steps.mode.outputs.args }} -- "${{ secrets.CARGO_REGISTRY_TOKEN }}"
 
       - name: Wait for index propagation
         if: steps.mode.outputs.is_dry == 'false'
@@ -95,15 +109,15 @@ jobs:
         if: steps.mode.outputs.is_dry == 'false'
         run: sleep 30
 
-      - name: Publish hexeract-bus
-        run: ./scripts/publish-or-skip.sh hexeract-bus ${{ steps.mode.outputs.args }} -- "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+      - name: Publish hexeract-middleware
+        run: ./scripts/publish-or-skip.sh hexeract-middleware ${{ steps.mode.outputs.args }} -- "${{ secrets.CARGO_REGISTRY_TOKEN }}"
 
       - name: Wait for index propagation
         if: steps.mode.outputs.is_dry == 'false'
         run: sleep 30
 
-      - name: Publish hexeract-bus-rabbitmq
-        run: ./scripts/publish-or-skip.sh hexeract-bus-rabbitmq ${{ steps.mode.outputs.args }} -- "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+      - name: Publish hexeract-macros
+        run: ./scripts/publish-or-skip.sh hexeract-macros ${{ steps.mode.outputs.args }} -- "${{ secrets.CARGO_REGISTRY_TOKEN }}"
 
       - name: Wait for index propagation
         if: steps.mode.outputs.is_dry == 'false'
