@@ -74,10 +74,14 @@ impl DeliveryDisposition {
 
     /// Whether the consumer loop should keep running after this outcome.
     ///
-    /// Always `true`: per-delivery settle failures are non-fatal to the
-    /// consumer by design.
+    /// Both variants return `true`: per-delivery settle failures are
+    /// non-fatal to the consumer by design. Matching on the variant
+    /// keeps the loop-survival decision colocated with the disposition,
+    /// so a future fatal disposition only has to be added here.
     const fn keep_running(self) -> bool {
-        true
+        match self {
+            Self::Settled | Self::LeftForRedelivery => true,
+        }
     }
 }
 
@@ -323,7 +327,6 @@ impl RabbitMqWorker {
                             },
                         )
                         .await
-                        .map(|()| ())
                         .map_err(|err| BusError::Transport(Box::new(err)));
                     if let Err(err) = &nack {
                         tracing::warn!(
@@ -377,7 +380,6 @@ impl RabbitMqWorker {
                 let ack = channel
                     .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
                     .await
-                    .map(|()| ())
                     .map_err(|err| BusError::Transport(Box::new(err)));
                 if let Err(err) = &ack {
                     tracing::warn!(
@@ -414,7 +416,6 @@ impl RabbitMqWorker {
                             },
                         )
                         .await
-                        .map(|()| ())
                         .map_err(|err| BusError::Transport(Box::new(err)));
                     if let Err(err) = &nack {
                         tracing::warn!(
@@ -467,7 +468,6 @@ impl RabbitMqWorker {
         let ack = channel
             .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
             .await
-            .map(|()| ())
             .map_err(|err| BusError::Transport(Box::new(err)));
         if let Err(err) = &ack {
             tracing::warn!(
