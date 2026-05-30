@@ -33,6 +33,19 @@ pub enum HexeractError {
         duration: Duration,
     },
 
+    /// A dispatch produced a value that could not be downcast to the expected
+    /// output type.
+    ///
+    /// This indicates a short-circuiting [`Middleware`](crate::middleware::Middleware)
+    /// boxed a value whose type is not the message's `Output`. A correct
+    /// short-circuit must box exactly the dispatched message's output type.
+    #[error("dispatch produced a value that is not the expected output type `{expected}`")]
+    #[non_exhaustive]
+    DowncastFailed {
+        /// Fully-qualified name of the output type the dispatch expected.
+        expected: &'static str,
+    },
+
     /// A generic dispatch-level error with a human-readable message.
     #[error("dispatch error: {0}")]
     Dispatch(String),
@@ -56,6 +69,15 @@ impl HexeractError {
             type_name,
             duration,
         }
+    }
+
+    /// Builds a [`HexeractError::DowncastFailed`] from the fully-qualified name
+    /// of the output type the dispatch expected. This is the only way to
+    /// construct the variant from outside this crate, since it is marked
+    /// `#[non_exhaustive]`.
+    #[must_use]
+    pub fn downcast_failed(expected: &'static str) -> Self {
+        Self::DowncastFailed { expected }
     }
 }
 
@@ -88,5 +110,13 @@ mod tests {
         let err = HexeractError::handler_failed(original);
         assert!(err.to_string().contains("handler failed"));
         assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn downcast_failed_names_the_expected_output_type() {
+        let err = HexeractError::downcast_failed("u32");
+        let rendered = err.to_string();
+        assert!(rendered.contains("u32"));
+        assert!(matches!(err, HexeractError::DowncastFailed { expected } if expected == "u32"));
     }
 }
