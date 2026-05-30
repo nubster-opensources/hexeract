@@ -41,6 +41,50 @@ pub const DEFAULT_PREFETCH: u16 = 16;
 /// Default per-delivery max attempts before giving up.
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 
+/// Decision taken after an attempt to settle a delivery with the broker.
+///
+/// A single transient broker error on `basic_ack` / `basic_nack` /
+/// dead-letter `basic_publish` must never tear down the long-running
+/// consumer. This enum captures the outcome of one such broker
+/// operation so the loop can decide whether to keep running. Every
+/// variant keeps the consumer alive; the distinction is purely about
+/// what to log and whether the delivery was left for redelivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryDisposition {
+    /// The broker operation succeeded and the delivery is fully settled.
+    Settled,
+    /// A broker operation failed; the error was logged and the delivery
+    /// is left unsettled so the broker can redeliver it. The consumer
+    /// keeps running.
+    LeftForRedelivery,
+}
+
+impl DeliveryDisposition {
+    /// Map the result of a broker settle operation into a disposition.
+    ///
+    /// `Ok` becomes [`DeliveryDisposition::Settled`]; any error becomes
+    /// [`DeliveryDisposition::LeftForRedelivery`]. The helper is pure so
+    /// the loop-survival policy can be unit-tested without a broker.
+    fn from_settle_result(result: &Result<(), BusError>) -> Self {
+        match result {
+            Ok(()) => Self::Settled,
+            Err(_) => Self::LeftForRedelivery,
+        }
+    }
+
+    /// Whether the consumer loop should keep running after this outcome.
+    ///
+    /// Both variants return `true`: per-delivery settle failures are
+    /// non-fatal to the consumer by design. Matching on the variant
+    /// keeps the loop-survival decision colocated with the disposition,
+    /// so a future fatal disposition only has to be added here.
+    const fn keep_running(self) -> bool {
+        match self {
+            Self::Settled | Self::LeftForRedelivery => true,
+        }
+    }
+}
+
 /// Ack discipline for a [`RabbitMqWorker`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AckMode {
@@ -202,9 +246,14 @@ pub struct RabbitMqWorker {
 impl RabbitMqWorker {
     /// Run the consume loop until `cancel` fires.
     ///
-    /// On `Ok(())` the loop drained normally on cancellation. Any
-    /// fatal broker error returns immediately; per-delivery handler
-    /// failures are absorbed by the retry / ack-mode policy.
+    /// On `Ok(())` the loop drained normally on cancellation. Only
+    /// fatal setup errors (channel open, `basic_qos`, `basic_consume`)
+    /// return immediately. Per-delivery handler failures are absorbed
+    /// by the retry / ack-mode policy, and transient broker errors on
+    /// settling a delivery (`basic_ack` / `basic_nack` / dead-letter
+    /// `basic_publish`) are logged and never abort the loop: the
+    /// consumer keeps running and the broker redelivers the unsettled
+    /// delivery.
     ///
     /// # Errors
     ///
@@ -243,7 +292,10 @@ impl RabbitMqWorker {
                     let Some(item) = next else { break; };
                     match item {
                         Ok(delivery) => {
-                            self.dispatch(&channel, delivery, &attempts).await?;
+                            let disposition = self.dispatch(&channel, delivery, &attempts).await;
+                            if !disposition.keep_running() {
+                                break;
+                            }
                         }
                         Err(err) => {
                             tracing::warn!(error = %err, "rabbitmq consumer stream error");
@@ -260,13 +312,13 @@ impl RabbitMqWorker {
         channel: &Channel,
         delivery: Delivery,
         attempts: &Arc<Mutex<HashMap<Uuid, u32>>>,
-    ) -> Result<(), BusError> {
+    ) -> DeliveryDisposition {
         let envelope = match delivery_to_envelope(&delivery.properties, &delivery.data) {
             Ok(env) => env,
             Err(err) => {
                 tracing::warn!(error = %err, "rabbitmq delivery decode failed");
                 if matches!(self.config.ack_mode, AckMode::Manual) {
-                    let _ = channel
+                    let nack = channel
                         .basic_nack(
                             delivery.delivery_tag,
                             BasicNackOptions {
@@ -274,9 +326,17 @@ impl RabbitMqWorker {
                                 ..BasicNackOptions::default()
                             },
                         )
-                        .await;
+                        .await
+                        .map_err(|err| BusError::Transport(Box::new(err)));
+                    if let Err(err) = &nack {
+                        tracing::warn!(
+                            delivery_tag = delivery.delivery_tag,
+                            error = %err,
+                            "rabbitmq nack of undecodable delivery failed; consumer continues"
+                        );
+                    }
                 }
-                return Ok(());
+                return DeliveryDisposition::Settled;
             }
         };
 
@@ -297,7 +357,7 @@ impl RabbitMqWorker {
                         "handler failed under AckMode::Auto, delivery already acked"
                     );
                 }
-                Ok(())
+                DeliveryDisposition::Settled
             }
             AckMode::Manual => {
                 self.handle_manual_outcome(channel, &delivery, &envelope, outcome, attempts)
@@ -313,15 +373,23 @@ impl RabbitMqWorker {
         envelope: &hexeract_bus::BusEnvelope,
         outcome: Result<(), BusError>,
         attempts: &Arc<Mutex<HashMap<Uuid, u32>>>,
-    ) -> Result<(), BusError> {
+    ) -> DeliveryDisposition {
         match outcome {
             Ok(()) => {
                 attempts.lock().await.remove(&envelope.message_id);
-                channel
+                let ack = channel
                     .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
                     .await
-                    .map_err(|err| BusError::Transport(Box::new(err)))?;
-                Ok(())
+                    .map_err(|err| BusError::Transport(Box::new(err)));
+                if let Err(err) = &ack {
+                    tracing::warn!(
+                        message_id = %envelope.message_id,
+                        delivery_tag = delivery.delivery_tag,
+                        error = %err,
+                        "rabbitmq ack failed; consumer continues, broker will redeliver"
+                    );
+                }
+                DeliveryDisposition::from_settle_result(&ack)
             }
             Err(err) => {
                 let current = {
@@ -332,13 +400,14 @@ impl RabbitMqWorker {
                 };
                 tracing::warn!(
                     message_type = %envelope.message_type,
+                    message_id = %envelope.message_id,
                     attempt = current,
                     max_attempts = self.config.max_attempts,
                     error = %err,
                     "handler failed"
                 );
                 if current < self.config.max_attempts {
-                    channel
+                    let nack = channel
                         .basic_nack(
                             delivery.delivery_tag,
                             BasicNackOptions {
@@ -347,37 +416,90 @@ impl RabbitMqWorker {
                             },
                         )
                         .await
-                        .map_err(|err| BusError::Transport(Box::new(err)))?;
-                } else {
-                    if let Some(routing_key) = &self.config.dead_letter_routing_key {
-                        channel
-                            .basic_publish(
-                                ShortString::from(""),
-                                ShortString::from(routing_key.as_str()),
-                                BasicPublishOptions::default(),
-                                &envelope.payload,
-                                delivery.properties.clone(),
-                            )
-                            .await
-                            .map_err(|err| BusError::Transport(Box::new(err)))?
-                            .await
-                            .map_err(|err| BusError::Transport(Box::new(err)))?;
-                    } else {
+                        .map_err(|err| BusError::Transport(Box::new(err)));
+                    if let Err(err) = &nack {
                         tracing::warn!(
-                            message_type = %envelope.message_type,
-                            attempts = current,
-                            "delivery dropped after exhausting retry budget"
+                            message_id = %envelope.message_id,
+                            delivery_tag = delivery.delivery_tag,
+                            error = %err,
+                            "rabbitmq nack failed; consumer continues, broker will redeliver"
                         );
                     }
-                    attempts.lock().await.remove(&envelope.message_id);
-                    channel
-                        .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
+                    DeliveryDisposition::from_settle_result(&nack)
+                } else {
+                    self.handle_exhausted(channel, delivery, envelope, attempts, current)
                         .await
-                        .map_err(|err| BusError::Transport(Box::new(err)))?;
                 }
-                Ok(())
             }
         }
+    }
+
+    async fn handle_exhausted(
+        &self,
+        channel: &Channel,
+        delivery: &Delivery,
+        envelope: &hexeract_bus::BusEnvelope,
+        attempts: &Arc<Mutex<HashMap<Uuid, u32>>>,
+        current: u32,
+    ) -> DeliveryDisposition {
+        if let Some(routing_key) = &self.config.dead_letter_routing_key {
+            let published = self
+                .publish_dead_letter(channel, delivery, envelope, routing_key)
+                .await;
+            if let Err(err) = &published {
+                tracing::error!(
+                    message_type = %envelope.message_type,
+                    message_id = %envelope.message_id,
+                    delivery_tag = delivery.delivery_tag,
+                    error = %err,
+                    "rabbitmq dead-letter publish failed; original left unacked for redelivery, consumer continues"
+                );
+                return DeliveryDisposition::LeftForRedelivery;
+            }
+        } else {
+            tracing::warn!(
+                message_type = %envelope.message_type,
+                message_id = %envelope.message_id,
+                attempts = current,
+                "delivery dropped after exhausting retry budget"
+            );
+        }
+        attempts.lock().await.remove(&envelope.message_id);
+        let ack = channel
+            .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
+            .await
+            .map_err(|err| BusError::Transport(Box::new(err)));
+        if let Err(err) = &ack {
+            tracing::warn!(
+                message_id = %envelope.message_id,
+                delivery_tag = delivery.delivery_tag,
+                error = %err,
+                "rabbitmq ack after dead-letter failed; consumer continues, broker will redeliver"
+            );
+        }
+        DeliveryDisposition::from_settle_result(&ack)
+    }
+
+    async fn publish_dead_letter(
+        &self,
+        channel: &Channel,
+        delivery: &Delivery,
+        envelope: &hexeract_bus::BusEnvelope,
+        routing_key: &str,
+    ) -> Result<(), BusError> {
+        channel
+            .basic_publish(
+                ShortString::from(""),
+                ShortString::from(routing_key),
+                BasicPublishOptions::default(),
+                &envelope.payload,
+                delivery.properties.clone(),
+            )
+            .await
+            .map_err(|err| BusError::Transport(Box::new(err)))?
+            .await
+            .map_err(|err| BusError::Transport(Box::new(err)))?;
+        Ok(())
     }
 }
 
@@ -542,6 +664,36 @@ mod tests {
     #[test]
     fn ack_mode_default_is_manual() {
         assert_eq!(AckMode::default(), AckMode::Manual);
+    }
+
+    #[test]
+    fn ack_error_keeps_the_consumer_running() {
+        let settle_failed: Result<(), BusError> =
+            Err(BusError::Internal("simulated basic_ack failure".to_owned()));
+        let disposition = DeliveryDisposition::from_settle_result(&settle_failed);
+        assert_eq!(disposition, DeliveryDisposition::LeftForRedelivery);
+        assert!(
+            disposition.keep_running(),
+            "a settle (ack/nack) error must not abort the consume loop"
+        );
+    }
+
+    #[test]
+    fn nack_error_keeps_the_consumer_running() {
+        let settle_failed: Result<(), BusError> = Err(BusError::Transport(Box::new(
+            std::io::Error::other("simulated basic_nack failure"),
+        )));
+        let disposition = DeliveryDisposition::from_settle_result(&settle_failed);
+        assert_eq!(disposition, DeliveryDisposition::LeftForRedelivery);
+        assert!(disposition.keep_running());
+    }
+
+    #[test]
+    fn successful_settle_keeps_running_and_marks_settled() {
+        let settled: Result<(), BusError> = Ok(());
+        let disposition = DeliveryDisposition::from_settle_result(&settled);
+        assert_eq!(disposition, DeliveryDisposition::Settled);
+        assert!(disposition.keep_running());
     }
 
     #[tokio::test]
