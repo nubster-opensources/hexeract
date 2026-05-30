@@ -42,7 +42,7 @@ bus-rabbitmq = ["bus", "dep:hexeract-bus-rabbitmq"]
 
 # In-process CQRS mediator and the `#[handler]` attribute macro.
 mediator = ["core", "dep:hexeract-mediator"]
-macros = ["dep:hexeract-macros"]
+macros = ["core", "dep:hexeract-macros"]
 
 # Built-in middlewares: tracing spans and dispatch timeouts.
 middleware = ["core", "dep:hexeract-middleware"]

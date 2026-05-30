@@ -10,6 +10,7 @@ extern crate proc_macro;
 use proc_macro::TokenStream;
 
 mod expand;
+mod krate;
 mod parse;
 
 /// Attribute macro that wires a handler into the Hexeract registry.
