@@ -22,7 +22,7 @@ pub struct OutboxEnvelope {
     pub event_type: String,
     /// JSON-serialized payload of the original event.
     pub payload: Vec<u8>,
-    /// Optional aggregate identifier used for partial ordering by subject.
+    /// Optional aggregate identifier used for partition routing.
     pub subject_id: Option<Uuid>,
     /// Instant at which the envelope was created.
     pub created_at: SystemTime,
@@ -81,9 +81,12 @@ impl OutboxEnvelope {
 
     /// Build a fresh envelope tagged with an aggregate subject.
     ///
-    /// Use this constructor when partial ordering matters: the worker can
-    /// guarantee that events sharing a `subject_id` are dispatched in
-    /// insertion order.
+    /// The `subject_id` is informational and intended for partition routing
+    /// (for example sharding dispatch across workers). Dispatch ordering is
+    /// best-effort and not guaranteed: stores that claim rows with
+    /// `FOR UPDATE SKIP LOCKED` let several workers relay concurrently, so
+    /// envelopes sharing a `subject_id` may be dispatched out of insertion
+    /// order or in parallel.
     ///
     /// # Errors
     ///

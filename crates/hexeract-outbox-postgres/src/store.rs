@@ -39,7 +39,7 @@ impl PgOutboxStore {
         let table_name = table_name.into();
         validate_table_name(&table_name)?;
         let poll_sql = format!(
-            "SELECT event_id, event_type, payload::text, subject_id, created_at, \
+            "SELECT event_id, event_type, payload, subject_id, created_at, \
                     attempts, last_error, next_retry_at \
              FROM {table_name} \
              WHERE delivered_at IS NULL \
@@ -117,17 +117,19 @@ impl OutboxStore for PgOutboxStore {
         for row in rows {
             let event_id: Uuid = row.get(0);
             let event_type: String = row.get(1);
-            let payload: String = row.get(2);
+            let payload: serde_json::Value = row.get(2);
             let subject_id: Option<Uuid> = row.get(3);
             let created_at: SystemTime = row.get(4);
             let attempts: i32 = row.get(5);
             let last_error: Option<String> = row.get(6);
             let next_retry_at: Option<SystemTime> = row.get(7);
 
+            let payload = serde_json::to_vec(&payload)?;
+
             envelopes.push(OutboxEnvelope::restore(
                 event_id,
                 event_type,
-                payload.into_bytes(),
+                payload,
                 subject_id,
                 created_at,
                 u32::try_from(attempts.max(0)).unwrap_or(u32::MAX),
