@@ -33,6 +33,17 @@ impl HandlerKindArg {
         Ident::new(s, Span::call_site())
     }
 
+    /// Identifier of the message marker trait carrying the `Output` associated
+    /// type (`Command` or `Query`); `Notification` carries no output.
+    pub(crate) fn marker_trait_ident(self) -> Ident {
+        let s = match self {
+            Self::Command => "Command",
+            Self::Query => "Query",
+            Self::Notification => "Notification",
+        };
+        Ident::new(s, Span::call_site())
+    }
+
     pub(crate) fn is_notification(self) -> bool {
         matches!(self, Self::Notification)
     }
@@ -48,7 +59,6 @@ pub(crate) struct HandlerImpl {
     pub(crate) kind: HandlerKindArg,
     pub(crate) item: ItemImpl,
     pub(crate) message_ty: Type,
-    pub(crate) output_ty: Type,
     pub(crate) error_ty: Type,
 }
 
@@ -57,7 +67,6 @@ pub(crate) struct HandlerFreeFn {
     pub(crate) item: ItemFn,
     pub(crate) handler_struct_ident: Ident,
     pub(crate) message_ty: Type,
-    pub(crate) output_ty: Type,
     pub(crate) error_ty: Type,
 }
 
@@ -125,12 +134,11 @@ fn parse_impl(kind: HandlerKindArg, item_impl: ItemImpl) -> syn::Result<HandlerI
             "`handle` must be `async`",
         ));
     }
-    let (message_ty, output_ty, error_ty) = extract_method_signature(kind, handle_fn)?;
+    let (message_ty, error_ty) = extract_method_signature(kind, handle_fn)?;
     Ok(HandlerImpl {
         kind,
         item: item_impl,
         message_ty,
-        output_ty,
         error_ty,
     })
 }
@@ -142,14 +150,13 @@ fn parse_free_fn(kind: HandlerKindArg, item_fn: ItemFn) -> syn::Result<HandlerFr
             "#[handler] free function must be `async`",
         ));
     }
-    let (message_ty, output_ty, error_ty) = extract_free_signature(kind, &item_fn.sig)?;
+    let (message_ty, error_ty) = extract_free_signature(kind, &item_fn.sig)?;
     let handler_struct_ident = pascal_case_handler(&item_fn.sig.ident);
     Ok(HandlerFreeFn {
         kind,
         item: item_fn,
         handler_struct_ident,
         message_ty,
-        output_ty,
         error_ty,
     })
 }
@@ -157,7 +164,7 @@ fn parse_free_fn(kind: HandlerKindArg, item_fn: ItemFn) -> syn::Result<HandlerFr
 fn extract_method_signature(
     kind: HandlerKindArg,
     handle_fn: &ImplItemFn,
-) -> syn::Result<(Type, Type, Type)> {
+) -> syn::Result<(Type, Type)> {
     let sig = &handle_fn.sig;
     let mut inputs = sig.inputs.iter();
     match inputs.next() {
@@ -189,14 +196,11 @@ fn extract_method_signature(
             "`handle` must take exactly 3 arguments",
         ));
     }
-    let (output_ty, error_ty) = extract_result_return(kind, sig)?;
-    Ok((message_ty, output_ty, error_ty))
+    let error_ty = extract_result_error(kind, sig)?;
+    Ok((message_ty, error_ty))
 }
 
-fn extract_free_signature(
-    kind: HandlerKindArg,
-    sig: &Signature,
-) -> syn::Result<(Type, Type, Type)> {
+fn extract_free_signature(kind: HandlerKindArg, sig: &Signature) -> syn::Result<(Type, Type)> {
     let mut inputs = sig.inputs.iter();
     let msg_arg = inputs.next().ok_or_else(|| {
         syn::Error::new_spanned(
@@ -215,8 +219,8 @@ fn extract_free_signature(
             "function must take exactly 2 arguments",
         ));
     }
-    let (output_ty, error_ty) = extract_result_return(kind, sig)?;
-    Ok((message_ty, output_ty, error_ty))
+    let error_ty = extract_result_error(kind, sig)?;
+    Ok((message_ty, error_ty))
 }
 
 fn typed_arg_type(arg: &FnArg, expected: &str) -> syn::Result<Type> {
@@ -229,7 +233,7 @@ fn typed_arg_type(arg: &FnArg, expected: &str) -> syn::Result<Type> {
     }
 }
 
-fn extract_result_return(kind: HandlerKindArg, sig: &Signature) -> syn::Result<(Type, Type)> {
+fn extract_result_error(kind: HandlerKindArg, sig: &Signature) -> syn::Result<Type> {
     let return_ty = match &sig.output {
         ReturnType::Type(_, ty) => &**ty,
         ReturnType::Default => {
@@ -288,7 +292,7 @@ fn extract_result_return(kind: HandlerKindArg, sig: &Signature) -> syn::Result<(
             "a notification handler must return `Result<(), Error>`",
         ));
     }
-    Ok((output_ty.clone(), error_ty.clone()))
+    Ok(error_ty.clone())
 }
 
 fn is_unit_type(ty: &Type) -> bool {

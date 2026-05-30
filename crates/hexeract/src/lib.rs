@@ -14,21 +14,21 @@
 //!
 //! ```toml
 //! [dependencies]
-//! hexeract = { version = "0.2", features = ["outbox-postgres"] }
+//! hexeract = { version = "0.3", features = ["outbox-postgres"] }
 //! ```
 //!
 //! Bus over RabbitMQ:
 //!
 //! ```toml
 //! [dependencies]
-//! hexeract = { version = "0.2", features = ["bus-rabbitmq"] }
+//! hexeract = { version = "0.3", features = ["bus-rabbitmq"] }
 //! ```
 //!
 //! Both together:
 //!
 //! ```toml
 //! [dependencies]
-//! hexeract = { version = "0.2", features = ["outbox-postgres", "bus-rabbitmq"] }
+//! hexeract = { version = "0.3", features = ["outbox-postgres", "bus-rabbitmq"] }
 //! ```
 //!
 //! # Feature matrix
@@ -42,7 +42,7 @@
 //! | `bus-rabbitmq` | RabbitMQ bus backend | [`hexeract_bus`] + [`hexeract_bus_rabbitmq`] |
 //! | `mediator` | In-process CQRS mediator | [`hexeract_mediator`] |
 //! | `middleware` | Built-in tracing and timeout middlewares | [`hexeract_middleware`] |
-//! | `macros` | `#[handler]` attribute macro for handler registration | [`hexeract_macros`] |
+//! | `macros` | `#[handler]` attribute macro for handler registration | [`hexeract_macros`] + [`hexeract_core`] |
 //!
 //! Every feature transitively enables `core`, so a downstream user
 //! who picks `outbox-postgres` automatically has access to

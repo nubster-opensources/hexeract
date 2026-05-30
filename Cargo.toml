@@ -11,6 +11,7 @@ members = [
     "crates/hexeract-bus",
     "crates/hexeract-bus-rabbitmq",
     "crates/hexeract-cli",
+    "crates/hexeract-umbrella-tests",
 ]
 
 [workspace.package]
@@ -42,6 +43,7 @@ tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] 
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-test = "0.2"
 trybuild = "1"
+proc-macro-crate = "3"
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full"] }
