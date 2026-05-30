@@ -393,7 +393,7 @@ impl Mediator {
         output
             .downcast::<C::Output>()
             .map(|boxed| *boxed)
-            .map_err(|_| HexeractError::Dispatch("command output downcast failed".into()))
+            .map_err(|_| HexeractError::downcast_failed(type_name::<C::Output>()))
     }
 
     /// Dispatches a [`Query`] to its registered handler and returns the
@@ -430,7 +430,7 @@ impl Mediator {
         output
             .downcast::<Q::Output>()
             .map(|boxed| *boxed)
-            .map_err(|_| HexeractError::Dispatch("query output downcast failed".into()))
+            .map_err(|_| HexeractError::downcast_failed(type_name::<Q::Output>()))
     }
 
     /// Publishes a [`Notification`] to every handler registered for `N`, in
