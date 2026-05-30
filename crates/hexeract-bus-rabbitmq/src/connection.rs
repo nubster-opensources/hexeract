@@ -19,6 +19,36 @@ pub const DEFAULT_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 /// crate does not need to depend on `lapin` directly. Cloning the
 /// wrapper clones the underlying [`Arc`], so every clone keeps pointing
 /// at the same broker session.
+///
+/// # Transport
+///
+/// Both [`Self::connect`] and [`Self::connect_with_retry`] take an AMQP
+/// URI and select the transport from its scheme:
+///
+/// - `amqp://` is plaintext AMQP 0.9.1 and offers no confidentiality.
+///   Use it only for local development against a broker on `localhost`.
+/// - `amqps://` is AMQP over TLS. Production deployments should always
+///   use `amqps://` so credentials and message payloads are encrypted
+///   in transit. Server certificate validation is performed by the
+///   platform trust store; point the broker at a certificate chain that
+///   the host already trusts.
+///
+/// # Security
+///
+/// The URI embeds the broker credentials in its userinfo component
+/// (`amqps://user:password@host:5671/vhost`). Treat the whole URI as a
+/// secret:
+///
+/// - Source it from an environment variable or a secrets manager, never
+///   hard-code it.
+/// - Never log the URI or interpolate it into error messages. This type
+///   derives [`Debug`] only over the opaque shared [`lapin::Connection`]
+///   handle, which does not render the originating URI, so logging a
+///   [`RabbitMqConnection`] cannot leak credentials. Connection failures
+///   surface as [`BusError::Connection`] wrapping the `lapin` error,
+///   which likewise does not echo the URI back.
+/// - Prefer per-environment credentials with least-privilege vhost
+///   permissions so a leaked development URI cannot reach production.
 #[derive(Clone, Debug)]
 pub struct RabbitMqConnection {
     inner: Arc<Connection>,
@@ -27,10 +57,20 @@ pub struct RabbitMqConnection {
 impl RabbitMqConnection {
     /// Connect to the broker described by `uri`, single attempt.
     ///
+    /// Pass an `amqps://` URI in production so the session is encrypted
+    /// with TLS; `amqp://` is plaintext and intended for local
+    /// development only.
+    ///
+    /// # Security
+    ///
+    /// `uri` carries the broker credentials and must be treated as a
+    /// secret: do not log it or place it in error messages. See the
+    /// [type-level security notes](RabbitMqConnection#security).
+    ///
     /// # Errors
     ///
     /// Returns [`BusError::Connection`] if `lapin` fails to negotiate
-    /// the AMQP handshake.
+    /// the AMQP handshake. The error does not include `uri`.
     pub async fn connect(uri: &str) -> Result<Self, BusError> {
         let inner = Connection::connect(uri, ConnectionProperties::default())
             .await
@@ -44,12 +84,20 @@ impl RabbitMqConnection {
     ///
     /// Tries up to `attempts` times, doubling the wait between
     /// attempts starting from `base_delay`. Each failing attempt is
-    /// logged via `tracing::warn`.
+    /// logged via `tracing::warn`. Use an `amqps://` URI in production
+    /// for a TLS-encrypted session.
+    ///
+    /// # Security
+    ///
+    /// `uri` carries the broker credentials and must be treated as a
+    /// secret. Only the attempt counter and the `lapin` error are
+    /// logged on failure; the URI is never logged. See the
+    /// [type-level security notes](RabbitMqConnection#security).
     ///
     /// # Errors
     ///
     /// Returns [`BusError::Connection`] wrapping the last `lapin`
-    /// error after the final attempt.
+    /// error after the final attempt. The error does not include `uri`.
     pub async fn connect_with_retry(
         uri: &str,
         attempts: u32,
