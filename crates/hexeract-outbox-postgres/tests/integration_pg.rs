@@ -345,6 +345,7 @@ async fn worker_marks_failed_and_increments_attempts_on_handler_error() {
         retry_delay: Duration::from_secs(60),
         max_attempts: 5,
         batch_size: 10,
+        ..OutboxWorkerConfig::default()
     };
     let worker = OutboxWorker::new(store, handlers, config);
     let cancel = CancellationToken::new();

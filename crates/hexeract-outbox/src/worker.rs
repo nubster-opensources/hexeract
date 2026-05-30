@@ -162,6 +162,14 @@ pub struct OutboxWorkerConfig {
     pub max_attempts: u32,
     /// Constant delay added to `next_retry_at` after a failed dispatch.
     pub retry_delay: Duration,
+    /// Minimum delay applied between consecutive non-empty poll cycles.
+    ///
+    /// A full batch otherwise loops with no delay, busy-spinning the store
+    /// under a sustained backlog. This floor paces back-to-back non-empty
+    /// cycles without affecting the empty-poll path (which still waits for
+    /// [`Self::poll_interval`]). Set it to [`Duration::ZERO`] to disable
+    /// pacing and restore the previous tight-loop behavior.
+    pub min_cycle_delay: Duration,
 }
 
 impl Default for OutboxWorkerConfig {
@@ -171,6 +179,7 @@ impl Default for OutboxWorkerConfig {
             batch_size: 10,
             max_attempts: 5,
             retry_delay: Duration::from_secs(5),
+            min_cycle_delay: Duration::from_millis(5),
         }
     }
 }
@@ -234,19 +243,25 @@ where
     {
         Box::pin(async move {
             while !cancel.is_cancelled() {
-                let should_sleep = match self.poll_cycle(&cancel).await {
-                    Ok(0) => true,
-                    Ok(_) => false,
+                let sleep_for = match self.poll_cycle(&cancel).await {
+                    Ok(0) => Some(self.config.poll_interval),
+                    Ok(_) => {
+                        if self.config.min_cycle_delay.is_zero() {
+                            None
+                        } else {
+                            Some(self.config.min_cycle_delay)
+                        }
+                    }
                     Err(err) => {
                         tracing::error!(
                             error = ?err,
                             "outbox worker poll cycle failed, sleeping before retry"
                         );
-                        true
+                        Some(self.config.poll_interval)
                     }
                 };
-                if should_sleep {
-                    tokio::time::sleep(self.config.poll_interval).await;
+                if let Some(delay) = sleep_for {
+                    tokio::time::sleep(delay).await;
                 }
             }
             Ok(())
@@ -410,6 +425,122 @@ mod tests {
         assert_eq!(cfg.batch_size, 10);
         assert_eq!(cfg.max_attempts, 5);
         assert_eq!(cfg.retry_delay, Duration::from_secs(5));
+        assert_eq!(cfg.min_cycle_delay, Duration::from_millis(5));
+    }
+
+    /// Store that records the virtual instant of the first empty poll so a
+    /// test can assert non-empty cycles were paced.
+    #[derive(Clone)]
+    struct PacingStore {
+        pending: Arc<Mutex<Vec<OutboxEnvelope>>>,
+        empty_poll_at: Arc<Mutex<Option<tokio::time::Instant>>>,
+    }
+
+    impl PacingStore {
+        fn new(initial: Vec<OutboxEnvelope>) -> Self {
+            Self {
+                pending: Arc::new(Mutex::new(initial)),
+                empty_poll_at: Arc::new(Mutex::new(None)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OutboxStore for PacingStore {
+        type Client = MockClient;
+        type Tx<'tx> = MockTx;
+
+        async fn acquire(&self) -> Result<Self::Client, OutboxError> {
+            Ok(MockClient)
+        }
+
+        async fn begin<'a>(
+            &self,
+            _client: &'a mut Self::Client,
+        ) -> Result<Self::Tx<'a>, OutboxError> {
+            Ok(MockTx)
+        }
+
+        async fn poll<'a>(
+            &self,
+            _tx: &mut Self::Tx<'a>,
+            batch_size: usize,
+            _max_attempts: u32,
+        ) -> Result<Vec<OutboxEnvelope>, OutboxError> {
+            let mut pending = self.pending.lock().unwrap();
+            let take = batch_size.min(pending.len());
+            let batch: Vec<OutboxEnvelope> = pending.drain(..take).collect();
+            if batch.is_empty() {
+                let mut slot = self.empty_poll_at.lock().unwrap();
+                if slot.is_none() {
+                    *slot = Some(tokio::time::Instant::now());
+                }
+            }
+            Ok(batch)
+        }
+
+        async fn mark_delivered<'a>(
+            &self,
+            _tx: &mut Self::Tx<'a>,
+            _event_id: Uuid,
+        ) -> Result<(), OutboxError> {
+            Ok(())
+        }
+
+        async fn mark_failed<'a>(
+            &self,
+            _tx: &mut Self::Tx<'a>,
+            _event_id: Uuid,
+            _error: &str,
+            _next_retry_at: SystemTime,
+        ) -> Result<(), OutboxError> {
+            Ok(())
+        }
+
+        async fn commit<'a>(&self, _tx: Self::Tx<'a>) -> Result<(), OutboxError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_paces_consecutive_non_empty_cycles() {
+        let non_empty_cycles: u32 = 4;
+        let envelopes: Vec<OutboxEnvelope> = (0..non_empty_cycles)
+            .map(|i| fresh_envelope(Uuid::from_u128(u128::from(i) + 1)))
+            .collect();
+        let store = PacingStore::new(envelopes);
+        let empty_poll_at = Arc::clone(&store.empty_poll_at);
+
+        let delay = Duration::from_millis(10);
+        let config = OutboxWorkerConfig {
+            poll_interval: Duration::from_secs(3600),
+            batch_size: 1,
+            min_cycle_delay: delay,
+            ..OutboxWorkerConfig::default()
+        };
+
+        let registry = registry_with(vec![Arc::new(TypedHandler::new(RecordingHandler {
+            seen: Arc::new(Mutex::new(Vec::new())),
+        }))]);
+        let worker = OutboxWorker::new(store, registry, config);
+
+        let cancel = CancellationToken::new();
+        let start = tokio::time::Instant::now();
+        let join = tokio::spawn(worker.run(cancel.clone()));
+
+        tokio::time::sleep(delay * non_empty_cycles + Duration::from_millis(1)).await;
+        cancel.cancel();
+        join.await.unwrap().unwrap();
+
+        let empty_at = empty_poll_at
+            .lock()
+            .unwrap()
+            .expect("the loop should have reached the empty poll");
+        assert_eq!(
+            empty_at.duration_since(start),
+            delay * non_empty_cycles,
+            "each non-empty cycle must be paced by min_cycle_delay before the empty poll"
+        );
     }
 
     /// `MockStore` lets us drive the worker without a real database in
