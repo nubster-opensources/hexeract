@@ -9,6 +9,32 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 ### Added
 - _Items in flight will be listed here until the next release._
 
+## [0.3.1] - 2026-05-31
+
+Patch release. Hardening and diagnostics across the mediator, outbox, bus and macro crates, plus a critical facade fix for the `#[handler]` macro. No breaking changes.
+
+### Fixed
+
+- `hexeract-macros`: the `#[handler]` macro resolves the `hexeract-core` path through `proc-macro-crate`, so handlers compile both when depending on `hexeract-core` directly and through the `hexeract` facade. The handler output type is derived from `<M as Command>::Output` / `<M as Query>::Output` instead of the type written in the `handle` signature. (#114, #115)
+- `hexeract-macros`: clearer compile-time diagnostics for handler misuse. Generic handlers, an invalid `ctx` argument, a message passed by reference, a non-path message type such as a tuple, array or slice, a `&mut HandlerContext`, and lifetime-only handlers are each rejected with a spanned, actionable error instead of an obscure failure on generated code. (#123, #124)
+- `hexeract-core`: dispatch returns a structured `HexeractError::DowncastFailed { expected }`, with a `downcast_failed` constructor, when a short-circuiting middleware boxes a value whose type is not the message output, instead of an opaque failure. (#125)
+- `hexeract-outbox`: non-empty poll cycles are paced by a configurable `min_cycle_delay` (default 5 ms) to avoid busy-spinning when the outbox is under sustained load. (#132)
+- `hexeract-bus-rabbitmq`: the consumer keeps running when an ack or nack call fails, classifying the delivery disposition instead of letting a transient broker error terminate the worker loop. (#122)
+
+### Performance
+
+- `hexeract-outbox-postgres`: the JSONB payload is bound directly to the query, avoiding an intermediate conversion through a string. (#134)
+
+### Documentation
+
+- `hexeract-outbox`: dropped the per-subject ordering guarantee that the worker could not actually enforce. (#131)
+- `hexeract-bus-rabbitmq`: documented `amqps` TLS connections and credential handling. (#139)
+
+### Internal
+
+- The release workflow publishes `hexeract-middleware` and orders publication to respect dev-dependencies, since `hexeract-macros` dev-depends on `hexeract-mediator`.
+- New `hexeract-umbrella-tests` crate (`publish = false`) exercises the `#[handler]` macro through the `hexeract` facade; its path dependency is pinned to satisfy `cargo-deny`.
+
 ## [0.3.0] - 2026-05-28
 
 Third public release. Ships the in-process Mediator, two built-in middlewares (`TracingMiddleware`, `TimeoutMiddleware`), and the `#[handler]` attribute proc-macro with inventory-based discovery. Completes the v0.3.0 milestone (issues #6, #7, #8, #9).
@@ -138,6 +164,8 @@ First public release. Ships the transactional outbox feature end to end against 
 
 This is the first published version, so no upgrade path applies.
 
-[Unreleased]: https://github.com/nubster-opensources/hexeract/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/nubster-opensources/hexeract/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/nubster-opensources/hexeract/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/nubster-opensources/hexeract/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/nubster-opensources/hexeract/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/nubster-opensources/hexeract/releases/tag/v0.1.0
