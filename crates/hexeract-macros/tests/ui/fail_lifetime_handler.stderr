@@ -1,0 +1,5 @@
+error: #[handler] does not support handlers with lifetime parameters: the generated trait impl cannot carry them
+  --> tests/ui/fail_lifetime_handler.rs:10:5
+   |
+10 | impl<'a> LifetimeHandler<'a> {
+   |     ^^^^

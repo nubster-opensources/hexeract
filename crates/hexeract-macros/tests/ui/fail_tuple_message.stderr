@@ -1,0 +1,5 @@
+error: the message argument must be an owned, named message type
+ --> tests/ui/fail_tuple_message.rs:9:14
+  |
+9 |         msg: (u8, u8),
+  |              ^^^^^^^^

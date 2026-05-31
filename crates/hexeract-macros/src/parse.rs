@@ -2,8 +2,8 @@
 
 use proc_macro2::{Span, TokenStream};
 use syn::{
-    FnArg, GenericArgument, Generics, Ident, ImplItem, ImplItemFn, ItemFn, ItemImpl, PathArguments,
-    ReturnType, Signature, Type,
+    FnArg, GenericArgument, GenericParam, Generics, Ident, ImplItem, ImplItemFn, ItemFn, ItemImpl,
+    PathArguments, ReturnType, Signature, Type,
 };
 
 /// Kind argument parsed from `#[handler(command|query|notification)]`.
@@ -239,13 +239,22 @@ fn typed_arg_type(arg: &FnArg, expected: &str) -> syn::Result<Type> {
 /// Rejects any generic parameters or where-clause: the macro generates a
 /// separate trait impl that does not carry the user's generics, so generic
 /// handlers cannot be expanded correctly. Generic handler support is a future
-/// feature, out of scope for this macro.
+/// feature, out of scope for this macro. A lifetime-only handler is reported
+/// with a dedicated message since the failure mode is identical but less
+/// obvious.
 fn reject_generics(generics: &Generics) -> syn::Result<()> {
     if generics.lt_token.is_some() || !generics.params.is_empty() {
-        return Err(syn::Error::new_spanned(
-            generics,
-            "#[handler] does not support generic handlers",
-        ));
+        let only_lifetimes = !generics.params.is_empty()
+            && generics
+                .params
+                .iter()
+                .all(|p| matches!(p, GenericParam::Lifetime(_)));
+        let message = if only_lifetimes {
+            "#[handler] does not support handlers with lifetime parameters: the generated trait impl cannot carry them"
+        } else {
+            "#[handler] does not support generic handlers"
+        };
+        return Err(syn::Error::new_spanned(generics, message));
     }
     if let Some(where_clause) = &generics.where_clause {
         return Err(syn::Error::new_spanned(
@@ -256,22 +265,29 @@ fn reject_generics(generics: &Generics) -> syn::Result<()> {
     Ok(())
 }
 
-/// Extracts the message type from the message argument, rejecting reference
-/// types (`&T`) and non-path types: only an owned, path-named message type can
-/// implement `Command`/`Query`/`Notification`.
+/// Extracts the message type from the message argument. Only an owned,
+/// path-named message type can implement `Command`/`Query`/`Notification`, so a
+/// reference (`&T`) is reported as such and any other shape (tuple, array,
+/// slice) is reported as not being a named type.
 fn owned_message_type(arg: &FnArg) -> syn::Result<Type> {
     let ty = typed_arg_type(arg, "msg: M")?;
     match &ty {
         Type::Path(_) => Ok(ty),
+        Type::Reference(_) => Err(syn::Error::new_spanned(
+            &ty,
+            "the message argument must be an owned message type, not a reference",
+        )),
         other => Err(syn::Error::new_spanned(
             other,
-            "the message argument must be an owned message type, not a reference",
+            "the message argument must be an owned, named message type",
         )),
     }
 }
 
 /// Validates that the context argument is `ctx: &HandlerContext`: a shared
-/// reference to a path type whose final segment is `HandlerContext`.
+/// reference to a path type whose final segment is `HandlerContext`. A mutable
+/// reference is rejected with a dedicated message, since the generated trait
+/// signature takes the context by shared reference.
 fn validate_ctx_arg(arg: &FnArg) -> syn::Result<()> {
     let ty = typed_arg_type(arg, "ctx: &HandlerContext")?;
     if let Type::Reference(reference) = &ty {
@@ -282,6 +298,12 @@ fn validate_ctx_arg(arg: &FnArg) -> syn::Result<()> {
                 .last()
                 .is_some_and(|seg| seg.ident == "HandlerContext")
             {
+                if reference.mutability.is_some() {
+                    return Err(syn::Error::new_spanned(
+                        &ty,
+                        "the context must be taken by shared reference `&HandlerContext`, not `&mut`",
+                    ));
+                }
                 return Ok(());
             }
         }
