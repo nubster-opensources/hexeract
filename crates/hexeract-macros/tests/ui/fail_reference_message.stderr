@@ -1,0 +1,5 @@
+error: the message argument must be an owned message type, not a reference
+  --> tests/ui/fail_reference_message.rs:11:14
+   |
+11 |         cmd: &SomeCmd,
+   |              ^^^^^^^^

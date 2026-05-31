@@ -2,7 +2,7 @@
 
 use proc_macro2::{Span, TokenStream};
 use syn::{
-    FnArg, GenericArgument, Ident, ImplItem, ImplItemFn, ItemFn, ItemImpl, PathArguments,
+    FnArg, GenericArgument, Generics, Ident, ImplItem, ImplItemFn, ItemFn, ItemImpl, PathArguments,
     ReturnType, Signature, Type,
 };
 
@@ -114,6 +114,7 @@ fn parse_impl(kind: HandlerKindArg, item_impl: ItemImpl) -> syn::Result<HandlerI
             "#[handler] must annotate a bare inherent impl, not a trait implementation",
         ));
     }
+    reject_generics(&item_impl.generics)?;
     let handle_fn = item_impl
         .items
         .iter()
@@ -166,6 +167,7 @@ fn extract_method_signature(
     handle_fn: &ImplItemFn,
 ) -> syn::Result<(Type, Type)> {
     let sig = &handle_fn.sig;
+    reject_generics(&sig.generics)?;
     let mut inputs = sig.inputs.iter();
     match inputs.next() {
         Some(FnArg::Receiver(r)) if r.reference.is_some() && r.mutability.is_none() => {}
@@ -185,11 +187,11 @@ fn extract_method_signature(
     let msg_arg = inputs.next().ok_or_else(|| {
         syn::Error::new_spanned(sig, "`handle` must take a message argument `msg: M`")
     })?;
-    let message_ty = typed_arg_type(msg_arg, "msg: M")?;
+    let message_ty = owned_message_type(msg_arg)?;
     let ctx_arg = inputs
         .next()
         .ok_or_else(|| syn::Error::new_spanned(sig, "`handle` must take `ctx: &HandlerContext`"))?;
-    typed_arg_type(ctx_arg, "ctx: &HandlerContext")?;
+    validate_ctx_arg(ctx_arg)?;
     if inputs.next().is_some() {
         return Err(syn::Error::new_spanned(
             sig,
@@ -201,6 +203,7 @@ fn extract_method_signature(
 }
 
 fn extract_free_signature(kind: HandlerKindArg, sig: &Signature) -> syn::Result<(Type, Type)> {
+    reject_generics(&sig.generics)?;
     let mut inputs = sig.inputs.iter();
     let msg_arg = inputs.next().ok_or_else(|| {
         syn::Error::new_spanned(
@@ -208,11 +211,11 @@ fn extract_free_signature(kind: HandlerKindArg, sig: &Signature) -> syn::Result<
             "function must take `msg: M` and `ctx: &HandlerContext`",
         )
     })?;
-    let message_ty = typed_arg_type(msg_arg, "msg: M")?;
+    let message_ty = owned_message_type(msg_arg)?;
     let ctx_arg = inputs.next().ok_or_else(|| {
         syn::Error::new_spanned(sig, "function must take a `ctx: &HandlerContext` argument")
     })?;
-    typed_arg_type(ctx_arg, "ctx: &HandlerContext")?;
+    validate_ctx_arg(ctx_arg)?;
     if inputs.next().is_some() {
         return Err(syn::Error::new_spanned(
             sig,
@@ -231,6 +234,62 @@ fn typed_arg_type(arg: &FnArg, expected: &str) -> syn::Result<Type> {
             format!("expected typed argument `{expected}`"),
         )),
     }
+}
+
+/// Rejects any generic parameters or where-clause: the macro generates a
+/// separate trait impl that does not carry the user's generics, so generic
+/// handlers cannot be expanded correctly. Generic handler support is a future
+/// feature, out of scope for this macro.
+fn reject_generics(generics: &Generics) -> syn::Result<()> {
+    if generics.lt_token.is_some() || !generics.params.is_empty() {
+        return Err(syn::Error::new_spanned(
+            generics,
+            "#[handler] does not support generic handlers",
+        ));
+    }
+    if let Some(where_clause) = &generics.where_clause {
+        return Err(syn::Error::new_spanned(
+            where_clause,
+            "#[handler] does not support generic handlers",
+        ));
+    }
+    Ok(())
+}
+
+/// Extracts the message type from the message argument, rejecting reference
+/// types (`&T`) and non-path types: only an owned, path-named message type can
+/// implement `Command`/`Query`/`Notification`.
+fn owned_message_type(arg: &FnArg) -> syn::Result<Type> {
+    let ty = typed_arg_type(arg, "msg: M")?;
+    match &ty {
+        Type::Path(_) => Ok(ty),
+        other => Err(syn::Error::new_spanned(
+            other,
+            "the message argument must be an owned message type, not a reference",
+        )),
+    }
+}
+
+/// Validates that the context argument is `ctx: &HandlerContext`: a shared
+/// reference to a path type whose final segment is `HandlerContext`.
+fn validate_ctx_arg(arg: &FnArg) -> syn::Result<()> {
+    let ty = typed_arg_type(arg, "ctx: &HandlerContext")?;
+    if let Type::Reference(reference) = &ty {
+        if let Type::Path(path) = &*reference.elem {
+            if path
+                .path
+                .segments
+                .last()
+                .is_some_and(|seg| seg.ident == "HandlerContext")
+            {
+                return Ok(());
+            }
+        }
+    }
+    Err(syn::Error::new_spanned(
+        &ty,
+        "the second argument must be `ctx: &HandlerContext`",
+    ))
 }
 
 fn extract_result_error(kind: HandlerKindArg, sig: &Signature) -> syn::Result<Type> {

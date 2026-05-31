@@ -1,0 +1,5 @@
+error: #[handler] does not support generic handlers
+  --> tests/ui/fail_generic_impl_handler.rs:10:5
+   |
+10 | impl<T> GenericHandler<T> {
+   |     ^^^

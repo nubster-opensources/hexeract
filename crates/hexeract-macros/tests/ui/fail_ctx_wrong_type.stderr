@@ -1,0 +1,5 @@
+error: the second argument must be `ctx: &HandlerContext`
+ --> tests/ui/fail_ctx_wrong_type.rs:9:43
+  |
+9 |     async fn handle(&self, cmd: Cmd, ctx: u32) -> Result<(), std::convert::Infallible> {
+  |                                           ^^^
