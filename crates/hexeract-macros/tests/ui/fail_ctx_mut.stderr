@@ -1,0 +1,5 @@
+error: the context must be taken by shared reference `&HandlerContext`, not `&mut`
+  --> tests/ui/fail_ctx_mut.rs:12:14
+   |
+12 |         ctx: &mut HandlerContext,
+   |              ^^^^^^^^^^^^^^^^^^^
