@@ -1,0 +1,7 @@
+# See deny.toml for the full rationale. RUSTSEC-2023-0071 (Marvin attack on
+# `rsa`) is pulled transitively by the optional `sqlx-mysql` driver for
+# caching_sha2_password authentication. No fixed release of `rsa` exists; it is
+# used client side to encrypt the password once during the MySQL handshake, not
+# as a repeatable decryption oracle, and the transport is secured via TLS.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]
