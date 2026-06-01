@@ -30,7 +30,7 @@ lapin = "4"
 serde = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
-toml = "0.8"
+toml = "1.1"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
