@@ -28,11 +28,13 @@ CREATE INDEX IF NOT EXISTS idx_{{table}}_subject
     WHERE subject_id IS NOT NULL;
 ";
 
-/// Canonical MySQL 8.0+ schema for an outbox table.
+/// Canonical MySQL schema for an outbox table (requires MySQL 8.0.13+).
 ///
 /// MySQL supports neither partial indexes nor `CREATE INDEX IF NOT EXISTS`,
 /// so the indexes are declared inline in the `CREATE TABLE` statement. UUIDs
-/// are stored as `BINARY(16)` and the payload as native `JSON`.
+/// are stored as `BINARY(16)` and the payload as native `JSON`. Timestamps use
+/// `DATETIME(6)` holding UTC, with an expression default `(UTC_TIMESTAMP(6))`
+/// that requires MySQL 8.0.13 or later.
 const MYSQL_SCHEMA_SQL: &str = r"
 CREATE TABLE IF NOT EXISTS {{table}} (
     id            BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -40,7 +42,7 @@ CREATE TABLE IF NOT EXISTS {{table}} (
     event_type    VARCHAR(64)  NOT NULL,
     payload       JSON         NOT NULL,
     subject_id    BINARY(16)   NULL,
-    created_at    DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    created_at    DATETIME(6)  NOT NULL DEFAULT (UTC_TIMESTAMP(6)),
     attempts      INT          NOT NULL DEFAULT 0,
     last_error    TEXT         NULL,
     next_retry_at DATETIME(6)  NULL,
@@ -116,7 +118,11 @@ impl Dialect {
     /// comparable to the stored timestamps.
     pub(crate) fn now_expr(self) -> &'static str {
         match self {
-            Self::Postgres | Self::MySql => "NOW()",
+            Self::Postgres => "NOW()",
+            // UTC_TIMESTAMP() is independent of the server session time zone,
+            // keeping comparisons consistent with the UTC values the MySQL
+            // store binds into DATETIME columns.
+            Self::MySql => "UTC_TIMESTAMP()",
             Self::Sqlite => "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
         }
     }
@@ -311,5 +317,17 @@ mod tests {
     fn schema_ddl_rejects_invalid_table_name() {
         let err = Dialect::Postgres.schema_ddl("bad name; DROP").unwrap_err();
         assert!(matches!(err, OutboxError::Internal(_)));
+    }
+
+    #[test]
+    fn mysql_compares_against_utc_not_session_time() {
+        let sql = Dialect::MySql.poll_sql("audit_outbox");
+        assert!(sql.contains("UTC_TIMESTAMP()"));
+    }
+
+    #[test]
+    fn mysql_schema_ddl_defaults_created_at_to_utc() {
+        let ddl = Dialect::MySql.schema_ddl("audit_outbox").unwrap();
+        assert!(ddl.contains("UTC_TIMESTAMP(6)"));
     }
 }

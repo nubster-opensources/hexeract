@@ -2,6 +2,8 @@ use std::time::SystemTime;
 
 use hexeract_outbox::OutboxEnvelope;
 use time::OffsetDateTime;
+#[cfg(feature = "mysql")]
+use time::PrimitiveDateTime;
 use uuid::Uuid;
 
 /// Convert a [`SystemTime`] into the `sqlx`-encodable [`OffsetDateTime`].
@@ -12,6 +14,24 @@ pub(crate) fn to_offset(t: SystemTime) -> OffsetDateTime {
 /// Convert an [`OffsetDateTime`] decoded from the database back into a [`SystemTime`].
 pub(crate) fn to_system_time(o: OffsetDateTime) -> SystemTime {
     SystemTime::from(o)
+}
+
+/// Convert a [`SystemTime`] into a UTC [`PrimitiveDateTime`] for a MySQL `DATETIME`.
+///
+/// MySQL `DATETIME` carries no time zone, so the value is normalized to UTC
+/// before the offset is dropped. The store reads it back with
+/// [`primitive_utc_to_system_time`].
+#[cfg(feature = "mysql")]
+pub(crate) fn to_primitive_utc(t: SystemTime) -> PrimitiveDateTime {
+    let odt = OffsetDateTime::from(t);
+    PrimitiveDateTime::new(odt.date(), odt.time())
+}
+
+/// Interpret a [`PrimitiveDateTime`] read from a MySQL `DATETIME` as UTC and
+/// convert it back into a [`SystemTime`].
+#[cfg(feature = "mysql")]
+pub(crate) fn primitive_utc_to_system_time(p: PrimitiveDateTime) -> SystemTime {
+    SystemTime::from(p.assume_utc())
 }
 
 /// Build an [`OutboxEnvelope`] from the scalar columns a backend store
@@ -52,6 +72,14 @@ mod tests {
     fn system_time_round_trips_through_offset_date_time() {
         let original = SystemTime::UNIX_EPOCH + Duration::new(1_750_000_000, 123_456_789);
         let restored = to_system_time(to_offset(original));
+        assert_eq!(restored, original);
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    fn system_time_round_trips_through_primitive_utc() {
+        let original = SystemTime::UNIX_EPOCH + Duration::new(1_750_000_000, 123_456_000);
+        let restored = primitive_utc_to_system_time(to_primitive_utc(original));
         assert_eq!(restored, original);
     }
 
