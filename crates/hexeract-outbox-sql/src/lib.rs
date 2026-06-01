@@ -29,10 +29,17 @@ mod validate;
 /// PostgreSQL backend backed by `sqlx::PgPool`.
 pub mod postgres;
 
+#[cfg(feature = "mysql")]
+/// MySQL backend backed by `sqlx::MySqlPool`.
+pub mod mysql;
+
 pub use dialect::Dialect;
 
 #[cfg(feature = "postgres")]
 pub use postgres::{PgOutboxPublisher, PgOutboxStore, PgOutboxWorkerBuilder};
+
+#[cfg(feature = "mysql")]
+pub use mysql::{MySqlOutboxPublisher, MySqlOutboxStore, MySqlOutboxWorkerBuilder};
 
 /// Default outbox table name used when a builder's `table_name` is not set.
 pub const DEFAULT_TABLE_NAME: &str = "audit_outbox";
