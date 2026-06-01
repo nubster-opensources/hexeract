@@ -36,6 +36,27 @@ fn database_error(error: impl std::error::Error + Send + Sync + 'static) -> Outb
     OutboxError::Database(Box::new(error))
 }
 
+/// Apply the canonical Postgres outbox schema to the target database.
+///
+/// **Intended for POCs, integration tests and local development.**
+/// Production deployments should run their own migration tooling against the
+/// SQL rendered by [`Dialect::schema_ddl`]. Applying DDL from the running
+/// application typically requires elevated privileges that the runtime role
+/// should not own, and clashes with versioned migration workflows.
+///
+/// # Errors
+///
+/// - [`OutboxError::Internal`] if `table_name` is not a valid identifier.
+/// - [`OutboxError::Database`] if the connection or the DDL statement fails.
+pub async fn ensure_schema(pool: &PgPool, table_name: &str) -> Result<(), OutboxError> {
+    let ddl = DIALECT.schema_ddl(table_name)?;
+    sqlx::raw_sql(&ddl)
+        .execute(pool)
+        .await
+        .map_err(database_error)?;
+    Ok(())
+}
+
 /// PostgreSQL implementation of [`OutboxStore`] backed by `sqlx::PgPool`.
 ///
 /// Cheap to clone (the pool and the cached SQL strings are reference-counted).
