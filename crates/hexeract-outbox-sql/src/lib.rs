@@ -33,6 +33,10 @@ pub mod postgres;
 /// MySQL backend backed by `sqlx::MySqlPool`.
 pub mod mysql;
 
+#[cfg(feature = "sqlite")]
+/// SQLite backend backed by `sqlx::SqlitePool`.
+pub mod sqlite;
+
 pub use dialect::Dialect;
 
 #[cfg(feature = "postgres")]
@@ -40,6 +44,9 @@ pub use postgres::{PgOutboxPublisher, PgOutboxStore, PgOutboxWorkerBuilder};
 
 #[cfg(feature = "mysql")]
 pub use mysql::{MySqlOutboxPublisher, MySqlOutboxStore, MySqlOutboxWorkerBuilder};
+
+#[cfg(feature = "sqlite")]
+pub use sqlite::{SqliteOutboxPublisher, SqliteOutboxStore, SqliteOutboxWorkerBuilder};
 
 /// Default outbox table name used when a builder's `table_name` is not set.
 pub const DEFAULT_TABLE_NAME: &str = "audit_outbox";

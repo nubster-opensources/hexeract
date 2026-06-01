@@ -1,17 +1,21 @@
 use std::time::SystemTime;
 
 use hexeract_outbox::OutboxEnvelope;
+#[cfg(feature = "sqlite")]
+use hexeract_outbox::OutboxError;
 use time::OffsetDateTime;
-#[cfg(feature = "mysql")]
+#[cfg(any(feature = "mysql", feature = "sqlite"))]
 use time::PrimitiveDateTime;
 use uuid::Uuid;
 
 /// Convert a [`SystemTime`] into the `sqlx`-encodable [`OffsetDateTime`].
+#[cfg(feature = "postgres")]
 pub(crate) fn to_offset(t: SystemTime) -> OffsetDateTime {
     OffsetDateTime::from(t)
 }
 
 /// Convert an [`OffsetDateTime`] decoded from the database back into a [`SystemTime`].
+#[cfg(feature = "postgres")]
 pub(crate) fn to_system_time(o: OffsetDateTime) -> SystemTime {
     SystemTime::from(o)
 }
@@ -32,6 +36,43 @@ pub(crate) fn to_primitive_utc(t: SystemTime) -> PrimitiveDateTime {
 #[cfg(feature = "mysql")]
 pub(crate) fn primitive_utc_to_system_time(p: PrimitiveDateTime) -> SystemTime {
     SystemTime::from(p.assume_utc())
+}
+
+/// Format a [`SystemTime`] as a UTC RFC 3339 string with millisecond precision
+/// for a SQLite `TEXT` column.
+///
+/// The layout matches the dialect's `strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`
+/// expression so lexicographic comparisons against the stored timestamps stay
+/// correct.
+///
+/// # Errors
+///
+/// Returns [`OutboxError::Internal`] if the value cannot be formatted.
+#[cfg(feature = "sqlite")]
+pub(crate) fn format_sqlite_utc(t: SystemTime) -> Result<String, OutboxError> {
+    let fmt = time::macros::format_description!(
+        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+    );
+    OffsetDateTime::from(t)
+        .format(fmt)
+        .map_err(|e| OutboxError::Internal(format!("sqlite timestamp format failed: {e}")))
+}
+
+/// Parse a SQLite `TEXT` timestamp written by [`format_sqlite_utc`] (or by the
+/// `strftime` column default) back into a [`SystemTime`], interpreting it as UTC.
+///
+/// # Errors
+///
+/// Returns [`OutboxError::Internal`] if the text does not match the expected
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ` layout.
+#[cfg(feature = "sqlite")]
+pub(crate) fn parse_sqlite_utc(s: &str) -> Result<SystemTime, OutboxError> {
+    let fmt = time::macros::format_description!(
+        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+    );
+    let parsed = PrimitiveDateTime::parse(s, fmt)
+        .map_err(|e| OutboxError::Internal(format!("sqlite timestamp parse failed: {e}")))?;
+    Ok(SystemTime::from(parsed.assume_utc()))
 }
 
 /// Build an [`OutboxEnvelope`] from the scalar columns a backend store
@@ -68,10 +109,22 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn system_time_round_trips_through_offset_date_time() {
         let original = SystemTime::UNIX_EPOCH + Duration::new(1_750_000_000, 123_456_789);
         let restored = to_system_time(to_offset(original));
+        assert_eq!(restored, original);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn system_time_round_trips_through_sqlite_text() {
+        let original = SystemTime::UNIX_EPOCH + Duration::new(1_750_000_000, 123_000_000);
+        let text = format_sqlite_utc(original).unwrap();
+        assert!(text.contains('T'));
+        assert!(text.ends_with('Z'));
+        let restored = parse_sqlite_utc(&text).unwrap();
         assert_eq!(restored, original);
     }
 
