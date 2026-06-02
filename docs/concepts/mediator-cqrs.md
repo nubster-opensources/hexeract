@@ -115,7 +115,7 @@ The mediator wraps `UserError` via `Into<HexeractError>` at the dispatch boundar
 
 ## Missing handler
 
-Dispatching a command or a query with no registered handler returns `HexeractError::HandlerNotFound { command_type }`. The field is named `command_type` for legacy reasons but is populated with the message type name for queries and notifications as well; it will be renamed `message_type` at v1.0.
+Dispatching a command or a query with no registered handler returns `HexeractError::HandlerNotFound { message_type }`, where `message_type` is the fully-qualified type name of the unregistered command, query or notification.
 
 ## When to use which channel
 

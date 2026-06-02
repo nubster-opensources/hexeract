@@ -44,7 +44,7 @@ impl Mediator {
 
 `Clone` is `O(1)` (shared `Arc<MediatorInner>`); pass clones to spawned tasks freely.
 
-**`send` errors.** Returns `HexeractError::HandlerNotFound { command_type }` if no handler is registered for `C`. Returns the handler's own error wrapped through `Into<HexeractError>` if the handler fails.
+**`send` errors.** Returns `HexeractError::HandlerNotFound { message_type }` if no handler is registered for `C`. Returns the handler's own error wrapped through `Into<HexeractError>` if the handler fails.
 
 **`query` errors.** Same shape as `send` against the query registry.
 
@@ -97,6 +97,6 @@ MediatorBuilder
 
 ## Stability
 
-The public types and methods listed above are part of the v0.3.x stable surface and follow the [SemVer policy](../SEMVER_POLICY.md). The crate currently exposes one known dette to be addressed at v1.0:
+The public types and methods listed above follow the [SemVer policy](../SEMVER_POLICY.md).
 
-- **`HexeractError::HandlerNotFound { command_type }`**. The field name `command_type` is populated for queries and notifications too. It will be renamed `message_type` at v1.0.
+- **`HexeractError::HandlerNotFound { message_type }`**. Renamed from `command_type` in 0.4.0; the field is populated for commands, queries and notifications alike.

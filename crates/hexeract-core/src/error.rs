@@ -8,11 +8,12 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum HexeractError {
-    /// No handler was registered for the given command or query type.
-    #[error("no handler registered for `{command_type}`")]
+    /// No handler was registered for the given message type.
+    #[error("no handler registered for `{message_type}`")]
     HandlerNotFound {
-        /// The fully-qualified type name of the unregistered command or query.
-        command_type: &'static str,
+        /// The fully-qualified type name of the unregistered command, query or
+        /// notification.
+        message_type: &'static str,
     },
 
     /// A handler returned an error. The original error is preserved as source.
@@ -46,7 +47,24 @@ pub enum HexeractError {
         expected: &'static str,
     },
 
+    /// A dispatch was cancelled before the handler produced a result, for
+    /// example because its [`HandlerContext`](crate::HandlerContext)
+    /// cancellation token fired.
+    #[error("dispatch of `{type_name}` was cancelled")]
+    #[non_exhaustive]
+    Cancelled {
+        /// Fully-qualified type name of the message whose dispatch was cancelled.
+        type_name: &'static str,
+    },
+
     /// A generic dispatch-level error with a human-readable message.
+    ///
+    /// Reserved as a last resort for cases that have no dedicated structured
+    /// variant, such as aggregating several notification handler failures into
+    /// one message, or reporting a framework invariant violation. Prefer a
+    /// specific variant ([`HandlerNotFound`](Self::HandlerNotFound),
+    /// [`DowncastFailed`](Self::DowncastFailed), [`Cancelled`](Self::Cancelled),
+    /// ...) whenever one applies.
     #[error("dispatch error: {0}")]
     Dispatch(String),
 }
@@ -79,6 +97,15 @@ impl HexeractError {
     pub fn downcast_failed(expected: &'static str) -> Self {
         Self::DowncastFailed { expected }
     }
+
+    /// Builds a [`HexeractError::Cancelled`] from the fully-qualified name of
+    /// the message whose dispatch was cancelled. This is the only way to
+    /// construct the variant from outside this crate, since it is marked
+    /// `#[non_exhaustive]`.
+    #[must_use]
+    pub fn cancelled(type_name: &'static str) -> Self {
+        Self::Cancelled { type_name }
+    }
 }
 
 #[cfg(test)]
@@ -88,9 +115,20 @@ mod tests {
     #[test]
     fn handler_not_found_display() {
         let err = HexeractError::HandlerNotFound {
-            command_type: "RegisterUser",
+            message_type: "RegisterUser",
         };
         assert_eq!(err.to_string(), "no handler registered for `RegisterUser`");
+    }
+
+    #[test]
+    fn cancelled_names_the_message_type() {
+        let err = HexeractError::cancelled("my::RegisterUser");
+        let rendered = err.to_string();
+        assert!(rendered.contains("RegisterUser"));
+        assert!(rendered.contains("cancelled"));
+        assert!(
+            matches!(err, HexeractError::Cancelled { type_name } if type_name == "my::RegisterUser")
+        );
     }
 
     #[test]
