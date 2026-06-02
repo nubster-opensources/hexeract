@@ -1,4 +1,5 @@
 #![allow(missing_docs)]
+#![allow(deprecated)]
 
 //! Criterion benchmark for [`PgOutboxPublisher::publish_in_tx`].
 //!

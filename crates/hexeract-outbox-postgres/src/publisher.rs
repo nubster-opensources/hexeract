@@ -10,6 +10,10 @@ use crate::schema::validate_table_name;
 /// PostgreSQL implementation of [`OutboxPublisher`] backed by `deadpool_postgres`.
 ///
 /// Cheap to clone (the underlying `Pool` is reference-counted).
+#[deprecated(
+    since = "0.4.0",
+    note = "use the hexeract-outbox-sql crate with the postgres feature; this crate is removed in 0.5.0"
+)]
 #[derive(Debug, Clone)]
 pub struct PgOutboxPublisher {
     pool: Pool,

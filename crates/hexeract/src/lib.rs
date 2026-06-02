@@ -14,21 +14,21 @@
 //!
 //! ```toml
 //! [dependencies]
-//! hexeract = { version = "0.3", features = ["outbox-postgres"] }
+//! hexeract = { version = "0.4", features = ["outbox-sql-postgres"] }
 //! ```
 //!
 //! Bus over RabbitMQ:
 //!
 //! ```toml
 //! [dependencies]
-//! hexeract = { version = "0.3", features = ["bus-rabbitmq"] }
+//! hexeract = { version = "0.4", features = ["bus-rabbitmq"] }
 //! ```
 //!
 //! Both together:
 //!
 //! ```toml
 //! [dependencies]
-//! hexeract = { version = "0.3", features = ["outbox-postgres", "bus-rabbitmq"] }
+//! hexeract = { version = "0.4", features = ["outbox-sql-postgres", "bus-rabbitmq"] }
 //! ```
 //!
 //! # Feature matrix
@@ -37,7 +37,10 @@
 //! | --- | --- | --- |
 //! | `core` | Cross-cutting primitives (`MessageId`, `CorrelationId`, `HandlerContext`) | [`hexeract_core`] |
 //! | `outbox` | Backend-agnostic outbox traits | [`hexeract_outbox`] |
-//! | `outbox-postgres` | PostgreSQL outbox backend | [`hexeract_outbox`] + [`hexeract_outbox_postgres`] |
+//! | `outbox-postgres` | PostgreSQL outbox backend (deprecated since 0.4.0) | [`hexeract_outbox`] + [`hexeract_outbox_postgres`] |
+//! | `outbox-sql-postgres` | PostgreSQL outbox backend via `sqlx` | [`hexeract_outbox`] + [`hexeract_outbox_sql`] |
+//! | `outbox-sql-mysql` | MySQL outbox backend via `sqlx` | [`hexeract_outbox`] + [`hexeract_outbox_sql`] |
+//! | `outbox-sql-sqlite` | SQLite outbox backend via `sqlx` | [`hexeract_outbox`] + [`hexeract_outbox_sql`] |
 //! | `bus` | Backend-agnostic bus traits | [`hexeract_bus`] |
 //! | `bus-rabbitmq` | RabbitMQ bus backend | [`hexeract_bus`] + [`hexeract_bus_rabbitmq`] |
 //! | `mediator` | In-process CQRS mediator | [`hexeract_mediator`] |
@@ -64,12 +67,32 @@ pub use hexeract_core as core;
 #[cfg_attr(docsrs, doc(cfg(feature = "outbox")))]
 pub use hexeract_outbox as outbox;
 
-/// PostgreSQL outbox backend.
+/// PostgreSQL outbox backend (deprecated).
 ///
-/// Re-export of [`hexeract_outbox_postgres`].
+/// Re-export of [`hexeract_outbox_postgres`]. Deprecated since 0.4.0: prefer
+/// [`outbox_sql`] with the `outbox-sql-postgres` feature.
 #[cfg(feature = "outbox-postgres")]
 #[cfg_attr(docsrs, doc(cfg(feature = "outbox-postgres")))]
 pub use hexeract_outbox_postgres as outbox_postgres;
+
+/// SQL outbox backends for PostgreSQL, MySQL and SQLite via `sqlx`.
+///
+/// Re-export of [`hexeract_outbox_sql`]. Enabled by any of the
+/// `outbox-sql-postgres`, `outbox-sql-mysql` or `outbox-sql-sqlite` features.
+#[cfg(any(
+    feature = "outbox-sql-postgres",
+    feature = "outbox-sql-mysql",
+    feature = "outbox-sql-sqlite"
+))]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(
+        feature = "outbox-sql-postgres",
+        feature = "outbox-sql-mysql",
+        feature = "outbox-sql-sqlite"
+    )))
+)]
+pub use hexeract_outbox_sql as outbox_sql;
 
 /// Backend-agnostic bus traits.
 ///

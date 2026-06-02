@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Integration tests for `hexeract-outbox-postgres`.
 //!
 //! # Running
