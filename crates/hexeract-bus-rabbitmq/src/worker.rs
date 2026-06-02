@@ -86,16 +86,35 @@ impl DeliveryDisposition {
 }
 
 /// Ack discipline for a [`RabbitMqWorker`].
+///
+/// The three modes trade delivery guarantees against throughput:
+///
+/// - [`AckMode::Manual`] is at-least-once: the broker redelivers until a
+///   handler succeeds.
+/// - [`AckMode::AckOnReceive`] is at-most-once with an explicit ack: the
+///   delivery is acknowledged as soon as it is received, before the handler
+///   runs, so a handler failure is not retried. A crash after the ack and
+///   before the handler completes drops that in-flight delivery.
+/// - [`AckMode::Unacknowledged`] is fire-and-forget: the broker is told not
+///   to expect any ack (`no_ack`), so it removes the message the moment it is
+///   sent. Highest throughput, but any handler failure or crash loses the
+///   message. Use only when loss is acceptable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AckMode {
-    /// Ack on receive, before the handler runs. Handler failures are
-    /// logged but never retried; the broker never sees the failure.
-    Auto,
     /// Ack only when the handler returns `Ok`. Handler failures
     /// trigger [`basic_nack`] with `requeue=true` up to
     /// `max_attempts`, then route to the dead-letter routing key if
-    /// configured or drop the delivery otherwise.
+    /// configured or drop the delivery otherwise. At-least-once.
     Manual,
+    /// Acknowledge each delivery explicitly as soon as it is received,
+    /// before the handler runs (`no_ack` is not set). Handler failures are
+    /// logged but never retried. At-most-once.
+    AckOnReceive,
+    /// Consume with `no_ack`: the broker removes the message on delivery,
+    /// before the handler runs, and never expects an acknowledgement.
+    /// Highest throughput, but handler failures and crashes lose the
+    /// message. Fire-and-forget.
+    Unacknowledged,
 }
 
 impl Default for AckMode {
@@ -266,7 +285,7 @@ impl RabbitMqWorker {
             .basic_qos(self.config.prefetch, BasicQosOptions::default())
             .await
             .map_err(|err| BusError::Transport(Box::new(err)))?;
-        let no_ack = matches!(self.config.ack_mode, AckMode::Auto);
+        let no_ack = matches!(self.config.ack_mode, AckMode::Unacknowledged);
         let mut consumer = channel
             .basic_consume(
                 ShortString::from(self.queue.as_str()),
@@ -317,28 +336,61 @@ impl RabbitMqWorker {
             Ok(env) => env,
             Err(err) => {
                 tracing::warn!(error = %err, "rabbitmq delivery decode failed");
-                if matches!(self.config.ack_mode, AckMode::Manual) {
-                    let nack = channel
-                        .basic_nack(
-                            delivery.delivery_tag,
-                            BasicNackOptions {
-                                requeue: false,
-                                ..BasicNackOptions::default()
-                            },
-                        )
-                        .await
-                        .map_err(|err| BusError::Transport(Box::new(err)));
-                    if let Err(err) = &nack {
-                        tracing::warn!(
-                            delivery_tag = delivery.delivery_tag,
-                            error = %err,
-                            "rabbitmq nack of undecodable delivery failed; consumer continues"
-                        );
+                match self.config.ack_mode {
+                    AckMode::Manual => {
+                        let nack = channel
+                            .basic_nack(
+                                delivery.delivery_tag,
+                                BasicNackOptions {
+                                    requeue: false,
+                                    ..BasicNackOptions::default()
+                                },
+                            )
+                            .await
+                            .map_err(|err| BusError::Transport(Box::new(err)));
+                        if let Err(err) = &nack {
+                            tracing::warn!(
+                                delivery_tag = delivery.delivery_tag,
+                                error = %err,
+                                "rabbitmq nack of undecodable delivery failed; consumer continues"
+                            );
+                        }
                     }
+                    AckMode::AckOnReceive => {
+                        let ack = channel
+                            .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
+                            .await
+                            .map_err(|err| BusError::Transport(Box::new(err)));
+                        if let Err(err) = &ack {
+                            tracing::warn!(
+                                delivery_tag = delivery.delivery_tag,
+                                error = %err,
+                                "rabbitmq ack of undecodable delivery failed; consumer continues"
+                            );
+                        }
+                    }
+                    AckMode::Unacknowledged => {}
                 }
                 return DeliveryDisposition::Settled;
             }
         };
+
+        // AckOnReceive settles the delivery before the handler runs, so a
+        // handler failure is never retried (at-most-once).
+        if matches!(self.config.ack_mode, AckMode::AckOnReceive) {
+            let ack = channel
+                .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
+                .await
+                .map_err(|err| BusError::Transport(Box::new(err)));
+            if let Err(err) = &ack {
+                tracing::warn!(
+                    delivery_tag = delivery.delivery_tag,
+                    error = %err,
+                    "rabbitmq ack-on-receive failed; consumer continues, broker will redeliver"
+                );
+                return DeliveryDisposition::from_settle_result(&ack);
+            }
+        }
 
         let ctx = build_handler_context(&delivery.properties);
         let outcome = match self.handlers.get(envelope.message_type.as_str()) {
@@ -349,19 +401,29 @@ impl RabbitMqWorker {
         };
 
         match self.config.ack_mode {
-            AckMode::Auto => {
+            AckMode::Manual => {
+                self.handle_manual_outcome(channel, &delivery, &envelope, outcome, attempts)
+                    .await
+            }
+            AckMode::AckOnReceive => {
                 if let Err(err) = outcome {
                     tracing::warn!(
                         message_type = %envelope.message_type,
                         error = %err,
-                        "handler failed under AckMode::Auto, delivery already acked"
+                        "handler failed under AckMode::AckOnReceive, delivery already acked"
                     );
                 }
                 DeliveryDisposition::Settled
             }
-            AckMode::Manual => {
-                self.handle_manual_outcome(channel, &delivery, &envelope, outcome, attempts)
-                    .await
+            AckMode::Unacknowledged => {
+                if let Err(err) = outcome {
+                    tracing::warn!(
+                        message_type = %envelope.message_type,
+                        error = %err,
+                        "handler failed under AckMode::Unacknowledged (no_ack), message already gone"
+                    );
+                }
+                DeliveryDisposition::Settled
             }
         }
     }
