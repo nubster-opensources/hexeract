@@ -19,6 +19,10 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 - `hexeract-core`: **breaking**. The `HexeractError::HandlerNotFound` field `command_type` is renamed `message_type`, since it carries the type name of commands, queries and notifications alike. `HexeractError::Dispatch(String)` is now documented as a last-resort variant; prefer the structured variants. (#126)
 - `hexeract-core`: **breaking**. The `Notification` trait no longer requires `Clone`, and `NotificationHandler::handle` receives the notification as `Arc<N>`. The mediator now shares a single `Arc<N>` across the fan-out instead of deep-cloning the payload per handler. Notification handlers written through `#[handler(notification)]` take `Arc<N>` as their message argument. (#128)
 
+### Performance
+
+- `hexeract-mediator`: the middleware chain is shared as an `Arc<[_]>` walked with an index cursor instead of being cloned into a `VecDeque` on every dispatch. `send`, `query` and `publish` no longer allocate the middleware chain per call; advancing the pipeline is a reference-count bump. `Next::new` now accepts any `Into<Arc<[_]>>`, so existing callers passing a `Vec` are unaffected. (#130)
+
 ### Deprecated
 
 - `hexeract-outbox-postgres` and the `hexeract` `outbox-postgres` feature are deprecated since 0.4.0 and will be removed in 0.5.0. Use `hexeract-outbox-sql` with the `postgres` feature (the `outbox-sql-postgres` facade feature) instead. The deprecated crate keeps its `deadpool_postgres` implementation for this release cycle.

@@ -1,5 +1,4 @@
 use std::any::Any;
-use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -95,21 +94,32 @@ pub trait Terminal: Send + Sync + 'static {
 
 /// Opaque continuation passed to a [`Middleware`]. Calling [`Next::run`]
 /// proceeds to the next middleware in the chain or to the [`Terminal`] if
-/// the chain is empty.
+/// the chain is exhausted.
+///
+/// The middleware chain is held as a shared `Arc<[_]>` walked with an index
+/// cursor, so advancing the pipeline is a reference-count bump rather than a
+/// per-dispatch allocation of the chain.
 pub struct Next {
-    chain: VecDeque<Arc<dyn DynMiddleware>>,
+    chain: Arc<[Arc<dyn DynMiddleware>]>,
+    index: usize,
     terminal: Arc<dyn Terminal>,
 }
 
 impl Next {
     /// Builds a new [`Next`] from a chain of middlewares and a terminal.
     ///
-    /// Middlewares are executed in the order they appear in the slice: the
-    /// first one wraps the second, which wraps the third, and so on.
+    /// Middlewares are executed in the order they appear: the first one wraps
+    /// the second, which wraps the third, and so on. The chain accepts any
+    /// `Into<Arc<[_]>>`, so a freshly built `Vec` or a pre-shared `Arc<[_]>`
+    /// (cloned once per dispatch as a reference-count bump) both work.
     #[must_use]
-    pub fn new(middlewares: Vec<Arc<dyn DynMiddleware>>, terminal: Arc<dyn Terminal>) -> Self {
+    pub fn new(
+        middlewares: impl Into<Arc<[Arc<dyn DynMiddleware>]>>,
+        terminal: Arc<dyn Terminal>,
+    ) -> Self {
         Self {
             chain: middlewares.into(),
+            index: 0,
             terminal,
         }
     }
@@ -121,12 +131,17 @@ impl Next {
     /// Returns the [`HexeractError`] produced by the next middleware in the
     /// chain or by the [`Terminal`] when the chain is exhausted.
     pub async fn run(
-        mut self,
+        self,
         envelope: &MessageEnvelope,
         ctx: &HandlerContext,
     ) -> Result<BoxOutput, HexeractError> {
-        if let Some(head) = self.chain.pop_front() {
-            head.execute(envelope, ctx, self).await
+        if let Some(head) = self.chain.get(self.index).cloned() {
+            let next = Next {
+                chain: self.chain,
+                index: self.index + 1,
+                terminal: self.terminal,
+            };
+            head.execute(envelope, ctx, next).await
         } else {
             self.terminal.dispatch(envelope, ctx).await
         }
