@@ -17,7 +17,7 @@ categories = ["asynchronous", "network-programming"]
 workspace = true
 
 [dependencies]
-hexeract-core = { path = "../hexeract-core", version = "0.3" }
+hexeract-core = { path = "../hexeract-core", version = "0.4" }
 inventory = { workspace = true }
 thiserror = { workspace = true }
 trait-variant = { workspace = true }

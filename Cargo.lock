@@ -1628,7 +1628,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hexeract"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "hexeract-bus",
  "hexeract-bus-rabbitmq",
@@ -1643,7 +1643,7 @@ dependencies = [
 
 [[package]]
 name = "hexeract-bus"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "hexeract-core",
@@ -1657,7 +1657,7 @@ dependencies = [
 
 [[package]]
 name = "hexeract-bus-rabbitmq"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1678,7 +1678,7 @@ dependencies = [
 
 [[package]]
 name = "hexeract-cli"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -1701,7 +1701,7 @@ dependencies = [
 
 [[package]]
 name = "hexeract-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "inventory",
  "serde",
@@ -1716,7 +1716,7 @@ dependencies = [
 
 [[package]]
 name = "hexeract-macros"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "hexeract-core",
  "hexeract-mediator",
@@ -1730,7 +1730,7 @@ dependencies = [
 
 [[package]]
 name = "hexeract-mediator"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "hexeract-core",
  "inventory",
@@ -1742,7 +1742,7 @@ dependencies = [
 
 [[package]]
 name = "hexeract-middleware"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "hexeract-core",
  "hexeract-mediator",
@@ -1753,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "hexeract-outbox"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "hexeract-core",
@@ -1770,7 +1770,7 @@ dependencies = [
 
 [[package]]
 name = "hexeract-outbox-postgres"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "criterion",
@@ -1791,7 +1791,7 @@ dependencies = [
 
 [[package]]
 name = "hexeract-outbox-sql"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "hexeract-core",
@@ -1810,7 +1810,7 @@ dependencies = [
 
 [[package]]
 name = "hexeract-umbrella-tests"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "hexeract",
  "tokio",
