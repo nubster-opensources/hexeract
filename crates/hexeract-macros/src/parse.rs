@@ -639,7 +639,7 @@ mod tests {
         };
         match parsed {
             HandlerItem::FreeFn(f) => {
-                assert_eq!(f.handler_struct_ident.to_string(), "AuditHandler")
+                assert_eq!(f.handler_struct_ident.to_string(), "AuditHandler");
             }
             HandlerItem::Impl(_) => panic!("must be parsed as FreeFn"),
         }
