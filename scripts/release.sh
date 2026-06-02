@@ -146,6 +146,12 @@ path.write_text(content, encoding="utf-8")
 print(f"CHANGELOG.md graduated: [Unreleased] -> [{new_version}] - {date}")
 PYEOF
 
+# 4b. Commit the graduated CHANGELOG before invoking cargo-release, which
+# refuses to operate on a dirty working tree. The subsequent cargo-release
+# bump lands in its own commit, mirroring the historical release layout.
+git add CHANGELOG.md
+git commit -m "docs(changelog): graduate Unreleased to v${NEW_VERSION}"
+
 # 5. Bump every Cargo.toml version (including inter-crate path deps)
 cargo release "${LEVEL}" --workspace --execute --no-confirm
 
