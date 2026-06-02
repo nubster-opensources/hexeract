@@ -13,7 +13,6 @@ use std::sync::Mutex;
 use hexeract::core::{HandlerContext, HexeractError, Notification, NotificationHandler};
 use hexeract::mediator::MediatorBuilder;
 
-#[derive(Clone)]
 pub struct UserRegistered {
     pub id: u64,
     pub email: String,
@@ -27,7 +26,7 @@ pub struct AuditHandler {
 
 impl NotificationHandler<UserRegistered> for AuditHandler {
     type Error = HexeractError;
-    async fn handle(&self, n: UserRegistered, _ctx: &HandlerContext) -> Result<(), HexeractError> {
+    async fn handle(&self, n: Arc<UserRegistered>, _ctx: &HandlerContext) -> Result<(), HexeractError> {
         self.audit_log
             .lock()
             .expect("audit log poisoned")
@@ -40,7 +39,7 @@ pub struct EmailHandler;
 
 impl NotificationHandler<UserRegistered> for EmailHandler {
     type Error = HexeractError;
-    async fn handle(&self, n: UserRegistered, _ctx: &HandlerContext) -> Result<(), HexeractError> {
+    async fn handle(&self, n: Arc<UserRegistered>, _ctx: &HandlerContext) -> Result<(), HexeractError> {
         // ... send welcome email to `n.email` ...
         let _ = n.email;
         Ok(())
@@ -51,7 +50,7 @@ pub struct SearchIndexHandler;
 
 impl NotificationHandler<UserRegistered> for SearchIndexHandler {
     type Error = HexeractError;
-    async fn handle(&self, n: UserRegistered, _ctx: &HandlerContext) -> Result<(), HexeractError> {
+    async fn handle(&self, n: Arc<UserRegistered>, _ctx: &HandlerContext) -> Result<(), HexeractError> {
         // ... insert into search index ...
         let _ = n.id;
         Ok(())
@@ -80,7 +79,7 @@ assert_eq!(*audit_log.lock().unwrap(), vec![1]);
 # Ok(()) }
 ```
 
-The three handlers run sequentially in registration order. Each one receives its own clone of the notification (`Notification: Clone` is enforced by the trait). All three share the same `CorrelationId` so observability tools can stitch the fan-out back to its publish site.
+The three handlers run sequentially in registration order. Each one receives a shared `Arc<UserRegistered>`; the mediator broadcasts a single value, so there is no per-handler deep clone and `Notification` does not require `Clone`. All three share the same `CorrelationId` so observability tools can stitch the fan-out back to its publish site.
 
 ## Fail-safe semantics
 
@@ -111,17 +110,15 @@ This is the right semantic for audit + email + search-index: the audit must alwa
 
 ## Large payloads
 
-Each handler receives a clone of the notification. If your payload is large (`Vec<u8>`, deep struct), the clone overhead adds up. Wrap shared data behind `Arc<T>`:
+The mediator shares one `Arc<N>` across the fan-out, so a large payload is never deep-cloned per handler: each handler gets a cheap `Arc` clone (one atomic increment). A handler that needs an owned value can clone out of the `Arc` itself, paying the cost only where it is actually required:
 
 ```rust,ignore
-#[derive(Clone)]
-pub struct UserRegistered {
-    pub id: u64,
-    pub user_record: Arc<UserRecord>,   // shared, no deep clone per handler
+async fn handle(&self, n: Arc<UserRegistered>, _ctx: &HandlerContext) -> Result<(), HexeractError> {
+    let owned: UserRegistered = (*n).clone(); // only if you truly need ownership
+    // ...
+    Ok(())
 }
 ```
-
-`Arc::clone` is `O(1)` (one atomic increment).
 
 ## Async pre-event side effects
 

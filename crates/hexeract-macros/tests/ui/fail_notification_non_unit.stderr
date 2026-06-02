@@ -1,13 +1,19 @@
 error: a notification handler must return `Result<(), Error>`
-  --> tests/ui/fail_notification_non_unit.rs:12:68
+  --> tests/ui/fail_notification_non_unit.rs:13:73
    |
-12 |     async fn handle(&self, _n: N, _ctx: &HandlerContext) -> Result<i32, HexeractError> {
-   |                                                                    ^^^
+13 |     async fn handle(&self, _n: Arc<N>, _ctx: &HandlerContext) -> Result<i32, HexeractError> {
+   |                                                                         ^^^
 
-warning: unused imports: `HandlerContext` and `HexeractError`
- --> tests/ui/fail_notification_non_unit.rs:1:21
+warning: unused import: `std::sync::Arc`
+ --> tests/ui/fail_notification_non_unit.rs:1:5
   |
-1 | use hexeract_core::{HandlerContext, HexeractError, Notification};
-  |                     ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^
+1 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
   |
   = note: `#[warn(unused_imports)]` on by default
+
+warning: unused imports: `HandlerContext` and `HexeractError`
+ --> tests/ui/fail_notification_non_unit.rs:3:21
+  |
+3 | use hexeract_core::{HandlerContext, HexeractError, Notification};
+  |                     ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^

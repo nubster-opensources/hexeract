@@ -187,7 +187,7 @@ fn extract_method_signature(
     let msg_arg = inputs.next().ok_or_else(|| {
         syn::Error::new_spanned(sig, "`handle` must take a message argument `msg: M`")
     })?;
-    let message_ty = owned_message_type(msg_arg)?;
+    let message_ty = message_type(kind, msg_arg)?;
     let ctx_arg = inputs
         .next()
         .ok_or_else(|| syn::Error::new_spanned(sig, "`handle` must take `ctx: &HandlerContext`"))?;
@@ -211,7 +211,7 @@ fn extract_free_signature(kind: HandlerKindArg, sig: &Signature) -> syn::Result<
             "function must take `msg: M` and `ctx: &HandlerContext`",
         )
     })?;
-    let message_ty = owned_message_type(msg_arg)?;
+    let message_ty = message_type(kind, msg_arg)?;
     let ctx_arg = inputs.next().ok_or_else(|| {
         syn::Error::new_spanned(sig, "function must take a `ctx: &HandlerContext` argument")
     })?;
@@ -280,6 +280,60 @@ fn owned_message_type(arg: &FnArg) -> syn::Result<Type> {
         other => Err(syn::Error::new_spanned(
             other,
             "the message argument must be an owned, named message type",
+        )),
+    }
+}
+
+/// Extracts the message type the generated impl is parameterized over. Command
+/// and query handlers receive the message by value, so the type is the argument
+/// itself. Notification handlers receive the notification shared as `Arc<N>`,
+/// so the message type is the single generic argument of that `Arc`.
+fn message_type(kind: HandlerKindArg, arg: &FnArg) -> syn::Result<Type> {
+    if kind.is_notification() {
+        notification_message_type(arg)
+    } else {
+        owned_message_type(arg)
+    }
+}
+
+/// Extracts `N` from a notification handler argument `Arc<N>`. The mediator
+/// shares the notification across handlers, so the argument must be an `Arc` of
+/// a named notification type.
+fn notification_message_type(arg: &FnArg) -> syn::Result<Type> {
+    let ty = typed_arg_type(arg, "msg: Arc<N>")?;
+    let Type::Path(tp) = &ty else {
+        return Err(syn::Error::new_spanned(
+            &ty,
+            "a notification handler argument must be `Arc<N>`, since the notification is shared across handlers",
+        ));
+    };
+    let last = tp.path.segments.last().ok_or_else(|| {
+        syn::Error::new_spanned(&ty, "a notification handler argument must be `Arc<N>`")
+    })?;
+    if last.ident != "Arc" {
+        return Err(syn::Error::new_spanned(
+            &ty,
+            "a notification handler argument must be `Arc<N>`, since the notification is shared across handlers",
+        ));
+    }
+    let PathArguments::AngleBracketed(args) = &last.arguments else {
+        return Err(syn::Error::new_spanned(
+            &ty,
+            "`Arc` must have exactly one type argument: `Arc<N>`",
+        ));
+    };
+    let mut generics = args.args.iter();
+    let (Some(GenericArgument::Type(inner)), None) = (generics.next(), generics.next()) else {
+        return Err(syn::Error::new_spanned(
+            &ty,
+            "`Arc` must have exactly one type argument: `Arc<N>`",
+        ));
+    };
+    match inner {
+        Type::Path(_) => Ok(inner.clone()),
+        other => Err(syn::Error::new_spanned(
+            other,
+            "the notification type inside `Arc<...>` must be a named type",
         )),
     }
 }
@@ -546,7 +600,7 @@ mod tests {
     fn parse_handler_item_rejects_notification_with_non_unit_output() {
         let item = quote! {
             impl H {
-                async fn handle(&self, n: N, ctx: &HandlerContext) -> Result<i32, E> { Ok(0) }
+                async fn handle(&self, n: std::sync::Arc<N>, ctx: &HandlerContext) -> Result<i32, E> { Ok(0) }
             }
         };
         let err = expect_parse_err(
@@ -555,6 +609,40 @@ mod tests {
             "notification must return Result<(), _>",
         );
         assert!(err.to_string().contains("notification handler must return"));
+    }
+
+    #[test]
+    fn parse_handler_item_rejects_notification_message_not_wrapped_in_arc() {
+        let item = quote! {
+            impl H {
+                async fn handle(&self, n: UserCreated, ctx: &HandlerContext) -> Result<(), E> { Ok(()) }
+            }
+        };
+        let err = expect_parse_err(
+            HandlerKindArg::Notification,
+            item,
+            "notification message must be Arc<N>",
+        );
+        assert!(err.to_string().contains("Arc<N>"));
+    }
+
+    #[test]
+    fn parse_handler_item_accepts_notification_with_arc_message() {
+        let item = quote! {
+            async fn audit(n: std::sync::Arc<UserCreated>, ctx: &HandlerContext) -> Result<(), MyError> {
+                Ok(())
+            }
+        };
+        let parsed = match parse_handler_item(HandlerKindArg::Notification, item) {
+            Ok(p) => p,
+            Err(err) => panic!("must parse: {err}"),
+        };
+        match parsed {
+            HandlerItem::FreeFn(f) => {
+                assert_eq!(f.handler_struct_ident.to_string(), "AuditHandler");
+            }
+            HandlerItem::Impl(_) => panic!("must be parsed as FreeFn"),
+        }
     }
 
     #[test]

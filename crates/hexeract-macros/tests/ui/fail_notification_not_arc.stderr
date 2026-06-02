@@ -1,0 +1,13 @@
+error: a notification handler argument must be `Arc<N>`, since the notification is shared across handlers
+  --> tests/ui/fail_notification_not_arc.rs:11:32
+   |
+11 |     async fn handle(&self, _n: N, _ctx: &HandlerContext) -> Result<(), HexeractError> {
+   |                                ^
+
+warning: unused imports: `HandlerContext` and `HexeractError`
+ --> tests/ui/fail_notification_not_arc.rs:1:21
+  |
+1 | use hexeract_core::{HandlerContext, HexeractError, Notification};
+  |                     ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default

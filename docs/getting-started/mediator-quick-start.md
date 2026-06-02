@@ -35,7 +35,6 @@ impl Query for CountUsers {
     type Output = u64;
 }
 
-#[derive(Clone)]
 pub struct UserRegistered {
     pub id: u64,
 }
@@ -43,13 +42,15 @@ pub struct UserRegistered {
 impl Notification for UserRegistered {}
 ```
 
-`Notification: Clone` is enforced by the trait: every handler in a fan-out receives its own clone.
+Notifications are shared across every handler as `Arc<N>`, so `Notification` does not require `Clone`.
 
 ## Implement the handlers
 
 Each channel has its own trait. Errors flow through `HexeractError` or any type that implements `Into<HexeractError>`.
 
 ```rust
+use std::sync::Arc;
+
 use hexeract::core::{CommandHandler, HandlerContext, HexeractError, NotificationHandler, QueryHandler};
 
 pub struct UserRepository;
@@ -75,7 +76,7 @@ pub struct AuditWriter;
 
 impl NotificationHandler<UserRegistered> for AuditWriter {
     type Error = HexeractError;
-    async fn handle(&self, n: UserRegistered, _ctx: &HandlerContext) -> Result<(), HexeractError> {
+    async fn handle(&self, n: Arc<UserRegistered>, _ctx: &HandlerContext) -> Result<(), HexeractError> {
         // ... append to audit storage ...
         let _ = n.id;
         Ok(())

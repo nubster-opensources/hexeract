@@ -63,7 +63,11 @@ struct RecordingNotifHandler {
 impl NotificationHandler<UserCreated> for RecordingNotifHandler {
     type Error = HexeractError;
 
-    async fn handle(&self, notif: UserCreated, _ctx: &HandlerContext) -> Result<(), Self::Error> {
+    async fn handle(
+        &self,
+        notif: Arc<UserCreated>,
+        _ctx: &HandlerContext,
+    ) -> Result<(), Self::Error> {
         self.seen
             .lock()
             .expect("recorder mutex poisoned")

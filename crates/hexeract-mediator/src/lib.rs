@@ -458,12 +458,16 @@ impl Mediator {
         let total = handlers.len();
         let mut failures: Vec<String> = Vec::new();
 
+        // Shared once across the fan-out: each handler receives a cheap
+        // `Arc` clone (refcount bump) rather than a deep clone of the payload.
+        let shared = Arc::new(notification);
+
         for handler in handlers {
             let message_id = MessageId::new();
             let envelope = MessageEnvelope::for_notification::<N>(message_id, correlation_id);
             let ctx = HandlerContext::new(message_id, correlation_id);
 
-            let payload = Box::new(notification.clone()) as BoxAny;
+            let payload = Box::new(Arc::clone(&shared)) as BoxAny;
             let terminal = Arc::new(NotificationTerminal {
                 handler: Arc::clone(handler),
                 payload: Mutex::new(Some(payload)),
@@ -539,7 +543,11 @@ mod tests {
     impl NotificationHandler<UserCreated> for AuditHandler {
         type Error = HexeractError;
 
-        async fn handle(&self, _n: UserCreated, _ctx: &HandlerContext) -> Result<(), Self::Error> {
+        async fn handle(
+            &self,
+            _n: Arc<UserCreated>,
+            _ctx: &HandlerContext,
+        ) -> Result<(), Self::Error> {
             Ok(())
         }
     }
@@ -554,7 +562,7 @@ mod tests {
 
         async fn handle(
             &self,
-            notif: UserCreated,
+            notif: Arc<UserCreated>,
             _ctx: &HandlerContext,
         ) -> Result<(), Self::Error> {
             self.seen
@@ -570,7 +578,11 @@ mod tests {
     impl NotificationHandler<UserCreated> for FailingNotifHandler {
         type Error = HexeractError;
 
-        async fn handle(&self, _n: UserCreated, _ctx: &HandlerContext) -> Result<(), Self::Error> {
+        async fn handle(
+            &self,
+            _n: Arc<UserCreated>,
+            _ctx: &HandlerContext,
+        ) -> Result<(), Self::Error> {
             Err(HexeractError::Dispatch("boom".into()))
         }
     }
