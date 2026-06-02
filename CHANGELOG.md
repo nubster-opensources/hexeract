@@ -7,7 +7,47 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 ## [Unreleased]
 
 ### Added
-- _Items in flight will be listed here until the next release._
+
+- `hexeract-outbox-sql`: new outbox backend crate built on `sqlx`, with one compile-time backend per Cargo feature, `postgres` (default), `mysql` and `sqlite`. A shared `Dialect` centralizes statement templating, row locking and the per-engine schema DDL. The PostgreSQL schema is byte-for-byte identical to `hexeract-outbox-postgres`, so no data migration is required, and the payload stays native `JSONB`. (#110, #111)
+- `hexeract` facade: `outbox-sql-postgres`, `outbox-sql-mysql` and `outbox-sql-sqlite` features re-export the new crate as `hexeract::outbox_sql`. (#113)
+- Integration tests for the three backends, covering publish, dispatch, retry accounting, competing-consumers `FOR UPDATE SKIP LOCKED` on PostgreSQL and MySQL, and `next_retry_at` scheduling on SQLite, run by the integration workflow. (#112)
+
+### Deprecated
+
+- `hexeract-outbox-postgres` and the `hexeract` `outbox-postgres` feature are deprecated since 0.4.0 and will be removed in 0.5.0. Use `hexeract-outbox-sql` with the `postgres` feature (the `outbox-sql-postgres` facade feature) instead. The deprecated crate keeps its `deadpool_postgres` implementation for this release cycle.
+
+### Migration
+
+The new backend is built on `sqlx` instead of `deadpool_postgres`, so the constructors take a `sqlx::PgPool` rather than a `deadpool_postgres::Pool`. The table schema is unchanged, so existing tables keep working.
+
+Before:
+
+```toml
+hexeract = { version = "0.3", features = ["outbox-postgres"] }
+```
+
+```rust
+use hexeract::outbox_postgres::{PgOutboxWorkerBuilder, ensure_schema};
+```
+
+After:
+
+```toml
+hexeract = { version = "0.4", features = ["outbox-sql-postgres"] }
+```
+
+```rust
+use hexeract::outbox_sql::PgOutboxWorkerBuilder;
+use hexeract::outbox_sql::postgres::ensure_schema;
+
+let pool = sqlx::PgPool::connect(&database_url).await?;
+ensure_schema(&pool, "audit_outbox").await?;
+let worker = PgOutboxWorkerBuilder::new(pool)
+    .register_handler::<MyEvent, _>(my_handler)
+    .build()?;
+```
+
+SQLite (`outbox-sql-sqlite`) is single-worker only; for competing-consumers fan-out across many workers use PostgreSQL or MySQL. See `docs/concepts/sqlite-outbox-concurrency.md`.
 
 ## [0.3.1] - 2026-05-31
 

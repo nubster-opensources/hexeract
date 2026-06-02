@@ -1638,6 +1638,7 @@ dependencies = [
  "hexeract-middleware",
  "hexeract-outbox",
  "hexeract-outbox-postgres",
+ "hexeract-outbox-sql",
 ]
 
 [[package]]

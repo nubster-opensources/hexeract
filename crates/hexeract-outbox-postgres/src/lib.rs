@@ -3,6 +3,16 @@
 //! This crate provides the canonical schema, the `PgOutboxPublisher`
 //! implementation of [`hexeract_outbox::OutboxPublisher`] backed by
 //! `deadpool_postgres`, and the helpers for managing the outbox table.
+//!
+//! # Deprecated
+//!
+//! This crate is deprecated since 0.4.0. Use the `hexeract-outbox-sql` crate
+//! with the `postgres` feature instead; it supersedes this backend and also
+//! adds MySQL and SQLite. This crate will be removed in 0.5.0.
+
+// The crate keeps referencing its own deprecated items internally for one
+// release cycle; external consumers still receive the deprecation warnings.
+#![allow(deprecated)]
 
 /// Fluent builder for an outbox worker backed by `PgOutboxStore`.
 pub mod builder;

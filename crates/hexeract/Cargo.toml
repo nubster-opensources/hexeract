@@ -25,6 +25,7 @@ hexeract-mediator = { path = "../hexeract-mediator", version = "0.3", optional =
 hexeract-middleware = { path = "../hexeract-middleware", version = "0.3", optional = true }
 hexeract-outbox = { path = "../hexeract-outbox", version = "0.3", optional = true }
 hexeract-outbox-postgres = { path = "../hexeract-outbox-postgres", version = "0.3", optional = true }
+hexeract-outbox-sql = { path = "../hexeract-outbox-sql", version = "0.3", optional = true, default-features = false }
 
 [features]
 default = []
@@ -32,9 +33,15 @@ default = []
 # Cross-cutting primitives. Pulled automatically by every feature that needs them.
 core = ["dep:hexeract-core"]
 
-# Outbox pattern: backend-agnostic core + PostgreSQL backend.
+# Outbox pattern: backend-agnostic core + SQL backends.
 outbox = ["core", "dep:hexeract-outbox"]
+# Deprecated since 0.4.0: deadpool-based PostgreSQL backend. Prefer the
+# `outbox-sql-*` features below, which use the `hexeract-outbox-sql` crate.
 outbox-postgres = ["outbox", "dep:hexeract-outbox-postgres"]
+# sqlx-based backends, one Cargo feature per engine.
+outbox-sql-postgres = ["outbox", "dep:hexeract-outbox-sql", "hexeract-outbox-sql/postgres"]
+outbox-sql-mysql = ["outbox", "dep:hexeract-outbox-sql", "hexeract-outbox-sql/mysql"]
+outbox-sql-sqlite = ["outbox", "dep:hexeract-outbox-sql", "hexeract-outbox-sql/sqlite"]
 
 # Bus pattern: backend-agnostic core + RabbitMQ backend.
 bus = ["core", "dep:hexeract-bus"]

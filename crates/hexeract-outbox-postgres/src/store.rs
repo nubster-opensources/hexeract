@@ -16,6 +16,10 @@ use crate::schema::validate_table_name;
 ///
 /// Cheap to clone (the underlying [`Pool`] and the cached SQL strings
 /// are reference-counted).
+#[deprecated(
+    since = "0.4.0",
+    note = "use the hexeract-outbox-sql crate with the postgres feature; this crate is removed in 0.5.0"
+)]
 #[derive(Debug, Clone)]
 pub struct PgOutboxStore {
     pool: Pool,

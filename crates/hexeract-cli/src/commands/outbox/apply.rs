@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use clap::Args;
 use hexeract_outbox_postgres::render_schema;
 use tokio_postgres::NoTls;

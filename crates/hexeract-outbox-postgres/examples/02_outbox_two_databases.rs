@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! End-to-end demonstration of the Outbox MVP with two-database isolation.
 //!
 //! This example spins up two PostgreSQL containers via `testcontainers`:

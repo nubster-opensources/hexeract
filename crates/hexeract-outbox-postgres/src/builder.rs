@@ -14,6 +14,10 @@ use hexeract_outbox::TypedHandler;
 use crate::PgOutboxStore;
 
 /// Default outbox table name used when [`PgOutboxWorkerBuilder::table_name`] is not called.
+#[deprecated(
+    since = "0.4.0",
+    note = "use the hexeract-outbox-sql crate with the postgres feature; this crate is removed in 0.5.0"
+)]
 pub const DEFAULT_TABLE_NAME: &str = "audit_outbox";
 
 /// Fluent builder for an [`OutboxWorker`] backed by [`PgOutboxStore`].
@@ -67,6 +71,10 @@ pub const DEFAULT_TABLE_NAME: &str = "audit_outbox";
 /// # Ok(())
 /// # }
 /// ```
+#[deprecated(
+    since = "0.4.0",
+    note = "use the hexeract-outbox-sql crate with the postgres feature; this crate is removed in 0.5.0"
+)]
 pub struct PgOutboxWorkerBuilder {
     pool: Pool,
     table_name: String,

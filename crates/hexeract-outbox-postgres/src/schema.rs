@@ -6,6 +6,10 @@ use hexeract_outbox::OutboxError;
 /// The literal `{{table}}` is substituted with the configured table name
 /// by [`render_schema`] before being applied. Designed to be copy-pasted
 /// into any migration tool (sqlx-cli, refinery, dbmate, Flyway, ...).
+#[deprecated(
+    since = "0.4.0",
+    note = "use the hexeract-outbox-sql crate with the postgres feature; this crate is removed in 0.5.0"
+)]
 pub const POSTGRES_SCHEMA_SQL: &str = r"
 CREATE TABLE IF NOT EXISTS {{table}} (
     id            BIGSERIAL    PRIMARY KEY,
@@ -33,6 +37,10 @@ CREATE INDEX IF NOT EXISTS idx_{{table}}_subject
 ///
 /// Returns [`OutboxError::Internal`] if `table_name` is not a valid
 /// PostgreSQL identifier matching `^[a-zA-Z_][a-zA-Z0-9_]*$`.
+#[deprecated(
+    since = "0.4.0",
+    note = "use hexeract_outbox_sql::Dialect::Postgres.schema_ddl(...); this crate is removed in 0.5.0"
+)]
 pub fn render_schema(table_name: &str) -> Result<String, OutboxError> {
     validate_table_name(table_name)?;
     Ok(POSTGRES_SCHEMA_SQL.replace("{{table}}", table_name))
@@ -52,6 +60,10 @@ pub fn render_schema(table_name: &str) -> Result<String, OutboxError> {
 /// - [`OutboxError::Internal`] if `table_name` is invalid.
 /// - [`OutboxError::Database`] if the pool, the connection or the DDL
 ///   statement fails.
+#[deprecated(
+    since = "0.4.0",
+    note = "use hexeract_outbox_sql::postgres::ensure_schema; this crate is removed in 0.5.0"
+)]
 pub async fn ensure_schema(pool: &Pool, table_name: &str) -> Result<(), OutboxError> {
     let sql = render_schema(table_name)?;
     let client = pool
