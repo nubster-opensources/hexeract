@@ -293,7 +293,7 @@ impl MediatorBuilder {
                 command_handlers: self.command_handlers,
                 query_handlers: self.query_handlers,
                 notification_handlers: self.notification_handlers,
-                middlewares: self.middlewares,
+                middlewares: self.middlewares.into(),
             }),
         })
     }
@@ -357,7 +357,7 @@ struct MediatorInner {
     command_handlers: HashMap<TypeId, Arc<dyn ErasedCommandHandler>>,
     query_handlers: HashMap<TypeId, Arc<dyn ErasedQueryHandler>>,
     notification_handlers: HashMap<TypeId, Vec<Arc<dyn ErasedNotificationHandler>>>,
-    middlewares: Vec<Arc<dyn DynMiddleware>>,
+    middlewares: Arc<[Arc<dyn DynMiddleware>]>,
 }
 
 impl Mediator {
