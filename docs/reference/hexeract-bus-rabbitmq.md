@@ -42,7 +42,7 @@ AMQP `BasicProperties` set on every publish: `message_id`, `correlation_id`, `co
 | `RabbitMqWorkerBuilder::new(connection)` | Fluent entry point. Symmetric with `PgOutboxWorkerBuilder`. |
 | `.queue(name)` | Mandatory. The queue to consume from. |
 | `.register_handler::<M, _>(handler)` | Register a typed handler per `MESSAGE_TYPE`. Repeated registration replaces silently. |
-| `.ack_mode(AckMode)` | `Auto` or `Manual` (default). |
+| `.ack_mode(AckMode)` | `Manual` (default), `AckOnReceive`, or `Unacknowledged`. |
 | `.max_attempts(n)` | Default 5. |
 | `.prefetch(n)` | Default 16. |
 | `.dead_letter_routing_key(rk)` | Routes exhausted deliveries to that routing key on the default exchange. |
@@ -51,8 +51,9 @@ AMQP `BasicProperties` set on every publish: `message_id`, `correlation_id`, `co
 
 | Item | Role |
 | --- | --- |
-| `AckMode::Auto` | Consumer-side `no_ack = true`, fire-and-forget. |
-| `AckMode::Manual` | Default. Retries per `message_id` up to `max_attempts`, then DLR or drop. |
+| `AckMode::Manual` | Default. At-least-once. Retries per `message_id` up to `max_attempts`, then DLR or drop. |
+| `AckMode::AckOnReceive` | At-most-once. Explicit `basic_ack` on receive before the handler runs (`no_ack = false`). |
+| `AckMode::Unacknowledged` | Fire-and-forget. Consumer-side `no_ack = true`, lossy on handler failure or crash. |
 | `RabbitMqWorkerConfig` | Tunable knobs: `ack_mode`, `max_attempts`, `prefetch`, `dead_letter_routing_key`. |
 
 See the [worker concept](../concepts/worker.md), the [ack modes](../concepts/ack-modes.md) and the [retry policy](../concepts/retry-policy.md).

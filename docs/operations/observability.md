@@ -12,7 +12,8 @@ Hexeract emits `tracing` events on every poll cycle, dispatch, retry and ack. Th
 | `rabbitmq connect failed` | `hexeract-bus-rabbitmq` | `warn` | `attempt`, `error` | A `connect_with_retry` attempt failed |
 | `rabbitmq consumer stream error` | `hexeract-bus-rabbitmq` | `warn` | `error` | The lapin consumer stream surfaced an error |
 | `rabbitmq delivery decode failed` | `hexeract-bus-rabbitmq` | `warn` | `error` | `delivery_to_envelope` returned `Err`, delivery `basic_nack`-ed without requeue |
-| `handler failed under AckMode::Auto, delivery already acked` | `hexeract-bus-rabbitmq` | `warn` | `message_type`, `error` | Handler returned `Err` and the worker is configured `AckMode::Auto` |
+| `handler failed under AckMode::AckOnReceive, delivery already acked` | `hexeract-bus-rabbitmq` | `warn` | `message_type`, `error` | Handler returned `Err` under `AckMode::AckOnReceive` (delivery acked before the handler ran) |
+| `handler failed under AckMode::Unacknowledged (no_ack), message already gone` | `hexeract-bus-rabbitmq` | `warn` | `message_type`, `error` | Handler returned `Err` under `AckMode::Unacknowledged` (broker removed the message on delivery) |
 | `handler failed` | `hexeract-bus-rabbitmq` | `warn` | `message_type`, `attempt`, `max_attempts`, `error` | Handler returned `Err` in `AckMode::Manual`, before the nack/DLR decision |
 | `delivery dropped after exhausting retry budget` | `hexeract-bus-rabbitmq` | `warn` | `message_type`, `attempts` | `max_attempts` reached with no DLR configured |
 | `rabbitmq worker cancelled` | `hexeract-bus-rabbitmq` | `info` | `queue` | The `CancellationToken` fired and the consume loop is exiting |

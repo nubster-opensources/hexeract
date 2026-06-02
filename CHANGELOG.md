@@ -12,6 +12,10 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 - `hexeract` facade: `outbox-sql-postgres`, `outbox-sql-mysql` and `outbox-sql-sqlite` features re-export the new crate as `hexeract::outbox_sql`. (#113)
 - Integration tests for the three backends, covering publish, dispatch, retry accounting, competing-consumers `FOR UPDATE SKIP LOCKED` on PostgreSQL and MySQL, and `next_retry_at` scheduling on SQLite, run by the integration workflow. (#112)
 
+### Changed
+
+- `hexeract-bus-rabbitmq`: **breaking**. `AckMode::Auto` is replaced by two explicit modes. `AckMode::AckOnReceive` acknowledges each delivery on receive, before the handler runs (`no_ack = false`, at-most-once with prefetch back-pressure), and `AckMode::Unacknowledged` keeps the previous `no_ack = true` fire-and-forget behavior under an honest name. The old `Auto` mode silently lost messages on handler failure or crash. Migrate `AckMode::Auto` to `AckMode::Unacknowledged` for identical semantics, or to `AckMode::AckOnReceive` for explicit at-most-once. (#120)
+
 ### Deprecated
 
 - `hexeract-outbox-postgres` and the `hexeract` `outbox-postgres` feature are deprecated since 0.4.0 and will be removed in 0.5.0. Use `hexeract-outbox-sql` with the `postgres` feature (the `outbox-sql-postgres` facade feature) instead. The deprecated crate keeps its `deadpool_postgres` implementation for this release cycle.

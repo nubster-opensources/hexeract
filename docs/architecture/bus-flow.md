@@ -60,9 +60,9 @@ flowchart TD
     delivery --> decode
     decode -- No --> nack_drop[basic_nack<br/>requeue=false]
     decode -- Yes --> ack_mode
-    ack_mode -- Auto --> dispatch_auto[/Dispatch to handler/]
+    ack_mode -- AckOnReceive/Unacknowledged --> dispatch_auto[/Dispatch to handler/]
     ack_mode -- Manual --> dispatch
-    dispatch_auto -. ack already sent .-> ignore_outcome([Log on error])
+    dispatch_auto -. already settled .-> ignore_outcome([Log on error])
 
     dispatch --> handler_ok
     handler_ok -- Yes --> ack

@@ -45,7 +45,7 @@ Expected behaviour: at-least-once delivery permits duplicates on crash or `max_a
 | --- | --- |
 | Queue name mismatch | `hexeract bus peek --queue <queue> --count 1` shows messages there; verify worker builder uses the same name |
 | `MESSAGE_TYPE` mismatch | The `Message::MESSAGE_TYPE` constant must match the AMQP `type` property the producer sets. If a foreign producer uses a different routing convention, register a handler for that exact type. |
-| Worker still acking under `AckMode::Auto` | Switch to `AckMode::Manual` if you need to observe handler failures |
+| Messages lost under `AckMode::AckOnReceive` or `AckMode::Unacknowledged` | Switch to `AckMode::Manual` if you need at-least-once and to retry handler failures |
 
 ### Same message dispatched again and again
 
