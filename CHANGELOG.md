@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 ## [Unreleased]
 
 ### Added
+- _Items in flight will be listed here until the next release._
+
+## [0.4.0] - 2026-06-02
+
+### Added
 
 - `hexeract-outbox-sql`: new outbox backend crate built on `sqlx`, with one compile-time backend per Cargo feature, `postgres` (default), `mysql` and `sqlite`. A shared `Dialect` centralizes statement templating, row locking and the per-engine schema DDL. The PostgreSQL schema is byte-for-byte identical to `hexeract-outbox-postgres`, so no data migration is required, and the payload stays native `JSONB`. (#110, #111)
 - `hexeract` facade: `outbox-sql-postgres`, `outbox-sql-mysql` and `outbox-sql-sqlite` features re-export the new crate as `hexeract::outbox_sql`. (#113)
@@ -215,7 +220,8 @@ First public release. Ships the transactional outbox feature end to end against 
 
 This is the first published version, so no upgrade path applies.
 
-[Unreleased]: https://github.com/nubster-opensources/hexeract/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/nubster-opensources/hexeract/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/nubster-opensources/hexeract/releases/tag/v0.4.0
 [0.3.1]: https://github.com/nubster-opensources/hexeract/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/nubster-opensources/hexeract/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/nubster-opensources/hexeract/compare/v0.1.0...v0.2.0
