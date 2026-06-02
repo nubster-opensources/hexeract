@@ -88,6 +88,13 @@ jobs:
         if: steps.mode.outputs.is_dry == 'false'
         run: sleep 30
 
+      - name: Publish hexeract-outbox-sql
+        run: ./scripts/publish-or-skip.sh hexeract-outbox-sql ${{ steps.mode.outputs.args }} -- "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+
+      - name: Wait for index propagation
+        if: steps.mode.outputs.is_dry == 'false'
+        run: sleep 30
+
       - name: Publish hexeract-bus
         run: ./scripts/publish-or-skip.sh hexeract-bus ${{ steps.mode.outputs.args }} -- "${{ secrets.CARGO_REGISTRY_TOKEN }}"
 
