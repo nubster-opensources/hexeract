@@ -53,10 +53,10 @@ The generated struct inherits the function's visibility (`pub` if the fn is `pub
 | --- | --- |
 | Impl block, command | `async fn handle(&self, msg: C, ctx: &HandlerContext) -> Result<C::Output, E>` |
 | Impl block, query | `async fn handle(&self, msg: Q, ctx: &HandlerContext) -> Result<Q::Output, E>` |
-| Impl block, notification | `async fn handle(&self, msg: N, ctx: &HandlerContext) -> Result<(), E>` |
+| Impl block, notification | `async fn handle(&self, msg: Arc<N>, ctx: &HandlerContext) -> Result<(), E>` |
 | Free fn, command | `async fn name(msg: C, ctx: &HandlerContext) -> Result<C::Output, E>` |
 | Free fn, query | `async fn name(msg: Q, ctx: &HandlerContext) -> Result<Q::Output, E>` |
-| Free fn, notification | `async fn name(msg: N, ctx: &HandlerContext) -> Result<(), E>` |
+| Free fn, notification | `async fn name(msg: Arc<N>, ctx: &HandlerContext) -> Result<(), E>` |
 
 `E` must implement `Into<HexeractError>`. `&HandlerContext` is the literal expected type; the second argument name is free.
 

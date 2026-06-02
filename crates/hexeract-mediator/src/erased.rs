@@ -10,6 +10,7 @@ use std::any::{Any, type_name};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use hexeract_core::{
     Command, CommandHandler, HandlerContext, HexeractError, Notification, NotificationHandler,
@@ -159,7 +160,7 @@ where
         ctx: &'a HandlerContext,
     ) -> BoxFuture<'a, Result<(), HexeractError>> {
         Box::pin(async move {
-            let notification = *input.downcast::<N>().map_err(|_| {
+            let notification = *input.downcast::<Arc<N>>().map_err(|_| {
                 HexeractError::Dispatch(format!(
                     "notification input downcast failed for {}",
                     type_name::<N>()
@@ -303,7 +304,7 @@ mod tests {
 
         async fn handle(
             &self,
-            notif: UserSignedUp,
+            notif: Arc<UserSignedUp>,
             _ctx: &HandlerContext,
         ) -> Result<(), Self::Error> {
             self.seen.lock().expect("poisoned").push(notif.id);
@@ -319,7 +320,7 @@ mod tests {
         });
         let ctx = fresh_ctx();
         typed
-            .handle(Box::new(UserSignedUp { id: 99 }), &ctx)
+            .handle(Box::new(Arc::new(UserSignedUp { id: 99 })), &ctx)
             .await
             .expect("notification dispatch must succeed");
         assert_eq!(seen.lock().unwrap().clone(), vec![99]);

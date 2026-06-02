@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::command::Command;
 use crate::context::HandlerContext;
 use crate::error::HexeractError;
@@ -70,14 +72,17 @@ pub trait NotificationHandler<N: Notification>: Send + Sync + 'static {
     type Error: Into<HexeractError> + Send + Sync + 'static;
 
     /// Handles the notification.
-    async fn handle(&self, notification: N, ctx: &HandlerContext) -> Result<(), Self::Error>;
+    ///
+    /// The notification is shared across every registered handler as an
+    /// [`Arc`], so it is never deep-cloned per handler. Clone out of the `Arc`
+    /// if an owned value is needed.
+    async fn handle(&self, notification: Arc<N>, ctx: &HandlerContext) -> Result<(), Self::Error>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ids::{CorrelationId, MessageId};
-    use std::sync::Arc;
     use std::time::Duration;
     use uuid::Uuid;
 

@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use hexeract_core::{HandlerContext, HexeractError, Notification};
 use hexeract_macros::handler;
 
@@ -10,8 +8,8 @@ struct H;
 
 #[handler(notification)]
 impl H {
-    async fn handle(&self, _n: Arc<N>, _ctx: &HandlerContext) -> Result<i32, HexeractError> {
-        Ok(0)
+    async fn handle(&self, _n: N, _ctx: &HandlerContext) -> Result<(), HexeractError> {
+        Ok(())
     }
 }
 

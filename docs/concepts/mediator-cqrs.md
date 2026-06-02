@@ -64,7 +64,7 @@ pub struct UserEmailChanged {
 impl Notification for UserEmailChanged {}
 ```
 
-`Notification` requires `Clone`: each handler receives its own clone of the payload. If your payload is large or expensive to clone, wrap shared data in `Arc<T>` inside the struct.
+`Notification` does not require `Clone`: the mediator shares one `Arc<N>` across every registered handler, so the payload is never deep-cloned per handler. A handler that needs an owned value clones out of the `Arc`.
 
 **Fan-out fail-safe.** If one handler returns an error, the mediator continues invoking the remaining handlers and aggregates failures into a single `HexeractError::Dispatch` with the format `"publish: N of M handlers failed: ..."`. Sibling handlers never silently lose their turn.
 

@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 
 - `hexeract-bus-rabbitmq`: **breaking**. `AckMode::Auto` is replaced by two explicit modes. `AckMode::AckOnReceive` acknowledges each delivery on receive, before the handler runs (`no_ack = false`, at-most-once with prefetch back-pressure), and `AckMode::Unacknowledged` keeps the previous `no_ack = true` fire-and-forget behavior under an honest name. The old `Auto` mode silently lost messages on handler failure or crash. Migrate `AckMode::Auto` to `AckMode::Unacknowledged` for identical semantics, or to `AckMode::AckOnReceive` for explicit at-most-once. (#120)
 - `hexeract-core`: **breaking**. The `HexeractError::HandlerNotFound` field `command_type` is renamed `message_type`, since it carries the type name of commands, queries and notifications alike. `HexeractError::Dispatch(String)` is now documented as a last-resort variant; prefer the structured variants. (#126)
+- `hexeract-core`: **breaking**. The `Notification` trait no longer requires `Clone`, and `NotificationHandler::handle` receives the notification as `Arc<N>`. The mediator now shares a single `Arc<N>` across the fan-out instead of deep-cloning the payload per handler. Notification handlers written through `#[handler(notification)]` take `Arc<N>` as their message argument. (#128)
 
 ### Deprecated
 

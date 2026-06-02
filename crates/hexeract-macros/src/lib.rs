@@ -27,8 +27,11 @@ mod parse;
 /// async fn list_users(q: ListUsers, ctx: &HandlerContext) -> Result<Vec<User>, MyError> { ... }
 ///
 /// #[handler(notification)]
-/// async fn audit(n: UserCreated, ctx: &HandlerContext) -> Result<(), MyError> { ... }
+/// async fn audit(n: Arc<UserCreated>, ctx: &HandlerContext) -> Result<(), MyError> { ... }
 /// ```
+///
+/// Notification handlers receive the notification shared as `Arc<N>`, since the
+/// mediator broadcasts a single value to every registered handler.
 ///
 /// The kind is mandatory and must be one of `command`, `query` or
 /// `notification`. The macro generates the matching trait

@@ -27,6 +27,7 @@ fn expand_impl(input: HandlerImpl) -> TokenStream {
     let kind_variant = kind.variant_ident();
     let self_ty = &item.self_ty;
     let output_ty = handler_output_ty(kind, &message_ty, &root);
+    let param_ty = handler_param_ty(kind, &message_ty);
     let registration = quote! {
         #root::registration::__private::inventory::submit!(
             #root::HandlerRegistration {
@@ -44,7 +45,7 @@ fn expand_impl(input: HandlerImpl) -> TokenStream {
             type Error = #error_ty;
             async fn handle(
                 &self,
-                msg: #message_ty,
+                msg: #param_ty,
                 ctx: &#root::HandlerContext,
             ) -> ::core::result::Result<#output_ty, #error_ty> {
                 self.handle(msg, ctx).await
@@ -69,6 +70,7 @@ fn expand_free_fn(input: HandlerFreeFn) -> TokenStream {
     let fn_ident = &item.sig.ident;
     let fn_vis = &item.vis;
     let output_ty = handler_output_ty(kind, &message_ty, &root);
+    let param_ty = handler_param_ty(kind, &message_ty);
     let registration = quote! {
         #root::registration::__private::inventory::submit!(
             #root::HandlerRegistration {
@@ -88,7 +90,7 @@ fn expand_free_fn(input: HandlerFreeFn) -> TokenStream {
             type Error = #error_ty;
             async fn handle(
                 &self,
-                msg: #message_ty,
+                msg: #param_ty,
                 ctx: &#root::HandlerContext,
             ) -> ::core::result::Result<#output_ty, #error_ty> {
                 #fn_ident(msg, ctx).await
@@ -109,5 +111,16 @@ fn handler_output_ty(kind: HandlerKindArg, message_ty: &Type, root: &TokenStream
     } else {
         let marker = kind.marker_trait_ident();
         quote!(<#message_ty as #root::#marker>::Output)
+    }
+}
+
+/// Computes the message argument type of the generated `handle` method:
+/// `Arc<N>` for notifications, which the mediator shares across handlers, and
+/// the owned message type otherwise.
+fn handler_param_ty(kind: HandlerKindArg, message_ty: &Type) -> TokenStream {
+    if kind.is_notification() {
+        quote!(::std::sync::Arc<#message_ty>)
+    } else {
+        quote!(#message_ty)
     }
 }

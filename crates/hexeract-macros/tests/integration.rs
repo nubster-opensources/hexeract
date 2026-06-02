@@ -6,6 +6,8 @@
     reason = "test handlers stay `async` to match the trait the macro expands to"
 )]
 
+use std::sync::Arc;
+
 use hexeract_core::{Command, HandlerContext, HexeractError, Notification, Query};
 use hexeract_macros::handler;
 use hexeract_mediator::{HandlersVerificationError, MediatorBuilder};
@@ -47,7 +49,10 @@ struct UserCreated {
 impl Notification for UserCreated {}
 
 #[handler(notification)]
-async fn audit_user_created(_n: UserCreated, _ctx: &HandlerContext) -> Result<(), HexeractError> {
+async fn audit_user_created(
+    _n: Arc<UserCreated>,
+    _ctx: &HandlerContext,
+) -> Result<(), HexeractError> {
     Ok(())
 }
 
