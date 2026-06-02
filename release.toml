@@ -13,7 +13,6 @@ consolidate-commits = true
 publish = false
 tag = false
 push = false
-dev-version = false
 sign-commit = false
 sign-tag = false
 
