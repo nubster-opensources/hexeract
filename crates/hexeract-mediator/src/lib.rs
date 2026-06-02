@@ -373,7 +373,7 @@ impl Mediator {
         let tid = TypeId::of::<C>();
         let handler = self.inner.command_handlers.get(&tid).ok_or_else(|| {
             HexeractError::HandlerNotFound {
-                command_type: type_name::<C>(),
+                message_type: type_name::<C>(),
             }
         })?;
 
@@ -411,7 +411,7 @@ impl Mediator {
                 .query_handlers
                 .get(&tid)
                 .ok_or_else(|| HexeractError::HandlerNotFound {
-                    command_type: type_name::<Q>(),
+                    message_type: type_name::<Q>(),
                 })?;
 
         let message_id = MessageId::new();
@@ -616,7 +616,7 @@ mod tests {
             .expect_err("missing handler must fail");
         assert!(matches!(
             err,
-            HexeractError::HandlerNotFound { command_type } if command_type.ends_with("::Ping")
+            HexeractError::HandlerNotFound { message_type } if message_type.ends_with("::Ping")
         ));
     }
 
@@ -639,7 +639,7 @@ mod tests {
             .expect_err("missing handler must fail");
         assert!(matches!(
             err,
-            HexeractError::HandlerNotFound { command_type } if command_type.ends_with("::GetCount")
+            HexeractError::HandlerNotFound { message_type } if message_type.ends_with("::GetCount")
         ));
     }
 

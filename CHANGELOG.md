@@ -11,10 +11,12 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 - `hexeract-outbox-sql`: new outbox backend crate built on `sqlx`, with one compile-time backend per Cargo feature, `postgres` (default), `mysql` and `sqlite`. A shared `Dialect` centralizes statement templating, row locking and the per-engine schema DDL. The PostgreSQL schema is byte-for-byte identical to `hexeract-outbox-postgres`, so no data migration is required, and the payload stays native `JSONB`. (#110, #111)
 - `hexeract` facade: `outbox-sql-postgres`, `outbox-sql-mysql` and `outbox-sql-sqlite` features re-export the new crate as `hexeract::outbox_sql`. (#113)
 - Integration tests for the three backends, covering publish, dispatch, retry accounting, competing-consumers `FOR UPDATE SKIP LOCKED` on PostgreSQL and MySQL, and `next_retry_at` scheduling on SQLite, run by the integration workflow. (#112)
+- `hexeract-core`: `HexeractError::Cancelled { type_name }` variant and the `HexeractError::cancelled` constructor for structured cancellation reporting. (#126)
 
 ### Changed
 
 - `hexeract-bus-rabbitmq`: **breaking**. `AckMode::Auto` is replaced by two explicit modes. `AckMode::AckOnReceive` acknowledges each delivery on receive, before the handler runs (`no_ack = false`, at-most-once with prefetch back-pressure), and `AckMode::Unacknowledged` keeps the previous `no_ack = true` fire-and-forget behavior under an honest name. The old `Auto` mode silently lost messages on handler failure or crash. Migrate `AckMode::Auto` to `AckMode::Unacknowledged` for identical semantics, or to `AckMode::AckOnReceive` for explicit at-most-once. (#120)
+- `hexeract-core`: **breaking**. The `HexeractError::HandlerNotFound` field `command_type` is renamed `message_type`, since it carries the type name of commands, queries and notifications alike. `HexeractError::Dispatch(String)` is now documented as a last-resort variant; prefer the structured variants. (#126)
 
 ### Deprecated
 
