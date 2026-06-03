@@ -36,6 +36,12 @@ fn database_error(error: impl std::error::Error + Send + Sync + 'static) -> Outb
     OutboxError::Database(Box::new(error))
 }
 
+#[derive(Debug, Clone)]
+struct DeadLetterSql {
+    insert_sql: Arc<str>,
+    delete_sql: Arc<str>,
+}
+
 /// Apply the canonical Postgres outbox schema to the target database.
 ///
 /// **Intended for POCs, integration tests and local development.**
@@ -67,6 +73,7 @@ pub struct PgOutboxStore {
     poll_sql: Arc<str>,
     mark_delivered_sql: Arc<str>,
     mark_failed_sql: Arc<str>,
+    dead_letter: Option<Arc<DeadLetterSql>>,
 }
 
 impl PgOutboxStore {
@@ -91,6 +98,7 @@ impl PgOutboxStore {
             poll_sql: Arc::from(poll_sql),
             mark_delivered_sql: Arc::from(mark_delivered_sql),
             mark_failed_sql: Arc::from(mark_failed_sql),
+            dead_letter: None,
         })
     }
 
@@ -104,6 +112,27 @@ impl PgOutboxStore {
     #[must_use]
     pub fn table_name(&self) -> &str {
         &self.table_name
+    }
+
+    /// Activate dead-letter persistence for this store.
+    ///
+    /// When enabled, envelopes that exhaust `max_attempts` are atomically
+    /// moved to `dlq_table` by [`OutboxStore::mark_dead_lettered`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutboxError::Internal`] if `dlq_table` is not a valid
+    /// identifier.
+    pub fn with_dead_letter(mut self, dlq_table: impl Into<String>) -> Result<Self, OutboxError> {
+        let dlq = dlq_table.into();
+        validate_table_name(&dlq)?;
+        let insert_sql = DIALECT.insert_dead_letter_sql(&self.table_name, &dlq);
+        let delete_sql = DIALECT.delete_from_main_sql(&self.table_name);
+        self.dead_letter = Some(Arc::new(DeadLetterSql {
+            insert_sql: Arc::from(insert_sql),
+            delete_sql: Arc::from(delete_sql),
+        }));
+        Ok(self)
     }
 }
 
@@ -195,6 +224,28 @@ impl OutboxStore for PgOutboxStore {
 
     async fn commit<'a>(&self, tx: Self::Tx<'a>) -> Result<(), OutboxError> {
         tx.commit().await.map_err(database_error)
+    }
+
+    async fn mark_dead_lettered<'a>(
+        &self,
+        tx: &mut Self::Tx<'a>,
+        event_id: Uuid,
+        _error: &str,
+    ) -> Result<(), OutboxError> {
+        let Some(dlq) = &self.dead_letter else {
+            return Ok(());
+        };
+        sqlx::query(&dlq.insert_sql)
+            .bind(event_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(database_error)?;
+        sqlx::query(&dlq.delete_sql)
+            .bind(event_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(database_error)?;
+        Ok(())
     }
 }
 
@@ -291,6 +342,7 @@ impl OutboxPublisher for PgOutboxPublisher {
 pub struct PgOutboxWorkerBuilder {
     pool: PgPool,
     table_name: String,
+    dead_letter_table: Option<String>,
     handlers: HashMap<&'static str, Arc<dyn ErasedHandler>>,
     config: OutboxWorkerConfig,
 }
@@ -302,6 +354,7 @@ impl PgOutboxWorkerBuilder {
         Self {
             pool,
             table_name: DEFAULT_TABLE_NAME.to_owned(),
+            dead_letter_table: None,
             handlers: HashMap::new(),
             config: OutboxWorkerConfig::default(),
         }
@@ -311,6 +364,17 @@ impl PgOutboxWorkerBuilder {
     #[must_use]
     pub fn table_name(mut self, name: impl Into<String>) -> Self {
         self.table_name = name.into();
+        self
+    }
+
+    /// Enable dead-letter persistence for poison messages.
+    ///
+    /// Envelopes that exhaust their retry budget are atomically moved to
+    /// `dlq_table` (INSERT + DELETE in the same transaction). When not set,
+    /// exhausted envelopes are logged via `tracing::error!` but not moved.
+    #[must_use]
+    pub fn dead_letter_table(mut self, name: impl Into<String>) -> Self {
+        self.dead_letter_table = Some(name.into());
         self
     }
 
@@ -378,9 +442,29 @@ impl PgOutboxWorkerBuilder {
     /// Returns [`OutboxError::Internal`] if the configured `table_name`
     /// is not a valid identifier.
     pub fn build(self) -> Result<OutboxWorker<PgOutboxStore>, OutboxError> {
-        let store = PgOutboxStore::new(self.pool, self.table_name)?;
+        let mut store = PgOutboxStore::new(self.pool, self.table_name)?;
+        if let Some(dlq) = self.dead_letter_table {
+            store = store.with_dead_letter(dlq)?;
+        }
         Ok(OutboxWorker::new(store, self.handlers, self.config))
     }
+}
+
+/// Apply the dead-letter schema to the target Postgres database.
+///
+/// **Intended for POCs, integration tests and local development.**
+///
+/// # Errors
+///
+/// - [`OutboxError::Internal`] if `table_name` is not a valid identifier.
+/// - [`OutboxError::Database`] if the connection or the DDL statement fails.
+pub async fn ensure_dead_letter_schema(pool: &PgPool, table_name: &str) -> Result<(), OutboxError> {
+    let ddl = DIALECT.dead_letter_schema_ddl(table_name)?;
+    sqlx::raw_sql(&ddl)
+        .execute(pool)
+        .await
+        .map_err(database_error)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -513,5 +597,40 @@ mod tests {
     async fn builder_build_with_default_table_name_succeeds() {
         let worker = PgOutboxWorkerBuilder::new(lazy_pool()).build();
         assert!(worker.is_ok());
+    }
+
+    #[tokio::test]
+    async fn store_with_dead_letter_caches_sql_for_dlq() {
+        let store = PgOutboxStore::new(lazy_pool(), "audit_outbox")
+            .unwrap()
+            .with_dead_letter("audit_outbox_dead_letter")
+            .unwrap();
+        let dlq = store.dead_letter.as_ref().unwrap();
+        assert!(
+            dlq.insert_sql
+                .contains("INSERT INTO audit_outbox_dead_letter")
+        );
+        assert!(dlq.insert_sql.contains("FROM audit_outbox"));
+        assert!(dlq.insert_sql.contains("$1"));
+        assert!(dlq.delete_sql.contains("DELETE FROM audit_outbox"));
+        assert!(dlq.delete_sql.contains("$1"));
+    }
+
+    #[tokio::test]
+    async fn store_with_dead_letter_rejects_invalid_dlq_name() {
+        let err = PgOutboxStore::new(lazy_pool(), "audit_outbox")
+            .unwrap()
+            .with_dead_letter("bad name; DROP")
+            .unwrap_err();
+        assert!(matches!(err, OutboxError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn builder_dead_letter_table_propagates_to_store() {
+        let worker = PgOutboxWorkerBuilder::new(lazy_pool())
+            .dead_letter_table("audit_outbox_dead_letter")
+            .build()
+            .unwrap();
+        drop(worker);
     }
 }

@@ -47,6 +47,12 @@ fn database_error(error: impl std::error::Error + Send + Sync + 'static) -> Outb
     OutboxError::Database(Box::new(error))
 }
 
+#[derive(Debug, Clone)]
+struct DeadLetterSql {
+    insert_sql: Arc<str>,
+    delete_sql: Arc<str>,
+}
+
 /// Apply the canonical SQLite outbox schema to the target database.
 ///
 /// **Intended for POCs, integration tests and local development.**
@@ -77,6 +83,7 @@ pub struct SqliteOutboxStore {
     poll_sql: Arc<str>,
     mark_delivered_sql: Arc<str>,
     mark_failed_sql: Arc<str>,
+    dead_letter: Option<Arc<DeadLetterSql>>,
 }
 
 impl SqliteOutboxStore {
@@ -98,6 +105,7 @@ impl SqliteOutboxStore {
             poll_sql: Arc::from(poll_sql),
             mark_delivered_sql: Arc::from(mark_delivered_sql),
             mark_failed_sql: Arc::from(mark_failed_sql),
+            dead_letter: None,
         })
     }
 
@@ -111,6 +119,23 @@ impl SqliteOutboxStore {
     #[must_use]
     pub fn table_name(&self) -> &str {
         &self.table_name
+    }
+
+    /// Activate dead-letter persistence for poison messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutboxError::Internal`] if `dlq_table` is not a valid identifier.
+    pub fn with_dead_letter(mut self, dlq_table: impl Into<String>) -> Result<Self, OutboxError> {
+        let dlq = dlq_table.into();
+        validate_table_name(&dlq)?;
+        let insert_sql = DIALECT.insert_dead_letter_sql(&self.table_name, &dlq);
+        let delete_sql = DIALECT.delete_from_main_sql(&self.table_name);
+        self.dead_letter = Some(Arc::new(DeadLetterSql {
+            insert_sql: Arc::from(insert_sql),
+            delete_sql: Arc::from(delete_sql),
+        }));
+        Ok(self)
     }
 }
 
@@ -204,6 +229,28 @@ impl OutboxStore for SqliteOutboxStore {
 
     async fn commit<'a>(&self, tx: Self::Tx<'a>) -> Result<(), OutboxError> {
         tx.commit().await.map_err(database_error)
+    }
+
+    async fn mark_dead_lettered<'a>(
+        &self,
+        tx: &mut Self::Tx<'a>,
+        event_id: Uuid,
+        _error: &str,
+    ) -> Result<(), OutboxError> {
+        let Some(dlq) = &self.dead_letter else {
+            return Ok(());
+        };
+        sqlx::query(&dlq.insert_sql)
+            .bind(event_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(database_error)?;
+        sqlx::query(&dlq.delete_sql)
+            .bind(event_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(database_error)?;
+        Ok(())
     }
 }
 
@@ -302,6 +349,7 @@ impl OutboxPublisher for SqliteOutboxPublisher {
 pub struct SqliteOutboxWorkerBuilder {
     pool: SqlitePool,
     table_name: String,
+    dead_letter_table: Option<String>,
     handlers: HashMap<&'static str, Arc<dyn ErasedHandler>>,
     config: OutboxWorkerConfig,
 }
@@ -313,6 +361,7 @@ impl SqliteOutboxWorkerBuilder {
         Self {
             pool,
             table_name: DEFAULT_TABLE_NAME.to_owned(),
+            dead_letter_table: None,
             handlers: HashMap::new(),
             config: OutboxWorkerConfig::default(),
         }
@@ -322,6 +371,13 @@ impl SqliteOutboxWorkerBuilder {
     #[must_use]
     pub fn table_name(mut self, name: impl Into<String>) -> Self {
         self.table_name = name.into();
+        self
+    }
+
+    /// Enable dead-letter persistence for poison messages.
+    #[must_use]
+    pub fn dead_letter_table(mut self, name: impl Into<String>) -> Self {
+        self.dead_letter_table = Some(name.into());
         self
     }
 
@@ -389,9 +445,32 @@ impl SqliteOutboxWorkerBuilder {
     /// Returns [`OutboxError::Internal`] if the configured `table_name`
     /// is not a valid identifier.
     pub fn build(self) -> Result<OutboxWorker<SqliteOutboxStore>, OutboxError> {
-        let store = SqliteOutboxStore::new(self.pool, self.table_name)?;
+        let mut store = SqliteOutboxStore::new(self.pool, self.table_name)?;
+        if let Some(dlq) = self.dead_letter_table {
+            store = store.with_dead_letter(dlq)?;
+        }
         Ok(OutboxWorker::new(store, self.handlers, self.config))
     }
+}
+
+/// Apply the dead-letter schema to the target SQLite database.
+///
+/// **Intended for POCs, integration tests and local development.**
+///
+/// # Errors
+///
+/// - [`OutboxError::Internal`] if `table_name` is not a valid identifier.
+/// - [`OutboxError::Database`] if the connection or the DDL statement fails.
+pub async fn ensure_dead_letter_schema(
+    pool: &SqlitePool,
+    table_name: &str,
+) -> Result<(), OutboxError> {
+    let ddl = DIALECT.dead_letter_schema_ddl(table_name)?;
+    sqlx::raw_sql(&ddl)
+        .execute(pool)
+        .await
+        .map_err(database_error)?;
+    Ok(())
 }
 
 #[cfg(test)]
