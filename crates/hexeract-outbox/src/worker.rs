@@ -77,6 +77,22 @@ pub trait OutboxStore: Send + Sync + 'static {
 
     /// Commit the transaction.
     async fn commit<'a>(&self, tx: Self::Tx<'a>) -> Result<(), OutboxError>;
+
+    /// Move an envelope that has exhausted its retry budget to the dead-letter store.
+    ///
+    /// Called by the worker after [`Self::mark_failed`] when
+    /// `attempts + 1 >= max_attempts`. The default implementation is a no-op so
+    /// backends that do not persist dead-lettered envelopes need not override it.
+    /// Called within the same transaction as `mark_failed` — both succeed or both
+    /// roll back.
+    async fn mark_dead_lettered<'a>(
+        &self,
+        _tx: &mut Self::Tx<'a>,
+        _event_id: Uuid,
+        _error: &str,
+    ) -> Result<(), OutboxError> {
+        Ok(())
+    }
 }
 
 /// Type-erased handler that the worker dispatches to.
@@ -297,6 +313,17 @@ where
                     self.store
                         .mark_failed(&mut tx, envelope.event_id, &message, next_retry_at)
                         .await?;
+                    if envelope.attempts + 1 >= self.config.max_attempts {
+                        tracing::error!(
+                            event_id = %envelope.event_id,
+                            event_type = %envelope.event_type,
+                            attempts = envelope.attempts + 1,
+                            "outbox envelope exhausted retry budget, moving to dead letter"
+                        );
+                        self.store
+                            .mark_dead_lettered(&mut tx, envelope.event_id, &message)
+                            .await?;
+                    }
                 }
             }
         }
@@ -551,6 +578,7 @@ mod tests {
         pending: Arc<Mutex<Vec<OutboxEnvelope>>>,
         delivered: Arc<Mutex<Vec<Uuid>>>,
         failed: Arc<Mutex<Vec<(Uuid, String)>>>,
+        dead_lettered: Arc<Mutex<Vec<Uuid>>>,
     }
 
     impl MockStore {
@@ -559,6 +587,7 @@ mod tests {
                 pending: Arc::new(Mutex::new(initial)),
                 delivered: Arc::new(Mutex::new(Vec::new())),
                 failed: Arc::new(Mutex::new(Vec::new())),
+                dead_lettered: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -613,6 +642,16 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((event_id, error.to_owned()));
+            Ok(())
+        }
+
+        async fn mark_dead_lettered<'a>(
+            &self,
+            _tx: &mut Self::Tx<'a>,
+            event_id: Uuid,
+            _error: &str,
+        ) -> Result<(), OutboxError> {
+            self.dead_lettered.lock().unwrap().push(event_id);
             Ok(())
         }
 
@@ -706,6 +745,66 @@ mod tests {
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].0, event_id);
         assert!(failed[0].1.contains("no handler"));
+    }
+
+    #[tokio::test]
+    async fn worker_dead_letters_envelope_when_max_attempts_exhausted() {
+        let envelope = fresh_envelope(Uuid::from_u128(1));
+        let event_id = envelope.event_id;
+        let store = MockStore::new(vec![envelope]);
+
+        let handler: Arc<dyn ErasedHandler> = Arc::new(TypedHandler::new(FailingHandler));
+        let registry = registry_with(vec![handler]);
+
+        let config = OutboxWorkerConfig {
+            max_attempts: 1,
+            batch_size: 1,
+            ..OutboxWorkerConfig::default()
+        };
+        let worker = OutboxWorker::new(store.clone(), registry, config);
+        let cancel = CancellationToken::new();
+        let join = tokio::spawn(worker.run(cancel.clone()));
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        cancel.cancel();
+        join.await.unwrap().unwrap();
+
+        let failed = store.failed.lock().unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0, event_id);
+        let dead = store.dead_lettered.lock().unwrap();
+        assert_eq!(dead.as_slice(), &[event_id]);
+    }
+
+    #[tokio::test]
+    async fn worker_does_not_dead_letter_before_attempts_exhausted() {
+        let envelope = fresh_envelope(Uuid::from_u128(1));
+        let event_id = envelope.event_id;
+        let store = MockStore::new(vec![envelope]);
+
+        let handler: Arc<dyn ErasedHandler> = Arc::new(TypedHandler::new(FailingHandler));
+        let registry = registry_with(vec![handler]);
+
+        let config = OutboxWorkerConfig {
+            max_attempts: 3,
+            batch_size: 1,
+            ..OutboxWorkerConfig::default()
+        };
+        let worker = OutboxWorker::new(store.clone(), registry, config);
+        let cancel = CancellationToken::new();
+        let join = tokio::spawn(worker.run(cancel.clone()));
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        cancel.cancel();
+        join.await.unwrap().unwrap();
+
+        let failed = store.failed.lock().unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0, event_id);
+        assert!(
+            store.dead_lettered.lock().unwrap().is_empty(),
+            "should not dead-letter when attempts(1) < max_attempts(3)"
+        );
     }
 
     #[tokio::test]

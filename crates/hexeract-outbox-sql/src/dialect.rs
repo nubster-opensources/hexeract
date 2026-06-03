@@ -52,6 +52,73 @@ CREATE TABLE IF NOT EXISTS {{table}} (
 );
 ";
 
+/// Canonical PostgreSQL dead-letter schema.
+///
+/// Rows are moved here when `attempts >= max_attempts`. `exhausted_at`
+/// defaults to `NOW()` and records when the envelope was declared poison.
+/// `{{table}}` is substituted by [`Dialect::dead_letter_schema_ddl`].
+const POSTGRES_DLQ_SCHEMA_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS {{table}}_dead_letter (
+    id            BIGSERIAL    PRIMARY KEY,
+    event_id      UUID         NOT NULL UNIQUE,
+    event_type    VARCHAR(64)  NOT NULL,
+    payload       JSONB        NOT NULL,
+    subject_id    UUID         NULL,
+    created_at    TIMESTAMPTZ  NOT NULL,
+    attempts      INTEGER      NOT NULL,
+    last_error    TEXT         NOT NULL,
+    exhausted_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_{{table}}_dead_letter_event_id
+    ON {{table}}_dead_letter (event_id);
+CREATE INDEX IF NOT EXISTS idx_{{table}}_dead_letter_exhausted_at
+    ON {{table}}_dead_letter (exhausted_at);
+";
+
+/// Canonical MySQL dead-letter schema (requires MySQL 8.0.13+).
+///
+/// Mirrors the MySQL outbox schema: UUIDs as `BINARY(16)`, payload as
+/// `JSON`, timestamps as `DATETIME(6)` UTC. `{{table}}` is substituted
+/// by [`Dialect::dead_letter_schema_ddl`].
+const MYSQL_DLQ_SCHEMA_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS {{table}}_dead_letter (
+    id            BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    event_id      BINARY(16)   NOT NULL UNIQUE,
+    event_type    VARCHAR(64)  NOT NULL,
+    payload       JSON         NOT NULL,
+    subject_id    BINARY(16)   NULL,
+    created_at    DATETIME(6)  NOT NULL,
+    attempts      INT          NOT NULL,
+    last_error    TEXT         NOT NULL,
+    exhausted_at  DATETIME(6)  NOT NULL DEFAULT (UTC_TIMESTAMP(6)),
+    INDEX idx_{{table}}_dead_letter_event_id (event_id),
+    INDEX idx_{{table}}_dead_letter_exhausted_at (exhausted_at)
+);
+";
+
+/// Canonical SQLite dead-letter schema.
+///
+/// Mirrors the SQLite outbox schema: UUIDs as `BLOB`, timestamps as
+/// `TEXT` in RFC 3339 form. `{{table}}` is substituted by
+/// [`Dialect::dead_letter_schema_ddl`].
+const SQLITE_DLQ_SCHEMA_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS {{table}}_dead_letter (
+    id            INTEGER  PRIMARY KEY AUTOINCREMENT,
+    event_id      BLOB     NOT NULL UNIQUE,
+    event_type    TEXT     NOT NULL,
+    payload       TEXT     NOT NULL,
+    subject_id    BLOB,
+    created_at    TEXT     NOT NULL,
+    attempts      INTEGER  NOT NULL,
+    last_error    TEXT     NOT NULL,
+    exhausted_at  TEXT     NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_{{table}}_dead_letter_event_id
+    ON {{table}}_dead_letter (event_id);
+CREATE INDEX IF NOT EXISTS idx_{{table}}_dead_letter_exhausted_at
+    ON {{table}}_dead_letter (exhausted_at);
+";
+
 /// Canonical SQLite schema for an outbox table.
 ///
 /// SQLite has dynamic typing, so UUIDs are stored as `BLOB` and the payload
@@ -195,6 +262,51 @@ impl Dialect {
         };
         Ok(template.replace("{{table}}", table))
     }
+
+    /// Dead-letter schema DDL (table + indexes) rendered for this dialect.
+    ///
+    /// Creates a table named `{table}_dead_letter`. Envelopes are moved here
+    /// when they exhaust `max_attempts`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutboxError::Internal`] if `table` is not a valid
+    /// identifier matching `^[a-zA-Z_][a-zA-Z0-9_]*$`.
+    pub fn dead_letter_schema_ddl(self, table: &str) -> Result<String, OutboxError> {
+        validate_table_name(table)?;
+        let template = match self {
+            Self::Postgres => POSTGRES_DLQ_SCHEMA_SQL,
+            Self::MySql => MYSQL_DLQ_SCHEMA_SQL,
+            Self::Sqlite => SQLITE_DLQ_SCHEMA_SQL,
+        };
+        Ok(template.replace("{{table}}", table))
+    }
+
+    /// `INSERT INTO {dlq} (...) SELECT ... FROM {main} WHERE event_id = {p1}`.
+    ///
+    /// Copies a row from the main outbox table into the dead-letter table.
+    /// `exhausted_at` is not listed and gets its `DEFAULT` value (`NOW()` or
+    /// equivalent). Called inside the same transaction as `mark_failed`.
+    pub(crate) fn insert_dead_letter_sql(self, main: &str, dlq: &str) -> String {
+        let event_id = self.placeholder(1);
+        format!(
+            "INSERT INTO {dlq} \
+             (event_id, event_type, payload, subject_id, created_at, attempts, last_error) \
+             SELECT event_id, event_type, payload, subject_id, created_at, attempts, last_error \
+             FROM {main} \
+             WHERE event_id = {event_id}"
+        )
+    }
+
+    /// `DELETE FROM {table} WHERE event_id = {p1}`.
+    ///
+    /// Removes the row from the main outbox table after it has been copied to
+    /// the dead-letter table. Called in the same transaction as
+    /// [`Self::insert_dead_letter_sql`].
+    pub(crate) fn delete_from_main_sql(self, table: &str) -> String {
+        let event_id = self.placeholder(1);
+        format!("DELETE FROM {table} WHERE event_id = {event_id}")
+    }
 }
 
 #[cfg(test)]
@@ -329,5 +441,79 @@ mod tests {
     fn mysql_schema_ddl_defaults_created_at_to_utc() {
         let ddl = Dialect::MySql.schema_ddl("audit_outbox").unwrap();
         assert!(ddl.contains("UTC_TIMESTAMP(6)"));
+    }
+
+    #[test]
+    fn postgres_dead_letter_schema_ddl_substitutes_table_name() {
+        let ddl = Dialect::Postgres
+            .dead_letter_schema_ddl("audit_outbox")
+            .unwrap();
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS audit_outbox_dead_letter"));
+        assert!(ddl.contains("exhausted_at"));
+        assert!(ddl.contains("idx_audit_outbox_dead_letter_event_id"));
+        assert!(ddl.contains("idx_audit_outbox_dead_letter_exhausted_at"));
+        assert!(!ddl.contains("{{table}}"));
+    }
+
+    #[test]
+    fn mysql_dead_letter_schema_ddl_uses_native_types() {
+        let ddl = Dialect::MySql
+            .dead_letter_schema_ddl("audit_outbox")
+            .unwrap();
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS audit_outbox_dead_letter"));
+        assert!(ddl.contains("BINARY(16)"));
+        assert!(ddl.contains("UTC_TIMESTAMP(6)"));
+        assert!(!ddl.contains("{{table}}"));
+    }
+
+    #[test]
+    fn sqlite_dead_letter_schema_ddl_uses_portable_text_types() {
+        let ddl = Dialect::Sqlite
+            .dead_letter_schema_ddl("audit_outbox")
+            .unwrap();
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS audit_outbox_dead_letter"));
+        assert!(ddl.contains("strftime"));
+        assert!(!ddl.contains("{{table}}"));
+    }
+
+    #[test]
+    fn dead_letter_schema_ddl_rejects_invalid_table_name() {
+        let err = Dialect::Postgres
+            .dead_letter_schema_ddl("bad name; DROP")
+            .unwrap_err();
+        assert!(matches!(err, OutboxError::Internal(_)));
+    }
+
+    #[test]
+    fn postgres_insert_dead_letter_sql_selects_from_main() {
+        let sql =
+            Dialect::Postgres.insert_dead_letter_sql("audit_outbox", "audit_outbox_dead_letter");
+        assert!(sql.contains("INSERT INTO audit_outbox_dead_letter"));
+        assert!(sql.contains("SELECT"));
+        assert!(sql.contains("FROM audit_outbox"));
+        assert!(sql.contains("$1"));
+        assert!(!sql.contains("exhausted_at"));
+    }
+
+    #[test]
+    fn sqlite_insert_dead_letter_sql_uses_question_mark() {
+        let sql = Dialect::Sqlite.insert_dead_letter_sql("audit_outbox", "audit_outbox_dlq");
+        assert!(sql.contains("INSERT INTO audit_outbox_dlq"));
+        assert!(sql.contains("FROM audit_outbox"));
+        assert!(sql.contains('?'));
+    }
+
+    #[test]
+    fn postgres_delete_from_main_sql_binds_positionally() {
+        let sql = Dialect::Postgres.delete_from_main_sql("audit_outbox");
+        assert!(sql.contains("DELETE FROM audit_outbox"));
+        assert!(sql.contains("$1"));
+    }
+
+    #[test]
+    fn sqlite_delete_from_main_sql_uses_question_mark() {
+        let sql = Dialect::Sqlite.delete_from_main_sql("audit_outbox");
+        assert!(sql.contains("DELETE FROM audit_outbox"));
+        assert!(sql.contains('?'));
     }
 }
