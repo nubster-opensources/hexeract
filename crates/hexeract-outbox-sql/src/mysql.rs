@@ -239,6 +239,24 @@ impl OutboxStore for MySqlOutboxStore {
             .map_err(database_error)?;
         Ok(())
     }
+
+    async fn claim<'a>(
+        &self,
+        tx: &mut Self::Tx<'a>,
+        event_ids: &[Uuid],
+        lease_until: SystemTime,
+    ) -> Result<(), OutboxError> {
+        if event_ids.is_empty() {
+            return Ok(());
+        }
+        let sql = DIALECT.claim_sql(&self.table_name, event_ids.len());
+        let mut query = sqlx::query(&sql).bind(to_primitive_utc(lease_until));
+        for id in event_ids {
+            query = query.bind(*id);
+        }
+        query.execute(&mut **tx).await.map_err(database_error)?;
+        Ok(())
+    }
 }
 
 /// MySQL implementation of [`OutboxPublisher`] backed by `sqlx::MySqlPool`.
@@ -423,6 +441,16 @@ impl MySqlOutboxWorkerBuilder {
         self
     }
 
+    /// Override the soft-lease duration for claimed envelopes (default 30 s).
+    ///
+    /// Must exceed the worst-case handler duration to avoid spurious
+    /// re-delivery while a worker is still dispatching.
+    #[must_use]
+    pub fn dispatch_timeout(mut self, d: Duration) -> Self {
+        self.config.dispatch_timeout = d;
+        self
+    }
+
     /// Consume the builder and produce an [`OutboxWorker`] ready to spawn.
     ///
     /// # Errors
@@ -566,5 +594,23 @@ mod tests {
     async fn builder_build_with_default_table_name_succeeds() {
         let worker = MySqlOutboxWorkerBuilder::new(lazy_pool()).build();
         assert!(worker.is_ok());
+    }
+
+    #[tokio::test]
+    async fn builder_dispatch_timeout_overrides_default() {
+        let worker = MySqlOutboxWorkerBuilder::new(lazy_pool())
+            .dispatch_timeout(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        drop(worker);
+    }
+
+    #[test]
+    fn store_claim_sql_embeds_table_name_and_question_mark_placeholders() {
+        let store = MySqlOutboxStore::new(lazy_pool(), "audit_outbox").unwrap();
+        let sql = DIALECT.claim_sql(store.table_name(), 2);
+        assert!(sql.contains("UPDATE audit_outbox"));
+        assert!(sql.contains("next_retry_at = ?"));
+        assert!(sql.contains("WHERE event_id IN (?, ?)"));
     }
 }
