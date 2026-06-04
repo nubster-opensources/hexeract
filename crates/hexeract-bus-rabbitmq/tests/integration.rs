@@ -403,9 +403,10 @@ impl Handler<OrderPlaced> for PanickingHandler {
     type Error = hexeract_bus::BusError;
 
     async fn handle(&self, msg: OrderPlaced, _ctx: &HandlerContext) -> Result<(), Self::Error> {
-        if msg.order_id == Uuid::from_u128(0) {
-            panic!("deliberate panic in handler");
-        }
+        assert!(
+            msg.order_id != Uuid::from_u128(0),
+            "deliberate panic in handler"
+        );
         self.seen_after.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
