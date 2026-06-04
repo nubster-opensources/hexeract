@@ -398,6 +398,9 @@ where
             });
         };
 
+        // Stable across retries: both IDs are pinned to the envelope's
+        // immutable event_id so every dispatch attempt of the same row
+        // presents an identical context to the handler.
         let ctx = HandlerContext::new(
             MessageId::from(envelope.event_id),
             CorrelationId::from(envelope.event_id),
