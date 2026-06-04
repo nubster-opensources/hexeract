@@ -398,8 +398,14 @@ where
             });
         };
 
-        let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new())
-            .with_cancellation(cancel.clone());
+        // Stable across retries: both IDs are pinned to the envelope's
+        // immutable event_id so every dispatch attempt of the same row
+        // presents an identical context to the handler.
+        let ctx = HandlerContext::new(
+            MessageId::from(envelope.event_id),
+            CorrelationId::from(envelope.event_id),
+        )
+        .with_cancellation(cancel.clone());
 
         tracing::debug!(
             event_id = %envelope.event_id,
@@ -441,6 +447,22 @@ mod tests {
             _ctx: &HandlerContext,
         ) -> Result<(), Self::Error> {
             self.seen.lock().unwrap().push(event.user_id);
+            Ok(())
+        }
+    }
+
+    struct ContextCapturingHandler {
+        captured_ids: Arc<Mutex<Vec<MessageId>>>,
+    }
+
+    impl Handler<UserRegistered> for ContextCapturingHandler {
+        type Error = OutboxError;
+        async fn handle(
+            &self,
+            _event: UserRegistered,
+            ctx: &HandlerContext,
+        ) -> Result<(), Self::Error> {
+            self.captured_ids.lock().unwrap().push(ctx.message_id);
             Ok(())
         }
     }
@@ -963,6 +985,53 @@ mod tests {
         assert!(
             store.claimed.lock().unwrap().is_empty(),
             "claim ids must not be recorded when claim returns an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_derives_context_ids_from_event_id_stable_across_retries() {
+        let event_id = Uuid::from_u128(99);
+        let e1 = OutboxEnvelope::new(
+            event_id,
+            &UserRegistered {
+                user_id: Uuid::from_u128(1),
+            },
+        )
+        .unwrap();
+        let e2 = OutboxEnvelope::new(
+            event_id,
+            &UserRegistered {
+                user_id: Uuid::from_u128(2),
+            },
+        )
+        .unwrap();
+        let store = MockStore::new(vec![e1, e2]);
+
+        let captured_ids = Arc::new(Mutex::new(Vec::new()));
+        let handler: Arc<dyn ErasedHandler> =
+            Arc::new(TypedHandler::new(ContextCapturingHandler {
+                captured_ids: Arc::clone(&captured_ids),
+            }));
+        let registry = registry_with(vec![handler]);
+
+        let worker = OutboxWorker::new(store.clone(), registry, OutboxWorkerConfig::default());
+        let cancel = CancellationToken::new();
+        let join = tokio::spawn(worker.run(cancel.clone()));
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        cancel.cancel();
+        join.await.unwrap().unwrap();
+
+        let ids = captured_ids.lock().unwrap();
+        assert_eq!(ids.len(), 2, "both envelopes must be dispatched");
+        assert_eq!(
+            ids[0], ids[1],
+            "message_id must be identical across dispatches of the same event_id"
+        );
+        assert_eq!(
+            ids[0],
+            MessageId::from(event_id),
+            "message_id must equal MessageId::from(event_id)"
         );
     }
 
