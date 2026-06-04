@@ -247,6 +247,24 @@ impl OutboxStore for PgOutboxStore {
             .map_err(database_error)?;
         Ok(())
     }
+
+    async fn claim<'a>(
+        &self,
+        tx: &mut Self::Tx<'a>,
+        event_ids: &[Uuid],
+        lease_until: SystemTime,
+    ) -> Result<(), OutboxError> {
+        if event_ids.is_empty() {
+            return Ok(());
+        }
+        let sql = DIALECT.claim_sql(&self.table_name, event_ids.len());
+        let mut query = sqlx::query(&sql).bind(to_offset(lease_until));
+        for id in event_ids {
+            query = query.bind(*id);
+        }
+        query.execute(&mut **tx).await.map_err(database_error)?;
+        Ok(())
+    }
 }
 
 /// PostgreSQL implementation of [`OutboxPublisher`] backed by `sqlx::PgPool`.
@@ -432,6 +450,16 @@ impl PgOutboxWorkerBuilder {
     #[must_use]
     pub fn retry_delay(mut self, d: Duration) -> Self {
         self.config.retry_delay = d;
+        self
+    }
+
+    /// Override the soft-lease duration for claimed envelopes (default 30 s).
+    ///
+    /// Must exceed the worst-case handler duration to avoid spurious
+    /// re-delivery while a worker is still dispatching.
+    #[must_use]
+    pub fn dispatch_timeout(mut self, d: Duration) -> Self {
+        self.config.dispatch_timeout = d;
         self
     }
 
@@ -632,5 +660,22 @@ mod tests {
             .build()
             .unwrap();
         drop(worker);
+    }
+
+    #[tokio::test]
+    async fn builder_dispatch_timeout_overrides_default() {
+        let worker = PgOutboxWorkerBuilder::new(lazy_pool())
+            .dispatch_timeout(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        drop(worker);
+    }
+
+    #[test]
+    fn store_claim_sql_embeds_table_name_and_correct_placeholder_count() {
+        let sql = DIALECT.claim_sql("audit_outbox", 3);
+        assert!(sql.contains("UPDATE audit_outbox"));
+        assert!(sql.contains("next_retry_at = $1"));
+        assert!(sql.contains("$2, $3, $4"));
     }
 }

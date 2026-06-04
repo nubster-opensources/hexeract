@@ -4,8 +4,7 @@ use crate::validate::validate_table_name;
 
 /// Canonical PostgreSQL schema for an outbox table.
 ///
-/// Byte-for-byte identical to the schema shipped by `hexeract-outbox-postgres`,
-/// so existing deployments need no data migration. `{{table}}` is substituted
+/// `{{table}}` is substituted
 /// by [`Dialect::schema_ddl`].
 const POSTGRES_SCHEMA_SQL: &str = r"
 CREATE TABLE IF NOT EXISTS {{table}} (
@@ -307,6 +306,27 @@ impl Dialect {
         let event_id = self.placeholder(1);
         format!("DELETE FROM {table} WHERE event_id = {event_id}")
     }
+
+    /// `UPDATE {table} SET next_retry_at = {p1} WHERE event_id IN ({p2..pN+1})`.
+    ///
+    /// Sets a soft lease on the given envelopes so competing workers skip
+    /// them until the lease expires. Parameter 1 is the lease timestamp;
+    /// parameters 2 through `n + 1` are the envelope `event_id` values.
+    ///
+    /// The query is generated dynamically because the `IN` clause length
+    /// varies with the actual batch size. Call frequency is low (once per
+    /// poll cycle) so the allocation is negligible.
+    pub(crate) fn claim_sql(self, table: &str, n: usize) -> String {
+        let lease = self.placeholder(1);
+        let placeholders = (2..=n + 1)
+            .map(|i| self.placeholder(i))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "UPDATE {table} SET next_retry_at = {lease} \
+             WHERE event_id IN ({placeholders})"
+        )
+    }
 }
 
 #[cfg(test)]
@@ -515,5 +535,30 @@ mod tests {
         let sql = Dialect::Sqlite.delete_from_main_sql("audit_outbox");
         assert!(sql.contains("DELETE FROM audit_outbox"));
         assert!(sql.contains('?'));
+    }
+
+    #[test]
+    fn postgres_claim_sql_uses_positional_placeholders() {
+        let sql = Dialect::Postgres.claim_sql("audit_outbox", 3);
+        assert!(sql.contains("UPDATE audit_outbox"));
+        assert!(sql.contains("SET next_retry_at = $1"));
+        assert!(sql.contains("$2, $3, $4"));
+        assert!(sql.contains("WHERE event_id IN"));
+    }
+
+    #[test]
+    fn mysql_claim_sql_uses_question_marks() {
+        let sql = Dialect::MySql.claim_sql("audit_outbox", 2);
+        assert!(sql.contains("UPDATE audit_outbox"));
+        assert!(sql.contains("SET next_retry_at = ?"));
+        assert!(sql.contains("WHERE event_id IN (?, ?)"));
+    }
+
+    #[test]
+    fn sqlite_claim_sql_uses_question_marks() {
+        let sql = Dialect::Sqlite.claim_sql("audit_outbox", 1);
+        assert!(sql.contains("UPDATE audit_outbox"));
+        assert!(sql.contains("SET next_retry_at = ?"));
+        assert!(sql.contains("WHERE event_id IN (?)"));
     }
 }

@@ -93,6 +93,28 @@ pub trait OutboxStore: Send + Sync + 'static {
     ) -> Result<(), OutboxError> {
         Ok(())
     }
+
+    /// Advance the soft lease on a batch of envelopes by setting their
+    /// `next_retry_at` to `lease_until`.
+    ///
+    /// Called within the same transaction as [`Self::poll`], immediately
+    /// after the batch is fetched. The worker commits the transaction right
+    /// after this call so `FOR UPDATE SKIP LOCKED` row-level locks are
+    /// released promptly. Competing workers skip envelopes whose
+    /// `next_retry_at` is in the future, so the claiming worker can
+    /// dispatch outside the lock without risking concurrent re-delivery.
+    ///
+    /// The default implementation is a no-op. Single-writer backends
+    /// (e.g. SQLite) and any backend that implements its own concurrency
+    /// control do not need to override it.
+    async fn claim<'a>(
+        &self,
+        _tx: &mut Self::Tx<'a>,
+        _event_ids: &[Uuid],
+        _lease_until: SystemTime,
+    ) -> Result<(), OutboxError> {
+        Ok(())
+    }
 }
 
 /// Type-erased handler that the worker dispatches to.
@@ -186,6 +208,20 @@ pub struct OutboxWorkerConfig {
     /// [`Self::poll_interval`]). Set it to [`Duration::ZERO`] to disable
     /// pacing and restore the previous tight-loop behavior.
     pub min_cycle_delay: Duration,
+    /// Soft-lease duration for envelopes claimed by this worker.
+    ///
+    /// After polling a batch, the worker sets `next_retry_at = now +
+    /// dispatch_timeout` on every envelope and commits the transaction
+    /// immediately. This releases the `FOR UPDATE SKIP LOCKED` row-level
+    /// locks before handler dispatch begins, allowing competing workers to
+    /// make progress on other envelopes.
+    ///
+    /// If the worker crashes or is killed after claiming but before
+    /// acknowledging an envelope, the lease expires and the envelope
+    /// becomes eligible for re-dispatch. The value must therefore exceed
+    /// the worst-case handler duration to avoid spurious re-delivery under
+    /// normal operation.
+    pub dispatch_timeout: Duration,
 }
 
 impl Default for OutboxWorkerConfig {
@@ -196,6 +232,7 @@ impl Default for OutboxWorkerConfig {
             max_attempts: 5,
             retry_delay: Duration::from_secs(5),
             min_cycle_delay: Duration::from_millis(5),
+            dispatch_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -285,22 +322,38 @@ where
     }
 
     async fn poll_cycle(&self, cancel: &CancellationToken) -> Result<usize, OutboxError> {
-        let mut client = self.store.acquire().await?;
-        let mut tx = self.store.begin(&mut client).await?;
-
-        let envelopes = self
-            .store
-            .poll(&mut tx, self.config.batch_size, self.config.max_attempts)
-            .await?;
+        // Phase 1 — claim (short transaction: SQL only, no handler I/O)
+        // The FOR UPDATE SKIP LOCKED locks are held only for the SELECT +
+        // the claim UPDATE, then released at commit. Competing workers can
+        // immediately pick up other rows.
+        let envelopes = {
+            let mut client = self.store.acquire().await?;
+            let mut tx = self.store.begin(&mut client).await?;
+            let batch = self
+                .store
+                .poll(&mut tx, self.config.batch_size, self.config.max_attempts)
+                .await?;
+            if !batch.is_empty() {
+                let lease_until = SystemTime::now() + self.config.dispatch_timeout;
+                let ids: Vec<Uuid> = batch.iter().map(|e| e.event_id).collect();
+                self.store.claim(&mut tx, &ids, lease_until).await?;
+            }
+            self.store.commit(tx).await?;
+            batch
+        };
         let count = envelopes.len();
 
-        for envelope in envelopes {
+        // Phase 2 — dispatch + ack (one transaction per envelope, outside the poll lock)
+        for envelope in &envelopes {
             let next_retry_at = SystemTime::now() + self.config.retry_delay;
-            match self.dispatch(&envelope, cancel).await {
+            match self.dispatch(envelope, cancel).await {
                 Ok(()) => {
+                    let mut client = self.store.acquire().await?;
+                    let mut tx = self.store.begin(&mut client).await?;
                     self.store
                         .mark_delivered(&mut tx, envelope.event_id)
                         .await?;
+                    self.store.commit(tx).await?;
                 }
                 Err(err) => {
                     let message = err.to_string();
@@ -310,6 +363,8 @@ where
                         error = %message,
                         "outbox handler dispatch failed"
                     );
+                    let mut client = self.store.acquire().await?;
+                    let mut tx = self.store.begin(&mut client).await?;
                     self.store
                         .mark_failed(&mut tx, envelope.event_id, &message, next_retry_at)
                         .await?;
@@ -324,11 +379,11 @@ where
                             .mark_dead_lettered(&mut tx, envelope.event_id, &message)
                             .await?;
                     }
+                    self.store.commit(tx).await?;
                 }
             }
         }
 
-        self.store.commit(tx).await?;
         Ok(count)
     }
 
@@ -362,6 +417,8 @@ mod tests {
     use serde::Deserialize;
     use serde::Serialize;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
     struct UserRegistered {
@@ -453,6 +510,7 @@ mod tests {
         assert_eq!(cfg.max_attempts, 5);
         assert_eq!(cfg.retry_delay, Duration::from_secs(5));
         assert_eq!(cfg.min_cycle_delay, Duration::from_millis(5));
+        assert_eq!(cfg.dispatch_timeout, Duration::from_secs(30));
     }
 
     /// Store that records the virtual instant of the first empty poll so a
@@ -572,13 +630,15 @@ mod tests {
 
     /// `MockStore` lets us drive the worker without a real database in
     /// unit tests. Integration testing of the SQL semantics happens in
-    /// `hexeract-outbox-postgres` via testcontainers.
+    /// `hexeract-outbox-sql` via testcontainers.
     #[derive(Clone)]
     struct MockStore {
         pending: Arc<Mutex<Vec<OutboxEnvelope>>>,
         delivered: Arc<Mutex<Vec<Uuid>>>,
         failed: Arc<Mutex<Vec<(Uuid, String)>>>,
         dead_lettered: Arc<Mutex<Vec<Uuid>>>,
+        claimed: Arc<Mutex<Vec<Uuid>>>,
+        fail_claim: Arc<AtomicBool>,
     }
 
     impl MockStore {
@@ -588,6 +648,8 @@ mod tests {
                 delivered: Arc::new(Mutex::new(Vec::new())),
                 failed: Arc::new(Mutex::new(Vec::new())),
                 dead_lettered: Arc::new(Mutex::new(Vec::new())),
+                claimed: Arc::new(Mutex::new(Vec::new())),
+                fail_claim: Arc::new(AtomicBool::new(false)),
             }
         }
     }
@@ -656,6 +718,19 @@ mod tests {
         }
 
         async fn commit<'a>(&self, _tx: Self::Tx<'a>) -> Result<(), OutboxError> {
+            Ok(())
+        }
+
+        async fn claim<'a>(
+            &self,
+            _tx: &mut Self::Tx<'a>,
+            event_ids: &[Uuid],
+            _lease_until: SystemTime,
+        ) -> Result<(), OutboxError> {
+            if self.fail_claim.load(Ordering::Relaxed) {
+                return Err(OutboxError::Internal("claim failed".into()));
+            }
+            self.claimed.lock().unwrap().extend_from_slice(event_ids);
             Ok(())
         }
     }
@@ -804,6 +879,90 @@ mod tests {
         assert!(
             store.dead_lettered.lock().unwrap().is_empty(),
             "should not dead-letter when attempts(1) < max_attempts(3)"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_claims_envelopes_before_dispatch() {
+        let envelopes = vec![
+            fresh_envelope(Uuid::from_u128(1)),
+            fresh_envelope(Uuid::from_u128(2)),
+        ];
+        let expected_ids: Vec<Uuid> = envelopes.iter().map(|e| e.event_id).collect();
+        let store = MockStore::new(envelopes);
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let handler: Arc<dyn ErasedHandler> = Arc::new(TypedHandler::new(RecordingHandler {
+            seen: Arc::clone(&seen),
+        }));
+        let registry = registry_with(vec![handler]);
+
+        let worker = OutboxWorker::new(store.clone(), registry, OutboxWorkerConfig::default());
+        let cancel = CancellationToken::new();
+        let join = tokio::spawn(worker.run(cancel.clone()));
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        cancel.cancel();
+        join.await.unwrap().unwrap();
+
+        let claimed = store.claimed.lock().unwrap();
+        assert_eq!(
+            claimed.as_slice(),
+            expected_ids.as_slice(),
+            "claim must be called with all polled ids"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_does_not_claim_when_batch_is_empty() {
+        let store = MockStore::new(Vec::new());
+        let registry = HashMap::new();
+
+        let worker = OutboxWorker::new(store.clone(), registry, OutboxWorkerConfig::default());
+        let cancel = CancellationToken::new();
+        let join = tokio::spawn(worker.run(cancel.clone()));
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        cancel.cancel();
+        join.await.unwrap().unwrap();
+
+        assert!(
+            store.claimed.lock().unwrap().is_empty(),
+            "claim must not be called when no envelopes are polled"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_aborts_poll_cycle_when_claim_fails_without_dispatching() {
+        let envelope = fresh_envelope(Uuid::from_u128(1));
+        let store = MockStore::new(vec![envelope]);
+        store.fail_claim.store(true, Ordering::Relaxed);
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let handler: Arc<dyn ErasedHandler> = Arc::new(TypedHandler::new(RecordingHandler {
+            seen: Arc::clone(&seen),
+        }));
+        let registry = registry_with(vec![handler]);
+
+        let worker = OutboxWorker::new(store.clone(), registry, OutboxWorkerConfig::default());
+        let cancel = CancellationToken::new();
+        let join = tokio::spawn(worker.run(cancel.clone()));
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        cancel.cancel();
+        join.await.unwrap().unwrap();
+
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "handler must not be called when claim fails"
+        );
+        assert!(
+            store.delivered.lock().unwrap().is_empty(),
+            "envelope must not be marked delivered when claim fails"
+        );
+        assert!(
+            store.claimed.lock().unwrap().is_empty(),
+            "claim ids must not be recorded when claim returns an error"
         );
     }
 

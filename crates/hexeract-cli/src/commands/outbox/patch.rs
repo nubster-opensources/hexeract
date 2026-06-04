@@ -1,7 +1,5 @@
-#![allow(deprecated)]
-
 use clap::Args;
-use hexeract_outbox_postgres::render_schema;
+use hexeract_outbox_sql::Dialect;
 
 /// Print the canonical outbox schema SQL templated with the given table name.
 #[derive(Args, Debug)]
@@ -13,7 +11,7 @@ pub(crate) struct PatchArgs {
 
 impl PatchArgs {
     pub(crate) fn run(self) -> Result<(), Box<dyn std::error::Error>> {
-        let sql = render_schema(&self.table)?;
+        let sql = Dialect::Postgres.schema_ddl(&self.table)?;
         println!("{sql}");
         Ok(())
     }

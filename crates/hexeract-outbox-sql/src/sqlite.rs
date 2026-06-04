@@ -438,6 +438,17 @@ impl SqliteOutboxWorkerBuilder {
         self
     }
 
+    /// Override the soft-lease duration for claimed envelopes (default 30 s).
+    ///
+    /// SQLite serializes writes through a single writer, so competing workers
+    /// cannot re-pick the same envelope concurrently; this value is stored in
+    /// the config for API uniformity but has no effect on SQLite dispatch.
+    #[must_use]
+    pub fn dispatch_timeout(mut self, d: Duration) -> Self {
+        self.config.dispatch_timeout = d;
+        self
+    }
+
     /// Consume the builder and produce an [`OutboxWorker`] ready to spawn.
     ///
     /// # Errors

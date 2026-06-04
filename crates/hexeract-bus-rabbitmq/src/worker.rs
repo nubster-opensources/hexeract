@@ -150,7 +150,7 @@ impl Default for RabbitMqWorkerConfig {
 }
 
 /// Fluent builder for [`RabbitMqWorker`], symmetric with
-/// `PgOutboxWorkerBuilder` from `hexeract-outbox-postgres`.
+/// `PgOutboxWorkerBuilder` from `hexeract-outbox-sql`.
 pub struct RabbitMqWorkerBuilder {
     connection: RabbitMqConnection,
     queue: Option<String>,

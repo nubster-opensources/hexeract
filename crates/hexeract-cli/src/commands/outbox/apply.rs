@@ -1,7 +1,5 @@
-#![allow(deprecated)]
-
 use clap::Args;
-use hexeract_outbox_postgres::render_schema;
+use hexeract_outbox_sql::Dialect;
 use tokio_postgres::NoTls;
 
 /// Apply the canonical outbox schema to a target PostgreSQL database.
@@ -38,7 +36,7 @@ impl ApplyArgs {
             std::process::exit(2);
         }
 
-        let sql = render_schema(&self.table)?;
+        let sql = Dialect::Postgres.schema_ddl(&self.table)?;
 
         tracing::info!(table = %self.table, "connecting to PostgreSQL");
         let (client, connection) = tokio_postgres::connect(&self.conn, NoTls).await?;

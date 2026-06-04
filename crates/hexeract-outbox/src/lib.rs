@@ -8,7 +8,7 @@
 //! [`OutboxError`] type.
 //!
 //! Backend implementations live in companion crates such as
-//! `hexeract-outbox-postgres`.
+//! `hexeract-outbox-sql`.
 
 /// Persisted representation of an event awaiting dispatch.
 pub mod envelope;

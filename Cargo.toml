@@ -7,7 +7,6 @@ members = [
     "crates/hexeract-middleware",
     "crates/hexeract",
     "crates/hexeract-outbox",
-    "crates/hexeract-outbox-postgres",
     "crates/hexeract-outbox-sql",
     "crates/hexeract-bus",
     "crates/hexeract-bus-rabbitmq",
