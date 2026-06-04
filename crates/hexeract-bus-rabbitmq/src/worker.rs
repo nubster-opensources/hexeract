@@ -7,9 +7,12 @@
 //!
 //! See [`RabbitMqWorkerBuilder`] for the entry point.
 
+use std::any::Any;
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
+use futures_util::FutureExt;
 use futures_util::StreamExt;
 use hexeract_bus::BusError;
 use hexeract_bus::ErasedHandler;
@@ -326,6 +329,7 @@ impl RabbitMqWorker {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn dispatch(
         &self,
         channel: &Channel,
@@ -394,7 +398,18 @@ impl RabbitMqWorker {
 
         let ctx = build_handler_context(&delivery.properties);
         let outcome = match self.handlers.get(envelope.message_type.as_str()) {
-            Some(handler) => handler.handle(&envelope, &ctx).await,
+            Some(handler) => AssertUnwindSafe(handler.handle(&envelope, &ctx))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|payload| {
+                    let msg = panic_message(&payload);
+                    tracing::error!(
+                        message_type = %envelope.message_type,
+                        panic = %msg,
+                        "handler panicked; treating as delivery failure"
+                    );
+                    Err(BusError::Internal(format!("handler panicked: {msg}")))
+                }),
             None => Err(BusError::MissingHandler {
                 message_type: envelope.message_type.clone(),
             }),
@@ -627,6 +642,16 @@ pub(crate) fn build_handler_context(props: &BasicProperties) -> HandlerContext {
         .and_then(|s| Uuid::parse_str(s.as_str()).ok())
         .map_or_else(CorrelationId::new, CorrelationId::from);
     HandlerContext::new(message_id, correlation_id)
+}
+
+fn panic_message(payload: &Box<dyn Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_owned()
+    }
 }
 
 // Suppress an unused-import warning when only some helpers are used.

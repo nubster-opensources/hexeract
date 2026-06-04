@@ -395,6 +395,23 @@ impl Handler<OrderPlaced> for FailOnceHandler {
     }
 }
 
+struct PanickingHandler {
+    seen_after: Arc<AtomicUsize>,
+}
+
+impl Handler<OrderPlaced> for PanickingHandler {
+    type Error = hexeract_bus::BusError;
+
+    async fn handle(&self, msg: OrderPlaced, _ctx: &HandlerContext) -> Result<(), Self::Error> {
+        assert!(
+            msg.order_id != Uuid::from_u128(0),
+            "deliberate panic in handler"
+        );
+        self.seen_after.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 async fn start_rabbit() -> (testcontainers::ContainerAsync<RabbitMq>, String) {
     let container = RabbitMq::default()
         .start()
@@ -618,4 +635,67 @@ async fn worker_returns_ok_on_cancellation_with_idle_queue() {
         .expect("worker stops within the timeout")
         .expect("worker task joins")
         .expect("worker run returns Ok on cancellation");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn worker_continues_after_handler_panic() {
+    let (_container, uri) = start_rabbit().await;
+    let queue_name = "worker.panic";
+    declare_temporary_queue(&uri, queue_name).await;
+
+    let transport = RabbitMqTransport::new(&uri).await.unwrap();
+    // First message triggers a panic (order_id == 0).
+    transport
+        .publish(
+            queue_name,
+            &OrderPlaced {
+                order_id: Uuid::from_u128(0),
+            },
+        )
+        .await
+        .unwrap();
+    // Second message must be processed normally.
+    transport
+        .publish(
+            queue_name,
+            &OrderPlaced {
+                order_id: Uuid::from_u128(1),
+            },
+        )
+        .await
+        .unwrap();
+
+    let seen_after = Arc::new(AtomicUsize::new(0));
+    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .register_handler::<OrderPlaced, _>(PanickingHandler {
+            seen_after: Arc::clone(&seen_after),
+        })
+        .build()
+        .unwrap();
+
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
+
+    for _ in 0..60 {
+        if seen_after.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    cancel.cancel();
+    handle
+        .await
+        .expect("worker task joins")
+        .expect("worker run returns Ok");
+
+    assert_eq!(
+        seen_after.load(Ordering::SeqCst),
+        1,
+        "worker must process the second delivery after the first handler panicked"
+    );
 }
