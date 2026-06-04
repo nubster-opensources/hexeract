@@ -8,6 +8,7 @@ use deadpool_postgres::Transaction;
 use hexeract_outbox::OutboxEnvelope;
 use hexeract_outbox::OutboxError;
 use hexeract_outbox::OutboxStore;
+use tokio_postgres::types::ToSql;
 use uuid::Uuid;
 
 use crate::schema::validate_table_name;
@@ -169,6 +170,35 @@ impl OutboxStore for PgOutboxStore {
         )
         .await
         .map_err(|e| OutboxError::Database(Box::new(e)))?;
+        Ok(())
+    }
+
+    async fn claim<'a>(
+        &self,
+        tx: &mut Self::Tx<'a>,
+        event_ids: &[Uuid],
+        lease_until: SystemTime,
+    ) -> Result<(), OutboxError> {
+        if event_ids.is_empty() {
+            return Ok(());
+        }
+        let n = event_ids.len();
+        let placeholders = (2..=n + 1)
+            .map(|i| format!("${i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "UPDATE {} SET next_retry_at = $1 WHERE event_id IN ({placeholders})",
+            self.table_name
+        );
+        let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(n + 1);
+        params.push(&lease_until);
+        for id in event_ids {
+            params.push(id);
+        }
+        tx.execute(sql.as_str(), &params)
+            .await
+            .map_err(|e| OutboxError::Database(Box::new(e)))?;
         Ok(())
     }
 
