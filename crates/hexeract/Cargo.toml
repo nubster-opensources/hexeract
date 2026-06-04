@@ -24,7 +24,6 @@ hexeract-macros = { path = "../hexeract-macros", version = "0.4", optional = tru
 hexeract-mediator = { path = "../hexeract-mediator", version = "0.4", optional = true }
 hexeract-middleware = { path = "../hexeract-middleware", version = "0.4", optional = true }
 hexeract-outbox = { path = "../hexeract-outbox", version = "0.4", optional = true }
-hexeract-outbox-postgres = { path = "../hexeract-outbox-postgres", version = "0.4", optional = true }
 hexeract-outbox-sql = { path = "../hexeract-outbox-sql", version = "0.4", optional = true, default-features = false }
 
 [features]
@@ -35,9 +34,6 @@ core = ["dep:hexeract-core"]
 
 # Outbox pattern: backend-agnostic core + SQL backends.
 outbox = ["core", "dep:hexeract-outbox"]
-# Deprecated since 0.4.0: deadpool-based PostgreSQL backend. Prefer the
-# `outbox-sql-*` features below, which use the `hexeract-outbox-sql` crate.
-outbox-postgres = ["outbox", "dep:hexeract-outbox-postgres"]
 # sqlx-based backends, one Cargo feature per engine.
 outbox-sql-postgres = ["outbox", "dep:hexeract-outbox-sql", "hexeract-outbox-sql/postgres"]
 outbox-sql-mysql = ["outbox", "dep:hexeract-outbox-sql", "hexeract-outbox-sql/mysql"]

@@ -24,7 +24,7 @@ workspace = true
 hexeract-bus = { path = "../hexeract-bus", version = "0.4" }
 hexeract-bus-rabbitmq = { path = "../hexeract-bus-rabbitmq", version = "0.4" }
 hexeract-outbox = { path = "../hexeract-outbox", version = "0.4" }
-hexeract-outbox-postgres = { path = "../hexeract-outbox-postgres", version = "0.4" }
+hexeract-outbox-sql = { path = "../hexeract-outbox-sql", version = "0.4", default-features = false }
 clap = { workspace = true }
 lapin = "4"
 serde = { workspace = true }

@@ -4,8 +4,7 @@ use crate::validate::validate_table_name;
 
 /// Canonical PostgreSQL schema for an outbox table.
 ///
-/// Byte-for-byte identical to the schema shipped by `hexeract-outbox-postgres`,
-/// so existing deployments need no data migration. `{{table}}` is substituted
+/// `{{table}}` is substituted
 /// by [`Dialect::schema_ddl`].
 const POSTGRES_SCHEMA_SQL: &str = r"
 CREATE TABLE IF NOT EXISTS {{table}} (

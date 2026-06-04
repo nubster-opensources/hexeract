@@ -37,7 +37,6 @@
 //! | --- | --- | --- |
 //! | `core` | Cross-cutting primitives (`MessageId`, `CorrelationId`, `HandlerContext`) | [`hexeract_core`] |
 //! | `outbox` | Backend-agnostic outbox traits | [`hexeract_outbox`] |
-//! | `outbox-postgres` | PostgreSQL outbox backend (deprecated since 0.4.0) | [`hexeract_outbox`] + [`hexeract_outbox_postgres`] |
 //! | `outbox-sql-postgres` | PostgreSQL outbox backend via `sqlx` | [`hexeract_outbox`] + [`hexeract_outbox_sql`] |
 //! | `outbox-sql-mysql` | MySQL outbox backend via `sqlx` | [`hexeract_outbox`] + [`hexeract_outbox_sql`] |
 //! | `outbox-sql-sqlite` | SQLite outbox backend via `sqlx` | [`hexeract_outbox`] + [`hexeract_outbox_sql`] |
@@ -48,8 +47,7 @@
 //! | `macros` | `#[handler]` attribute macro for handler registration | [`hexeract_macros`] + [`hexeract_core`] |
 //!
 //! Every feature transitively enables `core`, so a downstream user
-//! who picks `outbox-postgres` automatically has access to
-//! `hexeract::core::HandlerContext`.
+//! automatically has access to `hexeract::core::HandlerContext`.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
@@ -66,14 +64,6 @@ pub use hexeract_core as core;
 #[cfg(feature = "outbox")]
 #[cfg_attr(docsrs, doc(cfg(feature = "outbox")))]
 pub use hexeract_outbox as outbox;
-
-/// PostgreSQL outbox backend (deprecated).
-///
-/// Re-export of [`hexeract_outbox_postgres`]. Deprecated since 0.4.0: prefer
-/// [`outbox_sql`] with the `outbox-sql-postgres` feature.
-#[cfg(feature = "outbox-postgres")]
-#[cfg_attr(docsrs, doc(cfg(feature = "outbox-postgres")))]
-pub use hexeract_outbox_postgres as outbox_postgres;
 
 /// SQL outbox backends for PostgreSQL, MySQL and SQLite via `sqlx`.
 ///

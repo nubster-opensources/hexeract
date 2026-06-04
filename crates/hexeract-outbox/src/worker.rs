@@ -628,7 +628,7 @@ mod tests {
 
     /// `MockStore` lets us drive the worker without a real database in
     /// unit tests. Integration testing of the SQL semantics happens in
-    /// `hexeract-outbox-postgres` via testcontainers.
+    /// `hexeract-outbox-sql` via testcontainers.
     #[derive(Clone)]
     struct MockStore {
         pending: Arc<Mutex<Vec<OutboxEnvelope>>>,
