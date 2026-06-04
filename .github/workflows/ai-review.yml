@@ -10,11 +10,11 @@ permissions:
   pull-requests: write
 
 jobs:
-  review:
+  team:
     uses: nubster-opensources/.github/.github/workflows/ai-review.yml@main
     with:
       pr-number: ${{ github.event.pull_request.number }}
-      mode: review
+      mode: team
     secrets:
       mistral-api-key: ${{ secrets.MISTRAL_API_KEY }}
 
