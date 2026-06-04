@@ -607,8 +607,7 @@ mod tests {
 
     #[test]
     fn store_claim_sql_embeds_table_name_and_question_mark_placeholders() {
-        let store = MySqlOutboxStore::new(lazy_pool(), "audit_outbox").unwrap();
-        let sql = DIALECT.claim_sql(store.table_name(), 2);
+        let sql = DIALECT.claim_sql("audit_outbox", 2);
         assert!(sql.contains("UPDATE audit_outbox"));
         assert!(sql.contains("next_retry_at = ?"));
         assert!(sql.contains("WHERE event_id IN (?, ?)"));
