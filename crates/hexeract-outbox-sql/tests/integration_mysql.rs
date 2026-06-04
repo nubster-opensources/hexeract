@@ -177,7 +177,9 @@ async fn worker_marks_failed_and_increments_attempts_on_handler_error() {
 
     let config = OutboxWorkerConfig {
         poll_interval: Duration::from_millis(20),
-        retry_delay: Duration::from_secs(60),
+        retry_base_delay: Duration::from_secs(60),
+        retry_max_delay: Duration::from_secs(60),
+        jitter: false,
         ..OutboxWorkerConfig::default()
     };
     let worker = OutboxWorker::new(store, registry_with(FailingHandler), config);

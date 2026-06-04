@@ -484,10 +484,32 @@ impl PgOutboxWorkerBuilder {
         self
     }
 
-    /// Override the constant retry delay between failed attempts (default 5 s).
+    /// Override the base delay for exponential backoff (default 1 s).
+    ///
+    /// The actual delay before attempt `n` is `min(retry_max_delay, base × 2^n)`,
+    /// optionally jittered. See [`OutboxWorkerConfig::retry_base_delay`].
     #[must_use]
-    pub fn retry_delay(mut self, d: Duration) -> Self {
-        self.config.retry_delay = d;
+    pub fn retry_base_delay(mut self, d: Duration) -> Self {
+        self.config.retry_base_delay = d;
+        self
+    }
+
+    /// Override the maximum backoff delay (default 5 min).
+    ///
+    /// Caps `retry_base_delay × 2^n` regardless of the attempt count.
+    #[must_use]
+    pub fn retry_max_delay(mut self, d: Duration) -> Self {
+        self.config.retry_max_delay = d;
+        self
+    }
+
+    /// Enable or disable full jitter on the backoff delay (default `true`).
+    ///
+    /// When `true` the worker draws a uniform random value in `[0, computed_delay]`
+    /// instead of using the deterministic exponential.
+    #[must_use]
+    pub fn jitter(mut self, enabled: bool) -> Self {
+        self.config.jitter = enabled;
         self
     }
 
