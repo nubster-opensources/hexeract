@@ -417,6 +417,8 @@ mod tests {
     use serde::Deserialize;
     use serde::Serialize;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
     struct UserRegistered {
@@ -636,6 +638,7 @@ mod tests {
         failed: Arc<Mutex<Vec<(Uuid, String)>>>,
         dead_lettered: Arc<Mutex<Vec<Uuid>>>,
         claimed: Arc<Mutex<Vec<Uuid>>>,
+        fail_claim: Arc<AtomicBool>,
     }
 
     impl MockStore {
@@ -646,6 +649,7 @@ mod tests {
                 failed: Arc::new(Mutex::new(Vec::new())),
                 dead_lettered: Arc::new(Mutex::new(Vec::new())),
                 claimed: Arc::new(Mutex::new(Vec::new())),
+                fail_claim: Arc::new(AtomicBool::new(false)),
             }
         }
     }
@@ -723,6 +727,9 @@ mod tests {
             event_ids: &[Uuid],
             _lease_until: SystemTime,
         ) -> Result<(), OutboxError> {
+            if self.fail_claim.load(Ordering::Relaxed) {
+                return Err(OutboxError::Internal("claim failed".into()));
+            }
             self.claimed.lock().unwrap().extend_from_slice(event_ids);
             Ok(())
         }
@@ -922,6 +929,40 @@ mod tests {
         assert!(
             store.claimed.lock().unwrap().is_empty(),
             "claim must not be called when no envelopes are polled"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_aborts_poll_cycle_when_claim_fails_without_dispatching() {
+        let envelope = fresh_envelope(Uuid::from_u128(1));
+        let store = MockStore::new(vec![envelope]);
+        store.fail_claim.store(true, Ordering::Relaxed);
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let handler: Arc<dyn ErasedHandler> = Arc::new(TypedHandler::new(RecordingHandler {
+            seen: Arc::clone(&seen),
+        }));
+        let registry = registry_with(vec![handler]);
+
+        let worker = OutboxWorker::new(store.clone(), registry, OutboxWorkerConfig::default());
+        let cancel = CancellationToken::new();
+        let join = tokio::spawn(worker.run(cancel.clone()));
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        cancel.cancel();
+        join.await.unwrap().unwrap();
+
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "handler must not be called when claim fails"
+        );
+        assert!(
+            store.delivered.lock().unwrap().is_empty(),
+            "envelope must not be marked delivered when claim fails"
+        );
+        assert!(
+            store.claimed.lock().unwrap().is_empty(),
+            "claim ids must not be recorded when claim returns an error"
         );
     }
 
