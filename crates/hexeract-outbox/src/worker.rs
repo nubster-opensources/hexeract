@@ -198,8 +198,27 @@ pub struct OutboxWorkerConfig {
     pub batch_size: usize,
     /// Number of attempts allowed before an envelope stops being polled.
     pub max_attempts: u32,
-    /// Constant delay added to `next_retry_at` after a failed dispatch.
-    pub retry_delay: Duration,
+    /// Base delay for the exponential backoff applied after a failed dispatch.
+    ///
+    /// The actual delay before attempt `n` is:
+    /// `min(retry_max_delay, retry_base_delay × 2^n)`
+    ///
+    /// When [`Self::jitter`] is `true` (the default), a uniform random value
+    /// in `[0, computed_delay]` is drawn instead (full-jitter strategy), which
+    /// spreads retries across the window and avoids thundering-herd spikes.
+    pub retry_base_delay: Duration,
+    /// Upper bound on the computed backoff delay.
+    ///
+    /// Caps `retry_base_delay × 2^n` so retries never wait longer than this
+    /// value regardless of the attempt count.
+    pub retry_max_delay: Duration,
+    /// Apply full jitter to the backoff delay.
+    ///
+    /// When `true` (the default), the worker draws a uniform random value in
+    /// `[0, capped_delay]` instead of using the deterministic exponential.
+    /// Set to `false` to get a predictable delay (useful in tests or
+    /// environments where all workers share the same retry schedule).
+    pub jitter: bool,
     /// Minimum delay applied between consecutive non-empty poll cycles.
     ///
     /// A full batch otherwise loops with no delay, busy-spinning the store
@@ -230,9 +249,40 @@ impl Default for OutboxWorkerConfig {
             poll_interval: Duration::from_millis(100),
             batch_size: 10,
             max_attempts: 5,
-            retry_delay: Duration::from_secs(5),
+            retry_base_delay: Duration::from_secs(1),
+            retry_max_delay: Duration::from_secs(300),
+            jitter: true,
             min_cycle_delay: Duration::from_millis(5),
             dispatch_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+impl OutboxWorkerConfig {
+    /// Compute the next retry delay for an envelope that has failed `attempts` times.
+    ///
+    /// Uses bounded exponential backoff: `min(retry_max_delay, retry_base_delay × 2^attempts)`.
+    /// When [`Self::jitter`] is `true`, returns a uniform random value in
+    /// `[0, computed_delay]` (full-jitter strategy).
+    ///
+    /// The computation is overflow-safe: `checked_shl` returns `None` when the
+    /// shift overflows, in which case the factor falls back to `u32::MAX`, and
+    /// `Duration::saturating_mul` clamps the result instead of panicking.
+    #[must_use]
+    pub fn next_retry_delay(&self, attempts: u32) -> Duration {
+        let factor = 1u32.checked_shl(attempts).unwrap_or(u32::MAX);
+        let capped = self
+            .retry_base_delay
+            .saturating_mul(factor)
+            .min(self.retry_max_delay);
+        if self.jitter {
+            let nanos = capped.as_nanos();
+            // fastrand::u128 does not exist; use two u64 draws for wide ranges,
+            // or clamp to u64::MAX nanos (~584 years) which covers all practical caps.
+            let nanos_u64 = u64::try_from(nanos).unwrap_or(u64::MAX);
+            Duration::from_nanos(fastrand::u64(0..=nanos_u64))
+        } else {
+            capped
         }
     }
 }
@@ -345,7 +395,7 @@ where
 
         // Phase 2 — dispatch + ack (one transaction per envelope, outside the poll lock)
         for envelope in &envelopes {
-            let next_retry_at = SystemTime::now() + self.config.retry_delay;
+            let next_retry_at = SystemTime::now() + self.config.next_retry_delay(envelope.attempts);
             match self.dispatch(envelope, cancel).await {
                 Ok(()) => {
                     let mut client = self.store.acquire().await?;
@@ -530,9 +580,69 @@ mod tests {
         assert_eq!(cfg.poll_interval, Duration::from_millis(100));
         assert_eq!(cfg.batch_size, 10);
         assert_eq!(cfg.max_attempts, 5);
-        assert_eq!(cfg.retry_delay, Duration::from_secs(5));
+        assert_eq!(cfg.retry_base_delay, Duration::from_secs(1));
+        assert_eq!(cfg.retry_max_delay, Duration::from_secs(300));
+        assert!(cfg.jitter);
         assert_eq!(cfg.min_cycle_delay, Duration::from_millis(5));
         assert_eq!(cfg.dispatch_timeout, Duration::from_secs(30));
+    }
+
+    fn deterministic_config(base: Duration, max: Duration) -> OutboxWorkerConfig {
+        OutboxWorkerConfig {
+            retry_base_delay: base,
+            retry_max_delay: max,
+            jitter: false,
+            ..OutboxWorkerConfig::default()
+        }
+    }
+
+    #[test]
+    fn backoff_grows_exponentially_without_jitter() {
+        let cfg = deterministic_config(Duration::from_secs(1), Duration::from_secs(300));
+        assert_eq!(cfg.next_retry_delay(0), Duration::from_secs(1));
+        assert_eq!(cfg.next_retry_delay(1), Duration::from_secs(2));
+        assert_eq!(cfg.next_retry_delay(2), Duration::from_secs(4));
+        assert_eq!(cfg.next_retry_delay(3), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn backoff_caps_at_max_delay() {
+        let cfg = deterministic_config(Duration::from_secs(1), Duration::from_secs(30));
+        assert_eq!(cfg.next_retry_delay(10), Duration::from_secs(30));
+        assert_eq!(cfg.next_retry_delay(100), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn backoff_overflow_safe_for_large_attempts() {
+        let cfg = deterministic_config(Duration::from_secs(1), Duration::from_secs(300));
+        let delay = cfg.next_retry_delay(64);
+        assert_eq!(
+            delay,
+            Duration::from_secs(300),
+            "overflow must saturate at cap"
+        );
+    }
+
+    #[test]
+    fn backoff_jitter_stays_within_bounds() {
+        let base = Duration::from_secs(1);
+        let max = Duration::from_secs(30);
+        let cfg = OutboxWorkerConfig {
+            retry_base_delay: base,
+            retry_max_delay: max,
+            jitter: true,
+            ..OutboxWorkerConfig::default()
+        };
+        for attempts in 0u32..8 {
+            let delay = cfg.next_retry_delay(attempts);
+            let cap = base
+                .saturating_mul(1u32.checked_shl(attempts).unwrap_or(u32::MAX))
+                .min(max);
+            assert!(
+                delay <= cap,
+                "attempt {attempts}: jittered delay {delay:?} must be <= cap {cap:?}"
+            );
+        }
     }
 
     /// Store that records the virtual instant of the first empty poll so a

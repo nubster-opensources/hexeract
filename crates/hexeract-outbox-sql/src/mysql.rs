@@ -472,10 +472,24 @@ impl MySqlOutboxWorkerBuilder {
         self
     }
 
-    /// Override the constant retry delay between failed attempts (default 5 s).
+    /// Override the base delay for exponential backoff (default 1 s).
     #[must_use]
-    pub fn retry_delay(mut self, d: Duration) -> Self {
-        self.config.retry_delay = d;
+    pub fn retry_base_delay(mut self, d: Duration) -> Self {
+        self.config.retry_base_delay = d;
+        self
+    }
+
+    /// Override the maximum backoff delay (default 5 min).
+    #[must_use]
+    pub fn retry_max_delay(mut self, d: Duration) -> Self {
+        self.config.retry_max_delay = d;
+        self
+    }
+
+    /// Enable or disable full jitter on the backoff delay (default `true`).
+    #[must_use]
+    pub fn jitter(mut self, enabled: bool) -> Self {
+        self.config.jitter = enabled;
         self
     }
 
