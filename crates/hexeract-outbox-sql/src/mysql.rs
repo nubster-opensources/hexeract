@@ -36,6 +36,14 @@ fn database_error(error: impl std::error::Error + Send + Sync + 'static) -> Outb
     OutboxError::Database(Box::new(error))
 }
 
+fn pool_error(error: sqlx::Error) -> OutboxError {
+    if matches!(error, sqlx::Error::PoolTimedOut) {
+        OutboxError::PoolTimeout
+    } else {
+        OutboxError::Database(Box::new(error))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DeadLetterSql {
     insert_sql: Arc<str>,
@@ -133,7 +141,7 @@ impl OutboxStore for MySqlOutboxStore {
     type Tx<'tx> = Transaction<'tx, MySql>;
 
     async fn acquire(&self) -> Result<Self::Client, OutboxError> {
-        self.pool.acquire().await.map_err(database_error)
+        self.pool.acquire().await.map_err(pool_error)
     }
 
     async fn begin<'a>(&self, client: &'a mut Self::Client) -> Result<Self::Tx<'a>, OutboxError> {
@@ -331,6 +339,36 @@ impl OutboxPublisher for MySqlOutboxPublisher {
 }
 
 /// Fluent builder for an [`OutboxWorker`] backed by [`MySqlOutboxStore`].
+///
+/// # Pool sizing and acquire timeout
+///
+/// The worker and every concurrent publisher draw connections from the same
+/// pool. To avoid indefinite blocking under pressure, configure an acquire
+/// timeout on the `MySqlPool` before passing it here:
+///
+/// ```rust,ignore
+/// use sqlx::mysql::MySqlPoolOptions;
+/// use std::time::Duration;
+///
+/// let pool = MySqlPoolOptions::new()
+///     // 1 connection for the claim cycle + 1 per concurrent publisher + 2 headroom
+///     .max_connections(batch_size + num_publishers + 2)
+///     // surface PoolTimeout instead of blocking indefinitely
+///     .acquire_timeout(Duration::from_secs(5))
+///     .connect("mysql://...")
+///     .await?;
+///
+/// let worker = MySqlOutboxWorkerBuilder::new(pool)
+///     .batch_size(batch_size)
+///     .build()?;
+/// ```
+///
+/// When `acquire_timeout` expires, [`OutboxStore::acquire`] returns
+/// [`OutboxError::PoolTimeout`] instead of hanging. The worker logs the
+/// error and retries after [`OutboxWorkerConfig::poll_interval`].
+///
+/// [`OutboxError::PoolTimeout`]: hexeract_outbox::OutboxError::PoolTimeout
+/// [`OutboxWorkerConfig::poll_interval`]: hexeract_outbox::OutboxWorkerConfig::poll_interval
 pub struct MySqlOutboxWorkerBuilder {
     pool: MySqlPool,
     table_name: String,
@@ -510,6 +548,24 @@ mod tests {
         ) -> Result<(), Self::Error> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn pool_error_maps_pool_timed_out_to_pool_timeout_variant() {
+        let err = pool_error(sqlx::Error::PoolTimedOut);
+        assert!(
+            matches!(err, OutboxError::PoolTimeout),
+            "PoolTimedOut must map to OutboxError::PoolTimeout, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn pool_error_wraps_other_errors_as_database_error() {
+        let err = pool_error(sqlx::Error::RowNotFound);
+        assert!(
+            matches!(err, OutboxError::Database(_)),
+            "non-timeout errors must map to OutboxError::Database, got {err:?}"
+        );
     }
 
     #[tokio::test]

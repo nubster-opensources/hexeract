@@ -49,6 +49,21 @@ pub enum OutboxError {
         actual: String,
     },
 
+    /// The connection pool did not yield a connection within the configured
+    /// timeout.
+    ///
+    /// This is a transient condition: the pool is under pressure but the
+    /// database itself may be healthy. The outbox worker retries automatically
+    /// after [`OutboxWorkerConfig::poll_interval`]. Application code that
+    /// observes this variant can implement back-pressure or circuit-breaking.
+    ///
+    /// To prevent indefinite blocking, configure an acquire timeout on the
+    /// pool (e.g. `sqlx::pool::PoolOptions::acquire_timeout`).
+    ///
+    /// [`OutboxWorkerConfig::poll_interval`]: crate::OutboxWorkerConfig::poll_interval
+    #[error("connection pool acquire timed out")]
+    PoolTimeout,
+
     /// An invariant of the outbox machinery was violated.
     ///
     /// Signals a bug in the framework itself, not a recoverable error.
@@ -96,5 +111,11 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains(&event_id.to_string()));
         assert!(message.contains('5'));
+    }
+
+    #[test]
+    fn pool_timeout_has_descriptive_message() {
+        let error = OutboxError::PoolTimeout;
+        assert!(error.to_string().contains("timed out"));
     }
 }
