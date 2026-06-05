@@ -9,6 +9,7 @@
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
@@ -254,10 +255,13 @@ impl RabbitMqWorkerBuilder {
 /// the AMQP `message_id` (rather than `delivery_tag`) lets the
 /// counter survive `basic_nack(requeue=true)` redeliveries, since
 /// each redelivery reuses the same `message_id` but receives a fresh
-/// `delivery_tag`. The counter is still volatile across consumer
-/// restarts, so long-lived broker queues with persistent failures
-/// should pair the worker with a broker-side dead-letter exchange
-/// policy.
+/// `delivery_tag`. The counter is evicted as soon as a `message_id`
+/// reaches a terminal outcome (handler success, dead-lettered, or
+/// dropped), even when the broker settle operation fails, so a
+/// redelivery after a failed settle restarts with a fresh attempt
+/// budget. The counter is still volatile across consumer restarts, so
+/// long-lived broker queues with persistent failures should pair the
+/// worker with a broker-side dead-letter exchange policy.
 pub struct RabbitMqWorker {
     connection: RabbitMqConnection,
     queue: String,
@@ -519,29 +523,7 @@ impl RabbitMqWorker {
         attempts: &Arc<Mutex<HashMap<Uuid, u32>>>,
         current: u32,
     ) -> DeliveryDisposition {
-        // Remove the counter unconditionally: budget is exhausted and this
-        // message_id will not be tracked further, regardless of whether the
-        // dead-letter publish succeeds or fails. Without this early removal a
-        // permanently-broken dead-letter exchange would keep the entry in the
-        // map for the lifetime of the consumer, causing growth proportional to
-        // the number of distinct messages hitting the same broken DL path.
-        attempts.lock().await.remove(&envelope.message_id);
-
-        if let Some(routing_key) = &self.config.dead_letter_routing_key {
-            let published = self
-                .publish_dead_letter(channel, delivery, envelope, routing_key)
-                .await;
-            if let Err(err) = &published {
-                tracing::error!(
-                    message_type = %envelope.message_type,
-                    message_id = %envelope.message_id,
-                    delivery_tag = delivery.delivery_tag,
-                    error = %err,
-                    "rabbitmq dead-letter publish failed; original left unacked for redelivery, consumer continues"
-                );
-                return DeliveryDisposition::LeftForRedelivery;
-            }
-        } else {
+        if self.config.dead_letter_routing_key.is_none() {
             tracing::warn!(
                 message_type = %envelope.message_type,
                 message_id = %envelope.message_id,
@@ -549,19 +531,75 @@ impl RabbitMqWorker {
                 "delivery dropped after exhausting retry budget"
             );
         }
-        let ack = channel
-            .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
-            .await
-            .map_err(|err| BusError::Transport(Box::new(err)));
-        if let Err(err) = &ack {
-            tracing::warn!(
-                message_id = %envelope.message_id,
-                delivery_tag = delivery.delivery_tag,
-                error = %err,
-                "rabbitmq ack after dead-letter failed; consumer continues, broker will redeliver"
-            );
+        Self::exhausted_core(
+            attempts.as_ref(),
+            envelope.message_id,
+            self.config
+                .dead_letter_routing_key
+                .as_deref()
+                .map(|routing_key| {
+                    move || async move {
+                        let published = self
+                            .publish_dead_letter(channel, delivery, envelope, routing_key)
+                            .await;
+                        if let Err(err) = &published {
+                            tracing::error!(
+                                message_type = %envelope.message_type,
+                                message_id = %envelope.message_id,
+                                delivery_tag = delivery.delivery_tag,
+                                error = %err,
+                                "rabbitmq dead-letter publish failed; original left unacked for redelivery, consumer continues"
+                            );
+                        }
+                        published
+                    }
+                }),
+            move || async move {
+                let ack = channel
+                    .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
+                    .await
+                    .map_err(|err| BusError::Transport(Box::new(err)));
+                if let Err(err) = &ack {
+                    tracing::warn!(
+                        message_id = %envelope.message_id,
+                        delivery_tag = delivery.delivery_tag,
+                        error = %err,
+                        "rabbitmq ack after dead-letter failed; consumer continues, broker will redeliver"
+                    );
+                }
+                ack
+            },
+        )
+        .await
+    }
+
+    /// Evict-then-settle core of the exhausted path, generic over the
+    /// broker operations so the eviction ordering is unit-testable
+    /// without a broker.
+    ///
+    /// The attempt counter is removed unconditionally before any broker
+    /// call: a failing dead-letter publish must not pin entries in the
+    /// map for the lifetime of the consumer. A `None` dead-letter means
+    /// no routing key is configured and the delivery is dropped via ack.
+    async fn exhausted_core<P, PF, A, AF>(
+        attempts: &Mutex<HashMap<Uuid, u32>>,
+        message_id: Uuid,
+        dead_letter: Option<P>,
+        ack: A,
+    ) -> DeliveryDisposition
+    where
+        P: FnOnce() -> PF,
+        PF: Future<Output = Result<(), BusError>>,
+        A: FnOnce() -> AF,
+        AF: Future<Output = Result<(), BusError>>,
+    {
+        attempts.lock().await.remove(&message_id);
+        if let Some(publish) = dead_letter {
+            if publish().await.is_err() {
+                return DeliveryDisposition::LeftForRedelivery;
+            }
         }
-        DeliveryDisposition::from_settle_result(&ack)
+        DeliveryDisposition::from_settle_result(&ack().await)
     }
 
     async fn publish_dead_letter(
@@ -667,6 +705,9 @@ fn _suppress_unused_basic_properties(_p: BasicProperties) {}
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
     use super::*;
 
     #[test]
@@ -803,49 +844,98 @@ mod tests {
         assert!(connection_result.is_err());
     }
 
+    /// A dead-letter closure type that can name `None` for the no-DL case.
+    type NoDeadLetter = fn() -> std::future::Ready<Result<(), BusError>>;
+
     #[tokio::test]
-    async fn attempts_counter_removed_when_budget_exhausted() {
-        // Invariant: handle_exhausted clears the counter for a message_id
-        // regardless of what happens to the dead-letter publish. Without this
-        // a permanently-broken DL exchange would hold entries in the map for
-        // the consumer's entire lifetime.
-        let attempts: Arc<Mutex<HashMap<Uuid, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+    async fn exhausted_core_evicts_counter_even_when_dead_letter_publish_fails() {
         let id = Uuid::from_u128(0xDEAD_BEEF);
+        let attempts = Mutex::new(HashMap::from([(id, DEFAULT_MAX_ATTEMPTS)]));
+        let ack_called = AtomicBool::new(false);
 
-        attempts.lock().await.insert(id, DEFAULT_MAX_ATTEMPTS);
-        assert_eq!(
-            attempts.lock().await.len(),
-            1,
-            "precondition: entry present"
-        );
+        let disposition = RabbitMqWorker::exhausted_core(
+            &attempts,
+            id,
+            Some(|| async { Err(BusError::Internal("dead-letter broker down".to_owned())) }),
+            || async {
+                ack_called.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
 
-        // Simulate the unconditional remove at the top of handle_exhausted.
-        attempts.lock().await.remove(&id);
-
+        assert_eq!(disposition, DeliveryDisposition::LeftForRedelivery);
         assert!(
             attempts.lock().await.is_empty(),
-            "attempt counter must be removed once the retry budget is exhausted"
+            "counter must be evicted even when the dead-letter publish fails"
+        );
+        assert!(
+            !ack_called.load(Ordering::SeqCst),
+            "delivery must stay unacked so the broker redelivers it"
         );
     }
 
     #[tokio::test]
-    async fn attempts_counter_not_leaked_across_multiple_message_ids() {
-        // Verify that distinct message_ids are tracked independently and that
-        // removing one entry does not affect others — regression guard for the
-        // per-id cleanup logic in handle_exhausted.
-        let attempts: Arc<Mutex<HashMap<Uuid, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+    async fn exhausted_core_acks_and_evicts_when_dead_letter_publish_succeeds() {
+        let id = Uuid::from_u128(0xACED);
+        let attempts = Mutex::new(HashMap::from([(id, DEFAULT_MAX_ATTEMPTS)]));
+
+        let disposition =
+            RabbitMqWorker::exhausted_core(&attempts, id, Some(|| async { Ok(()) }), || async {
+                Ok(())
+            })
+            .await;
+
+        assert_eq!(disposition, DeliveryDisposition::Settled);
+        assert!(attempts.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exhausted_core_acks_and_evicts_when_no_dead_letter_configured() {
+        let id = Uuid::from_u128(0xD0D0);
+        let attempts = Mutex::new(HashMap::from([(id, DEFAULT_MAX_ATTEMPTS)]));
+
+        let disposition =
+            RabbitMqWorker::exhausted_core(&attempts, id, None::<NoDeadLetter>, || async {
+                Ok(())
+            })
+            .await;
+
+        assert_eq!(disposition, DeliveryDisposition::Settled);
+        assert!(attempts.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exhausted_core_evicts_counter_even_when_final_ack_fails() {
+        let id = Uuid::from_u128(0xBAD_ACE);
+        let attempts = Mutex::new(HashMap::from([(id, DEFAULT_MAX_ATTEMPTS)]));
+
+        let disposition =
+            RabbitMqWorker::exhausted_core(&attempts, id, Some(|| async { Ok(()) }), || async {
+                Err(BusError::Internal("simulated basic_ack failure".to_owned()))
+            })
+            .await;
+
+        assert_eq!(disposition, DeliveryDisposition::LeftForRedelivery);
+        assert!(
+            attempts.lock().await.is_empty(),
+            "eviction must hold even when the final ack fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_core_only_evicts_the_exhausted_message_id() {
         let id_a = Uuid::from_u128(0xAAAA);
         let id_b = Uuid::from_u128(0xBBBB);
+        let attempts = Mutex::new(HashMap::from([(id_a, DEFAULT_MAX_ATTEMPTS), (id_b, 2)]));
 
-        {
-            let mut guard = attempts.lock().await;
-            guard.insert(id_a, DEFAULT_MAX_ATTEMPTS);
-            guard.insert(id_b, 2);
-        }
-        assert_eq!(attempts.lock().await.len(), 2);
+        let disposition =
+            RabbitMqWorker::exhausted_core(&attempts, id_a, None::<NoDeadLetter>, || async {
+                Ok(())
+            })
+            .await;
 
-        attempts.lock().await.remove(&id_a);
-
+        assert_eq!(disposition, DeliveryDisposition::Settled);
         let guard = attempts.lock().await;
         assert!(!guard.contains_key(&id_a), "id_a must be evicted");
         assert!(guard.contains_key(&id_b), "id_b must remain tracked");
