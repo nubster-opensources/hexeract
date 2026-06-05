@@ -103,7 +103,10 @@ impl DeliveryDisposition {
 /// The three modes trade delivery guarantees against throughput:
 ///
 /// - [`AckMode::Manual`] is at-least-once: the broker redelivers until a
-///   handler succeeds.
+///   handler succeeds. Duplicates are possible whenever a settle
+///   operation fails after its side effect took place (for example an
+///   ack failing after the retry copy reached the wait queue), so
+///   handlers must be idempotent.
 /// - [`AckMode::AckOnReceive`] is at-most-once with an explicit ack: the
 ///   delivery is acknowledged as soon as it is received, before the handler
 ///   runs, so a handler failure is not retried. A crash after the ack and
