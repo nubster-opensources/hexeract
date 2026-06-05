@@ -14,9 +14,9 @@ This document explains how the Hexeract Outbox is structured, what guarantees it
 | `OutboxStore` | `hexeract-outbox` | Backend-agnostic trait for the storage operations the worker needs: `acquire`, `begin`, `poll`, `mark_delivered`, `mark_failed`, `commit`. |
 | `ErasedHandler` + `TypedHandler<E, H>` | `hexeract-outbox` | Adapter pair that lifts a typed `Handler<E>` into a dyn-safe handler the worker keys by `event_type` at runtime. |
 | `OutboxWorker<S>` | `hexeract-outbox` | Generic worker that polls the store and dispatches envelopes to handlers. `run(cancel)` returns a boxed `Send` future the caller spawns. |
-| `PgOutboxPublisher` | `hexeract-outbox-postgres` | PostgreSQL implementation of `OutboxPublisher` backed by `deadpool_postgres`. |
-| `PgOutboxStore` | `hexeract-outbox-postgres` | PostgreSQL implementation of `OutboxStore`. |
-| `PgOutboxWorkerBuilder` | `hexeract-outbox-postgres` | Ergonomic builder that wires a pool, a typed handler registry and tuning knobs into an `OutboxWorker<PgOutboxStore>`. |
+| `PgOutboxPublisher` | `hexeract-outbox-sql` | PostgreSQL implementation of `OutboxPublisher` backed by `sqlx::PgPool`. MySQL and SQLite ship the same surface (`MySqlOutboxPublisher`, `SqliteOutboxPublisher`). |
+| `PgOutboxStore` | `hexeract-outbox-sql` | PostgreSQL implementation of `OutboxStore`. |
+| `PgOutboxWorkerBuilder` | `hexeract-outbox-sql` | Ergonomic builder that wires a pool, a typed handler registry and tuning knobs into an `OutboxWorker<PgOutboxStore>`. |
 
 ## End-to-end flow
 
@@ -93,7 +93,7 @@ Targets validated on a developer laptop against a local PostgreSQL 16 container:
 | Dispatch p99 (publish → handler call) | < 200 ms | Default `poll_interval = 100 ms`. Lower the interval (e.g. `50 ms`) to halve the upper bound at the cost of CPU. |
 | Sustained throughput | 100 events/s with default tuning | Linear with the number of workers. |
 
-A `criterion` benchmark in `crates/hexeract-outbox-postgres/benches/publish_in_tx.rs` reproduces the publish latency measurement.
+The publish latency was measured with a `criterion` benchmark against the PostgreSQL backend; the benchmark retired with the `hexeract-outbox-postgres` crate and has not yet been ported to `hexeract-outbox-sql`.
 
 ## Tuning knobs
 
@@ -101,18 +101,18 @@ A `criterion` benchmark in `crates/hexeract-outbox-postgres/benches/publish_in_t
 
 - `poll_interval` (default `100 ms`): sleep between empty polls.
 - `batch_size` (default `10`): rows per poll.
-- `max_attempts` (default `5`): excludes a row from polling once it reaches this value. Failed rows past max are observable via SQL.
-- `retry_delay` (default `5 s`): constant cooldown between attempts on a failed row.
+- `max_attempts` (default `5`): excludes a row from polling once it reaches this value. Failed rows past max are observable via SQL, or moved to the dead-letter table when one is configured.
+- `retry_base_delay` (default `1 s`) and `retry_max_delay` (default `300 s`): exponential backoff between attempts on a failed row, `min(retry_max_delay, retry_base_delay × 2^n)` with full jitter.
 
 For low-latency workloads, drop `poll_interval` to `20-50 ms` and bump `batch_size` to `25-50`. For high-volume backfills, scale horizontally with more workers, each on its own pool.
 
-## What the outbox does NOT do (in v0.1.0)
+Dead-lettering is opt-in: call `dead_letter_table("name")` on the SQL worker builders (PostgreSQL, MySQL, SQLite) to move rows past `max_attempts` into a dedicated table instead of leaving them in the outbox.
 
-- **No exponential backoff**. Retries use a fixed delay. Backoff lands in v0.5 (Reliability milestone).
-- **No dead-letter queue**. Rows past `max_attempts` stop being polled; observability is via SQL.
+## What the outbox does NOT do
+
 - **No cross-DB transaction**. The publisher commits in the caller's DB only. Handlers can talk to a different database (or any other backend) but the cross-system delivery is at-least-once.
 - **No scheduled dispatch**. The Scheduler feature lands in v0.6.
-- **No bus integration**. The Bus feature (RabbitMQ, NATS, Kafka, SQS) lands in v0.2 then v0.9.
+- **No polyglot bus brokers**. NATS, Kafka and SQS land in v0.9; RabbitMQ is available today through `hexeract-bus-rabbitmq`.
 
 ## Failure modes
 

@@ -32,7 +32,9 @@ sequenceDiagram
     alt Handler Ok
         Worker->>Broker: basic_ack(delivery_tag)
     else Handler Err & attempts < max
-        Worker->>Broker: basic_nack(delivery_tag, requeue=true)
+        Worker->>Broker: basic_publish(wait queue, payload, props)
+        Worker->>Broker: basic_ack(delivery_tag)
+        Note over Broker: Wait queue TTL expires, the broker<br/>dead-letters the message back to the queue<br/>and increments x-death
     else Handler Err & attempts == max
         Worker->>Broker: basic_publish(dead_letter_routing_key, payload, props)
         Worker->>Broker: basic_ack(delivery_tag)
@@ -50,10 +52,10 @@ flowchart TD
     ack_mode{AckMode?}
     dispatch[/Dispatch to handler/]
     handler_ok{Handler<br/>Ok?}
-    attempts{attempts<br/>< max?}
+    attempts{x-death + 1<br/>< max?}
     dlr{DLR<br/>configured?}
     ack[basic_ack]
-    nack_requeue[basic_nack<br/>requeue=true]
+    publish_wait[basic_publish<br/>to wait queue + ack]
     publish_dlr[basic_publish<br/>to DLR + ack]
     drop[ack & drop]
 
@@ -67,7 +69,8 @@ flowchart TD
     dispatch --> handler_ok
     handler_ok -- Yes --> ack
     handler_ok -- No --> attempts
-    attempts -- Yes --> nack_requeue
+    attempts -- Yes --> publish_wait
+    publish_wait -. TTL expiry, broker<br/>dead-letters back .-> delivery
     attempts -- No --> dlr
     dlr -- Yes --> publish_dlr
     dlr -- No --> drop
@@ -83,7 +86,8 @@ flowchart TD
 | Delivery decode | `worker::delivery_to_envelope` |
 | Handler context build | `worker::build_handler_context` |
 | Dispatch | `ErasedHandler::handle` (via `TypedHandler<M, H>`) |
-| Retry accounting | `HashMap<message_id, attempts>` inside `RabbitMqWorker::dispatch` |
-| DLR routing | `RabbitMqWorker::handle_manual_outcome` |
+| Retry accounting | `x-death` header read by `worker::death_count` |
+| Retry scheduling | `RabbitMqWorker::schedule_retry` (wait queue declared at startup) |
+| DLR routing | `RabbitMqWorker::handle_exhausted` |
 
-For the full retry state machine and the rationale behind keying the counter on `message_id` rather than `delivery_tag`, see the [retry policy](../concepts/retry-policy.md).
+For the full retry state machine and the durable accounting via `x-death`, see the [retry policy](../concepts/retry-policy.md).

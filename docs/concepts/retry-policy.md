@@ -1,6 +1,6 @@
 # Retry policy and dead-letter routing
 
-In `AckMode::Manual`, the `RabbitMqWorker` retries each delivery up to `max_attempts` times before routing it to a dead-letter destination or dropping it. This page explains the state machine, the rationale behind keying the retry counter on `message_id`, and the volatility caveat across consumer restarts.
+In `AckMode::Manual`, the `RabbitMqWorker` retries each delivery up to `max_attempts` times before routing it to a dead-letter destination or dropping it. Retries are delayed and counted by the broker: failed deliveries sit in a durable wait queue (`<queue>.retry`) whose TTL enforces `retry_delay`, and the attempt count travels in the broker-maintained `x-death` header. This page explains the state machine, the durable accounting, and the operational caveats.
 
 ## State machine per delivery
 
@@ -12,8 +12,8 @@ stateDiagram-v2
     Decoded --> Dispatched
     Dispatched --> Delivered: Handler Ok
     Dispatched --> Failed: Handler Err
-    Failed --> Retrying: attempts < max_attempts<br/>basic_nack(requeue=true)
-    Retrying --> Received: Broker redelivers<br/>(same message_id, new delivery_tag)
+    Failed --> Waiting: attempts < max_attempts<br/>basic_publish to wait queue<br/>basic_ack original
+    Waiting --> Received: TTL expires, broker dead-letters<br/>back to the queue<br/>(x-death count += 1)
     Failed --> Parked: attempts == max_attempts<br/>+ DLR configured<br/>basic_publish to DLR<br/>basic_ack
     Failed --> Dropped: attempts == max_attempts<br/>+ no DLR<br/>basic_ack
     Delivered --> [*]
@@ -22,41 +22,32 @@ stateDiagram-v2
     Discarded --> [*]
 ```
 
-## Why the counter is keyed on `message_id`
+## Durable accounting via `x-death`
 
-`basic_nack(requeue=true)` puts the same payload back on the queue but the broker assigns a fresh `delivery_tag` on the next delivery. A naive counter keyed on `delivery_tag` would therefore reset on every redelivery and the worker would retry forever.
-
-`hexeract-bus-rabbitmq` sidesteps the problem by keying its in-memory `HashMap<Uuid, u32>` on the AMQP `message_id` property, which the publisher mints once (UUIDv7) and the broker carries verbatim through `basic_nack(requeue=true)` redeliveries.
+Every time the broker dead-letters a message it appends or updates an entry in the `x-death` header. The wait queue is a dead-letter hop by construction (the message expires there and is routed back to the consumed queue), so the entry whose `queue` is the wait queue and whose `reason` is `expired` counts the completed retry cycles. The worker reads that count and adds one to obtain the current attempt number; nothing is stored in process memory.
 
 ```mermaid
 graph LR
     subgraph "First attempt"
-        d1[delivery_tag = 7<br/>message_id = abc] -- handler Err --> nack1[basic_nack requeue=true]
+        d1[x-death absent<br/>attempt = 1] -- handler Err --> w1[publish to wait queue + ack]
     end
     subgraph "Second attempt"
-        d2[delivery_tag = 11<br/>message_id = abc] -- handler Err --> nack2[basic_nack requeue=true]
+        d2[x-death count = 1<br/>attempt = 2] -- handler Err --> w2[publish to wait queue + ack]
     end
     subgraph "Third attempt"
-        d3[delivery_tag = 19<br/>message_id = abc] -- handler Err --> dlr[publish to DLR + ack]
+        d3[x-death count = 2<br/>attempt = 3] -- handler Err --> dlr[publish to DLR + ack]
     end
-    nack1 --> d2
-    nack2 --> d3
-
-    counter[("HashMap message_id -> attempts<br/>abc -> 1 -> 2 -> 3")]
-    d1 -.-> counter
-    d2 -.-> counter
-    d3 -.-> counter
+    w1 -. TTL expiry .-> d2
+    w2 -. TTL expiry .-> d3
 ```
 
-## Volatility caveat
+Because the count travels with the message, it survives worker restarts and is shared by every consumer of the queue: a poison message restarted mid-retry resumes at its real attempt number instead of getting a fresh budget.
 
-The counter lives in memory. If the consumer process restarts mid-retry, the counter resets to zero on the next delivery for that `message_id`. Three concrete consequences:
+## Operational caveats
 
-1. A pathological message that always fails can survive the `max_attempts` budget across restarts and keep being retried.
-2. The actual number of attempts observed by an external system can exceed `max_attempts` if you restart the consumer often.
-3. The exact `attempts == max_attempts` boundary is a per-process counter, not a global counter.
-
-For workloads that need durable retry accounting, pair the worker with a broker-side dead-letter exchange (DLX) policy. RabbitMQ DLX moves a message to a target exchange after a configurable redelivery limit, and the limit is enforced by the broker rather than by the consumer.
+1. **Wait queue arguments are frozen at declare time.** The TTL is baked into the `<queue>.retry` arguments, so changing `retry_delay` for an existing wait queue makes the declaration fail with a broker precondition error. Delete the wait queue first (or keep the delay stable per queue).
+2. **Duplicates are possible.** If the ack of the original fails after the retry copy reached the wait queue, the broker redelivers the original and both copies eventually run. This is inherent to at-least-once delivery; handlers must be idempotent.
+3. **The delay is uniform per queue.** Every retry of every message on a given queue waits the same `retry_delay`; per-message TTLs are deliberately avoided because RabbitMQ only expires the head of a queue (head-of-line blocking).
 
 ## Dead-letter routing key
 
@@ -75,6 +66,6 @@ When the routing key is not configured, exhausted deliveries are silently droppe
 
 ## Roadmap notes
 
-- **Exponential backoff** between retries lands in v0.5.0 (`Reliability` milestone). Today every redelivery is immediate.
-- **Persistent retry counters** are out of scope for v0.2.0; the broker-side DLX is the recommended workaround.
-- **Per-handler retry policies** (different `max_attempts` per message type) land in v0.5.0.
+- **Delayed retries and persistent counters** shipped with the wait-queue mechanism described above (`Reliability` milestone).
+- **Exponential backoff tiers** (multiple wait queues with increasing TTLs) are a possible extension; today the delay is a single fixed `retry_delay` per queue.
+- **Per-handler retry policies** (different `max_attempts` per message type) are tracked in the `Reliability` milestone.

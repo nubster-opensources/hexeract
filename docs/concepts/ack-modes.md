@@ -4,46 +4,45 @@ The `RabbitMqWorker` reacts to handler outcomes differently depending on the [`A
 
 | Variant | Consumer flag | Ack timing | Handler failure | Guarantee |
 | --- | --- | --- | --- | --- |
-| `AckMode::Manual` (default) | `no_ack = false` | After handler `Ok` | `basic_nack(requeue=true)` up to `max_attempts`, then DLR or drop | At-least-once |
+| `AckMode::Manual` (default) | `no_ack = false` | After handler `Ok` | Republished to the wait queue, redelivered after `retry_delay`, up to `max_attempts`, then DLR or drop | At-least-once |
 | `AckMode::AckOnReceive` | `no_ack = false` | On receive, before handler | Logged via `tracing::warn`, never retried | At-most-once |
 | `AckMode::Unacknowledged` | `no_ack = true` | None (broker removes on send) | Logged via `tracing::warn`, never retried | Fire-and-forget (lossy) |
 
-## Manual: ack on success, nack on failure
+## Manual: ack on success, delayed retry on failure
 
-In `AckMode::Manual`, the broker keeps the delivery until the worker sends an explicit `basic_ack` or `basic_nack`. The worker keeps an in-memory `HashMap<message_id, attempts>` to track redeliveries.
+In `AckMode::Manual`, the broker keeps the delivery until the worker settles it. On handler failure the worker republishes the delivery to a durable wait queue (`<queue>.retry`, declared by the worker at startup) and acks the original. The wait queue carries a per-queue TTL equal to `retry_delay` and a dead-letter route back to the consumed queue, so the broker redelivers the message after the delay and increments the `x-death` header that the worker reads as the attempt count.
 
 ```mermaid
 sequenceDiagram
     autonumber
+    participant WaitQ as Wait queue<br/>(<queue>.retry, TTL)
     participant Broker
     participant Worker as RabbitMqWorker
     participant Handler
-    participant Counter as attempts<br/>HashMap<message_id, u32>
 
     Broker->>Worker: Delivery (no_ack=false)
     Worker->>Handler: handle(envelope, ctx)
 
     alt Handler Ok
         Handler-->>Worker: Ok(())
-        Worker->>Counter: remove(message_id)
         Worker->>Broker: basic_ack(delivery_tag)
     else Handler Err
         Handler-->>Worker: Err(_)
-        Worker->>Counter: counter += 1
-        alt counter < max_attempts
-            Worker->>Broker: basic_nack(delivery_tag, requeue=true)
-            Note over Broker: Same message_id, new delivery_tag
-        else counter == max_attempts
+        Note over Worker: attempts = x-death count + 1
+        alt attempts < max_attempts
+            Worker->>WaitQ: basic_publish(payload, props)
+            Worker->>Broker: basic_ack(delivery_tag)
+            Note over WaitQ,Broker: TTL expires, the broker dead-letters<br/>the message back to the queue<br/>and increments x-death
+        else attempts == max_attempts
             opt dead_letter_routing_key set
                 Worker->>Broker: basic_publish("", DLR, props, payload)
             end
-            Worker->>Counter: remove(message_id)
             Worker->>Broker: basic_ack(delivery_tag)
         end
     end
 ```
 
-The counter is keyed on the AMQP `message_id` so it survives across redeliveries (which mint a fresh `delivery_tag` each time the broker hands the message back). See the [retry policy](retry-policy.md) for the full state machine and the volatility caveat across consumer restarts.
+The attempt count travels with the message in the broker-maintained `x-death` header instead of living in process memory, so it survives worker restarts and is shared by every consumer of the queue. See the [retry policy](retry-policy.md) for the full state machine and operational caveats.
 
 ## AckOnReceive: explicit at-most-once
 
