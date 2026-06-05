@@ -16,23 +16,24 @@ Hexeract is sponsored by [Nubster](https://nubster.com).
 
 ## Status
 
-🚀 **v0.3.0: Mediator, middlewares and `#[handler]` macro shipped.** The in-process mediator dispatches commands, queries and notifications through a type-safe, reflection-free registry. Two built-in middlewares (`TracingMiddleware`, `TimeoutMiddleware`) cover observability and dispatch deadlines. The `#[handler]` attribute proc-macro generates trait implementations and emits link-time metadata for `MediatorBuilder::verify_handlers()` to catch missing registrations in CI. Outbox MVP and Bus RabbitMQ remain stable from v0.1.0 and v0.2.0.
+🚀 **v0.4.0: multi-database outbox shipped.** The transactional outbox now runs on PostgreSQL, MySQL and SQLite through a single `sqlx`-backed crate (`hexeract-outbox-sql`), with per-dialect DDL and identical semantics across backends. `hexeract-outbox-postgres` is deprecated in favour of the new backend. Mediator, middlewares, the `#[handler]` macro and Bus RabbitMQ remain stable from v0.3.0.
 
-| Feature | v0.1.0 | v0.2.0 | v0.3.0 |
-| --- | --- | --- | --- |
-| Transactional outbox (PostgreSQL) | ✅ | ✅ | ✅ |
-| Worker poll loop with `SKIP LOCKED` | ✅ | ✅ | ✅ |
-| Fluent builder API | ✅ | ✅ | ✅ |
-| `hexeract outbox` CLI | ✅ | ✅ | ✅ |
-| Bus core (`Message`, `BusEnvelope`, `Transport`, `Handler<M>`) | ⏳ | ✅ | ✅ |
-| RabbitMQ backend (`lapin` connection pool, publish, consume, retry) | ⏳ | ✅ | ✅ |
-| Topology types (`Exchange`, `Queue`, `Binding`, `RoutingKey`) | ⏳ | ✅ | ✅ |
-| `hexeract bus declare / peek / purge` CLI | ⏳ | ✅ | ✅ |
-| In-process CQRS mediator (`send`, `query`, `publish`) | ⏳ | ⏳ | ✅ |
-| Built-in `TracingMiddleware` and `TimeoutMiddleware` | ⏳ | ⏳ | ✅ |
-| `#[handler]` attribute macro with `verify_handlers()` | ⏳ | ⏳ | ✅ |
-| Polyglot bus (NATS, Kafka, SQS) | ⏳ v0.9.0 | ⏳ v0.9.0 | ⏳ v0.9.0 |
-| Sagas, Scheduler, Request and Reply | ⏳ later | ⏳ later | ⏳ later |
+| Feature | v0.1.0 | v0.2.0 | v0.3.0 | v0.4.0 |
+| --- | --- | --- | --- | --- |
+| Transactional outbox (PostgreSQL) | ✅ | ✅ | ✅ | ✅ |
+| Worker poll loop with `SKIP LOCKED` | ✅ | ✅ | ✅ | ✅ |
+| Fluent builder API | ✅ | ✅ | ✅ | ✅ |
+| `hexeract outbox` CLI | ✅ | ✅ | ✅ | ✅ |
+| Bus core (`Message`, `BusEnvelope`, `Transport`, `Handler<M>`) | ⏳ | ✅ | ✅ | ✅ |
+| RabbitMQ backend (`lapin` connection pool, publish, consume, retry) | ⏳ | ✅ | ✅ | ✅ |
+| Topology types (`Exchange`, `Queue`, `Binding`, `RoutingKey`) | ⏳ | ✅ | ✅ | ✅ |
+| `hexeract bus declare / peek / purge` CLI | ⏳ | ✅ | ✅ | ✅ |
+| In-process CQRS mediator (`send`, `query`, `publish`) | ⏳ | ⏳ | ✅ | ✅ |
+| Built-in `TracingMiddleware` and `TimeoutMiddleware` | ⏳ | ⏳ | ✅ | ✅ |
+| `#[handler]` attribute macro with `verify_handlers()` | ⏳ | ⏳ | ✅ | ✅ |
+| Multi-database outbox (`hexeract-outbox-sql`: PostgreSQL, MySQL, SQLite) | ⏳ | ⏳ | ⏳ | ✅ |
+| Polyglot bus (NATS, Kafka, SQS) | ⏳ v0.9.0 | ⏳ v0.9.0 | ⏳ v0.9.0 | ⏳ v0.9.0 |
+| Sagas, Scheduler, Request and Reply | ⏳ later | ⏳ later | ⏳ later | ⏳ later |
 
 See the [CHANGELOG](./CHANGELOG.md) for the detailed history.
 
@@ -40,14 +41,14 @@ See the [CHANGELOG](./CHANGELOG.md) for the detailed history.
 
 ### Outbox (PostgreSQL)
 
-Add the umbrella crate with the `outbox-postgres` feature to your `Cargo.toml`:
+Add the umbrella crate with the `outbox-sql-postgres` feature to your `Cargo.toml` (`outbox-sql-mysql` and `outbox-sql-sqlite` ship the same surface):
 
 ```toml
 [dependencies]
-hexeract = { version = "0.3", features = ["outbox-postgres"] }
+hexeract = { version = "0.4", features = ["outbox-sql-postgres"] }
 ```
 
-> Power users who prefer a strict SemVer per crate can keep depending on `hexeract-outbox`, `hexeract-outbox-postgres`, `hexeract-bus`, `hexeract-bus-rabbitmq` etc. directly.
+> Power users who prefer a strict SemVer per crate can keep depending on `hexeract-outbox`, `hexeract-outbox-sql`, `hexeract-bus`, `hexeract-bus-rabbitmq` etc. directly.
 
 Declare a domain event, a handler and wire a worker:
 
@@ -55,7 +56,7 @@ Declare a domain event, a handler and wire a worker:
 use std::time::Duration;
 use hexeract::core::HandlerContext;
 use hexeract::outbox::{Event, Handler, OutboxError, OutboxPublisher};
-use hexeract::outbox_postgres::{PgOutboxPublisher, PgOutboxWorkerBuilder};
+use hexeract::outbox_sql::{PgOutboxPublisher, PgOutboxWorkerBuilder};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -76,7 +77,7 @@ impl Handler<UserRegistered> for AuditWriter {
     }
 }
 
-# async fn run(pool: deadpool_postgres::Pool) -> Result<(), Box<dyn std::error::Error>> {
+# async fn run(pool: sqlx::PgPool) -> Result<(), Box<dyn std::error::Error>> {
 let publisher = PgOutboxPublisher::new(pool.clone(), "audit_outbox")?;
 
 let worker = PgOutboxWorkerBuilder::new(pool.clone())
@@ -89,8 +90,7 @@ let cancel = CancellationToken::new();
 let join = tokio::spawn(worker.run(cancel.clone()));
 
 // inside a business use case:
-let mut client = pool.get().await?;
-let mut tx = client.transaction().await?;
+let mut tx = pool.begin().await?;
 let event_id = publisher.publish_in_tx(&mut tx, &UserRegistered { user_id: Uuid::new_v4() }).await?;
 tx.commit().await?;
 println!("published event {event_id}");
@@ -100,7 +100,7 @@ join.await??;
 # Ok(()) }
 ```
 
-See [`docs/tutorial/getting-started.md`](./docs/tutorial/getting-started.md) and the runnable [`examples/`](./crates/hexeract-outbox-postgres/examples/) for the full integration walkthrough.
+See [`docs/tutorial/getting-started.md`](./docs/tutorial/getting-started.md) for the full integration walkthrough.
 
 ### Bus (RabbitMQ)
 
@@ -108,7 +108,7 @@ Add the umbrella crate with the `bus-rabbitmq` feature to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-hexeract = { version = "0.3", features = ["bus-rabbitmq"] }
+hexeract = { version = "0.4", features = ["bus-rabbitmq"] }
 ```
 
 Declare a domain message, a handler and wire a publisher plus a worker:
