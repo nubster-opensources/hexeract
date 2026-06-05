@@ -395,6 +395,31 @@ impl Handler<OrderPlaced> for FailOnceHandler {
     }
 }
 
+#[derive(Debug)]
+struct TimestampingFailingHandler {
+    attempts: Arc<AtomicUsize>,
+    seen_at: Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+}
+
+impl Handler<OrderPlaced> for TimestampingFailingHandler {
+    type Error = hexeract_bus::BusError;
+
+    async fn handle(
+        &self,
+        _message: OrderPlaced,
+        _ctx: &HandlerContext,
+    ) -> Result<(), Self::Error> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        self.seen_at
+            .lock()
+            .expect("timestamp mutex must not be poisoned")
+            .push(std::time::Instant::now());
+        Err(hexeract_bus::BusError::Internal(
+            "deliberate poison".to_owned(),
+        ))
+    }
+}
+
 struct PanickingHandler {
     seen_after: Arc<AtomicUsize>,
 }
@@ -522,6 +547,7 @@ async fn worker_retries_on_failure_then_succeeds() {
     let worker = RabbitMqWorkerBuilder::new(consumer_conn)
         .queue(queue_name)
         .max_attempts(5)
+        .retry_delay(Duration::from_millis(200))
         .register_handler::<OrderPlaced, _>(FailOnceHandler {
             attempts: Arc::clone(&attempts),
         })
@@ -569,6 +595,7 @@ async fn worker_routes_to_dead_letter_after_exhausting_attempts() {
     let worker = RabbitMqWorkerBuilder::new(consumer_conn)
         .queue(queue_name)
         .max_attempts(2)
+        .retry_delay(Duration::from_millis(200))
         .dead_letter_routing_key(dlr_queue)
         .register_handler::<OrderPlaced, _>(AlwaysFailingHandler {
             attempts: Arc::clone(&attempts),
@@ -698,4 +725,120 @@ async fn worker_continues_after_handler_panic() {
         1,
         "worker must process the second delivery after the first handler panicked"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn worker_delays_retries_and_retry_count_survives_restart() {
+    let (_container, uri) = start_rabbit().await;
+    let queue_name = "worker.poison";
+    let dlr_queue = "worker.poison.parked";
+    let retry_delay = Duration::from_millis(300);
+    declare_temporary_queue(&uri, queue_name).await;
+    declare_temporary_queue(&uri, dlr_queue).await;
+
+    let transport = RabbitMqTransport::new(&uri).await.unwrap();
+    transport
+        .publish(
+            queue_name,
+            &OrderPlaced {
+                order_id: Uuid::from_u128(4),
+            },
+        )
+        .await
+        .unwrap();
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let seen_at = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    // First worker instance: two failing attempts, spaced by the wait
+    // queue TTL rather than redelivered in a tight loop.
+    let first_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let first_worker = RabbitMqWorkerBuilder::new(first_conn)
+        .queue(queue_name)
+        .max_attempts(3)
+        .retry_delay(retry_delay)
+        .dead_letter_routing_key(dlr_queue)
+        .register_handler::<OrderPlaced, _>(TimestampingFailingHandler {
+            attempts: Arc::clone(&attempts),
+            seen_at: Arc::clone(&seen_at),
+        })
+        .build()
+        .unwrap();
+    let first_cancel = CancellationToken::new();
+    let first_cancel_for_task = first_cancel.clone();
+    let first_handle = tokio::spawn(async move { first_worker.run(first_cancel_for_task).await });
+
+    for _ in 0..80 {
+        if attempts.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "first worker must have seen exactly two attempts"
+    );
+    {
+        let timestamps = seen_at.lock().expect("timestamp mutex");
+        let gap = timestamps[1].duration_since(timestamps[0]);
+        assert!(
+            gap >= retry_delay - Duration::from_millis(50),
+            "retries must be delayed by the wait queue TTL, got {gap:?}"
+        );
+    }
+
+    // Restart: drop the first worker while the delivery sits in the
+    // wait queue, then consume with a fresh instance. The retry count
+    // travels in the broker-maintained x-death header, so the third
+    // attempt must exhaust the budget instead of starting over.
+    first_cancel.cancel();
+    first_handle.await.unwrap().unwrap();
+
+    let second_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let second_worker = RabbitMqWorkerBuilder::new(second_conn)
+        .queue(queue_name)
+        .max_attempts(3)
+        .retry_delay(retry_delay)
+        .dead_letter_routing_key(dlr_queue)
+        .register_handler::<OrderPlaced, _>(TimestampingFailingHandler {
+            attempts: Arc::clone(&attempts),
+            seen_at: Arc::clone(&seen_at),
+        })
+        .build()
+        .unwrap();
+    let second_cancel = CancellationToken::new();
+    let second_cancel_for_task = second_cancel.clone();
+    let second_handle =
+        tokio::spawn(async move { second_worker.run(second_cancel_for_task).await });
+
+    let probe = Connection::connect(&uri, ConnectionProperties::default())
+        .await
+        .unwrap();
+    let probe_channel = probe.create_channel().await.unwrap();
+    let mut parked = None;
+    for _ in 0..80 {
+        let candidate = probe_channel
+            .basic_get(dlr_queue.into(), BasicGetOptions::default())
+            .await
+            .unwrap();
+        if candidate.is_some() {
+            parked = candidate;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        parked.is_some(),
+        "the poison message must reach the dead-letter queue after the restart"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        3,
+        "the restarted worker must continue the count at attempt 3, not restart from 1"
+    );
+
+    second_cancel.cancel();
+    second_handle.await.unwrap().unwrap();
 }

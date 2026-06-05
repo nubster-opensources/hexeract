@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::FutureExt;
 use futures_util::StreamExt;
@@ -31,9 +32,10 @@ use lapin::options::BasicConsumeOptions;
 use lapin::options::BasicNackOptions;
 use lapin::options::BasicPublishOptions;
 use lapin::options::BasicQosOptions;
+use lapin::options::QueueDeclareOptions;
+use lapin::types::AMQPValue;
 use lapin::types::FieldTable;
 use lapin::types::ShortString;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -44,6 +46,13 @@ pub const DEFAULT_PREFETCH: u16 = 16;
 
 /// Default per-delivery max attempts before giving up.
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
+
+/// Suffix appended to the consumed queue name to form the wait queue
+/// that holds failed deliveries until their retry delay expires.
+pub const RETRY_QUEUE_SUFFIX: &str = ".retry";
+
+/// Default broker-side delay before a failed delivery is retried.
+pub const DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// Decision taken after an attempt to settle a delivery with the broker.
 ///
@@ -105,10 +114,11 @@ impl DeliveryDisposition {
 ///   message. Use only when loss is acceptable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AckMode {
-    /// Ack only when the handler returns `Ok`. Handler failures
-    /// trigger [`basic_nack`] with `requeue=true` up to
-    /// `max_attempts`, then route to the dead-letter routing key if
-    /// configured or drop the delivery otherwise. At-least-once.
+    /// Ack only when the handler returns `Ok`. Handler failures are
+    /// republished to the wait queue and retried after
+    /// [`RabbitMqWorkerConfig::retry_delay`], up to `max_attempts`,
+    /// then routed to the dead-letter routing key if configured or
+    /// dropped otherwise. At-least-once.
     Manual,
     /// Acknowledge each delivery explicitly as soon as it is received,
     /// before the handler runs (`no_ack` is not set). Handler failures are
@@ -140,6 +150,12 @@ pub struct RabbitMqWorkerConfig {
     /// deliveries which exhausted their retry budget. `None` drops
     /// exhausted deliveries silently.
     pub dead_letter_routing_key: Option<String>,
+    /// Broker-side delay between retries, enforced by the TTL of the
+    /// wait queue declared by the worker. The TTL is baked into the
+    /// queue arguments at declare time, so changing this value for an
+    /// existing wait queue makes the declaration fail with a broker
+    /// precondition error: delete the `<queue>.retry` queue first.
+    pub retry_delay: Duration,
 }
 
 impl Default for RabbitMqWorkerConfig {
@@ -149,6 +165,7 @@ impl Default for RabbitMqWorkerConfig {
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             prefetch: DEFAULT_PREFETCH,
             dead_letter_routing_key: None,
+            retry_delay: DEFAULT_RETRY_DELAY,
         }
     }
 }
@@ -224,6 +241,16 @@ impl RabbitMqWorkerBuilder {
         self
     }
 
+    /// Override the broker-side retry delay (default [`DEFAULT_RETRY_DELAY`]).
+    ///
+    /// See [`RabbitMqWorkerConfig::retry_delay`] for the constraint on
+    /// changing the delay of an already-declared wait queue.
+    #[must_use]
+    pub fn retry_delay(mut self, delay: Duration) -> Self {
+        self.config.retry_delay = delay;
+        self
+    }
+
     /// Build the worker.
     ///
     /// # Errors
@@ -248,20 +275,16 @@ impl RabbitMqWorkerBuilder {
 /// Built through [`RabbitMqWorkerBuilder`]. [`Self::run`] drives the
 /// consume loop until the supplied [`CancellationToken`] fires.
 ///
-/// # Retry counter
+/// # Retry flow
 ///
-/// In [`AckMode::Manual`], the worker keeps an in-memory
-/// `HashMap<message_id, attempts>` per consumer instance. Keying on
-/// the AMQP `message_id` (rather than `delivery_tag`) lets the
-/// counter survive `basic_nack(requeue=true)` redeliveries, since
-/// each redelivery reuses the same `message_id` but receives a fresh
-/// `delivery_tag`. The counter is evicted as soon as a `message_id`
-/// reaches a terminal outcome (handler success, dead-lettered, or
-/// dropped), even when the broker settle operation fails, so a
-/// redelivery after a failed settle restarts with a fresh attempt
-/// budget. The counter is still volatile across consumer restarts, so
-/// long-lived broker queues with persistent failures should pair the
-/// worker with a broker-side dead-letter exchange policy.
+/// In [`AckMode::Manual`], a failed delivery is republished to a
+/// durable wait queue (`<queue>.retry`, declared by the worker at
+/// startup) whose per-queue TTL enforces [`RabbitMqWorkerConfig::retry_delay`]
+/// and whose dead-letter route points back at the consumed queue. The
+/// retry count is read from the broker-maintained `x-death` header,
+/// so it survives worker restarts and never lives in process memory.
+/// Once the count reaches `max_attempts` the delivery is routed to
+/// the configured dead-letter routing key, or dropped.
 pub struct RabbitMqWorker {
     connection: RabbitMqConnection,
     queue: String,
@@ -292,6 +315,9 @@ impl RabbitMqWorker {
             .basic_qos(self.config.prefetch, BasicQosOptions::default())
             .await
             .map_err(|err| BusError::Transport(Box::new(err)))?;
+        if matches!(self.config.ack_mode, AckMode::Manual) {
+            Self::declare_retry_queue(&channel, &self.queue, self.config.retry_delay).await?;
+        }
         let no_ack = matches!(self.config.ack_mode, AckMode::Unacknowledged);
         let mut consumer = channel
             .basic_consume(
@@ -306,8 +332,6 @@ impl RabbitMqWorker {
             .await
             .map_err(|err| BusError::Transport(Box::new(err)))?;
 
-        let attempts: Arc<Mutex<HashMap<Uuid, u32>>> = Arc::new(Mutex::new(HashMap::new()));
-
         loop {
             tokio::select! {
                 () = cancel.cancelled() => {
@@ -318,7 +342,7 @@ impl RabbitMqWorker {
                     let Some(item) = next else { break; };
                     match item {
                         Ok(delivery) => {
-                            let disposition = self.dispatch(&channel, delivery, &attempts).await;
+                            let disposition = self.dispatch(&channel, delivery).await;
                             if !disposition.keep_running() {
                                 break;
                             }
@@ -334,12 +358,7 @@ impl RabbitMqWorker {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn dispatch(
-        &self,
-        channel: &Channel,
-        delivery: Delivery,
-        attempts: &Arc<Mutex<HashMap<Uuid, u32>>>,
-    ) -> DeliveryDisposition {
+    async fn dispatch(&self, channel: &Channel, delivery: Delivery) -> DeliveryDisposition {
         let envelope = match delivery_to_envelope(&delivery.properties, &delivery.data) {
             Ok(env) => env,
             Err(err) => {
@@ -421,7 +440,7 @@ impl RabbitMqWorker {
 
         match self.config.ack_mode {
             AckMode::Manual => {
-                self.handle_manual_outcome(channel, &delivery, &envelope, outcome, attempts)
+                self.handle_manual_outcome(channel, &delivery, &envelope, outcome)
                     .await
             }
             AckMode::AckOnReceive => {
@@ -453,11 +472,9 @@ impl RabbitMqWorker {
         delivery: &Delivery,
         envelope: &hexeract_bus::BusEnvelope,
         outcome: Result<(), BusError>,
-        attempts: &Arc<Mutex<HashMap<Uuid, u32>>>,
     ) -> DeliveryDisposition {
         match outcome {
             Ok(()) => {
-                attempts.lock().await.remove(&envelope.message_id);
                 let ack = channel
                     .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
                     .await
@@ -473,12 +490,8 @@ impl RabbitMqWorker {
                 DeliveryDisposition::from_settle_result(&ack)
             }
             Err(err) => {
-                let current = {
-                    let mut guard = attempts.lock().await;
-                    let counter = guard.entry(envelope.message_id).or_insert(0);
-                    *counter += 1;
-                    *counter
-                };
+                let wait_queue = wait_queue_name(&self.queue);
+                let current = death_count(&delivery.properties, &wait_queue) + 1;
                 tracing::warn!(
                     message_type = %envelope.message_type,
                     message_id = %envelope.message_id,
@@ -488,31 +501,126 @@ impl RabbitMqWorker {
                     "handler failed"
                 );
                 if current < self.config.max_attempts {
-                    let nack = channel
-                        .basic_nack(
-                            delivery.delivery_tag,
-                            BasicNackOptions {
-                                multiple: false,
-                                requeue: true,
-                            },
-                        )
+                    self.schedule_retry(channel, delivery, envelope, &wait_queue)
                         .await
-                        .map_err(|err| BusError::Transport(Box::new(err)));
-                    if let Err(err) = &nack {
-                        tracing::warn!(
-                            message_id = %envelope.message_id,
-                            delivery_tag = delivery.delivery_tag,
-                            error = %err,
-                            "rabbitmq nack failed; consumer continues, broker will redeliver"
-                        );
-                    }
-                    DeliveryDisposition::from_settle_result(&nack)
                 } else {
-                    self.handle_exhausted(channel, delivery, envelope, attempts, current)
+                    self.handle_exhausted(channel, delivery, envelope, current)
                         .await
                 }
             }
         }
+    }
+
+    /// Republish the failed delivery to the wait queue, then ack the
+    /// original. The wait queue TTL plus its dead-letter route back to
+    /// the consumed queue turn this into a broker-side delayed retry,
+    /// so the consumer never sleeps and the count survives restarts.
+    async fn schedule_retry(
+        &self,
+        channel: &Channel,
+        delivery: &Delivery,
+        envelope: &hexeract_bus::BusEnvelope,
+        wait_queue: &str,
+    ) -> DeliveryDisposition {
+        Self::retry_core(
+            move || async move {
+                let published = channel
+                    .basic_publish(
+                        ShortString::from(""),
+                        ShortString::from(wait_queue),
+                        BasicPublishOptions::default(),
+                        &delivery.data,
+                        delivery.properties.clone(),
+                    )
+                    .await
+                    .map_err(|err| BusError::Transport(Box::new(err)))
+                    .map(|_confirm| ());
+                if let Err(err) = &published {
+                    tracing::warn!(
+                        message_id = %envelope.message_id,
+                        delivery_tag = delivery.delivery_tag,
+                        error = %err,
+                        "rabbitmq retry publish failed; original left unacked for redelivery, consumer continues"
+                    );
+                }
+                published
+            },
+            move || async move {
+                let ack = channel
+                    .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
+                    .await
+                    .map_err(|err| BusError::Transport(Box::new(err)));
+                if let Err(err) = &ack {
+                    tracing::warn!(
+                        message_id = %envelope.message_id,
+                        delivery_tag = delivery.delivery_tag,
+                        error = %err,
+                        "rabbitmq ack after retry publish failed; consumer continues, broker may redeliver a duplicate"
+                    );
+                }
+                ack
+            },
+        )
+        .await
+    }
+
+    /// Publish-then-ack core of the retry path, generic over the broker
+    /// operations so the ordering is unit-testable without a broker.
+    ///
+    /// The original delivery is only acked once the copy is safely in
+    /// the wait queue; a failed publish leaves it unacked so the broker
+    /// redelivers it instead of losing it.
+    async fn retry_core<P, PF, A, AF>(publish_to_wait_queue: P, ack: A) -> DeliveryDisposition
+    where
+        P: FnOnce() -> PF,
+        PF: Future<Output = Result<(), BusError>>,
+        A: FnOnce() -> AF,
+        AF: Future<Output = Result<(), BusError>>,
+    {
+        if publish_to_wait_queue().await.is_err() {
+            return DeliveryDisposition::LeftForRedelivery;
+        }
+        DeliveryDisposition::from_settle_result(&ack().await)
+    }
+
+    /// Declare the durable wait queue `<queue>.retry` whose per-queue
+    /// TTL enforces the retry delay and whose dead-letter route points
+    /// back at the consumed queue.
+    ///
+    /// Declaration is idempotent for identical arguments; a different
+    /// `retry_delay` makes the broker reject it with a precondition
+    /// error (see [`RabbitMqWorkerConfig::retry_delay`]).
+    async fn declare_retry_queue(
+        channel: &Channel,
+        queue: &str,
+        retry_delay: Duration,
+    ) -> Result<(), BusError> {
+        let ttl_ms = i64::try_from(retry_delay.as_millis()).unwrap_or(i64::MAX);
+        let mut args = FieldTable::default();
+        args.insert(
+            ShortString::from("x-message-ttl"),
+            AMQPValue::LongLongInt(ttl_ms),
+        );
+        args.insert(
+            ShortString::from("x-dead-letter-exchange"),
+            AMQPValue::LongString("".into()),
+        );
+        args.insert(
+            ShortString::from("x-dead-letter-routing-key"),
+            AMQPValue::LongString(queue.into()),
+        );
+        channel
+            .queue_declare(
+                ShortString::from(wait_queue_name(queue).as_str()),
+                QueueDeclareOptions {
+                    durable: true,
+                    ..QueueDeclareOptions::default()
+                },
+                args,
+            )
+            .await
+            .map_err(|err| BusError::Transport(Box::new(err)))?;
+        Ok(())
     }
 
     async fn handle_exhausted(
@@ -520,7 +628,6 @@ impl RabbitMqWorker {
         channel: &Channel,
         delivery: &Delivery,
         envelope: &hexeract_bus::BusEnvelope,
-        attempts: &Arc<Mutex<HashMap<Uuid, u32>>>,
         current: u32,
     ) -> DeliveryDisposition {
         if self.config.dead_letter_routing_key.is_none() {
@@ -532,8 +639,6 @@ impl RabbitMqWorker {
             );
         }
         Self::exhausted_core(
-            attempts.as_ref(),
-            envelope.message_id,
             self.config
                 .dead_letter_routing_key
                 .as_deref()
@@ -573,27 +678,20 @@ impl RabbitMqWorker {
         .await
     }
 
-    /// Evict-then-settle core of the exhausted path, generic over the
-    /// broker operations so the eviction ordering is unit-testable
-    /// without a broker.
+    /// Dead-letter-then-ack core of the exhausted path, generic over
+    /// the broker operations so the ordering is unit-testable without
+    /// a broker.
     ///
-    /// The attempt counter is removed unconditionally before any broker
-    /// call: a failing dead-letter publish must not pin entries in the
-    /// map for the lifetime of the consumer. A `None` dead-letter means
-    /// no routing key is configured and the delivery is dropped via ack.
-    async fn exhausted_core<P, PF, A, AF>(
-        attempts: &Mutex<HashMap<Uuid, u32>>,
-        message_id: Uuid,
-        dead_letter: Option<P>,
-        ack: A,
-    ) -> DeliveryDisposition
+    /// A `None` dead-letter means no routing key is configured and the
+    /// delivery is dropped via ack. A failing dead-letter publish
+    /// leaves the delivery unacked so the broker redelivers it.
+    async fn exhausted_core<P, PF, A, AF>(dead_letter: Option<P>, ack: A) -> DeliveryDisposition
     where
         P: FnOnce() -> PF,
         PF: Future<Output = Result<(), BusError>>,
         A: FnOnce() -> AF,
         AF: Future<Output = Result<(), BusError>>,
     {
-        attempts.lock().await.remove(&message_id);
         if let Some(publish) = dead_letter {
             if publish().await.is_err() {
                 return DeliveryDisposition::LeftForRedelivery;
@@ -623,6 +721,46 @@ impl RabbitMqWorker {
             .map_err(|err| BusError::Transport(Box::new(err)))?;
         Ok(())
     }
+}
+
+/// Name of the wait queue paired with `queue`.
+pub(crate) fn wait_queue_name(queue: &str) -> String {
+    format!("{queue}{RETRY_QUEUE_SUFFIX}")
+}
+
+/// Read the broker-maintained retry count from the `x-death` header.
+///
+/// Each time the broker dead-letters a message it appends or updates
+/// an entry in `x-death`; the entry whose `queue` is the wait queue
+/// and whose `reason` is `expired` counts the completed retry cycles.
+/// Returns 0 when the header or the entry is absent (first attempt).
+pub(crate) fn death_count(props: &BasicProperties, wait_queue: &str) -> u32 {
+    let Some(headers) = props.headers().as_ref() else {
+        return 0;
+    };
+    let Some(AMQPValue::FieldArray(deaths)) = headers.inner().get("x-death") else {
+        return 0;
+    };
+    for death in deaths.as_slice() {
+        let AMQPValue::FieldTable(entry) = death else {
+            continue;
+        };
+        let fields = entry.inner();
+        let queue_matches = matches!(
+            fields.get("queue"),
+            Some(AMQPValue::LongString(q)) if q.as_bytes() == wait_queue.as_bytes()
+        );
+        let reason_matches = matches!(
+            fields.get("reason"),
+            Some(AMQPValue::LongString(r)) if r.as_bytes() == b"expired"
+        );
+        if queue_matches && reason_matches {
+            if let Some(AMQPValue::LongLongInt(count)) = fields.get("count") {
+                return u32::try_from(*count).unwrap_or(u32::MAX);
+            }
+        }
+    }
+    0
 }
 
 pub(crate) fn delivery_to_envelope(
@@ -717,6 +855,7 @@ mod tests {
         assert_eq!(cfg.max_attempts, DEFAULT_MAX_ATTEMPTS);
         assert_eq!(cfg.prefetch, DEFAULT_PREFETCH);
         assert!(cfg.dead_letter_routing_key.is_none());
+        assert_eq!(cfg.retry_delay, DEFAULT_RETRY_DELAY);
     }
 
     #[test]
@@ -848,14 +987,10 @@ mod tests {
     type NoDeadLetter = fn() -> std::future::Ready<Result<(), BusError>>;
 
     #[tokio::test]
-    async fn exhausted_core_evicts_counter_even_when_dead_letter_publish_fails() {
-        let id = Uuid::from_u128(0xDEAD_BEEF);
-        let attempts = Mutex::new(HashMap::from([(id, DEFAULT_MAX_ATTEMPTS)]));
+    async fn exhausted_core_leaves_unacked_when_dead_letter_publish_fails() {
         let ack_called = AtomicBool::new(false);
 
         let disposition = RabbitMqWorker::exhausted_core(
-            &attempts,
-            id,
             Some(|| async { Err(BusError::Internal("dead-letter broker down".to_owned())) }),
             || async {
                 ack_called.store(true, Ordering::SeqCst);
@@ -866,78 +1001,141 @@ mod tests {
 
         assert_eq!(disposition, DeliveryDisposition::LeftForRedelivery);
         assert!(
-            attempts.lock().await.is_empty(),
-            "counter must be evicted even when the dead-letter publish fails"
-        );
-        assert!(
             !ack_called.load(Ordering::SeqCst),
             "delivery must stay unacked so the broker redelivers it"
         );
     }
 
     #[tokio::test]
-    async fn exhausted_core_acks_and_evicts_when_dead_letter_publish_succeeds() {
-        let id = Uuid::from_u128(0xACED);
-        let attempts = Mutex::new(HashMap::from([(id, DEFAULT_MAX_ATTEMPTS)]));
-
+    async fn exhausted_core_acks_when_dead_letter_publish_succeeds() {
         let disposition =
-            RabbitMqWorker::exhausted_core(&attempts, id, Some(|| async { Ok(()) }), || async {
-                Ok(())
-            })
-            .await;
-
+            RabbitMqWorker::exhausted_core(Some(|| async { Ok(()) }), || async { Ok(()) }).await;
         assert_eq!(disposition, DeliveryDisposition::Settled);
-        assert!(attempts.lock().await.is_empty());
     }
 
     #[tokio::test]
-    async fn exhausted_core_acks_and_evicts_when_no_dead_letter_configured() {
-        let id = Uuid::from_u128(0xD0D0);
-        let attempts = Mutex::new(HashMap::from([(id, DEFAULT_MAX_ATTEMPTS)]));
-
+    async fn exhausted_core_acks_when_no_dead_letter_configured() {
         let disposition =
-            RabbitMqWorker::exhausted_core(&attempts, id, None::<NoDeadLetter>, || async {
-                Ok(())
-            })
-            .await;
-
+            RabbitMqWorker::exhausted_core(None::<NoDeadLetter>, || async { Ok(()) }).await;
         assert_eq!(disposition, DeliveryDisposition::Settled);
-        assert!(attempts.lock().await.is_empty());
     }
 
     #[tokio::test]
-    async fn exhausted_core_evicts_counter_even_when_final_ack_fails() {
-        let id = Uuid::from_u128(0xBAD_ACE);
-        let attempts = Mutex::new(HashMap::from([(id, DEFAULT_MAX_ATTEMPTS)]));
+    async fn exhausted_core_reports_left_for_redelivery_when_final_ack_fails() {
+        let disposition = RabbitMqWorker::exhausted_core(Some(|| async { Ok(()) }), || async {
+            Err(BusError::Internal("simulated basic_ack failure".to_owned()))
+        })
+        .await;
+        assert_eq!(disposition, DeliveryDisposition::LeftForRedelivery);
+    }
 
-        let disposition =
-            RabbitMqWorker::exhausted_core(&attempts, id, Some(|| async { Ok(()) }), || async {
-                Err(BusError::Internal("simulated basic_ack failure".to_owned()))
-            })
-            .await;
+    #[tokio::test]
+    async fn retry_core_leaves_unacked_when_wait_queue_publish_fails() {
+        let ack_called = AtomicBool::new(false);
+
+        let disposition = RabbitMqWorker::retry_core(
+            || async { Err(BusError::Internal("wait queue publish failed".to_owned())) },
+            || async {
+                ack_called.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
 
         assert_eq!(disposition, DeliveryDisposition::LeftForRedelivery);
         assert!(
-            attempts.lock().await.is_empty(),
-            "eviction must hold even when the final ack fails"
+            !ack_called.load(Ordering::SeqCst),
+            "the original must stay unacked when the retry copy was not published"
         );
     }
 
     #[tokio::test]
-    async fn exhausted_core_only_evicts_the_exhausted_message_id() {
-        let id_a = Uuid::from_u128(0xAAAA);
-        let id_b = Uuid::from_u128(0xBBBB);
-        let attempts = Mutex::new(HashMap::from([(id_a, DEFAULT_MAX_ATTEMPTS), (id_b, 2)]));
+    async fn retry_core_acks_only_after_successful_publish() {
+        let published = AtomicBool::new(false);
+        let acked_after_publish = AtomicBool::new(false);
 
-        let disposition =
-            RabbitMqWorker::exhausted_core(&attempts, id_a, None::<NoDeadLetter>, || async {
+        let disposition = RabbitMqWorker::retry_core(
+            || async {
+                published.store(true, Ordering::SeqCst);
                 Ok(())
-            })
-            .await;
+            },
+            || async {
+                acked_after_publish.store(published.load(Ordering::SeqCst), Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
 
         assert_eq!(disposition, DeliveryDisposition::Settled);
-        let guard = attempts.lock().await;
-        assert!(!guard.contains_key(&id_a), "id_a must be evicted");
-        assert!(guard.contains_key(&id_b), "id_b must remain tracked");
+        assert!(
+            acked_after_publish.load(Ordering::SeqCst),
+            "ack must run after the wait queue publish succeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_core_reports_left_for_redelivery_when_ack_fails() {
+        let disposition = RabbitMqWorker::retry_core(
+            || async { Ok(()) },
+            || async { Err(BusError::Internal("simulated basic_ack failure".to_owned())) },
+        )
+        .await;
+        assert_eq!(disposition, DeliveryDisposition::LeftForRedelivery);
+    }
+
+    #[test]
+    fn wait_queue_name_appends_suffix() {
+        assert_eq!(wait_queue_name("orders"), "orders.retry");
+    }
+
+    fn x_death_properties(entries: Vec<AMQPValue>) -> BasicProperties {
+        let mut headers = FieldTable::default();
+        headers.insert(
+            ShortString::from("x-death"),
+            AMQPValue::FieldArray(lapin::types::FieldArray::from(entries)),
+        );
+        BasicProperties::default().with_headers(headers)
+    }
+
+    fn x_death_entry(queue: &str, reason: &str, count: i64) -> AMQPValue {
+        let mut entry = FieldTable::default();
+        entry.insert(
+            ShortString::from("queue"),
+            AMQPValue::LongString(queue.into()),
+        );
+        entry.insert(
+            ShortString::from("reason"),
+            AMQPValue::LongString(reason.into()),
+        );
+        entry.insert(ShortString::from("count"), AMQPValue::LongLongInt(count));
+        AMQPValue::FieldTable(entry)
+    }
+
+    #[test]
+    fn death_count_returns_zero_without_headers() {
+        let props = BasicProperties::default();
+        assert_eq!(death_count(&props, "orders.retry"), 0);
+    }
+
+    #[test]
+    fn death_count_returns_zero_for_entries_of_other_queues() {
+        let props = x_death_properties(vec![x_death_entry("payments.retry", "expired", 4)]);
+        assert_eq!(death_count(&props, "orders.retry"), 0);
+    }
+
+    #[test]
+    fn death_count_ignores_non_expired_reasons() {
+        let props = x_death_properties(vec![x_death_entry("orders.retry", "rejected", 4)]);
+        assert_eq!(death_count(&props, "orders.retry"), 0);
+    }
+
+    #[test]
+    fn death_count_reads_the_expired_entry_of_the_wait_queue() {
+        let props = x_death_properties(vec![
+            x_death_entry("payments.retry", "expired", 9),
+            x_death_entry("orders.retry", "rejected", 1),
+            x_death_entry("orders.retry", "expired", 3),
+        ]);
+        assert_eq!(death_count(&props, "orders.retry"), 3);
     }
 }
