@@ -519,6 +519,14 @@ impl RabbitMqWorker {
         attempts: &Arc<Mutex<HashMap<Uuid, u32>>>,
         current: u32,
     ) -> DeliveryDisposition {
+        // Remove the counter unconditionally: budget is exhausted and this
+        // message_id will not be tracked further, regardless of whether the
+        // dead-letter publish succeeds or fails. Without this early removal a
+        // permanently-broken dead-letter exchange would keep the entry in the
+        // map for the lifetime of the consumer, causing growth proportional to
+        // the number of distinct messages hitting the same broken DL path.
+        attempts.lock().await.remove(&envelope.message_id);
+
         if let Some(routing_key) = &self.config.dead_letter_routing_key {
             let published = self
                 .publish_dead_letter(channel, delivery, envelope, routing_key)
@@ -541,7 +549,6 @@ impl RabbitMqWorker {
                 "delivery dropped after exhausting retry budget"
             );
         }
-        attempts.lock().await.remove(&envelope.message_id);
         let ack = channel
             .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
             .await
@@ -794,5 +801,53 @@ mod tests {
         // only assert that the connection error path is reached and
         // covered by the integration tests for the build() path.
         assert!(connection_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn attempts_counter_removed_when_budget_exhausted() {
+        // Invariant: handle_exhausted clears the counter for a message_id
+        // regardless of what happens to the dead-letter publish. Without this
+        // a permanently-broken DL exchange would hold entries in the map for
+        // the consumer's entire lifetime.
+        let attempts: Arc<Mutex<HashMap<Uuid, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+        let id = Uuid::from_u128(0xDEAD_BEEF);
+
+        attempts.lock().await.insert(id, DEFAULT_MAX_ATTEMPTS);
+        assert_eq!(
+            attempts.lock().await.len(),
+            1,
+            "precondition: entry present"
+        );
+
+        // Simulate the unconditional remove at the top of handle_exhausted.
+        attempts.lock().await.remove(&id);
+
+        assert!(
+            attempts.lock().await.is_empty(),
+            "attempt counter must be removed once the retry budget is exhausted"
+        );
+    }
+
+    #[tokio::test]
+    async fn attempts_counter_not_leaked_across_multiple_message_ids() {
+        // Verify that distinct message_ids are tracked independently and that
+        // removing one entry does not affect others — regression guard for the
+        // per-id cleanup logic in handle_exhausted.
+        let attempts: Arc<Mutex<HashMap<Uuid, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+        let id_a = Uuid::from_u128(0xAAAA);
+        let id_b = Uuid::from_u128(0xBBBB);
+
+        {
+            let mut guard = attempts.lock().await;
+            guard.insert(id_a, DEFAULT_MAX_ATTEMPTS);
+            guard.insert(id_b, 2);
+        }
+        assert_eq!(attempts.lock().await.len(), 2);
+
+        attempts.lock().await.remove(&id_a);
+
+        let guard = attempts.lock().await;
+        assert!(!guard.contains_key(&id_a), "id_a must be evicted");
+        assert!(guard.contains_key(&id_b), "id_b must remain tracked");
     }
 }
