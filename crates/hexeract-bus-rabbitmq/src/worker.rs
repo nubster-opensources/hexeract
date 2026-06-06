@@ -26,12 +26,14 @@ use hexeract_core::HandlerContext;
 use hexeract_core::MessageId;
 use lapin::BasicProperties;
 use lapin::Channel;
+use lapin::Confirmation;
 use lapin::message::Delivery;
 use lapin::options::BasicAckOptions;
 use lapin::options::BasicConsumeOptions;
 use lapin::options::BasicNackOptions;
 use lapin::options::BasicPublishOptions;
 use lapin::options::BasicQosOptions;
+use lapin::options::ConfirmSelectOptions;
 use lapin::options::QueueDeclareOptions;
 use lapin::types::AMQPValue;
 use lapin::types::FieldTable;
@@ -149,9 +151,12 @@ pub struct RabbitMqWorkerConfig {
     pub max_attempts: u32,
     /// Per-channel prefetch (`basic.qos`).
     pub prefetch: u16,
-    /// Optional routing key on the default exchange that receives
-    /// deliveries which exhausted their retry budget. `None` drops
-    /// exhausted deliveries silently.
+    /// Optional name of the durable dead-letter queue that receives
+    /// deliveries which exhausted their retry budget. The worker
+    /// declares the queue at startup and publishes to it through the
+    /// default exchange with a mandatory, confirmed and persistent
+    /// publish, so an exhausted delivery is never silently lost.
+    /// `None` drops exhausted deliveries with a warning instead.
     pub dead_letter_routing_key: Option<String>,
     /// Broker-side delay between retries, enforced by the TTL of the
     /// wait queue declared by the worker. The TTL is baked into the
@@ -237,7 +242,11 @@ impl RabbitMqWorkerBuilder {
         self
     }
 
-    /// Route exhausted deliveries to `routing_key` on the default exchange.
+    /// Route exhausted deliveries to the durable dead-letter queue
+    /// named `routing_key`, declared by the worker at startup and fed
+    /// through a mandatory, confirmed and persistent publish.
+    ///
+    /// See [`RabbitMqWorkerConfig::dead_letter_routing_key`].
     #[must_use]
     pub fn dead_letter_routing_key(mut self, routing_key: impl Into<String>) -> Self {
         self.config.dead_letter_routing_key = Some(routing_key.into());
@@ -286,8 +295,11 @@ impl RabbitMqWorkerBuilder {
 /// and whose dead-letter route points back at the consumed queue. The
 /// retry count is read from the broker-maintained `x-death` header,
 /// so it survives worker restarts and never lives in process memory.
-/// Once the count reaches `max_attempts` the delivery is routed to
-/// the configured dead-letter routing key, or dropped.
+/// Once the count reaches `max_attempts` the delivery is published
+/// to the configured dead-letter queue, declared by the worker at
+/// startup and written with a mandatory, confirmed and persistent
+/// publish, or dropped with a warning when no dead-letter queue is
+/// configured.
 pub struct RabbitMqWorker {
     connection: RabbitMqConnection,
     queue: String,
@@ -299,7 +311,8 @@ impl RabbitMqWorker {
     /// Run the consume loop until `cancel` fires.
     ///
     /// On `Ok(())` the loop drained normally on cancellation. Only
-    /// fatal setup errors (channel open, `basic_qos`, `basic_consume`)
+    /// fatal setup errors (channel open, `basic_qos`, wait and dead-
+    /// letter queue declarations, `confirm_select`, `basic_consume`)
     /// return immediately. Per-delivery handler failures are absorbed
     /// by the retry / ack-mode policy, and transient broker errors on
     /// settling a delivery (`basic_ack` / `basic_nack` / dead-letter
@@ -310,8 +323,9 @@ impl RabbitMqWorker {
     /// # Errors
     ///
     /// Returns [`BusError::Connection`] if the consumer channel
-    /// cannot be opened or [`BusError::Transport`] if
-    /// [`Channel::basic_consume`] is rejected.
+    /// cannot be opened or [`BusError::Transport`] if the broker
+    /// rejects a setup command (queue declaration, `confirm_select`
+    /// or [`Channel::basic_consume`]).
     pub async fn run(self, cancel: CancellationToken) -> Result<(), BusError> {
         let channel = self.connection.create_channel().await?;
         channel
@@ -320,6 +334,13 @@ impl RabbitMqWorker {
             .map_err(|err| BusError::Transport(Box::new(err)))?;
         if matches!(self.config.ack_mode, AckMode::Manual) {
             Self::declare_retry_queue(&channel, &self.queue, self.config.retry_delay).await?;
+            if let Some(dead_letter_queue) = self.config.dead_letter_routing_key.as_deref() {
+                Self::declare_dead_letter_queue(&channel, dead_letter_queue).await?;
+                channel
+                    .confirm_select(ConfirmSelectOptions::default())
+                    .await
+                    .map_err(|err| BusError::Transport(Box::new(err)))?;
+            }
         }
         let no_ack = matches!(self.config.ack_mode, AckMode::Unacknowledged);
         let mut consumer = channel
@@ -626,6 +647,29 @@ impl RabbitMqWorker {
         Ok(())
     }
 
+    /// Declare the durable dead-letter queue so the dead-letter
+    /// routing key always has a bound queue on the default exchange
+    /// and an exhausted delivery can never be silently unroutable.
+    ///
+    /// Declaration is idempotent for identical arguments; a pre-
+    /// existing queue with different arguments makes the broker
+    /// reject the setup with a precondition error, surfacing the
+    /// conflict at startup instead of losing messages at runtime.
+    async fn declare_dead_letter_queue(channel: &Channel, queue: &str) -> Result<(), BusError> {
+        channel
+            .queue_declare(
+                ShortString::from(queue),
+                QueueDeclareOptions {
+                    durable: true,
+                    ..QueueDeclareOptions::default()
+                },
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|err| BusError::Transport(Box::new(err)))?;
+        Ok(())
+    }
+
     async fn handle_exhausted(
         &self,
         channel: &Channel,
@@ -703,6 +747,14 @@ impl RabbitMqWorker {
         DeliveryDisposition::from_settle_result(&ack().await)
     }
 
+    /// Publish the exhausted delivery to the dead-letter queue with a
+    /// mandatory, confirmed and persistent publish.
+    ///
+    /// The copy is forced to `delivery_mode` 2 so it survives a broker
+    /// restart even when the original delivery was transient. Success
+    /// requires a broker ack without a returned message; every other
+    /// confirmation surfaces as an error so the caller leaves the
+    /// original delivery unacked for redelivery.
     async fn publish_dead_letter(
         &self,
         channel: &Channel,
@@ -710,19 +762,52 @@ impl RabbitMqWorker {
         envelope: &hexeract_bus::BusEnvelope,
         routing_key: &str,
     ) -> Result<(), BusError> {
-        channel
+        let confirmation = channel
             .basic_publish(
                 ShortString::from(""),
                 ShortString::from(routing_key),
-                BasicPublishOptions::default(),
+                BasicPublishOptions {
+                    mandatory: true,
+                    ..BasicPublishOptions::default()
+                },
                 &envelope.payload,
-                delivery.properties.clone(),
+                delivery.properties.clone().with_delivery_mode(2),
             )
             .await
             .map_err(|err| BusError::Transport(Box::new(err)))?
             .await
             .map_err(|err| BusError::Transport(Box::new(err)))?;
-        Ok(())
+        Self::confirmation_to_result(confirmation)
+    }
+
+    /// Map a broker confirmation to a dead-letter publish outcome.
+    ///
+    /// Only an ack without a returned message proves the dead-letter
+    /// copy is safely queued. An ack carrying a returned message means
+    /// the mandatory publish was unroutable, a nack means the broker
+    /// could not store the message, and `NotRequested` means publisher
+    /// confirms were never enabled on the channel: all three map to an
+    /// error so the original delivery stays unacked and the broker
+    /// redelivers it.
+    fn confirmation_to_result(confirmation: Confirmation) -> Result<(), BusError> {
+        match confirmation {
+            Confirmation::Ack(None) => Ok(()),
+            Confirmation::Ack(Some(returned)) | Confirmation::Nack(Some(returned)) => {
+                Err(BusError::Transport(
+                    format!(
+                        "dead-letter publish returned as unroutable by the broker: {} (code {})",
+                        returned.reply_text, returned.reply_code
+                    )
+                    .into(),
+                ))
+            }
+            Confirmation::Nack(None) => Err(BusError::Transport(
+                "dead-letter publish nacked by the broker".into(),
+            )),
+            Confirmation::NotRequested => Err(BusError::Internal(
+                "dead-letter publish completed without publisher confirms enabled".to_owned(),
+            )),
+        }
     }
 }
 
@@ -1030,6 +1115,26 @@ mod tests {
         })
         .await;
         assert_eq!(disposition, DeliveryDisposition::LeftForRedelivery);
+    }
+
+    #[test]
+    fn confirmation_to_result_accepts_unreturned_ack() {
+        let result = RabbitMqWorker::confirmation_to_result(Confirmation::Ack(None));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn confirmation_to_result_rejects_nack() {
+        let err = RabbitMqWorker::confirmation_to_result(Confirmation::Nack(None))
+            .expect_err("a broker nack must fail the dead-letter publish");
+        assert!(matches!(err, BusError::Transport(_)));
+    }
+
+    #[test]
+    fn confirmation_to_result_rejects_unconfirmed_channel() {
+        let err = RabbitMqWorker::confirmation_to_result(Confirmation::NotRequested)
+            .expect_err("an unrequested confirmation must never count as a confirmed publish");
+        assert!(matches!(err, BusError::Internal(_)));
     }
 
     #[tokio::test]

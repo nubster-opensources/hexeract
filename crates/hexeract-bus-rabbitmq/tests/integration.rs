@@ -577,7 +577,6 @@ async fn worker_routes_to_dead_letter_after_exhausting_attempts() {
     let queue_name = "worker.dlr.source";
     let dlr_queue = "worker.dlr.parked";
     declare_temporary_queue(&uri, queue_name).await;
-    declare_temporary_queue(&uri, dlr_queue).await;
 
     let transport = RabbitMqTransport::new(&uri).await.unwrap();
     transport
@@ -624,9 +623,13 @@ async fn worker_routes_to_dead_letter_after_exhausting_attempts() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(
-        parked.is_some(),
-        "DLR queue must receive the parked delivery"
+    let parked = parked.expect(
+        "DLR queue must receive the parked delivery even though only the worker declared it",
+    );
+    assert_eq!(
+        *parked.delivery.properties.delivery_mode(),
+        Some(2),
+        "dead-letter copy must be persistent"
     );
     assert!(
         attempts.load(Ordering::SeqCst) >= 2,
@@ -735,7 +738,6 @@ async fn worker_delays_retries_and_retry_count_survives_restart() {
     let dlr_queue = "worker.poison.parked";
     let retry_delay = Duration::from_millis(300);
     declare_temporary_queue(&uri, queue_name).await;
-    declare_temporary_queue(&uri, dlr_queue).await;
 
     let transport = RabbitMqTransport::new(&uri).await.unwrap();
     transport
