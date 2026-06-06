@@ -606,20 +606,24 @@ async fn worker_routes_to_dead_letter_after_exhausting_attempts() {
     let cancel_for_task = cancel.clone();
     let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
 
-    // Wait until DLR queue receives the parked message.
+    // Wait until the DLR queue receives the parked message. The queue
+    // is declared by the worker, so early probes can race the startup:
+    // a basic_get on a missing queue is a channel-closing soft error,
+    // hence a fresh channel per attempt and errors treated as retries.
     let probe = Connection::connect(&uri, ConnectionProperties::default())
         .await
         .unwrap();
-    let probe_channel = probe.create_channel().await.unwrap();
     let mut parked = None;
     for _ in 0..80 {
-        let candidate = probe_channel
+        let probe_channel = probe.create_channel().await.unwrap();
+        if let Ok(candidate) = probe_channel
             .basic_get(dlr_queue.into(), BasicGetOptions::default())
             .await
-            .unwrap();
-        if candidate.is_some() {
-            parked = candidate;
-            break;
+        {
+            if candidate.is_some() {
+                parked = candidate;
+                break;
+            }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
