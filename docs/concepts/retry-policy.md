@@ -49,9 +49,9 @@ Because the count travels with the message, it survives worker restarts and is s
 2. **Duplicates are possible.** If the ack of the original fails after the retry copy reached the wait queue, the broker redelivers the original and both copies eventually run. This is inherent to at-least-once delivery; handlers must be idempotent.
 3. **The delay is uniform per queue.** Every retry of every message on a given queue waits the same `retry_delay`; per-message TTLs are deliberately avoided because RabbitMQ only expires the head of a queue (head-of-line blocking).
 
-## Dead-letter routing key
+## Dead-letter queue
 
-Set `dead_letter_routing_key` on the builder to route exhausted deliveries to the default exchange under a known routing key. The default exchange routes by routing key directly to the queue of the same name, so declaring a `dead_letter_routing_key = "orders.parked"` plus a queue named `orders.parked` is all you need.
+Set `dead_letter_routing_key` on the builder to route exhausted deliveries to a durable dead-letter queue of that name. The worker declares the queue at startup, so the routing key always has a bound queue on the default exchange and an exhausted delivery can never be silently unroutable.
 
 ```rust
 let worker = RabbitMqWorkerBuilder::new(connection)
@@ -62,7 +62,14 @@ let worker = RabbitMqWorkerBuilder::new(connection)
     .build()?;
 ```
 
-When the routing key is not configured, exhausted deliveries are silently dropped (logged via `tracing::warn`).
+The dead-letter publish is hardened end to end: the worker channel runs with publisher confirms, the publish is `mandatory`, and the copy is forced to persistent delivery (`delivery_mode` 2) so it survives a broker restart. Success requires a broker ack without a returned message; any other outcome (a nack, an unroutable return, a missing confirm) leaves the original delivery unacked so the broker redelivers it instead of losing it.
+
+Two operational notes:
+
+1. **Queue arguments must match.** The worker declares the dead-letter queue as a plain durable queue. If a queue of the same name already exists with different arguments, the declaration fails with a broker precondition error at startup; align or delete the pre-existing queue.
+2. **Duplicates are possible.** As with retries, if the final ack fails after the dead-letter copy was confirmed, the broker redelivers the original and a second copy can reach the dead-letter queue. Consumers of the dead-letter queue must tolerate duplicates.
+
+When the routing key is not configured, exhausted deliveries are dropped with a `tracing::warn` log.
 
 ## Roadmap notes
 

@@ -36,7 +36,8 @@ sequenceDiagram
         Worker->>Broker: basic_ack(delivery_tag)
         Note over Broker: Wait queue TTL expires, the broker<br/>dead-letters the message back to the queue<br/>and increments x-death
     else Handler Err & attempts == max
-        Worker->>Broker: basic_publish(dead_letter_routing_key, payload, props)
+        Worker->>Broker: basic_publish(dead-letter queue,<br/>mandatory, persistent, payload)
+        Broker-->>Worker: publisher confirm
         Worker->>Broker: basic_ack(delivery_tag)
     end
 ```
@@ -56,7 +57,7 @@ flowchart TD
     dlr{DLR<br/>configured?}
     ack[basic_ack]
     publish_wait[basic_publish<br/>to wait queue + ack]
-    publish_dlr[basic_publish<br/>to DLR + ack]
+    publish_dlr[confirmed basic_publish<br/>to DLQ + ack]
     drop[ack & drop]
 
     delivery --> decode
@@ -88,6 +89,6 @@ flowchart TD
 | Dispatch | `ErasedHandler::handle` (via `TypedHandler<M, H>`) |
 | Retry accounting | `x-death` header read by `worker::death_count` |
 | Retry scheduling | `RabbitMqWorker::schedule_retry` (wait queue declared at startup) |
-| DLR routing | `RabbitMqWorker::handle_exhausted` |
+| Dead-letter routing | `RabbitMqWorker::handle_exhausted` (queue declared at startup, confirmed publish) |
 
 For the full retry state machine and the durable accounting via `x-death`, see the [retry policy](../concepts/retry-policy.md).
