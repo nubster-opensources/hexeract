@@ -35,14 +35,15 @@ sequenceDiagram
             Note over WaitQ,Broker: TTL expires, the broker dead-letters<br/>the message back to the queue<br/>and increments x-death
         else attempts == max_attempts
             opt dead_letter_routing_key set
-                Worker->>Broker: basic_publish("", DLR, props, payload)
+                Worker->>Broker: basic_publish("", DLQ, mandatory,<br/>persistent, payload)
+                Broker-->>Worker: publisher confirm
             end
             Worker->>Broker: basic_ack(delivery_tag)
         end
     end
 ```
 
-The attempt count travels with the message in the broker-maintained `x-death` header instead of living in process memory, so it survives worker restarts and is shared by every consumer of the queue. See the [retry policy](retry-policy.md) for the full state machine and operational caveats.
+The attempt count travels with the message in the broker-maintained `x-death` header instead of living in process memory, so it survives worker restarts and is shared by every consumer of the queue. Exhausted deliveries go to a durable dead-letter queue declared by the worker at startup, through a mandatory, confirmed and persistent publish; a failed publish leaves the original unacked for redelivery. See the [retry policy](retry-policy.md) for the full state machine and operational caveats.
 
 ## AckOnReceive: explicit at-most-once
 
