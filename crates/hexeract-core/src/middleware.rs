@@ -126,15 +126,24 @@ impl Next {
 
     /// Advances the pipeline by one step.
     ///
+    /// The context's cancellation token is observed before each step: a
+    /// middleware that cancels the token short-circuits the rest of the
+    /// chain at the next [`Next::run`] call, and the [`Terminal`] is never
+    /// reached. A step that is already executing is not interrupted.
+    ///
     /// # Errors
     ///
-    /// Returns the [`HexeractError`] produced by the next middleware in the
-    /// chain or by the [`Terminal`] when the chain is exhausted.
+    /// Returns [`HexeractError::Cancelled`] if the context's cancellation
+    /// token fired, or the [`HexeractError`] produced by the next middleware
+    /// in the chain or by the [`Terminal`] when the chain is exhausted.
     pub async fn run(
         self,
         envelope: &MessageEnvelope,
         ctx: &HandlerContext,
     ) -> Result<BoxOutput, HexeractError> {
+        if ctx.is_cancelled() {
+            return Err(HexeractError::cancelled(envelope.type_name()));
+        }
         if let Some(head) = self.chain.get(self.index).cloned() {
             let next = Next {
                 chain: self.chain,
@@ -344,6 +353,51 @@ mod tests {
             HexeractError::Dispatch(ref m) => assert_eq!(m, "middleware refusal"),
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    struct CancellingMiddleware;
+    impl Middleware for CancellingMiddleware {
+        async fn execute(
+            &self,
+            envelope: &MessageEnvelope,
+            ctx: &HandlerContext,
+            next: Next,
+        ) -> Result<BoxOutput, HexeractError> {
+            ctx.cancellation.cancel();
+            next.run(envelope, ctx).await
+        }
+    }
+
+    #[tokio::test]
+    async fn run_returns_cancelled_when_token_fired_before_dispatch() {
+        let ctx = fresh_ctx();
+        ctx.cancellation.cancel();
+        let next = Next::new(vec![], Arc::new(FailingTerminal));
+        let err = next
+            .run(&fresh_env(), &ctx)
+            .await
+            .expect_err("cancelled dispatch must fail");
+        assert!(
+            matches!(err, HexeractError::Cancelled { type_name } if type_name.contains("DummyCmd"))
+        );
+    }
+
+    #[tokio::test]
+    async fn middleware_cancelling_token_short_circuits_the_chain() {
+        let recorder = Recorder::new();
+        let next = Next::new(
+            vec![
+                dyn_mw(CancellingMiddleware),
+                dyn_mw(tracing_mw("B", "B_post", recorder.clone())),
+            ],
+            Arc::new(FailingTerminal),
+        );
+        let err = next
+            .run(&fresh_env(), &fresh_ctx())
+            .await
+            .expect_err("cancelled chain must fail");
+        assert!(matches!(err, HexeractError::Cancelled { .. }));
+        assert!(recorder.snapshot().is_empty());
     }
 
     fn assert_send<T: Send>(_: &T) {}

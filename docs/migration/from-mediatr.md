@@ -87,7 +87,7 @@ let id = mediator.send(CreateUser { email: "alice@example.com".into() }).await?;
 Key differences:
 
 - **No DI container.** You hold the handler instance; pass it to `register_command_handler` once. Stateful dependencies (the `UserRepository` here) are fields of the handler struct.
-- **No `CancellationToken`.** Hexeract uses tokio cooperative cancellation; if you need a timeout, wire `TimeoutMiddleware` (see [hexeract-middleware reference](../reference/hexeract-middleware.md)). For explicit cancellation, pass a `tokio_util::sync::CancellationToken` inside the command payload or through `HandlerContext` extensions (planned for v0.4).
+- **`CancellationToken` lives on the context.** `HandlerContext` exposes a `tokio_util::sync::CancellationToken`; the dispatch pipeline observes it before each middleware and before the handler, and returns `HexeractError::Cancelled` once it fired. Middlewares can cancel the token, and handlers can poll `ctx.is_cancelled()` in long cooperative sections. If you need a timeout, wire `TimeoutMiddleware` (see [hexeract-middleware reference](../reference/hexeract-middleware.md)).
 - **Async by trait.** Rust 2024 + `trait_variant::make(Send)` makes async-in-traits ergonomic without `Task`/`ConfigureAwait` ceremony.
 
 ## Pipeline behavior to middleware
