@@ -49,19 +49,23 @@ A [`RabbitMqWorker`](../concepts/worker.md) reacts to handler failures different
 ```mermaid
 flowchart TD
     delivery([Delivery received])
-    decode{Decode<br/>envelope?}
+    decode{Decode envelope?<br/>(payload cap, AMQP type)}
     ack_mode{AckMode?}
     dispatch[/Dispatch to handler/]
     handler_ok{Handler<br/>Ok?}
     attempts{x-death + 1<br/>< max?}
     dlr{DLR<br/>configured?}
+    dlr_poison{DLR<br/>configured?}
     ack[basic_ack]
     publish_wait[basic_publish<br/>to wait queue + ack]
     publish_dlr[confirmed basic_publish<br/>to DLQ + ack]
+    publish_poison[confirmed basic_publish<br/>to DLQ + ack]
     drop[ack & drop]
 
     delivery --> decode
-    decode -- No --> nack_drop[basic_nack<br/>requeue=false]
+    decode -- No --> dlr_poison
+    dlr_poison -- Yes --> publish_poison
+    dlr_poison -- No --> nack_drop[basic_nack<br/>requeue=false]
     decode -- Yes --> ack_mode
     ack_mode -- AckOnReceive/Unacknowledged --> dispatch_auto[/Dispatch to handler/]
     ack_mode -- Manual --> dispatch
@@ -90,5 +94,6 @@ flowchart TD
 | Retry accounting | `x-death` header read by `worker::death_count` |
 | Retry scheduling | `RabbitMqWorker::schedule_retry` (wait queue declared at startup) |
 | Dead-letter routing | `RabbitMqWorker::handle_exhausted` (queue declared at startup, confirmed publish) |
+| Poison routing | `RabbitMqWorker::handle_poison` (oversize or undecodable deliveries, same confirmed publish) |
 
 For the full retry state machine and the durable accounting via `x-death`, see the [retry policy](../concepts/retry-policy.md).

@@ -46,10 +46,11 @@ A non-empty poll runs back-to-back without sleeping, so a backlog drains as fast
 
 ## Bus-specific timing
 
-`RabbitMqWorker` is push-based: it calls `basic_consume` and reacts to deliveries the broker pushes. Two knobs:
+`RabbitMqWorker` is push-based: it calls `basic_consume` and reacts to deliveries the broker pushes. Three knobs:
 
 - `prefetch` (default `16`): how many unacknowledged deliveries the broker may have in flight at once.
 - `max_attempts` (default `5`): retry budget per `message_id` before the delivery is parked or dropped (see [retry policy](retry-policy.md)).
+- `max_payload_bytes` (default `1 MiB`): cap on the size of a consumed payload, enforced before the payload is copied or deserialized. Broker bytes cross a trust boundary, so an oversize delivery follows the poison path: parked in the dead-letter queue when one is configured, dropped with a warning otherwise (see [retry policy](retry-policy.md)). The broker has already buffered the frame when the worker sees it, so the cap bounds the consumer's work, not the network: pair it with the broker-side `max_message_size` to bound ingress. Worst-case consumer buffering is roughly `prefetch x max_payload_bytes`.
 
 ## ErasedHandler and TypedHandler
 
