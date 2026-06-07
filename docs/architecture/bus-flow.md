@@ -18,8 +18,9 @@ sequenceDiagram
     Tx->>Tx: BusEnvelope::new(cid, &msg)
     Tx->>Pool: acquire()
     Pool-->>Tx: PooledChannel
-    Tx->>Broker: basic_publish(exchange, rk, props, payload)
+    Tx->>Broker: basic_publish(exchange, rk, mandatory,<br/>persistent, props, payload)
     Broker-->>Tx: publisher confirm
+    Note over Tx: Ack without return = stored<br/>Returned = BusError::Unroutable
     Tx-->>App: Ok(message_id)
 
     Note over Broker,Worker: Broker routes per binding<br/>and prefetch
@@ -87,7 +88,8 @@ flowchart TD
 | --- | --- |
 | Envelope construction | `BusEnvelope::new` / `with_headers` |
 | Channel acquisition | `ChannelPool::acquire` |
-| Publish + confirm | `RabbitMqTransport::publish_envelope` |
+| Publish + confirm | `RabbitMqTransport::publish_envelope` (mandatory, persistent; opt out with `fire_and_forget`) |
+| Confirm mapping | `confirm::confirmation_to_result` (shared by transport and worker) |
 | Delivery decode | `worker::delivery_to_envelope` |
 | Handler context build | `worker::build_handler_context` |
 | Dispatch | `ErasedHandler::handle` (via `TypedHandler<M, H>`) |

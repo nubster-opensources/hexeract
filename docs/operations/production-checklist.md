@@ -17,6 +17,7 @@ Run through this list before letting a Hexeract-powered service answer a real wo
 - [ ] **Durable queues for at-least-once semantics.** Set `durable = true` on every queue that must survive a broker restart, plus `auto_delete = false`.
 - [ ] **Prefetch matched to handler throughput.** Default `prefetch = 16` is appropriate for most cases; raise for fast, CPU-bound handlers, lower for handlers that block on slow downstream calls.
 - [ ] **AckMode chosen consciously.** Manual (at-least-once) is the default; only choose a lossy [`AckMode`](../concepts/ack-modes.md) (`AckOnReceive` for at-most-once, `Unacknowledged` for fire-and-forget) when delivery loss is acceptable.
+- [ ] **Publish mode chosen consciously.** The transport awaits a publisher confirm by default, so `Ok` proves the broker stored the message and an unroutable routing key raises `BusError::Unroutable`. Only switch a transport to `fire_and_forget()` when loss is acceptable on the publish side, mirroring the consume-side trade-off above.
 - [ ] **Dead-letter routing key configured** when at-least-once must not drop on exhaustion. See [retry policy](../concepts/retry-policy.md).
 - [ ] **Broker reconnect tested.** `RabbitMqConnection::connect_with_retry` retries on startup, but the running connection does not auto-reconnect mid-session. Wrap your worker spawn in a supervisor that restarts on terminal broker errors.
 

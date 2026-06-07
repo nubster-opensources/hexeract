@@ -32,7 +32,7 @@ Each side wraps the user payload in an envelope. The envelope is what crosses th
 | `attempts` | not exposed (in-memory) | `i32` (persisted) | Retry counter |
 | `next_retry_at` | not applicable | `Option<SystemTime>` | Cooldown for the next dispatch |
 | `delivered_at` | not applicable | `Option<SystemTime>` | Marks successful dispatch |
-| `published_at` / `created_at` | `SystemTime` | `SystemTime` | Producer-side timestamp |
+| `published_at` / `created_at` | `SystemTime` | `SystemTime` | Producer-side timestamp; the bus propagates it to the AMQP `timestamp` property (epoch seconds) |
 
 ## Debug masks the payload
 
