@@ -13,6 +13,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use hexeract_bus::Binding;
+use hexeract_bus::BusError;
 use hexeract_bus::Exchange;
 use hexeract_bus::ExchangeKind;
 use hexeract_bus::Handler;
@@ -642,6 +643,37 @@ async fn worker_routes_to_dead_letter_after_exhausting_attempts() {
 
     cancel.cancel();
     handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn worker_run_returns_connection_error_when_broker_stops() {
+    let (container, uri) = start_rabbit().await;
+    let queue_name = "worker.broker.down";
+    declare_temporary_queue(&uri, queue_name).await;
+
+    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .build()
+        .unwrap();
+
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
+
+    // Let the consumer subscribe before taking the broker down.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    container.stop().await.expect("container must stop");
+
+    let result = tokio::time::timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("worker must exit after the broker stops")
+        .expect("worker task must not panic");
+    assert!(
+        matches!(result, Err(BusError::Connection(_))),
+        "a dead broker must surface as a connection error so a supervisor restarts the worker, got {result:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
