@@ -647,6 +647,159 @@ async fn worker_routes_to_dead_letter_after_exhausting_attempts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
+async fn worker_routes_oversize_delivery_to_dead_letter_queue() {
+    let (_container, uri) = start_rabbit().await;
+    let queue_name = "worker.oversize.source";
+    let dlr_queue = "worker.oversize.parked";
+    declare_temporary_queue(&uri, queue_name).await;
+
+    let publisher = Connection::connect(&uri, ConnectionProperties::default())
+        .await
+        .unwrap();
+    let publish_channel = publisher.create_channel().await.unwrap();
+    let oversize_payload = vec![b'x'; 256];
+    publish_channel
+        .basic_publish(
+            ShortString::from(""),
+            ShortString::from(queue_name),
+            BasicPublishOptions::default(),
+            &oversize_payload,
+            BasicProperties::default().with_type("orders.placed".into()),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .max_payload_bytes(64)
+        .dead_letter_routing_key(dlr_queue)
+        .register_handler::<OrderPlaced, _>(AlwaysFailingHandler {
+            attempts: Arc::clone(&attempts),
+        })
+        .build()
+        .unwrap();
+
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
+
+    // The DLR queue is declared by the worker, so early probes can race
+    // the startup: a basic_get on a missing queue is a channel-closing
+    // soft error, hence a fresh channel per attempt.
+    let probe = Connection::connect(&uri, ConnectionProperties::default())
+        .await
+        .unwrap();
+    let mut parked = None;
+    for _ in 0..80 {
+        let probe_channel = probe.create_channel().await.unwrap();
+        if let Ok(candidate) = probe_channel
+            .basic_get(dlr_queue.into(), BasicGetOptions::default())
+            .await
+        {
+            if candidate.is_some() {
+                parked = candidate;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let parked = parked.expect("oversize delivery must be routed to the dead-letter queue");
+    assert_eq!(
+        parked.delivery.data.len(),
+        256,
+        "the dead-letter copy must carry the original payload"
+    );
+    assert_eq!(
+        *parked.delivery.properties.delivery_mode(),
+        Some(2),
+        "dead-letter copy must be persistent"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        0,
+        "handler must never run for an oversize delivery"
+    );
+
+    cancel.cancel();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn worker_routes_undecodable_delivery_to_dead_letter_queue() {
+    let (_container, uri) = start_rabbit().await;
+    let queue_name = "worker.undecodable.source";
+    let dlr_queue = "worker.undecodable.parked";
+    declare_temporary_queue(&uri, queue_name).await;
+
+    let publisher = Connection::connect(&uri, ConnectionProperties::default())
+        .await
+        .unwrap();
+    let publish_channel = publisher.create_channel().await.unwrap();
+    publish_channel
+        .basic_publish(
+            ShortString::from(""),
+            ShortString::from(queue_name),
+            BasicPublishOptions::default(),
+            b"{}",
+            BasicProperties::default(),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .dead_letter_routing_key(dlr_queue)
+        .register_handler::<OrderPlaced, _>(AlwaysFailingHandler {
+            attempts: Arc::clone(&attempts),
+        })
+        .build()
+        .unwrap();
+
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
+
+    let probe = Connection::connect(&uri, ConnectionProperties::default())
+        .await
+        .unwrap();
+    let mut parked = None;
+    for _ in 0..80 {
+        let probe_channel = probe.create_channel().await.unwrap();
+        if let Ok(candidate) = probe_channel
+            .basic_get(dlr_queue.into(), BasicGetOptions::default())
+            .await
+        {
+            if candidate.is_some() {
+                parked = candidate;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let parked = parked
+        .expect("a delivery missing the `type` property must be routed to the dead-letter queue");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        0,
+        "handler must never run for an undecodable delivery"
+    );
+    drop(parked);
+
+    cancel.cancel();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
 async fn worker_run_returns_connection_error_when_broker_stops() {
     let (container, uri) = start_rabbit().await;
     let queue_name = "worker.broker.down";

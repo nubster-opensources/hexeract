@@ -136,6 +136,18 @@ impl BusEnvelope {
 
     /// Deserialize the payload back into the strongly-typed message.
     ///
+    /// # Trust boundary
+    ///
+    /// The payload may originate from any producer allowed to publish
+    /// to the broker, so it is untrusted input. Deeply nested JSON is
+    /// bounded by the `serde_json` recursion limit (128 levels by
+    /// default), which turns a potential stack exhaustion into a
+    /// [`BusError::Serialization`]. Payload size is not bounded here:
+    /// the bytes are already in memory by the time an envelope exists,
+    /// so transport backends must enforce their size cap before
+    /// constructing the envelope, the way `hexeract-bus-rabbitmq` does
+    /// with its `max_payload_bytes` worker setting.
+    ///
     /// # Errors
     ///
     /// Returns [`BusError::TypeMismatch`] if the envelope's
@@ -255,5 +267,45 @@ mod tests {
         let e1 = BusEnvelope::new(Uuid::nil(), &sample_order()).unwrap();
         let e2 = BusEnvelope::new(Uuid::nil(), &sample_order()).unwrap();
         assert_ne!(e1.message_id, e2.message_id);
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct FreeForm {
+        data: serde_json::Value,
+    }
+
+    impl Message for FreeForm {
+        const MESSAGE_TYPE: &'static str = "tests.free_form";
+    }
+
+    /// Pins the `serde_json` recursion limit this crate relies on to
+    /// guard [`BusEnvelope::decode`] against stack exhaustion from
+    /// deeply nested untrusted payloads. If a dependency change ever
+    /// lifts that limit, this test fails instead of the guard silently
+    /// disappearing.
+    #[test]
+    fn decode_rejects_deeply_nested_payload() {
+        let depth = 200;
+        let nested = format!("{{\"data\":{}{}}}", "[".repeat(depth), "]".repeat(depth));
+        let envelope = BusEnvelope::restore(
+            Uuid::nil(),
+            FreeForm::MESSAGE_TYPE.to_owned(),
+            nested.into_bytes(),
+            Uuid::nil(),
+            None,
+            HashMap::new(),
+            SystemTime::UNIX_EPOCH,
+        );
+
+        let err = envelope.decode::<FreeForm>().unwrap_err();
+        match err {
+            BusError::Serialization(source) => {
+                assert!(
+                    source.to_string().contains("recursion limit"),
+                    "expected the recursion limit to trip, got: {source}"
+                );
+            }
+            other => panic!("expected BusError::Serialization, got {other:?}"),
+        }
     }
 }

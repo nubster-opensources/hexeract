@@ -45,6 +45,8 @@ sequenceDiagram
 
 The attempt count travels with the message in the broker-maintained `x-death` header instead of living in process memory, so it survives worker restarts and is shared by every consumer of the queue. Exhausted deliveries go to a durable dead-letter queue declared by the worker at startup, through a mandatory, confirmed and persistent publish; a failed publish leaves the original unacked for redelivery. See the [retry policy](retry-policy.md) for the full state machine and operational caveats.
 
+Deliveries that fail to decode into an envelope (a payload larger than `max_payload_bytes`, a missing AMQP `type` property) never reach a handler and skip the retry budget entirely. With a dead-letter queue configured they are parked immediately through the same hardened publish, whatever the ack mode (best-effort under `Unacknowledged`, which cannot settle). Without one, `Manual` nacks them without requeue so a broker-level dead-letter exchange still applies, and the other modes drop them with a warning.
+
 ## AckOnReceive: explicit at-most-once
 
 In `AckMode::AckOnReceive`, the worker sends `basic_ack` as soon as it receives and decodes a delivery, before running the handler. `no_ack` is not set, so the broker still applies prefetch (`basic.qos`) and the ack is a real protocol acknowledgement. A handler failure is logged and never retried.

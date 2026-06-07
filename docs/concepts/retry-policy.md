@@ -8,7 +8,8 @@ In `AckMode::Manual`, the `RabbitMqWorker` retries each delivery up to `max_atte
 stateDiagram-v2
     [*] --> Received: Delivery in<br/>(message_id, delivery_tag)
     Received --> Decoded: delivery_to_envelope OK
-    Received --> Discarded: Decode failed<br/>basic_nack(requeue=false)
+    Received --> Parked: Decode failed (oversize payload,<br/>missing AMQP type) + DLR configured<br/>confirmed basic_publish + basic_ack
+    Received --> Discarded: Decode failed<br/>+ no DLR<br/>basic_nack(requeue=false)
     Decoded --> Dispatched
     Dispatched --> Delivered: Handler Ok
     Dispatched --> Failed: Handler Err
@@ -63,6 +64,8 @@ let worker = RabbitMqWorkerBuilder::new(connection)
 ```
 
 The dead-letter publish is hardened end to end: the worker channel runs with publisher confirms, the publish is `mandatory`, and the copy is forced to persistent delivery (`delivery_mode` 2) so it survives a broker restart. Success requires a broker ack without a returned message; any other outcome (a nack, an unroutable return, a missing confirm) leaves the original delivery unacked so the broker redelivers it instead of losing it.
+
+The same hardened publish parks poison deliveries: a payload larger than `max_payload_bytes` or a delivery missing the AMQP `type` property never reaches a handler, skips the retry budget entirely, and is routed straight to the dead-letter queue when one is configured. Without a dead-letter queue, a `Manual` consume nacks the poison delivery without requeue, so a broker-level dead-letter exchange configured on the queue still receives it.
 
 Two operational notes:
 
