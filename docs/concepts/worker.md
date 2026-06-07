@@ -76,3 +76,36 @@ Both workers honour cooperative cancellation:
 4. `run` returns `Ok(())` and the `JoinHandle` resolves.
 
 A worker that crashes (panic or unwrap) bubbles the panic to the `JoinHandle`. Wrap your handler logic in `Result::Err` mapping rather than panicking.
+
+## Connection loss and supervised recovery
+
+`RabbitMqWorker` never reconnects on its own. The contract of `run` makes the two exit paths unambiguous:
+
+- `Ok(())` is returned for a cooperative cancellation, and nothing else.
+- `BusError::Connection` is returned when the consumer stream ends while the token has not fired: the connection or channel is gone and the worker cannot recover it.
+
+Recovery belongs to the caller, because a supervisor that rebuilds everything from scratch has no partial state to reconcile. Each iteration of the loop below reconnects with backoff, re-applies the application topology, and re-creates the worker, which re-declares the wait and dead-letter queues, re-enables publisher confirms and re-subscribes the consumer:
+
+```rust
+loop {
+    let connection =
+        RabbitMqConnection::connect_with_retry(&uri, 5, Duration::from_millis(500)).await?;
+    ensure_topology(&connection, &exchanges, &queues, &bindings).await?;
+    let worker = RabbitMqWorkerBuilder::new(connection)
+        .queue("orders.received")
+        .dead_letter_routing_key("orders.parked")
+        .register_handler::<OrderPlaced, _>(MyHandler)
+        .build()?;
+    match worker.run(cancel.clone()).await {
+        Ok(()) => break,
+        Err(err) => {
+            tracing::error!(error = %err, "bus worker stopped, restarting");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+}
+```
+
+Redeliveries across reconnects are covered by the at-least-once semantics above: unacked deliveries return to the queue when the connection drops and the retry budget keeps travelling in the `x-death` header, so a restarted worker resumes the count instead of starting over.
+
+On the publish side, `RabbitMqTransport` fails fast rather than recovering: the channel pool discards cached channels whose connection has dropped and surfaces `BusError::Connection` when a fresh channel cannot be opened. Wrap publishes with the retry or outbox layer when the application needs them to survive a broker outage.
