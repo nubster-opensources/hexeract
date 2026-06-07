@@ -39,6 +39,14 @@ const JSON_CONTENT_TYPE: &str = "application/json";
 /// `basic_publish`es the JSON-encoded payload, and returns the
 /// envelope's `message_id`. The AMQP `correlation_id` is minted by
 /// the transport when the caller does not provide one.
+///
+/// By default every publish is hardened: the message is persistent
+/// (`delivery_mode` 2), the publish is `mandatory`, and the transport
+/// awaits a publisher confirm before returning. `Ok` therefore proves
+/// the broker stored the message in at least one queue; an unroutable
+/// routing key surfaces as [`BusError::Unroutable`] instead of
+/// silently dropping the message. Opt out of the confirm round-trip
+/// with [`Self::fire_and_forget`].
 #[derive(Debug)]
 pub struct RabbitMqTransport {
     pool: Arc<ChannelPool>,
@@ -132,6 +140,27 @@ impl RabbitMqTransport {
         }
     }
 
+    /// Switch the transport to fire-and-forget publishing.
+    ///
+    /// Disables publisher confirms and the `mandatory` flag: a publish
+    /// returns as soon as the frame is written, without waiting for a
+    /// broker acknowledgement. `Ok` no longer proves delivery, and an
+    /// unroutable routing key drops the message silently instead of
+    /// raising [`BusError::Unroutable`]. Messages are still published
+    /// as persistent (`delivery_mode` 2).
+    ///
+    /// Reserve this mode for flows where loss is acceptable and
+    /// throughput matters more than the delivery guarantee, such as
+    /// metrics or non-critical fan-out, mirroring the consume-side
+    /// trade-off of `AckMode::Unacknowledged`.
+    #[must_use]
+    pub fn fire_and_forget(mut self) -> Self {
+        let pool = ChannelPool::new(self.pool.connection().clone(), self.pool.max_size())
+            .without_confirms();
+        self.pool = Arc::new(pool);
+        self
+    }
+
     /// Borrow the [`ChannelPool`] this transport publishes through.
     #[must_use]
     pub fn pool(&self) -> &ChannelPool {
@@ -151,12 +180,16 @@ impl RabbitMqTransport {
     ) -> Result<Uuid, BusError> {
         let pooled = self.pool.acquire().await?;
         let properties = envelope_to_properties(envelope);
-        pooled
+        let confirms = self.pool.confirms();
+        let confirmation = pooled
             .channel()
             .basic_publish(
                 ShortString::from(self.exchange.as_str()),
                 ShortString::from(routing_key),
-                BasicPublishOptions::default(),
+                BasicPublishOptions {
+                    mandatory: confirms,
+                    ..BasicPublishOptions::default()
+                },
                 &envelope.payload,
                 properties,
             )
@@ -164,6 +197,9 @@ impl RabbitMqTransport {
             .map_err(|err| BusError::Transport(Box::new(err)))?
             .await
             .map_err(|err| BusError::Transport(Box::new(err)))?;
+        if confirms {
+            crate::confirm::confirmation_to_result(confirmation, "publish", routing_key)?;
+        }
         Ok(envelope.message_id)
     }
 }
@@ -218,11 +254,18 @@ fn envelope_to_properties(envelope: &BusEnvelope) -> BasicProperties {
             AMQPValue::LongString(v.as_str().into()),
         );
     }
+    let published_at_secs = envelope
+        .published_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let mut properties = BasicProperties::default()
         .with_message_id(envelope.message_id.to_string().into())
         .with_correlation_id(envelope.correlation_id.to_string().into())
         .with_content_type(JSON_CONTENT_TYPE.into())
         .with_type(envelope.message_type.as_str().into())
+        .with_delivery_mode(2)
+        .with_timestamp(published_at_secs)
         .with_headers(amqp_headers);
     if let Some(reply_to) = &envelope.reply_to {
         properties = properties.with_reply_to(reply_to.as_str().into());
@@ -322,6 +365,37 @@ mod tests {
             }
             other => panic!("expected LongString header, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn envelope_to_properties_sets_persistent_delivery_mode() {
+        let envelope = BusEnvelope::new(
+            Uuid::from_u128(1),
+            &OrderPlaced {
+                order_id: Uuid::from_u128(4),
+            },
+        )
+        .unwrap();
+        let properties = envelope_to_properties(&envelope);
+        assert_eq!(*properties.delivery_mode(), Some(2));
+    }
+
+    #[test]
+    fn envelope_to_properties_propagates_published_at_as_timestamp() {
+        let envelope = BusEnvelope::new(
+            Uuid::from_u128(1),
+            &OrderPlaced {
+                order_id: Uuid::from_u128(5),
+            },
+        )
+        .unwrap();
+        let expected = envelope
+            .published_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let properties = envelope_to_properties(&envelope);
+        assert_eq!(*properties.timestamp(), Some(expected));
     }
 
     #[tokio::test]

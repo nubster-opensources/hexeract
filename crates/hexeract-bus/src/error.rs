@@ -22,6 +22,25 @@ pub enum BusError {
     #[error("connection error")]
     Connection(#[source] Box<dyn std::error::Error + Send + Sync>),
 
+    /// A mandatory publish was returned by the broker as unroutable.
+    ///
+    /// The broker accepted the message but found no queue bound to the
+    /// routing key, so the message was returned instead of being
+    /// enqueued. Raised by transport backends that publish with
+    /// publisher confirms enabled; declare the missing queue or
+    /// binding, or fix the routing key, before retrying.
+    #[error(
+        "publish to routing key `{routing_key}` returned as unroutable: {reply_text} (code {reply_code})"
+    )]
+    Unroutable {
+        /// Routing key the publish targeted.
+        routing_key: String,
+        /// Human-readable reply text sent by the broker.
+        reply_text: String,
+        /// AMQP reply code sent by the broker (typically `312`).
+        reply_code: u16,
+    },
+
     /// The worker consumed an envelope whose `message_type` has no registered handler.
     #[error("no handler registered for message type `{message_type}`")]
     MissingHandler {
@@ -114,6 +133,19 @@ mod tests {
             reason: "exchange name cannot be empty".to_owned(),
         };
         assert!(error.to_string().contains("exchange name cannot be empty"));
+    }
+
+    #[test]
+    fn unroutable_message_includes_routing_key_and_broker_reply() {
+        let error = BusError::Unroutable {
+            routing_key: "orders.unknown".to_owned(),
+            reply_text: "NO_ROUTE".to_owned(),
+            reply_code: 312,
+        };
+        let message = error.to_string();
+        assert!(message.contains("orders.unknown"));
+        assert!(message.contains("NO_ROUTE"));
+        assert!(message.contains("312"));
     }
 
     #[test]

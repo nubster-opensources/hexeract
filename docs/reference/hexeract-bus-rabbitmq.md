@@ -20,7 +20,8 @@ The full rustdoc lives at <https://docs.rs/hexeract-bus-rabbitmq>.
 
 | Item | Role |
 | --- | --- |
-| `ChannelPool::new(connection, max_size)` | Build a per-publisher bounded cache. |
+| `ChannelPool::new(connection, max_size)` | Build a per-publisher bounded cache. Channels are opened with publisher confirms enabled. |
+| `ChannelPool::without_confirms()` | Opt out of `confirm_select` on freshly opened channels. Call before the first `acquire()`: confirm mode is sticky per channel. |
 | `ChannelPool::acquire()` | Return a `PooledChannel<'_>` RAII guard that releases the channel on drop. |
 | `DEFAULT_POOL_MAX_SIZE = 8` | Default capacity. |
 
@@ -31,9 +32,10 @@ The full rustdoc lives at <https://docs.rs/hexeract-bus-rabbitmq>.
 | `RabbitMqTransport::new(uri)` | Connect with retry and target the AMQP default exchange. |
 | `RabbitMqTransport::with_exchange(uri, exchange)` | Connect, declare a typed `Exchange`, target it. |
 | `RabbitMqTransport::from_connection(connection, pool_size)` | Reuse an existing connection (useful when several transports share a broker session). |
-| Implements `Transport` from `hexeract-bus` (three publish methods). | Mints `BusEnvelope`, encodes JSON, sends through `lapin::Channel::basic_publish`, awaits the publisher confirm. |
+| `RabbitMqTransport::fire_and_forget()` | Switch to fire-and-forget publishing: no publisher confirm, no `mandatory` flag, `Ok` no longer proves delivery. Messages stay persistent. |
+| Implements `Transport` from `hexeract-bus` (three publish methods). | Mints `BusEnvelope`, encodes JSON, sends through `lapin::Channel::basic_publish` with `mandatory` set, awaits the publisher confirm. An unroutable routing key surfaces as `BusError::Unroutable` instead of silently dropping the message. |
 
-AMQP `BasicProperties` set on every publish: `message_id`, `correlation_id`, `content_type = "application/json"`, `type = MESSAGE_TYPE`, optional `reply_to`, free-form `headers` (each as `LongString`).
+AMQP `BasicProperties` set on every publish: `message_id`, `correlation_id`, `content_type = "application/json"`, `type = MESSAGE_TYPE`, `delivery_mode = 2` (persistent), `timestamp` (the envelope's `published_at` in epoch seconds), optional `reply_to`, free-form `headers` (each as `LongString`).
 
 ### Worker
 

@@ -26,7 +26,6 @@ use hexeract_core::HandlerContext;
 use hexeract_core::MessageId;
 use lapin::BasicProperties;
 use lapin::Channel;
-use lapin::Confirmation;
 use lapin::message::Delivery;
 use lapin::options::BasicAckOptions;
 use lapin::options::BasicConsumeOptions;
@@ -918,37 +917,7 @@ impl RabbitMqWorker {
             .map_err(|err| BusError::Transport(Box::new(err)))?
             .await
             .map_err(|err| BusError::Transport(Box::new(err)))?;
-        Self::confirmation_to_result(confirmation)
-    }
-
-    /// Map a broker confirmation to a dead-letter publish outcome.
-    ///
-    /// Only an ack without a returned message proves the dead-letter
-    /// copy is safely queued. An ack carrying a returned message means
-    /// the mandatory publish was unroutable, a nack means the broker
-    /// could not store the message, and `NotRequested` means publisher
-    /// confirms were never enabled on the channel: all three map to an
-    /// error so the original delivery stays unacked and the broker
-    /// redelivers it.
-    fn confirmation_to_result(confirmation: Confirmation) -> Result<(), BusError> {
-        match confirmation {
-            Confirmation::Ack(None) => Ok(()),
-            Confirmation::Ack(Some(returned)) | Confirmation::Nack(Some(returned)) => {
-                Err(BusError::Transport(
-                    format!(
-                        "dead-letter publish returned as unroutable by the broker: {} (code {})",
-                        returned.reply_text, returned.reply_code
-                    )
-                    .into(),
-                ))
-            }
-            Confirmation::Nack(None) => Err(BusError::Transport(
-                "dead-letter publish nacked by the broker".into(),
-            )),
-            Confirmation::NotRequested => Err(BusError::Internal(
-                "dead-letter publish completed without publisher confirms enabled".to_owned(),
-            )),
-        }
+        crate::confirm::confirmation_to_result(confirmation, "dead-letter publish", routing_key)
     }
 }
 
@@ -1315,26 +1284,6 @@ mod tests {
         })
         .await;
         assert_eq!(disposition, DeliveryDisposition::LeftForRedelivery);
-    }
-
-    #[test]
-    fn confirmation_to_result_accepts_unreturned_ack() {
-        let result = RabbitMqWorker::confirmation_to_result(Confirmation::Ack(None));
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn confirmation_to_result_rejects_nack() {
-        let err = RabbitMqWorker::confirmation_to_result(Confirmation::Nack(None))
-            .expect_err("a broker nack must fail the dead-letter publish");
-        assert!(matches!(err, BusError::Transport(_)));
-    }
-
-    #[test]
-    fn confirmation_to_result_rejects_unconfirmed_channel() {
-        let err = RabbitMqWorker::confirmation_to_result(Confirmation::NotRequested)
-            .expect_err("an unrequested confirmation must never count as a confirmed publish");
-        assert!(matches!(err, BusError::Internal(_)));
     }
 
     #[tokio::test]

@@ -19,6 +19,8 @@
 //! RabbitMQ container; those tests are tagged `#[ignore]` and run via
 //! `cargo test -p hexeract-bus-rabbitmq -- --ignored`.
 
+/// Publisher confirm mapping shared by the transport and the worker.
+pub(crate) mod confirm;
 /// Bounded reconnect loop around a `lapin` connection.
 pub mod connection;
 /// Per-publisher pool of `lapin` channels.
