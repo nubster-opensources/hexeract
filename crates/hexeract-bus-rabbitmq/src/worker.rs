@@ -310,22 +310,59 @@ pub struct RabbitMqWorker {
 impl RabbitMqWorker {
     /// Run the consume loop until `cancel` fires.
     ///
-    /// On `Ok(())` the loop drained normally on cancellation. Only
-    /// fatal setup errors (channel open, `basic_qos`, wait and dead-
-    /// letter queue declarations, `confirm_select`, `basic_consume`)
-    /// return immediately. Per-delivery handler failures are absorbed
-    /// by the retry / ack-mode policy, and transient broker errors on
-    /// settling a delivery (`basic_ack` / `basic_nack` / dead-letter
+    /// `Ok(())` means the loop drained normally on cancellation, and
+    /// nothing else: a consumer stream that ends while the token has
+    /// not fired signals a lost connection or channel and surfaces as
+    /// [`BusError::Connection`], so a supervisor can rebuild and
+    /// restart the worker. Only fatal setup errors (channel open,
+    /// `basic_qos`, wait and dead-letter queue declarations,
+    /// `confirm_select`, `basic_consume`) return immediately.
+    /// Per-delivery handler failures are absorbed by the retry /
+    /// ack-mode policy, and transient broker errors on settling a
+    /// delivery (`basic_ack` / `basic_nack` / dead-letter
     /// `basic_publish`) are logged and never abort the loop: the
     /// consumer keeps running and the broker redelivers the unsettled
     /// delivery.
     ///
+    /// # Recovery
+    ///
+    /// The worker never reconnects on its own: recovery belongs to
+    /// the caller, which rebuilds every piece of broker state from
+    /// scratch on each iteration. Re-creating the worker re-declares
+    /// the wait and dead-letter queues, re-enables publisher confirms
+    /// and re-subscribes the consumer.
+    ///
+    /// ```rust,no_run
+    /// # use std::time::Duration;
+    /// # use hexeract_bus_rabbitmq::{RabbitMqConnection, RabbitMqWorkerBuilder};
+    /// # use tokio_util::sync::CancellationToken;
+    /// # async fn supervise(uri: &str, cancel: CancellationToken) -> Result<(), hexeract_bus::BusError> {
+    /// loop {
+    ///     let connection =
+    ///         RabbitMqConnection::connect_with_retry(uri, 5, Duration::from_millis(500)).await?;
+    ///     let worker = RabbitMqWorkerBuilder::new(connection)
+    ///         .queue("orders.received")
+    ///         .build()?;
+    ///     match worker.run(cancel.clone()).await {
+    ///         Ok(()) => break,
+    ///         Err(err) => {
+    ///             tracing::error!(error = %err, "bus worker stopped, restarting");
+    ///             tokio::time::sleep(Duration::from_secs(1)).await;
+    ///         }
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns [`BusError::Connection`] if the consumer channel
-    /// cannot be opened or [`BusError::Transport`] if the broker
-    /// rejects a setup command (queue declaration, `confirm_select`
-    /// or [`Channel::basic_consume`]).
+    /// cannot be opened or if the consumer stream ends before
+    /// cancellation (lost connection or channel), and
+    /// [`BusError::Transport`] if the broker rejects a setup command
+    /// (queue declaration, `confirm_select` or
+    /// [`Channel::basic_consume`]).
     pub async fn run(self, cancel: CancellationToken) -> Result<(), BusError> {
         let channel = self.connection.create_channel().await?;
         channel
@@ -363,7 +400,15 @@ impl RabbitMqWorker {
                     break;
                 }
                 next = consumer.next() => {
-                    let Some(item) = next else { break; };
+                    let Some(item) = next else {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        return Err(BusError::Connection(
+                            "rabbitmq consumer stream ended unexpectedly: connection or channel lost"
+                                .into(),
+                        ));
+                    };
                     match item {
                         Ok(delivery) => {
                             let disposition = self.dispatch(&channel, delivery).await;
