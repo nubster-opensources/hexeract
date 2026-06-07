@@ -106,6 +106,36 @@ impl Middleware for FeatureFlagMiddleware {
 }
 ```
 
+## Cooperative cancellation
+
+`HandlerContext` carries a `tokio_util::sync::CancellationToken` in its `cancellation` field. The pipeline observes it before each step: when the token fires, the next `Next::run` call returns `HexeractError::Cancelled { type_name }` instead of advancing, and the handler never runs. A step that is already executing is not interrupted; cancellation takes effect at the next pipeline boundary.
+
+A middleware can use this to shed load or enforce a deadline without crafting the error itself:
+
+```rust
+use hexeract::core::{BoxOutput, HandlerContext, HexeractError, MessageEnvelope, Middleware, Next};
+
+pub struct LoadSheddingMiddleware {
+    overloaded: bool,
+}
+
+impl Middleware for LoadSheddingMiddleware {
+    async fn execute(
+        &self,
+        envelope: &MessageEnvelope,
+        ctx: &HandlerContext,
+        next: Next,
+    ) -> Result<BoxOutput, HexeractError> {
+        if self.overloaded {
+            ctx.cancellation.cancel();
+        }
+        next.run(envelope, ctx).await
+    }
+}
+```
+
+Handlers with long cooperative sections can also poll `ctx.is_cancelled()` themselves and bail out early; `HexeractError::cancelled(type_name)` builds the matching error.
+
 ## What middlewares are not
 
 - **Not interceptors per type.** Every middleware runs on every dispatch. If you need per-message-type behavior, branch inside `execute` on `envelope.type_name()` or build the registry conditionally.
