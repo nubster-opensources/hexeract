@@ -42,6 +42,19 @@ pub enum BusError {
         actual: String,
     },
 
+    /// A consumed payload exceeds the transport's configured size limit.
+    ///
+    /// Returned by transport backends before the payload is copied or
+    /// deserialized, so an oversize delivery from an untrusted producer
+    /// bounds the consumer's memory and CPU instead of exhausting them.
+    #[error("payload of {size} bytes exceeds the configured limit of {max} bytes")]
+    PayloadTooLarge {
+        /// Size of the rejected payload in bytes.
+        size: usize,
+        /// Configured maximum payload size in bytes.
+        max: usize,
+    },
+
     /// A topology declaration (exchange, queue, binding or routing key)
     /// failed validation.
     #[error("invalid topology: {reason}")]
