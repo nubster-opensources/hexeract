@@ -47,9 +47,13 @@ pub enum HexeractError {
         expected: &'static str,
     },
 
-    /// A dispatch was cancelled before the handler produced a result, for
-    /// example because its [`HandlerContext`](crate::HandlerContext)
-    /// cancellation token fired.
+    /// A dispatch was cancelled before the handler produced a result because
+    /// its [`HandlerContext`](crate::HandlerContext) cancellation token fired.
+    ///
+    /// The dispatch pipeline observes the token before each middleware and
+    /// before the terminal handler, so a middleware that cancels the token
+    /// short-circuits the rest of the chain. Handlers and middlewares may
+    /// also raise this variant themselves via [`HexeractError::cancelled`].
     #[error("dispatch of `{type_name}` was cancelled")]
     #[non_exhaustive]
     Cancelled {
