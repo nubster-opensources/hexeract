@@ -137,6 +137,54 @@ async fn transport_publishes_through_default_exchange_and_consumer_reads_it_back
         properties.kind().as_ref().map(ShortString::as_str),
         Some("orders.placed")
     );
+    assert_eq!(*properties.delivery_mode(), Some(2));
+    assert!(properties.timestamp().is_some_and(|secs| secs > 0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn transport_publish_to_unroutable_routing_key_fails() {
+    let (_container, uri) = start_rabbit().await;
+    let transport = RabbitMqTransport::new(&uri)
+        .await
+        .expect("transport must connect");
+
+    let err = transport
+        .publish(
+            "orders.nowhere",
+            &OrderPlaced {
+                order_id: Uuid::from_u128(7),
+            },
+        )
+        .await
+        .expect_err("publish to a routing key with no bound queue must fail");
+
+    assert!(
+        matches!(err, BusError::Unroutable { ref routing_key, .. } if routing_key == "orders.nowhere"),
+        "expected BusError::Unroutable, got {err:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn fire_and_forget_publish_to_unroutable_routing_key_returns_ok() {
+    let (_container, uri) = start_rabbit().await;
+    let transport = RabbitMqTransport::new(&uri)
+        .await
+        .expect("transport must connect")
+        .fire_and_forget();
+
+    let message_id = transport
+        .publish(
+            "orders.nowhere",
+            &OrderPlaced {
+                order_id: Uuid::from_u128(8),
+            },
+        )
+        .await
+        .expect("fire-and-forget publish must not await a broker verdict");
+
+    assert_ne!(message_id, Uuid::nil());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
