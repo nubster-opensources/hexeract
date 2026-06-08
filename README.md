@@ -1,6 +1,9 @@
 # Hexeract
 
-> The 6-dimension Rust messaging framework: Mediator, Bus, Outbox, Sagas, Scheduler, Request/Reply.
+**Hexeract: the batteries-included messaging framework for Rust.**
+
+In-process mediator (CQRS), external message bus (RabbitMQ) and a transactional
+outbox/inbox, unified in a single coherent SDK with compile-time guarantees.
 
 [![crates.io](https://img.shields.io/crates/v/hexeract-outbox.svg?label=crates.io)](https://crates.io/crates/hexeract-outbox)
 [![docs.rs](https://img.shields.io/docsrs/hexeract-outbox?label=docs.rs)](https://docs.rs/hexeract-outbox)
@@ -10,9 +13,20 @@
 [![Status](https://img.shields.io/badge/status-alpha-yellow)](#status)
 [![Made with Rust](https://img.shields.io/badge/made%20with-Rust-orange?logo=rust)](https://www.rust-lang.org/)
 
-Hexeract is a server-side messaging framework written in Rust. It unifies in-process mediator handlers, external message bus transports, transactional outbox and inbox, long-running sagas, scheduled messages and request/reply RPC in a single coherent SDK. The framework relies on Rust's type system and procedural macros to provide compile-time guarantees in place of runtime reflection.
+Hexeract is a server-side messaging framework written in Rust. It unifies in-process mediator handlers, external message bus transports, and a transactional outbox/inbox in a single coherent SDK. The framework relies on Rust's type system and procedural macros to provide compile-time guarantees in place of runtime reflection.
 
 Hexeract is sponsored by [Nubster](https://nubster.com).
+
+## What do you need?
+
+| You need... | Reach for | Crate |
+|---|---|---|
+| Reliable event delivery tied to your DB transaction | Transactional outbox | `hexeract-outbox` |
+| A SQL outbox on Postgres, MySQL or SQLite | SQL backends | `hexeract-outbox-sql` |
+| In-process command/query dispatch (CQRS) | Mediator | `hexeract-mediator` |
+| Publish and consume over a broker | Message bus | `hexeract-bus` |
+| A RabbitMQ transport | AMQP backend | `hexeract-bus-rabbitmq` |
+| Everything wired together | Umbrella facade | `hexeract` |
 
 ## Status
 
@@ -223,16 +237,20 @@ Queries (`Mediator::query`) and notifications (`Mediator::publish`) follow the s
 
 ## Why Hexeract
 
-Building event-driven services in Rust today means manually wiring a broker client, an outbox table, a job queue, a workflow library and a saga state machine together. Hexeract closes that gap with a single SDK that covers the full surface area while keeping each feature independently usable:
+Building event-driven services in Rust today means manually wiring a broker client, an outbox table, and an in-process dispatch layer together. Hexeract closes that gap with a single SDK that covers the full shipped surface while keeping each feature independently usable:
 
 - **Mediator**, dispatch commands to handlers in-process, type-safe and reflection-free.
-- **Bus**, send messages to RabbitMQ, NATS, Kafka or AWS SQS through a unified transport abstraction.
+- **Bus**, publish and consume over a message broker through a unified transport abstraction.
 - **Outbox**, save business state and outgoing messages atomically in a single database transaction.
-- **Sagas**, orchestrate long-running workflows with persisted state, retries and compensations.
-- **Scheduler**, schedule messages for later delivery, with cron, delays, exponential backoff retries and dead-letter handling.
-- **Request/Reply**, perform RPC-style synchronous calls on top of an asynchronous bus via correlation identifiers.
 
 The bet behind Hexeract is that Rust's compile-time guarantees turn the outbox pattern from a vigilance discipline into something the type system enforces.
+
+## Roadmap
+
+Available today: Mediator, Bus, Outbox/Inbox, and delivery reliability
+(dead-letter handling, publisher confirms, idempotency).
+
+Planned: Sagas, Scheduler, Request/Reply. See [`ROADMAP.md`](./ROADMAP.md).
 
 ## What Hexeract is **not**
 
