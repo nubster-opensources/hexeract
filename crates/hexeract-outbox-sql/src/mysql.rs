@@ -622,7 +622,7 @@ mod tests {
         assert_eq!(store.table_name(), "audit_outbox");
         assert!(store.poll_sql.contains("FROM audit_outbox"));
         assert!(store.poll_sql.contains("FOR UPDATE SKIP LOCKED"));
-        assert!(store.poll_sql.contains("UTC_TIMESTAMP()"));
+        assert!(store.poll_sql.contains("UTC_TIMESTAMP(6)"));
         assert!(store.mark_delivered_sql.contains("UPDATE audit_outbox"));
         assert!(store.mark_failed_sql.contains("attempts = attempts + 1"));
     }
