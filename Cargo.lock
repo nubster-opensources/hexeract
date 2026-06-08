@@ -1577,6 +1577,7 @@ dependencies = [
 name = "hexeract-mediator"
 version = "0.4.0"
 dependencies = [
+ "futures-util",
  "hexeract-core",
  "inventory",
  "thiserror",

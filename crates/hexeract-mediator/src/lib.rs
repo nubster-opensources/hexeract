@@ -9,8 +9,8 @@
 //!
 //! Commands and queries are single-handler: registering a second handler for
 //! the same type is a build-time error. Notifications are multi-handler and
-//! fan out in registration order; failures are aggregated so siblings keep
-//! running even when one handler returns an error.
+//! fan out concurrently; every handler runs regardless of its siblings, and
+//! failures are aggregated so one handler's error never hides another.
 //!
 //! The three built-in middlewares (`TracingMiddleware`, `LoggingMiddleware`,
 //! `TimeoutMiddleware`) ship in a follow-up release; users can still wire
@@ -60,10 +60,11 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use futures_util::future::join_all;
 use hexeract_core::{
     Command, CommandHandler, CorrelationId, DynMiddleware, HandlerContext, HandlerKind,
     HandlerRegistration, HexeractError, MessageEnvelope, MessageId, Middleware, Next, Notification,
-    NotificationHandler, Query, QueryHandler,
+    NotificationFailure, NotificationHandler, Query, QueryHandler,
 };
 
 use crate::erased::{
@@ -433,18 +434,32 @@ impl Mediator {
             .map_err(|_| HexeractError::downcast_failed(type_name::<Q::Output>()))
     }
 
-    /// Publishes a [`Notification`] to every handler registered for `N`, in
-    /// registration order. A notification with zero handlers is a no-op.
+    /// Publishes a [`Notification`] to every handler registered for `N`.
+    /// A notification with zero handlers is a no-op.
     ///
-    /// Every handler shares the same [`CorrelationId`] so traces can link
-    /// the fan-out to its source publish call, but each handler receives a
-    /// dedicated [`MessageId`].
+    /// Handlers are dispatched **concurrently**: every handler future is built
+    /// up front and driven together with [`join_all`], so a slow handler no
+    /// longer blocks the handlers registered after it. The fan-out is
+    /// cooperative and runtime-agnostic: it runs on the caller's task without
+    /// spawning, so a CPU-bound handler that never `.await`s still blocks its
+    /// siblings until it yields. Every handler shares the same
+    /// [`CorrelationId`] so traces can link the fan-out to its source publish
+    /// call, but each handler receives a dedicated [`MessageId`].
+    ///
+    /// # Ordering
+    ///
+    /// Execution is interleaved, so the order in which handlers observe the
+    /// notification is unspecified. Only the *collection* order is
+    /// deterministic: the [`NotificationFailure`]s aggregated on failure
+    /// appear in handler registration order.
     ///
     /// # Errors
     ///
-    /// Every handler is invoked even if a previous one failed; failures are
-    /// aggregated into a single [`HexeractError::Dispatch`] message of the
-    /// form `"publish: N of M handlers failed: ..."`.
+    /// Every handler runs regardless of its siblings. If one or more fail,
+    /// their typed errors are aggregated into [`HexeractError::PublishFailed`],
+    /// each [`NotificationFailure`] retaining the failing handler's name and
+    /// the error `source` chain so the caller can recover an individual
+    /// failure instead of parsing a flattened string.
     pub async fn publish<N: Notification>(&self, notification: N) -> Result<(), HexeractError> {
         let tid = TypeId::of::<N>();
         let Some(handlers) = self.inner.notification_handlers.get(&tid) else {
@@ -456,13 +471,13 @@ impl Mediator {
 
         let correlation_id = CorrelationId::new();
         let total = handlers.len();
-        let mut failures: Vec<String> = Vec::new();
 
         // Shared once across the fan-out: each handler receives a cheap
         // `Arc` clone (refcount bump) rather than a deep clone of the payload.
         let shared = Arc::new(notification);
 
-        for handler in handlers {
+        let dispatches = handlers.iter().map(|handler| {
+            let handler_name = handler.handler_type_name();
             let message_id = MessageId::new();
             let envelope = MessageEnvelope::for_notification::<N>(message_id, correlation_id);
             let ctx = HandlerContext::new(message_id, correlation_id);
@@ -472,22 +487,32 @@ impl Mediator {
                 handler: Arc::clone(handler),
                 payload: Mutex::new(Some(payload)),
             });
-
             let next = Next::new(self.inner.middlewares.clone(), terminal);
-            if let Err(err) = next.run(&envelope, &ctx).await {
-                failures.push(err.to_string());
+
+            async move {
+                next.run(&envelope, &ctx)
+                    .await
+                    .map_err(|error| NotificationFailure {
+                        handler: handler_name,
+                        error,
+                    })
             }
-        }
+        });
+
+        let failures: Vec<NotificationFailure> = join_all(dispatches)
+            .await
+            .into_iter()
+            .filter_map(Result::err)
+            .collect();
 
         if failures.is_empty() {
             Ok(())
         } else {
-            Err(HexeractError::Dispatch(format!(
-                "publish: {} of {} handlers failed: {}",
-                failures.len(),
+            Err(HexeractError::publish_failed(
+                type_name::<N>(),
                 total,
-                failures.join("; ")
-            )))
+                failures,
+            ))
         }
     }
 }
@@ -584,6 +609,49 @@ mod tests {
             _ctx: &HandlerContext,
         ) -> Result<(), Self::Error> {
             Err(HexeractError::Dispatch("boom".into()))
+        }
+    }
+
+    struct BarrierNotifHandler {
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    impl NotificationHandler<UserCreated> for BarrierNotifHandler {
+        type Error = HexeractError;
+
+        async fn handle(
+            &self,
+            _n: Arc<UserCreated>,
+            _ctx: &HandlerContext,
+        ) -> Result<(), Self::Error> {
+            self.barrier.wait().await;
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    enum PersistError {
+        #[error("database unavailable")]
+        Unavailable,
+    }
+
+    impl From<PersistError> for HexeractError {
+        fn from(err: PersistError) -> Self {
+            HexeractError::handler_failed(err)
+        }
+    }
+
+    struct SourcedFailingHandler;
+
+    impl NotificationHandler<UserCreated> for SourcedFailingHandler {
+        type Error = PersistError;
+
+        async fn handle(
+            &self,
+            _n: Arc<UserCreated>,
+            _ctx: &HandlerContext,
+        ) -> Result<(), Self::Error> {
+            Err(PersistError::Unavailable)
         }
     }
 
@@ -717,13 +785,22 @@ mod tests {
             .await
             .expect_err("at least one handler failed");
 
-        match err {
-            HexeractError::Dispatch(msg) => {
-                assert!(msg.starts_with("publish: 1 of 3 handlers failed"));
-                assert!(msg.contains("boom"));
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
+        let HexeractError::PublishFailed {
+            total,
+            ref failures,
+            ..
+        } = err
+        else {
+            panic!("unexpected variant: {err:?}");
+        };
+        assert_eq!(total, 3);
+        assert_eq!(failures.len(), 1);
+        assert!(matches!(failures[0].error, HexeractError::Dispatch(_)));
+        assert!(failures[0].error.to_string().contains("boom"));
+        assert!(
+            err.to_string()
+                .starts_with("publish: 1 of 3 handlers failed")
+        );
 
         let recorded = seen.lock().unwrap().clone();
         assert_eq!(
@@ -731,6 +808,74 @@ mod tests {
             vec![("first", 42), ("third", 42)],
             "siblings must run even after a failure"
         );
+    }
+
+    #[tokio::test]
+    async fn publish_runs_handlers_concurrently() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mediator = MediatorBuilder::new()
+            .register_notification_handler::<UserCreated, _>(BarrierNotifHandler {
+                barrier: Arc::clone(&barrier),
+            })
+            .register_notification_handler::<UserCreated, _>(BarrierNotifHandler {
+                barrier: Arc::clone(&barrier),
+            })
+            .build()
+            .expect("build must succeed");
+
+        // Each handler parks on the shared barrier and only completes once the
+        // other has arrived. Sequential dispatch would park the first handler
+        // forever and trip the timeout; concurrent fan-out lets both arrive.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            mediator.publish(UserCreated { id: 1 }),
+        )
+        .await
+        .expect("handlers must run concurrently, not sequentially")
+        .expect("publish must succeed");
+    }
+
+    #[tokio::test]
+    async fn publish_aggregates_typed_failures_with_handler_names() {
+        let mediator = MediatorBuilder::new()
+            .register_notification_handler::<UserCreated, _>(SourcedFailingHandler)
+            .register_notification_handler::<UserCreated, _>(AuditHandler)
+            .register_notification_handler::<UserCreated, _>(FailingNotifHandler)
+            .build()
+            .expect("build must succeed");
+
+        let err = mediator
+            .publish(UserCreated { id: 9 })
+            .await
+            .expect_err("two of three handlers failed");
+
+        let HexeractError::PublishFailed {
+            notification_type,
+            total,
+            failures,
+            ..
+        } = err
+        else {
+            panic!("expected PublishFailed, got {err:?}");
+        };
+
+        assert!(notification_type.ends_with("::UserCreated"));
+        assert_eq!(total, 3);
+        assert_eq!(failures.len(), 2);
+
+        // Failures keep registration order: the sourced failure comes first.
+        assert!(failures[0].handler.ends_with("SourcedFailingHandler"));
+        assert!(matches!(
+            failures[0].error,
+            HexeractError::HandlerFailed { .. }
+        ));
+        assert!(
+            std::error::Error::source(&failures[0].error).is_some(),
+            "the handler's typed source must survive aggregation"
+        );
+
+        assert!(failures[1].handler.ends_with("FailingNotifHandler"));
+        assert!(matches!(failures[1].error, HexeractError::Dispatch(_)));
     }
 
     #[tokio::test]
