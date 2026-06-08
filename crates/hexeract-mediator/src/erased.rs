@@ -129,6 +129,11 @@ pub(crate) trait ErasedNotificationHandler: Send + Sync + 'static {
         input: BoxAny,
         ctx: &'a HandlerContext,
     ) -> BoxFuture<'a, Result<(), HexeractError>>;
+
+    /// Fully-qualified type name of the concrete handler `H`, recorded at
+    /// registration before the handler's type was erased. Used to attribute
+    /// failures during a concurrent `publish` fan-out.
+    fn handler_type_name(&self) -> &'static str;
 }
 
 pub(crate) struct TypedNotificationHandler<N, H> {
@@ -171,6 +176,10 @@ where
                 .await
                 .map_err(Into::into)
         })
+    }
+
+    fn handler_type_name(&self) -> &'static str {
+        type_name::<H>()
     }
 }
 

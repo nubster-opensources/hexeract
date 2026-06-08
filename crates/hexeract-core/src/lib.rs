@@ -34,7 +34,7 @@ pub mod registration;
 pub use command::Command;
 pub use context::HandlerContext;
 pub use envelope::MessageEnvelope;
-pub use error::HexeractError;
+pub use error::{HexeractError, NotificationFailure};
 pub use handler::{CommandHandler, NotificationHandler, QueryHandler};
 pub use ids::{CorrelationId, MessageId};
 pub use middleware::{BoxOutput, DynMiddleware, Middleware, Next, Terminal};

@@ -18,12 +18,13 @@ workspace = true
 
 [dependencies]
 hexeract-core = { path = "../hexeract-core", version = "0.4" }
+futures-util = { workspace = true }
 inventory = { workspace = true }
 thiserror = { workspace = true }
 trait-variant = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }
 uuid = { workspace = true }
 
 [package.metadata.docs.rs]

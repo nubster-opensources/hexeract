@@ -156,7 +156,6 @@ If your Wolverine service relies on these, Hexeract has them on the roadmap:
 - **Sagas** with persisted state and timeouts. Planned for the milestone after v0.3.0.
 - **Scheduled messages** (`bus.ScheduleAsync`). Planned same.
 - **Request/Reply over the bus** (correlation-id-based RPC pattern). Planned same.
-- **Parallel notification fan-out.** Hexeract dispatches sequentially today; parallelism is on the v0.4 list.
 
 For everything covered today (Mediator, Bus, Outbox), Hexeract should give you feature parity with a Rust ergonomic surface.
 

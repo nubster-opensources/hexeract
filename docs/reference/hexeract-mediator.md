@@ -48,7 +48,7 @@ impl Mediator {
 
 **`query` errors.** Same shape as `send` against the query registry.
 
-**`publish` errors.** Returns `Ok(())` if no handler is registered or the handler list is empty. Otherwise, every handler is invoked even if previous handlers failed; failures are aggregated into `HexeractError::Dispatch(format!("publish: N of M handlers failed: ..."))`.
+**`publish` errors.** Returns `Ok(())` if no handler is registered or the handler list is empty. Otherwise, handlers run concurrently and every handler runs regardless of its siblings; failures are aggregated into `HexeractError::PublishFailed { notification_type, total, failures }`, where each `NotificationFailure { handler, error }` retains the failing handler's typed error and `source` chain in registration order. Its `Display` renders `"publish: N of M handlers failed: ..."`.
 
 ## `MediatorBuildError`
 

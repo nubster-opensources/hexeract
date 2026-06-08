@@ -51,7 +51,7 @@ Mediator::send::<C>(command)
 
 ## Fan-out (notification)
 
-`publish::<N>` iterates the registered handlers sequentially:
+`publish::<N>` builds one future per handler and drives them concurrently:
 
 ```text
 Mediator::publish::<N>(notification)
@@ -59,28 +59,28 @@ Mediator::publish::<N>(notification)
       ├─ miss or empty Vec → Ok(())
       └─ hit → continue
   ├─> mint a shared CorrelationId once for the entire fan-out
-  ├─> for each handler in registration order:
+  ├─> wrap the payload in a single Arc<N> shared across handlers
+  ├─> build one future per handler, in registration order:
+  │     ├─> capture the handler's type name (for failure attribution)
   │     ├─> mint a fresh MessageId
   │     ├─> build MessageEnvelope::for_notification::<N>(message_id, correlation_id)
   │     ├─> build HandlerContext with the shared correlation_id
-  │     ├─> wrap handler in NotificationTerminal with a payload = notification.clone()
+  │     ├─> wrap handler in NotificationTerminal with payload = Arc::clone(&shared)
   │     ├─> Next::new(middlewares.clone(), terminal)
-  │     ├─> next.run(&envelope, &ctx).await
-  │     │     └─> on Err: record into failures: Vec<String>
-  │     │     └─> on Ok:  continue to next handler
-  │     └─> continue regardless of outcome
+  │     └─> async move { next.run(&envelope, &ctx).await
+  │             .map_err(|error| NotificationFailure { handler, error }) }
+  ├─> join_all(futures).await        // cooperative, single task, no spawn
+  ├─> collect the Err arms into failures: Vec<NotificationFailure>
   └─> if failures.is_empty() { Ok(()) }
-      else { Err(HexeractError::Dispatch(format!(
-                "publish: {} of {} handlers failed: {}",
-                failures.len(), total, failures.join("; ")
-            ))) }
+      else { Err(HexeractError::publish_failed(type_name::<N>(), total, failures)) }
 ```
 
-Three properties fall out of this design:
+Four properties fall out of this design:
 
-1. **Fail-safe.** Sibling handlers always run, even if a predecessor returns an error. This matches the "audit + email + projection" pattern where you do not want a failing audit to prevent the email from going out.
-2. **Aggregated diagnostics.** All failures are surfaced in one error message, ordered like the handler registration order. The caller learns *how many* of *how many* handlers failed.
-3. **Causal correlation.** The shared `CorrelationId` lets traces stitch the entire fan-out back to its publish point, even though each handler also has its own `MessageId` for per-handler observability.
+1. **Concurrent.** Handler futures are built up front and driven together with `join_all`, so a slow handler no longer blocks the handlers registered after it. The fan-out is cooperative and runtime-agnostic: it runs on the caller's task without spawning, so a CPU-bound handler that never `.await`s still blocks its siblings until it yields.
+2. **Fail-safe.** Sibling handlers always run, even if a predecessor returns an error. This matches the "audit + email + projection" pattern where you do not want a failing audit to prevent the email from going out.
+3. **Structured diagnostics.** Failures are aggregated into `HexeractError::PublishFailed`, which keeps every `NotificationFailure { handler, error }` in registration order. Each entry retains the failing handler's typed error and its `source` chain, so the caller can recover an individual failure instead of parsing a flattened string. Execution is interleaved, so only this *collection* order is deterministic, not the order in which handlers observe the notification.
+4. **Causal correlation.** The shared `CorrelationId` lets traces stitch the entire fan-out back to its publish point, even though each handler also has its own `MessageId` for per-handler observability.
 
 ## Why type erasure
 
