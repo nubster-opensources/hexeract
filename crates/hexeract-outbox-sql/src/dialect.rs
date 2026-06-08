@@ -185,10 +185,10 @@ impl Dialect {
     pub(crate) fn now_expr(self) -> &'static str {
         match self {
             Self::Postgres => "NOW()",
-            // UTC_TIMESTAMP() is independent of the server session time zone,
-            // keeping comparisons consistent with the UTC values the MySQL
-            // store binds into DATETIME columns.
-            Self::MySql => "UTC_TIMESTAMP()",
+            // UTC_TIMESTAMP(6) is independent of the server session time zone
+            // and matches the DATETIME(6) microsecond precision the MySQL store
+            // binds, so the poll predicate never skips a sub-second retry.
+            Self::MySql => "UTC_TIMESTAMP(6)",
             Self::Sqlite => "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
         }
     }
@@ -452,9 +452,16 @@ mod tests {
     }
 
     #[test]
-    fn mysql_compares_against_utc_not_session_time() {
+    fn mysql_poll_compares_against_microsecond_utc() {
         let sql = Dialect::MySql.poll_sql("audit_outbox");
-        assert!(sql.contains("UTC_TIMESTAMP()"));
+        assert!(sql.contains("UTC_TIMESTAMP(6)"));
+        assert!(!sql.contains("UTC_TIMESTAMP()"));
+    }
+
+    #[test]
+    fn mysql_mark_delivered_uses_microsecond_utc() {
+        let sql = Dialect::MySql.mark_delivered_sql("audit_outbox");
+        assert!(sql.contains("delivered_at = UTC_TIMESTAMP(6)"));
     }
 
     #[test]
