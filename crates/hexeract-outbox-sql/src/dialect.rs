@@ -316,6 +316,9 @@ impl Dialect {
     /// The query is generated dynamically because the `IN` clause length
     /// varies with the actual batch size. Call frequency is low (once per
     /// poll cycle) so the allocation is negligible.
+    // Only the competing-consumers postgres and mysql stores issue claims;
+    // a sqlite-only build never calls this, so the method is dead there.
+    #[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
     pub(crate) fn claim_sql(self, table: &str, n: usize) -> String {
         let lease = self.placeholder(1);
         let placeholders = (2..=n + 1)
