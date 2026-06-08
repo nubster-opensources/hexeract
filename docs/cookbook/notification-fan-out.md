@@ -79,24 +79,27 @@ assert_eq!(*audit_log.lock().unwrap(), vec![1]);
 # Ok(()) }
 ```
 
-The three handlers run sequentially in registration order. Each one receives a shared `Arc<UserRegistered>`; the mediator broadcasts a single value, so there is no per-handler deep clone and `Notification` does not require `Clone`. All three share the same `CorrelationId` so observability tools can stitch the fan-out back to its publish site.
+The three handlers run concurrently: their futures are built up front and driven together, so a slow handler does not block the ones registered after it. The fan-out is cooperative (single task, no spawning), so a CPU-bound handler that never `.await`s still blocks its siblings until it yields. Each handler receives a shared `Arc<UserRegistered>`; the mediator broadcasts a single value, so there is no per-handler deep clone and `Notification` does not require `Clone`. All three share the same `CorrelationId` so observability tools can stitch the fan-out back to its publish site.
 
 ## Fail-safe semantics
 
-If one of the three handlers returns an error, the mediator still calls the remaining two. The final `Err` returned by `publish` aggregates all failures into a `HexeractError::Dispatch` with the format:
+If one of the three handlers returns an error, the mediator still runs the remaining two. The final `Err` returned by `publish` aggregates the typed errors into a `HexeractError::PublishFailed`, which keeps every failing handler as a `NotificationFailure { handler, error }` in registration order. Its `Display` renders:
 
 ```text
-publish: 1 of 3 handlers failed: dispatch error: smtp connection refused
+publish: 1 of 3 handlers failed: my_app::EmailHandler: dispatch error: smtp connection refused
 ```
 
-Caller code can match on the variant:
+Caller code can match on the variant and recover each handler's typed error and its `source` chain, instead of parsing a flattened message:
 
 ```rust,ignore
 match mediator.publish(UserRegistered { /* ... */ }).await {
     Ok(()) => { /* all good */ }
-    Err(HexeractError::Dispatch(msg)) if msg.starts_with("publish:") => {
+    Err(HexeractError::PublishFailed { total, failures, .. }) => {
         // at least one handler failed; sibling handlers still ran
-        tracing::error!(error = %msg, "partial notification fan-out failure");
+        for failure in &failures {
+            tracing::error!(handler = failure.handler, error = %failure.error, "notification handler failed");
+        }
+        tracing::warn!(failed = failures.len(), total, "partial notification fan-out");
     }
     Err(err) => return Err(err),
 }

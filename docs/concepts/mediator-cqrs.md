@@ -49,7 +49,7 @@ The trait `Query` is a marker. Hexeract does not enforce read-only semantics at 
 
 ## Notification
 
-A notification is a broadcast event. Zero, one, or many handlers may subscribe to the same notification type. `Mediator::publish` fans out to every registered handler in registration order.
+A notification is a broadcast event. Zero, one, or many handlers may subscribe to the same notification type. `Mediator::publish` fans out to every registered handler concurrently.
 
 ```rust
 use hexeract::core::{Notification, NotificationHandler, HandlerContext};
@@ -66,7 +66,7 @@ impl Notification for UserEmailChanged {}
 
 `Notification` does not require `Clone`: the mediator shares one `Arc<N>` across every registered handler, so the payload is never deep-cloned per handler. A handler that needs an owned value clones out of the `Arc`.
 
-**Fan-out fail-safe.** If one handler returns an error, the mediator continues invoking the remaining handlers and aggregates failures into a single `HexeractError::Dispatch` with the format `"publish: N of M handlers failed: ..."`. Sibling handlers never silently lose their turn.
+**Fan-out fail-safe.** Handlers run concurrently and every handler runs regardless of its siblings. If one or more return an error, the mediator aggregates the typed errors into a single `HexeractError::PublishFailed`, exposing each failure as a `NotificationFailure { handler, error }` in registration order so the caller can recover an individual handler's error and its `source` chain. Its `Display` keeps the `"publish: N of M handlers failed: ..."` summary. Sibling handlers never silently lose their turn.
 
 **Zero handlers is a no-op.** Publishing a notification with no registered subscriber returns `Ok(())`. This is intentional: an audit hook removed in development should not break the publishing code path.
 

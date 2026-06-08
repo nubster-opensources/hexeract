@@ -151,7 +151,7 @@ For built-in equivalents of MediatR's `LoggingBehavior` and `ValidationBehavior`
 
 MediatR runs every handler sequentially and, by default, propagates the first exception. You can swap publishers (`ForeachAwaitPublisher`, `TaskWhenAllPublisher`) to change semantics.
 
-Hexeract runs every handler sequentially and **always aggregates** failures: every handler is invoked even if a sibling failed, and the final `HexeractError::Dispatch(...)` carries all failure messages. There is no equivalent of the parallel `TaskWhenAllPublisher` shipped in v0.3.0; parallel fan-out is a candidate for v0.4 driven by feature flag.
+Hexeract runs every handler **concurrently** and **always aggregates** failures: every handler runs regardless of its siblings, and the final `HexeractError::PublishFailed` carries each `NotificationFailure { handler, error }` with its typed error and `source` chain. This is closest to MediatR's `TaskWhenAllPublisher`, except failures are never swallowed: a sibling's error never hides another's.
 
 ## Auto-discovery
 
