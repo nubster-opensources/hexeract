@@ -29,8 +29,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 thiserror = { workspace = true }
-testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["postgres", "rabbitmq"] }
 
 [dev-dependencies]
 testcontainers = "0.27"
