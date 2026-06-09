@@ -1560,6 +1560,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "hexeract-examples"
+version = "0.4.0"
+dependencies = [
+ "hexeract",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "testcontainers",
+ "testcontainers-modules",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "hexeract-macros"
 version = "0.4.0"
 dependencies = [

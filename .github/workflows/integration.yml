@@ -36,3 +36,11 @@ jobs:
 
       - name: Run #[ignore]-d integration tests
         run: cargo test --workspace --all-features -- --ignored --test-threads=1
+
+      - name: Run self-asserting examples
+        run: |
+          cargo run --example 01_command_handler   -p hexeract-examples
+          cargo run --example 02_outbox_transactional -p hexeract-examples
+          cargo run --example 03_bus_pubsub          -p hexeract-examples
+          cargo run --example 04_bus_mediator        -p hexeract-examples
+          cargo run --example 05_orders_to_payments  -p hexeract-examples

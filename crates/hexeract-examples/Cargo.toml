@@ -1,0 +1,35 @@
+[package]
+name = "hexeract-examples"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+hexeract = { path = "../hexeract", version = "0.4", features = [
+  "core",
+  "macros",
+  "mediator",
+  "middleware",
+  "outbox",
+  "outbox-sql-postgres",
+  "bus",
+  "bus-rabbitmq",
+] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true, features = ["postgres", "uuid"] }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres", "rabbitmq"] }
