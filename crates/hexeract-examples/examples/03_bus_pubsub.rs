@@ -3,7 +3,7 @@
 //! Run with:
 //!
 //! ```bash
-//! cargo run --example 03_bus_pubsub -p hexeract-bus-rabbitmq
+//! cargo run --example 03_bus_pubsub -p hexeract-examples
 //! ```
 //!
 //! The example spins up a RabbitMQ container via `testcontainers`,
@@ -21,20 +21,20 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
-use hexeract_bus::Binding;
-use hexeract_bus::BusError;
-use hexeract_bus::Exchange;
-use hexeract_bus::ExchangeKind;
-use hexeract_bus::Handler;
-use hexeract_bus::Message;
-use hexeract_bus::Queue;
-use hexeract_bus::RoutingKey;
-use hexeract_bus::Transport;
-use hexeract_bus_rabbitmq::RabbitMqConnection;
-use hexeract_bus_rabbitmq::RabbitMqTransport;
-use hexeract_bus_rabbitmq::RabbitMqWorkerBuilder;
-use hexeract_bus_rabbitmq::ensure_topology;
-use hexeract_core::HandlerContext;
+use hexeract::bus::Binding;
+use hexeract::bus::BusError;
+use hexeract::bus::Exchange;
+use hexeract::bus::ExchangeKind;
+use hexeract::bus::Handler;
+use hexeract::bus::Message;
+use hexeract::bus::Queue;
+use hexeract::bus::RoutingKey;
+use hexeract::bus::Transport;
+use hexeract::bus_rabbitmq::RabbitMqConnection;
+use hexeract::bus_rabbitmq::RabbitMqTransport;
+use hexeract::bus_rabbitmq::RabbitMqWorkerBuilder;
+use hexeract::bus_rabbitmq::ensure_topology;
+use hexeract::core::HandlerContext;
 use serde::Deserialize;
 use serde::Serialize;
 use testcontainers::runners::AsyncRunner;
