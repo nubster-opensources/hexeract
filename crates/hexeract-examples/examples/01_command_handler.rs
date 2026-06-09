@@ -1,8 +1,8 @@
 //! End-to-end example of a stateful [`CommandHandler`].
 //!
-//! Run with `cargo run --example 01_command_handler -p hexeract-core`.
+//! Run with `cargo run --example 01_command_handler -p hexeract-examples`.
 
-use hexeract_core::{
+use hexeract::core::{
     Command, CommandHandler, CorrelationId, HandlerContext, HexeractError, MessageId,
 };
 use std::sync::Mutex;
