@@ -184,7 +184,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     cancel.cancel();
-    let _ = worker_handle.await;
+    worker_handle.await??;
 
     assert_eq!(recorded.lock().expect("poisoned").as_slice(), &[order_id]);
     println!("processed payment for order {order_id}");

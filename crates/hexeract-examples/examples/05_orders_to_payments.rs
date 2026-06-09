@@ -266,8 +266,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     outbox_cancel.cancel();
     bus_cancel.cancel();
-    let _ = outbox_handle.await;
-    let _ = bus_handle.await;
+    outbox_handle.await??;
+    bus_handle.await??;
 
     assert_eq!(
         recorded.lock().expect("poisoned").as_slice(),
