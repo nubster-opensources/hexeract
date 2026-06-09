@@ -12,6 +12,7 @@ members = [
     "crates/hexeract-bus-rabbitmq",
     "crates/hexeract-cli",
     "crates/hexeract-umbrella-tests",
+    "crates/hexeract-examples",
 ]
 
 [workspace.package]
