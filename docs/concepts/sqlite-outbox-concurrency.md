@@ -10,7 +10,7 @@ shapes how you deploy its worker.
 The outbox worker relies on `SELECT ... FOR UPDATE SKIP LOCKED` to let several
 workers poll the same table at once. Each worker locks the rows it claims and
 skips rows already locked by another worker, so a backlog is drained in parallel
-without any envelope being dispatched twice. PostgreSQL and MySQL 8.0+ both
+without any envelope being dispatched twice. PostgreSQL and MySQL 8.0.13+ both
 support this clause, so they support competing consumers out of the box: run as
 many workers as you need.
 
@@ -40,7 +40,16 @@ clause that the other two dialects emit.
 ## Timestamps
 
 PostgreSQL stores timestamps as `TIMESTAMPTZ`, MySQL as UTC `DATETIME(6)`, and
-SQLite as `TEXT`. The SQLite backend writes and reads timestamps as UTC RFC 3339
+SQLite as `TEXT`.
+
+The MySQL backend requires **MySQL 8.0.13 or later**. The canonical schema
+defaults `created_at` to the expression `(UTC_TIMESTAMP(6))`, and expression
+defaults in a column definition only landed in 8.0.13; earlier 8.0 point
+releases reject the `CREATE TABLE`. The microsecond `DATETIME(6)` precision also
+matches the `UTC_TIMESTAMP(6)` the poll predicate compares against, so a due
+sub-second retry is never skipped.
+
+The SQLite backend writes and reads timestamps as UTC RFC 3339
 strings with millisecond precision (`YYYY-MM-DDTHH:MM:SS.mmmZ`). This layout is
 identical to the `strftime('%Y-%m-%dT%H:%M:%fZ', 'now')` expression the dialect
 uses for the current instant, so the `next_retry_at <= now` comparison that

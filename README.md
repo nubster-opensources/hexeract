@@ -191,7 +191,7 @@ hexeract bus peek --queue orders.received --count 5
 hexeract bus purge --queue orders.received --yes-i-know
 ```
 
-See the runnable [`crates/hexeract-bus-rabbitmq/examples/03_bus_pubsub.rs`](./crates/hexeract-bus-rabbitmq/examples/03_bus_pubsub.rs) for an end-to-end pub/sub against a real RabbitMQ container, and [`crates/hexeract-cli/examples/topology.toml`](./crates/hexeract-cli/examples/topology.toml) for the topology file format consumed by `hexeract bus declare`.
+See the runnable [`crates/hexeract-examples/examples/03_bus_pubsub.rs`](./crates/hexeract-examples/examples/03_bus_pubsub.rs) for an end-to-end pub/sub against a real RabbitMQ container, and [`crates/hexeract-cli/examples/topology.toml`](./crates/hexeract-cli/examples/topology.toml) for the topology file format consumed by `hexeract bus declare`.
 
 ### Mediator (in-process)
 
@@ -199,7 +199,7 @@ Add the umbrella crate with the `mediator` feature to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-hexeract = { version = "0.3", features = ["mediator"] }
+hexeract = { version = "0.4", features = ["mediator"] }
 ```
 
 Register a command handler and dispatch through the mediator:

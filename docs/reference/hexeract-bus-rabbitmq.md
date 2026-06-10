@@ -76,4 +76,4 @@ Documented as POC / dev-convenience: declare your topology once at startup, not 
 - [Bus quick start](../getting-started/bus-quick-start.md)
 - [Bus flow architecture](../architecture/bus-flow.md)
 - [Worker concept](../concepts/worker.md)
-- Runnable example: `cargo run --example 03_bus_pubsub -p hexeract-bus-rabbitmq`
+- Runnable example: `cargo run --example 03_bus_pubsub -p hexeract-examples`

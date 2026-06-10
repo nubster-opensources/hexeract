@@ -54,7 +54,7 @@ Released as v0.1.0 on crates.io. The seven shipped crates are `hexeract-core`, `
 - Sample topology file at `crates/hexeract-cli/examples/topology.toml`.
 - Integration tests `#[ignore]`-gated and triggered by the existing `integration.yml` workflow.
 
-## v0.3.0: Mediator Core
+## v0.3.0: Mediator Core (DONE)
 
 **Goal.** Dispatch a typed `Command` to its `Handler` in-process, type-safe and reflection-free. The pattern Wolverine and MediatR popularised in .NET, but with compile-time guarantees instead of runtime registries.
 
@@ -65,14 +65,14 @@ Released as v0.1.0 on crates.io. The seven shipped crates are `hexeract-core`, `
 - `#[handler]` procedural macro that wires a struct into the compile-time registry without boilerplate.
 - `hexeract` facade crate re-exports the curated surface.
 
-## v0.4.0: Outbox Multi-Database
+## v0.4.0: Outbox Multi-Database (DONE)
 
-**Goal.** Portable outbox schema across SQLite and MySQL in addition to Postgres. The same `OutboxStore` trait, same `OutboxWorker` code, three backend crates.
+**Goal.** Portable outbox schema across SQLite and MySQL in addition to Postgres. The same `OutboxStore` trait, same `OutboxWorker` code, one `sqlx`-backed crate with a backend per feature.
 
 **Scope:**
 
-- `hexeract-outbox-sqlite` and `hexeract-outbox-mysql` crates mirroring the PostgreSQL backend.
-- Portable SQL schema strategy with embedded migrations available as constants.
+- A single `hexeract-outbox-sql` crate with one compile-time backend per Cargo feature (`postgres`, `mysql`, `sqlite`), replacing the originally planned separate `hexeract-outbox-sqlite` and `hexeract-outbox-mysql` crates.
+- A shared `Dialect` centralizing statement templating, row locking and the per-engine schema DDL. The PostgreSQL schema stays byte-for-byte identical to `hexeract-outbox-postgres`, so no data migration is required.
 - Integration tests via `testcontainers` covering each engine.
 
 ## v0.5.0: Reliability

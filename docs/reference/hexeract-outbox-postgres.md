@@ -1,5 +1,7 @@
 # `hexeract-outbox-postgres` API reference
 
+> **Deprecated since 0.4.0, scheduled for removal in 0.5.0.** Use [`hexeract-outbox-sql`](hexeract-outbox-sql.md) with the `postgres` feature instead (the `outbox-sql-postgres` facade feature). The PostgreSQL schema is byte-for-byte identical, so no data migration is required; the constructors take a `sqlx::PgPool` rather than a `deadpool_postgres::Pool`. See the migration steps in the [CHANGELOG](../../CHANGELOG.md) under `[0.4.0]`.
+
 PostgreSQL backend for the outbox, powered by `deadpool_postgres`. Implements [`OutboxPublisher`](hexeract-outbox.md) and [`OutboxStore`](hexeract-outbox.md) plus a fluent worker builder.
 
 The full rustdoc lives at <https://docs.rs/hexeract-outbox-postgres>.

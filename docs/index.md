@@ -1,14 +1,15 @@
 # Hexeract Documentation
 
-Hexeract is a six-dimension Rust messaging framework: **Mediator**, **Bus**, **Outbox**, **Sagas**, **Scheduler**, **Request/Reply**. This index points at the documentation that is shipped today (v0.3.0).
+Hexeract is a six-dimension Rust messaging framework: **Mediator**, **Bus**, **Outbox**, **Sagas**, **Scheduler**, **Request/Reply**. This index points at the documentation that is shipped today (v0.4.0).
 
 ## Start here
 
 | If you want to | Read |
 | --- | --- |
 | Dispatch commands, queries and notifications in process | [Mediator quick start](getting-started/mediator-quick-start.md) |
-| Persist outgoing events transactionally with PostgreSQL | [Outbox quick start](getting-started/outbox-quick-start.md) |
+| Persist outgoing events transactionally with PostgreSQL, MySQL or SQLite | [Outbox quick start](getting-started/outbox-quick-start.md) |
 | Publish and consume messages on RabbitMQ | [Bus quick start](getting-started/bus-quick-start.md) |
+| Migrate an existing project from v0.3.0 to v0.4.0 | [Migration v0.3 to v0.4](operations/migration-v0.3-v0.4.md) |
 | Migrate an existing project from v0.1.0 to v0.2.0 | [Migration v0.1 to v0.2](operations/migration-v0.1-v0.2.md) |
 | Operate Hexeract services in production | [Production checklist](operations/production-checklist.md) |
 
@@ -39,7 +40,8 @@ One file per cross-cutting concept the API exposes.
 - [Outbox pattern](concepts/outbox-pattern.md)
 - [Topology types](concepts/topology.md) (`Exchange`, `Queue`, `Binding`, `RoutingKey`)
 - [Worker lifecycle](concepts/worker.md)
-- [Ack modes](concepts/ack-modes.md) (`Auto`, `Manual`)
+- [Ack modes](concepts/ack-modes.md) (`Manual`, `AckOnReceive`, `Unacknowledged`)
+- [SQLite outbox concurrency](concepts/sqlite-outbox-concurrency.md) (single-writer model, backend choice)
 - [Retry policy and dead-letter routing](concepts/retry-policy.md)
 - [Correlation ID propagation](concepts/correlation-id.md)
 
@@ -61,7 +63,8 @@ Stable artefacts that operators reach for.
 - [`hexeract-middleware` API](reference/hexeract-middleware.md)
 - [`hexeract-macros` API](reference/hexeract-macros.md)
 - [`hexeract-outbox` API](reference/hexeract-outbox.md)
-- [`hexeract-outbox-postgres` API](reference/hexeract-outbox-postgres.md)
+- [`hexeract-outbox-sql` API](reference/hexeract-outbox-sql.md) (PostgreSQL, MySQL, SQLite on `sqlx`)
+- [`hexeract-outbox-postgres` API](reference/hexeract-outbox-postgres.md) (deprecated since 0.4.0)
 - [`hexeract-bus` API](reference/hexeract-bus.md)
 - [`hexeract-bus-rabbitmq` API](reference/hexeract-bus-rabbitmq.md)
 - [Outbox PostgreSQL schema](reference/outbox-postgres-schema.md)
@@ -74,6 +77,7 @@ How to run Hexeract services after the SDK leaves your hands.
 - [Production checklist](operations/production-checklist.md)
 - [Observability](operations/observability.md)
 - [Troubleshooting](operations/troubleshooting.md)
+- [Migration v0.3 to v0.4](operations/migration-v0.3-v0.4.md)
 - [Migration v0.1 to v0.2](operations/migration-v0.1-v0.2.md)
 
 ## Design notes
