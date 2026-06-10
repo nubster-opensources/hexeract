@@ -25,6 +25,7 @@ use lapin::types::ShortString;
 use predicates::str::contains;
 use tempfile::NamedTempFile;
 use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::rabbitmq::RabbitMq;
 
 #[test]
@@ -226,4 +227,140 @@ fn bus_purge_without_safety_flag_short_circuits_without_connecting() {
         .assert()
         .failure()
         .stderr(contains("yes-i-know"));
+}
+
+/// Verify that `bus peek --count N` returns N distinct messages rather than
+/// repeating the first one N times (regression for #224).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn bus_peek_count_n_returns_n_distinct_messages() {
+    let (_container, uri) = start_rabbit().await;
+    let queue_name = "cli.peek.distinct";
+
+    let setup = Connection::connect(&uri, ConnectionProperties::default())
+        .await
+        .expect("setup connection must open");
+    let setup_channel = setup
+        .create_channel()
+        .await
+        .expect("setup channel must open");
+    setup_channel
+        .queue_declare(
+            ShortString::from(queue_name),
+            QueueDeclareOptions {
+                durable: false,
+                auto_delete: false,
+                ..QueueDeclareOptions::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .expect("queue declare must succeed");
+
+    // Publish 3 messages with clearly distinct payloads.
+    for index in 1..=3u32 {
+        setup_channel
+            .basic_publish(
+                ShortString::from(""),
+                ShortString::from(queue_name),
+                BasicPublishOptions::default(),
+                format!("{{\"seq\":{index}}}").as_bytes(),
+                BasicProperties::default(),
+            )
+            .await
+            .expect("publish must succeed")
+            .await
+            .expect("confirm must succeed");
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Peek all 3: the output must contain each distinct payload exactly once.
+    let output = Command::cargo_bin("hexeract")
+        .unwrap()
+        .args([
+            "bus", "peek", "--conn", &uri, "--queue", queue_name, "--count", "3",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&output);
+
+    assert!(
+        stdout.contains("{\"seq\":1}"),
+        "peek output must include message 1; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("{\"seq\":2}"),
+        "peek output must include message 2; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("{\"seq\":3}"),
+        "peek output must include message 3; got: {stdout}"
+    );
+
+    // Ensure the queue still has all 3 messages (non-destructive).
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let after = Command::cargo_bin("hexeract")
+        .unwrap()
+        .args([
+            "bus", "peek", "--conn", &uri, "--queue", queue_name, "--count", "5",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let after_out = String::from_utf8_lossy(&after);
+    assert!(
+        !after_out.contains("is empty"),
+        "queue must not be empty after non-destructive peek"
+    );
+}
+
+/// Verify that `outbox check` ignores tables in other schemas with the same
+/// name, preventing false-positive validation (regression for #233).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn outbox_check_ignores_same_named_table_in_other_schema() {
+    let container = Postgres::default()
+        .start()
+        .await
+        .expect("docker daemon must be running");
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    // Use sslmode=disable because the test container does not have TLS configured.
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
+
+    // Connect directly to set up a cross-schema scenario: create
+    // `other.audit_outbox` with all required columns but leave
+    // `public.audit_outbox` absent.
+    let (setup_client, setup_conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("setup connect");
+    tokio::spawn(async move {
+        let _ = setup_conn.await;
+    });
+
+    setup_client
+        .batch_execute(
+            "CREATE SCHEMA other; \
+             CREATE TABLE other.audit_outbox ( \
+               id BIGSERIAL, event_id UUID, event_type TEXT, payload JSONB, \
+               subject_id UUID, created_at TIMESTAMPTZ, attempts INT, \
+               last_error TEXT, next_retry_at TIMESTAMPTZ, delivered_at TIMESTAMPTZ \
+             );",
+        )
+        .await
+        .expect("setup DDL must succeed");
+
+    // `hexeract outbox check` must fail: public.audit_outbox does not exist.
+    Command::cargo_bin("hexeract")
+        .unwrap()
+        .args(["outbox", "check", "--conn", &url, "--table", "audit_outbox"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(contains("does not exist"));
 }

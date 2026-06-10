@@ -24,9 +24,11 @@ workspace = true
 hexeract-bus = { path = "../hexeract-bus", version = "0.4" }
 hexeract-bus-rabbitmq = { path = "../hexeract-bus-rabbitmq", version = "0.4" }
 hexeract-outbox = { path = "../hexeract-outbox", version = "0.4" }
-hexeract-outbox-sql = { path = "../hexeract-outbox-sql", version = "0.4", default-features = false }
+hexeract-outbox-sql = { path = "../hexeract-outbox-sql", version = "0.4", default-features = false, features = ["postgres"] }
 clap = { workspace = true }
 lapin = "4"
+native-tls = "0.2"
+postgres-native-tls = "0.5"
 serde = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
@@ -39,7 +41,9 @@ assert_cmd = { workspace = true }
 predicates = { workspace = true }
 tempfile = "3"
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["rabbitmq"] }
+testcontainers-modules = { version = "0.15", features = ["rabbitmq", "postgres"] }
+tokio = { workspace = true }
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
 
 [package.metadata.docs.rs]
 all-features = true

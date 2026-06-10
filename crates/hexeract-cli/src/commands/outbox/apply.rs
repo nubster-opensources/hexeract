@@ -1,6 +1,9 @@
 use clap::Args;
 use hexeract_outbox_sql::Dialect;
+use postgres_native_tls::MakeTlsConnector;
 use tokio_postgres::NoTls;
+
+use super::check::is_ssl_disabled;
 
 /// Apply the canonical outbox schema to a target PostgreSQL database.
 ///
@@ -39,17 +42,36 @@ impl ApplyArgs {
         let sql = Dialect::Postgres.schema_ddl(&self.table)?;
 
         tracing::info!(table = %self.table, "connecting to PostgreSQL");
-        let (client, connection) = tokio_postgres::connect(&self.conn, NoTls).await?;
-        tokio::spawn(async move {
-            if let Err(err) = connection.await {
-                tracing::error!(error = %err, "PostgreSQL connection task error");
-            }
-        });
+        let client = connect(&self.conn).await?;
 
         tracing::info!(table = %self.table, "applying canonical outbox schema");
         client.batch_execute(&sql).await?;
 
         println!("Schema applied to table `{}`.", self.table);
         Ok(())
+    }
+}
+
+/// Connect to PostgreSQL, using TLS unless `sslmode=disable` is present in the URL.
+async fn connect(url: &str) -> Result<tokio_postgres::Client, Box<dyn std::error::Error>> {
+    if is_ssl_disabled(url) {
+        tracing::warn!("TLS disabled via sslmode=disable; credentials will be sent in cleartext");
+        let (client, connection) = tokio_postgres::connect(url, NoTls).await?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::error!(error = %err, "PostgreSQL connection task error");
+            }
+        });
+        Ok(client)
+    } else {
+        let builder = native_tls::TlsConnector::builder().build()?;
+        let connector = MakeTlsConnector::new(builder);
+        let (client, connection) = tokio_postgres::connect(url, connector).await?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::error!(error = %err, "PostgreSQL connection task error");
+            }
+        });
+        Ok(client)
     }
 }
