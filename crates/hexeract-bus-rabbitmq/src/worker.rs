@@ -135,6 +135,11 @@ pub enum AckMode {
     /// before the handler runs, and never expects an acknowledgement.
     /// Highest throughput, but handler failures and crashes lose the
     /// message. Fire-and-forget.
+    ///
+    /// The broker applies no `QoS` bound to a `no_ack` consumer, so
+    /// [`RabbitMqWorkerConfig::prefetch`] has no effect and there is no
+    /// broker-side flow control: deliveries can accumulate in the client
+    /// buffer without limit. The worker skips `basic.qos` in this mode.
     Unacknowledged,
 }
 
@@ -142,6 +147,16 @@ impl Default for AckMode {
     fn default() -> Self {
         Self::Manual
     }
+}
+
+/// Whether `basic.qos` prefetch is honoured under the given ack mode.
+///
+/// A `no_ack` consumer ([`AckMode::Unacknowledged`]) never settles a
+/// delivery, so the broker applies no `QoS` bound to it: issuing
+/// `basic.qos` would advertise a backpressure limit that does not
+/// exist. The worker skips the call in that case.
+const fn qos_applies(ack_mode: AckMode) -> bool {
+    !matches!(ack_mode, AckMode::Unacknowledged)
 }
 
 /// Tuning parameters for a [`RabbitMqWorker`].
@@ -152,6 +167,12 @@ pub struct RabbitMqWorkerConfig {
     /// Maximum number of attempts per delivery before giving up.
     pub max_attempts: u32,
     /// Per-channel prefetch (`basic.qos`).
+    ///
+    /// Bounds in-flight unacknowledged deliveries under
+    /// [`AckMode::Manual`] and [`AckMode::AckOnReceive`]. Has no effect
+    /// under [`AckMode::Unacknowledged`]: a `no_ack` consumer never
+    /// acknowledges, so the broker applies no bound and exerts no flow
+    /// control, and the worker skips the `basic.qos` call entirely.
     pub prefetch: u16,
     /// Optional name of the durable dead-letter queue that receives
     /// deliveries which exhausted their retry budget. The worker
@@ -251,6 +272,9 @@ impl RabbitMqWorkerBuilder {
     }
 
     /// Override the consumer prefetch (default [`DEFAULT_PREFETCH`]).
+    ///
+    /// Has no effect under [`AckMode::Unacknowledged`]; see
+    /// [`RabbitMqWorkerConfig::prefetch`].
     #[must_use]
     pub fn prefetch(mut self, n: u16) -> Self {
         self.config.prefetch = n;
@@ -391,10 +415,12 @@ impl RabbitMqWorker {
     /// [`Channel::basic_consume`]).
     pub async fn run(self, cancel: CancellationToken) -> Result<(), BusError> {
         let channel = self.connection.create_channel().await?;
-        channel
-            .basic_qos(self.config.prefetch, BasicQosOptions::default())
-            .await
-            .map_err(|err| BusError::Transport(Box::new(err)))?;
+        if qos_applies(self.config.ack_mode) {
+            channel
+                .basic_qos(self.config.prefetch, BasicQosOptions::default())
+                .await
+                .map_err(|err| BusError::Transport(Box::new(err)))?;
+        }
         if matches!(self.config.ack_mode, AckMode::Manual) {
             Self::declare_retry_queue(&channel, &self.queue, self.config.retry_delay).await?;
             if let Some(dead_letter_queue) = self.config.dead_letter_routing_key.as_deref() {
@@ -1063,6 +1089,13 @@ mod tests {
         assert!(cfg.dead_letter_routing_key.is_none());
         assert_eq!(cfg.retry_delay, DEFAULT_RETRY_DELAY);
         assert_eq!(cfg.max_payload_bytes, DEFAULT_MAX_PAYLOAD_BYTES);
+    }
+
+    #[test]
+    fn qos_is_skipped_only_under_unacknowledged() {
+        assert!(qos_applies(AckMode::Manual));
+        assert!(qos_applies(AckMode::AckOnReceive));
+        assert!(!qos_applies(AckMode::Unacknowledged));
     }
 
     #[test]
