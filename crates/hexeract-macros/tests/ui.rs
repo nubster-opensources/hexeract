@@ -12,6 +12,10 @@ fn ui() {
     t.compile_fail("tests/ui/fail_no_result_return.rs");
     t.compile_fail("tests/ui/fail_notification_non_unit.rs");
     t.compile_fail("tests/ui/fail_notification_not_arc.rs");
+    t.compile_fail("tests/ui/fail_notification_arc_non_std.rs");
+    t.compile_fail("tests/ui/fail_notification_arc_ref.rs");
+    t.compile_fail("tests/ui/fail_notification_arc_arity.rs");
+    t.pass("tests/ui/pass_notification_impl_arc.rs");
     t.compile_fail("tests/ui/fail_wrong_output_type.rs");
     t.compile_fail("tests/ui/fail_generic_impl_handler.rs");
     t.compile_fail("tests/ui/fail_lifetime_handler.rs");
