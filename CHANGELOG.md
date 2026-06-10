@@ -19,6 +19,15 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 
 - `hexeract-macros`: the `#[handler(notification)]` macro now validates that the message argument is a standard-library `Arc<N>` (`Arc`, `std::sync::Arc`, `alloc::sync::Arc` and their leading-colon forms). A different path whose final segment is `Arc` (a module re-export such as `foo::Arc`, or a shadowed local alias) was silently accepted and then forwarded as `::std::sync::Arc`, producing a confusing type-mismatch error on macro-generated code. It is now rejected with a clear diagnostic at the argument span. (#172)
 - `hexeract-outbox-sql`: the MySQL `Dialect::now_expr` returned the whole-second `UTC_TIMESTAMP()` while the schema stores `DATETIME(6)` microsecond timestamps, so the poll predicate `next_retry_at <= now` could treat a due retry as not-yet-due and skip it for up to roughly one second. It now returns `UTC_TIMESTAMP(6)`, matching the bound sub-second precision for both polling and mark-delivered. (#166)
+- `hexeract-outbox-sql`: clarified in the rustdoc that the SQLite backend stores timestamps at millisecond resolution and truncates (rather than rounds) any sub-millisecond component, while PostgreSQL and MySQL keep microsecond resolution. Added a characterization test that asserts the truncation on a value past the half-millisecond mark, replacing a case that masked it. (#168)
+
+### Documentation
+
+- Refreshed the outbox documentation for the v0.4 multi-database backend. The outbox quick start, the docs index, the README and the architecture overview now steer adopters to `hexeract-outbox-sql` (built on `sqlx`) instead of the deprecated `hexeract-outbox-postgres` (`deadpool_postgres`). Stale example paths left by the `hexeract-examples` consolidation are corrected throughout. (#167, #176)
+- Added a `hexeract-outbox-sql` API reference page covering the three backends, the `Dialect`, the publisher, the store and the worker builder, and a deprecation notice on the `hexeract-outbox-postgres` reference page. (#167)
+- Added a v0.3 to v0.4 migration guide (`docs/operations/migration-v0.3-v0.4.md`) covering the switch to `hexeract-outbox-sql` and the three breaking changes: the `AckMode::Auto` removal, the `HandlerNotFound` field rename and notifications taking `Arc<N>`. (#170)
+- Marked v0.3.0 and v0.4.0 as done in `ROADMAP.md` and corrected the planned outbox layout to the single `hexeract-outbox-sql` crate with one feature per backend. (#171)
+- Documented the MySQL 8.0.13 minimum (required by the `(UTC_TIMESTAMP(6))` schema default) in the SQLite outbox concurrency concept. (#173)
 
 ## [0.4.0] - 2026-06-02
 

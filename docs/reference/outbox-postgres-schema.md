@@ -161,8 +161,8 @@ WHERE event_id = '<uuid>';
 
 The next poll will pick it up.
 
-## Future evolution
+## Schema evolution
 
-- **v0.4 Outbox Multi-Database**: SQLite and MySQL backends will ship their own canonical schemas.
-- **v0.5 Reliability**: a dedicated dead-letter table is on the roadmap; today the convention is to leave failed rows in place and observe them via SQL.
+- **Multi-database (shipped in v0.4)**: the `hexeract-outbox-sql` crate renders this same schema for PostgreSQL plus equivalent canonical schemas for MySQL and SQLite, through `Dialect::schema_ddl`. The PostgreSQL schema is byte-for-byte identical to the one above, so no data migration is required when moving from `hexeract-outbox-postgres` to `hexeract-outbox-sql`.
+- **Dead-letter table (shipped in v0.4)**: each backend also renders a `{table}_dead_letter` companion schema via `Dialect::dead_letter_schema_ddl`. Exhausted envelopes are moved there instead of being left in place.
 - **Partitioning**: for high-volume deployments, the table can be partitioned by `created_at` or by `event_type` ranges without changes to the publisher or worker.

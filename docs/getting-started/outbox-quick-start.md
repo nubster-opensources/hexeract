@@ -6,19 +6,23 @@ Estimated time: **5 minutes** (assuming you already have a PostgreSQL instance r
 
 ## 1. Add the dependencies
 
+The outbox runs on PostgreSQL, MySQL or SQLite through the `sqlx`-backed `hexeract-outbox-sql` crate. This guide uses the `postgres` feature; the `mysql` and `sqlite` features expose the same surface (`MySqlOutboxPublisher` / `SqliteOutboxPublisher` and their builders).
+
 ```toml
 [dependencies]
-hexeract-outbox = "0.1"
-hexeract-outbox-postgres = "0.1"
+hexeract-outbox = "0.4"
+hexeract-outbox-sql = { version = "0.4", features = ["postgres"] }
 
 # Already in most async Rust services:
-deadpool-postgres = "0.14"
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls-ring", "postgres", "uuid"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
 tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 uuid = { version = "1", features = ["v7"] }
 ```
+
+> The legacy `hexeract-outbox-postgres` crate (built on `deadpool_postgres`) is deprecated since 0.4.0 and will be removed in 0.5.0. New projects should start on `hexeract-outbox-sql`.
 
 ## 2. Apply the canonical schema
 
@@ -34,6 +38,8 @@ For local development you can apply the schema directly against a running databa
 ```sh
 hexeract outbox apply --conn "postgres://user:pass@localhost/db" --table audit_outbox --yes-i-know
 ```
+
+For POCs and integration tests you can apply the schema from Rust with `hexeract_outbox_sql::postgres::ensure_schema(&pool, "audit_outbox").await?`. Production deployments should run their own migration tooling rather than apply DDL from the running service.
 
 The schema is documented in [outbox-postgres-schema.md](../reference/outbox-postgres-schema.md).
 
@@ -61,22 +67,21 @@ Pick a stable identifier for `EVENT_TYPE`. The convention is `"<bounded-context>
 
 ```rust
 use hexeract_outbox::OutboxPublisher;
-use hexeract_outbox_postgres::PgOutboxPublisher;
+use hexeract_outbox_sql::PgOutboxPublisher;
 
 async fn register_user(
-    pool: &deadpool_postgres::Pool,
+    pool: &sqlx::PgPool,
     publisher: &PgOutboxPublisher,
     email: String,
 ) -> Result<Uuid, Box<dyn std::error::Error>> {
-    let mut client = pool.get().await?;
-    let mut tx = client.transaction().await?;
+    let mut tx = pool.begin().await?;
 
-    let user_id = Uuid::new_v4();
-    tx.execute(
-        "INSERT INTO users (id, email) VALUES ($1, $2)",
-        &[&user_id, &email],
-    )
-    .await?;
+    let user_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO users (id, email) VALUES ($1, $2)")
+        .bind(user_id)
+        .bind(&email)
+        .execute(&mut *tx)
+        .await?;
 
     let event_id = publisher
         .publish_in_tx(&mut tx, &UserRegistered { user_id, email })
@@ -94,10 +99,10 @@ The outbox row is committed atomically with the `INSERT INTO users`. If the busi
 
 ```rust
 use hexeract_core::HandlerContext;
-use hexeract_outbox::{Handler, OutboxError};
+use hexeract_outbox::{Event, Handler, OutboxError};
 
 pub struct AuditWriter {
-    pub audit_pool: deadpool_postgres::Pool,
+    pub audit_pool: sqlx::PgPool,
 }
 
 impl Handler<UserRegistered> for AuditWriter {
@@ -108,16 +113,12 @@ impl Handler<UserRegistered> for AuditWriter {
         event: UserRegistered,
         _ctx: &HandlerContext,
     ) -> Result<(), Self::Error> {
-        let client = self
-            .audit_pool
-            .get()
-            .await
-            .map_err(|e| OutboxError::Database(Box::new(e)))?;
-        client
-            .execute(
-                "INSERT INTO audit_log (event_type, payload) VALUES ($1, $2)",
-                &[&UserRegistered::EVENT_TYPE, &serde_json::to_string(&event)?],
-            )
+        let payload =
+            serde_json::to_string(&event).map_err(|e| OutboxError::Internal(e.to_string()))?;
+        sqlx::query("INSERT INTO audit_log (event_type, payload) VALUES ($1, $2)")
+            .bind(UserRegistered::EVENT_TYPE)
+            .bind(payload)
+            .execute(&self.audit_pool)
             .await
             .map_err(|e| OutboxError::Database(Box::new(e)))?;
         Ok(())
@@ -131,12 +132,12 @@ Handlers must be **idempotent**: the outbox guarantees at-least-once delivery, s
 
 ```rust
 use std::time::Duration;
-use hexeract_outbox_postgres::PgOutboxWorkerBuilder;
+use hexeract_outbox_sql::PgOutboxWorkerBuilder;
 use tokio_util::sync::CancellationToken;
 
 async fn run_service(
-    pool: deadpool_postgres::Pool,
-    audit_pool: deadpool_postgres::Pool,
+    pool: sqlx::PgPool,
+    audit_pool: sqlx::PgPool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let worker = PgOutboxWorkerBuilder::new(pool.clone())
         .table_name("audit_outbox")
@@ -165,4 +166,4 @@ async fn run_service(
 - [Outbox PostgreSQL schema](../reference/outbox-postgres-schema.md): canonical schema and migration tooling guidance.
 - [Outbox pattern concept](../concepts/outbox-pattern.md): the why, the guarantees, the trade-offs.
 - [Outbox MVP requirements (v0.1.0)](../design/outbox-mvp-requirements.md): the public requirements that drove v0.1.0.
-- The runnable [`examples/02_outbox_two_databases.rs`](../../crates/hexeract-outbox-postgres/examples/02_outbox_two_databases.rs) demonstrates the full flow against two isolated PostgreSQL containers.
+- The runnable [`examples/02_outbox_transactional.rs`](../../crates/hexeract-examples/examples/02_outbox_transactional.rs) demonstrates the full publish-to-dispatch flow against a real PostgreSQL container: `cargo run --example 02_outbox_transactional -p hexeract-examples` (Docker required).

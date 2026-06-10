@@ -70,12 +70,15 @@ crates/
 │   └── src/{envelope,error,handler,message,topology,transport}.rs
 ├── hexeract-bus-rabbitmq/
 │   ├── src/{connection,pool,topology,transport,worker}.rs
-│   ├── tests/integration.rs
-│   └── examples/03_bus_pubsub.rs
+│   └── tests/integration.rs
 ├── hexeract-outbox/
 │   └── src/{envelope,error,event,handler,publisher,worker}.rs
+├── hexeract-outbox-sql/
+│   └── src/{dialect,envelope,validate,postgres,mysql,sqlite}.rs
 ├── hexeract-outbox-postgres/
 │   └── src/{builder,publisher,schema,store}.rs
+├── hexeract-examples/
+│   └── examples/{01_command_handler,02_outbox_transactional,03_bus_pubsub,04_bus_mediator,05_orders_to_payments}.rs
 └── hexeract-cli/
     └── src/{cli,commands/{outbox,bus}}.rs
 ```

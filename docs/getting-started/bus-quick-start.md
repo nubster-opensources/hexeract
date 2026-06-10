@@ -143,5 +143,5 @@ flowchart LR
 
 - Read the [bus flow architecture](../architecture/bus-flow.md) for the full lifecycle from publish to ack.
 - Read the [ack modes](../concepts/ack-modes.md) and [retry policy](../concepts/retry-policy.md) to tune the consumer for your reliability targets.
-- Run the end-to-end example: `cargo run --example 03_bus_pubsub -p hexeract-bus-rabbitmq` (Docker required).
+- Run the end-to-end example: `cargo run --example 03_bus_pubsub -p hexeract-examples` (Docker required).
 - Provision topology out of band with [`hexeract bus declare`](../reference/cli.md).

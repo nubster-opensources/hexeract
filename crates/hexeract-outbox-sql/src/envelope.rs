@@ -45,6 +45,14 @@ pub(crate) fn primitive_utc_to_system_time(p: PrimitiveDateTime) -> SystemTime {
 /// expression so lexicographic comparisons against the stored timestamps stay
 /// correct.
 ///
+/// SQLite stores outbox timestamps at millisecond resolution. Any
+/// sub-millisecond component of `t` is **truncated**, not rounded, when it is
+/// formatted, so it does not survive a round-trip through [`parse_sqlite_utc`].
+/// PostgreSQL (`TIMESTAMPTZ`) and MySQL (`DATETIME(6)`) keep finer,
+/// microsecond resolution. The outbox tolerates the SQLite granularity: poll
+/// ordering and `next_retry_at` scheduling only need lexicographically sortable
+/// timestamps, and millisecond granularity is sufficient for both.
+///
 /// # Errors
 ///
 /// Returns [`OutboxError::Internal`] if the value cannot be formatted.
@@ -60,6 +68,10 @@ pub(crate) fn format_sqlite_utc(t: SystemTime) -> Result<String, OutboxError> {
 
 /// Parse a SQLite `TEXT` timestamp written by [`format_sqlite_utc`] (or by the
 /// `strftime` column default) back into a [`SystemTime`], interpreting it as UTC.
+///
+/// The stored text carries millisecond precision, so the returned
+/// [`SystemTime`] is aligned to a whole millisecond: any sub-millisecond part of
+/// the original value was already truncated by [`format_sqlite_utc`].
 ///
 /// # Errors
 ///
@@ -126,6 +138,28 @@ mod tests {
         assert!(text.ends_with('Z'));
         let restored = parse_sqlite_utc(&text).unwrap();
         assert_eq!(restored, original);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_text_truncates_sub_millisecond_precision() {
+        // 123_900_000 ns is 123.9 ms: the 900_000 ns tail sits past the
+        // millisecond boundary. A value above the half-millisecond mark would
+        // round up to 124 ms, so this case distinguishes truncation from
+        // rounding rather than just precision loss.
+        let original = SystemTime::UNIX_EPOCH + Duration::new(1_750_000_000, 123_900_000);
+        let truncated = SystemTime::UNIX_EPOCH + Duration::new(1_750_000_000, 123_000_000);
+
+        let restored = parse_sqlite_utc(&format_sqlite_utc(original).unwrap()).unwrap();
+
+        assert_ne!(
+            restored, original,
+            "sub-millisecond precision must not survive a SQLite round-trip"
+        );
+        assert_eq!(
+            restored, truncated,
+            "the sub-millisecond tail must be truncated, not rounded"
+        );
     }
 
     #[cfg(feature = "mysql")]
