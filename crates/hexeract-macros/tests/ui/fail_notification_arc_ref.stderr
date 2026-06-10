@@ -1,0 +1,19 @@
+error: the notification type inside `Arc<...>` must be a named type
+  --> tests/ui/fail_notification_arc_ref.rs:13:36
+   |
+13 |     async fn handle(&self, _n: Arc<&N>, _ctx: &HandlerContext) -> Result<(), HexeractError> {
+   |                                    ^^
+
+warning: unused import: `std::sync::Arc`
+ --> tests/ui/fail_notification_arc_ref.rs:1:5
+  |
+1 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused imports: `HandlerContext` and `HexeractError`
+ --> tests/ui/fail_notification_arc_ref.rs:3:21
+  |
+3 | use hexeract_core::{HandlerContext, HexeractError, Notification};
+  |                     ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^

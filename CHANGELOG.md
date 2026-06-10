@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 
 ### Fixed
 
+- `hexeract-macros`: the `#[handler(notification)]` macro now validates that the message argument is a standard-library `Arc<N>` (`Arc`, `std::sync::Arc`, `alloc::sync::Arc` and their leading-colon forms). A different path whose final segment is `Arc` (a module re-export such as `foo::Arc`, or a shadowed local alias) was silently accepted and then forwarded as `::std::sync::Arc`, producing a confusing type-mismatch error on macro-generated code. It is now rejected with a clear diagnostic at the argument span. (#172)
 - `hexeract-outbox-sql`: the MySQL `Dialect::now_expr` returned the whole-second `UTC_TIMESTAMP()` while the schema stores `DATETIME(6)` microsecond timestamps, so the poll predicate `next_retry_at <= now` could treat a due retry as not-yet-due and skip it for up to roughly one second. It now returns `UTC_TIMESTAMP(6)`, matching the bound sub-second precision for both polling and mark-delivered. (#166)
 
 ## [0.4.0] - 2026-06-02

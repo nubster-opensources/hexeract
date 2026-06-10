@@ -1,4 +1,4 @@
-error: a notification handler argument must be `Arc<N>`, since the notification is shared across handlers
+error: a notification handler argument must be a standard `Arc<N>` (`std::sync::Arc` or `alloc::sync::Arc`), since the notification is shared across handlers
   --> tests/ui/fail_notification_not_arc.rs:11:32
    |
 11 |     async fn handle(&self, _n: N, _ctx: &HandlerContext) -> Result<(), HexeractError> {

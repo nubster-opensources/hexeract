@@ -1,0 +1,25 @@
+error: `Arc` must have exactly one type argument: `Arc<N>`
+  --> tests/ui/fail_notification_arc_arity.rs:13:32
+   |
+13 |     async fn handle(&self, _n: Arc<N, N>, _ctx: &HandlerContext) -> Result<(), HexeractError> {
+   |                                ^^^^^^^^^
+
+error: `Arc` must have exactly one type argument: `Arc<N>`
+  --> tests/ui/fail_notification_arc_arity.rs:22:32
+   |
+22 |     async fn handle(&self, _n: Arc<>, _ctx: &HandlerContext) -> Result<(), HexeractError> {
+   |                                ^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> tests/ui/fail_notification_arc_arity.rs:1:5
+  |
+1 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused imports: `HandlerContext` and `HexeractError`
+ --> tests/ui/fail_notification_arc_arity.rs:3:21
+  |
+3 | use hexeract_core::{HandlerContext, HexeractError, Notification};
+  |                     ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^

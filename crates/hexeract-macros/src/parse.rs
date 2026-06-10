@@ -310,10 +310,10 @@ fn notification_message_type(arg: &FnArg) -> syn::Result<Type> {
     let last = tp.path.segments.last().ok_or_else(|| {
         syn::Error::new_spanned(&ty, "a notification handler argument must be `Arc<N>`")
     })?;
-    if last.ident != "Arc" {
+    if !is_std_arc_path(&tp.path) {
         return Err(syn::Error::new_spanned(
-            &ty,
-            "a notification handler argument must be `Arc<N>`, since the notification is shared across handlers",
+            &tp.path,
+            "a notification handler argument must be a standard `Arc<N>` (`std::sync::Arc` or `alloc::sync::Arc`), since the notification is shared across handlers",
         ));
     }
     let PathArguments::AngleBracketed(args) = &last.arguments else {
@@ -335,6 +335,30 @@ fn notification_message_type(arg: &FnArg) -> syn::Result<Type> {
             other,
             "the notification type inside `Arc<...>` must be a named type",
         )),
+    }
+}
+
+/// Returns `true` if `path` is a recognized spelling of the standard
+/// `sync::Arc`: bare `Arc`, `std::sync::Arc`, `alloc::sync::Arc`, and
+/// their leading-colon (`::std::sync::Arc`) forms.
+///
+/// The check is syntactic, not name-resolved, since a proc-macro has no
+/// type information. A different path whose final segment is `Arc` (a
+/// module re-export such as `foo::Arc`, or a shadowed local alias) is
+/// deliberately rejected: the generated handler signature forwards a
+/// `::std::sync::Arc`, and only these spellings are guaranteed to match
+/// it, so anything else is refused at the argument span rather than
+/// failing later on macro-generated code.
+fn is_std_arc_path(path: &syn::Path) -> bool {
+    let segments: Vec<String> = path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect();
+    match segments.as_slice() {
+        [arc] => arc == "Arc",
+        [root, sync, arc] => (root == "std" || root == "alloc") && sync == "sync" && arc == "Arc",
+        _ => false,
     }
 }
 
