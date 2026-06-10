@@ -4,13 +4,17 @@
 # release workflow.
 #
 # Usage:
-#   scripts/publish-or-skip.sh <crate-name> [extra args] -- <token>
+#   scripts/publish-or-skip.sh <crate-name> [extra args]
+#
+# The crates.io token is read from the CARGO_REGISTRY_TOKEN environment
+# variable, which cargo reads natively. Never pass the token as a
+# command-line argument.
 #
 # The script:
 #   1. Reads the local version of <crate-name> via `cargo pkgid`.
 #   2. Checks the crates.io API for that exact version.
 #   3. Skips the publish if the version is already on crates.io.
-#   4. Otherwise runs `cargo publish -p <crate-name> [extra args] --token <token>`.
+#   4. Otherwise runs `cargo publish -p <crate-name> [extra args]`.
 #
 # Why: the release workflow needs to be re-runnable after a partial
 # failure (mid-pipeline timeout, missing intermediate crate, ...).
@@ -19,8 +23,8 @@
 
 set -euo pipefail
 
-if [[ $# -lt 3 ]]; then
-  echo "usage: $0 <crate-name> [extra-args ...] -- <token>" >&2
+if [[ $# -lt 1 ]]; then
+  echo "usage: $0 <crate-name> [extra-args ...]" >&2
   exit 2
 fi
 
@@ -29,19 +33,9 @@ shift
 
 extra_args=()
 while [[ $# -gt 0 ]]; do
-  if [[ "$1" == "--" ]]; then
-    shift
-    break
-  fi
   extra_args+=("$1")
   shift
 done
-
-if [[ $# -ne 1 ]]; then
-  echo "usage: $0 <crate-name> [extra-args ...] -- <token>" >&2
-  exit 2
-fi
-token="$1"
 
 # Resolve the local version through `cargo pkgid`. Output format depends
 # on the cargo release in use; handle both `name@version` and `...#version`.
@@ -107,4 +101,4 @@ if [[ "$is_dry_run" == true ]]; then
   exit 0
 fi
 
-cargo publish -p "$crate" "${extra_args[@]}" --token "$token"
+cargo publish -p "$crate" "${extra_args[@]}"
