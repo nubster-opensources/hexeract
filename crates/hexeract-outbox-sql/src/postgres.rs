@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::SystemTime;
 
 use async_trait::async_trait;
 use hexeract_outbox::ErasedHandler;
@@ -26,7 +25,6 @@ use uuid::Uuid;
 use crate::DEFAULT_TABLE_NAME;
 use crate::dialect::Dialect;
 use crate::envelope::assemble_envelope;
-use crate::envelope::to_offset;
 use crate::envelope::to_system_time;
 use crate::validate::validate_table_name;
 
@@ -42,6 +40,35 @@ fn pool_error(error: sqlx::Error) -> OutboxError {
     } else {
         OutboxError::Database(Box::new(error))
     }
+}
+
+/// Decode one polled row into an [`OutboxEnvelope`].
+///
+/// Kept separate from the poll loop so a decode failure can be isolated to the
+/// offending row (logged and skipped) instead of aborting the whole batch.
+fn decode_pg_row(row: &sqlx::postgres::PgRow) -> Result<OutboxEnvelope, OutboxError> {
+    let event_id: Uuid = row.try_get("event_id").map_err(database_error)?;
+    let event_type: String = row.try_get("event_type").map_err(database_error)?;
+    let payload: serde_json::Value = row.try_get("payload").map_err(database_error)?;
+    let subject_id: Option<Uuid> = row.try_get("subject_id").map_err(database_error)?;
+    let created_at: OffsetDateTime = row.try_get("created_at").map_err(database_error)?;
+    let attempts: i32 = row.try_get("attempts").map_err(database_error)?;
+    let last_error: Option<String> = row.try_get("last_error").map_err(database_error)?;
+    let next_retry_at: Option<OffsetDateTime> =
+        row.try_get("next_retry_at").map_err(database_error)?;
+
+    let payload = serde_json::to_vec(&payload)?;
+
+    Ok(assemble_envelope(
+        event_id,
+        event_type,
+        payload,
+        subject_id,
+        to_system_time(created_at),
+        u32::try_from(attempts.max(0)).unwrap_or(u32::MAX),
+        last_error,
+        next_retry_at.map(to_system_time),
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -174,28 +201,20 @@ impl OutboxStore for PgOutboxStore {
 
         let mut envelopes = Vec::with_capacity(rows.len());
         for row in rows {
-            let event_id: Uuid = row.try_get("event_id").map_err(database_error)?;
-            let event_type: String = row.try_get("event_type").map_err(database_error)?;
-            let payload: serde_json::Value = row.try_get("payload").map_err(database_error)?;
-            let subject_id: Option<Uuid> = row.try_get("subject_id").map_err(database_error)?;
-            let created_at: OffsetDateTime = row.try_get("created_at").map_err(database_error)?;
-            let attempts: i32 = row.try_get("attempts").map_err(database_error)?;
-            let last_error: Option<String> = row.try_get("last_error").map_err(database_error)?;
-            let next_retry_at: Option<OffsetDateTime> =
-                row.try_get("next_retry_at").map_err(database_error)?;
-
-            let payload = serde_json::to_vec(&payload)?;
-
-            envelopes.push(assemble_envelope(
-                event_id,
-                event_type,
-                payload,
-                subject_id,
-                to_system_time(created_at),
-                u32::try_from(attempts.max(0)).unwrap_or(u32::MAX),
-                last_error,
-                next_retry_at.map(to_system_time),
-            ));
+            // A single undecodable row (schema drift, corrupt payload) must not
+            // abort the whole poll: that head-of-line poisons the queue forever
+            // (#214). Log it and skip so the rest of the batch keeps draining.
+            match decode_pg_row(&row) {
+                Ok(envelope) => envelopes.push(envelope),
+                Err(error) => {
+                    let event_id = row.try_get::<Uuid, _>("event_id").ok();
+                    tracing::error!(
+                        ?event_id,
+                        error = %error,
+                        "skipping undecodable outbox row; the rest of the batch continues"
+                    );
+                }
+            }
         }
         Ok(envelopes)
     }
@@ -218,11 +237,12 @@ impl OutboxStore for PgOutboxStore {
         tx: &mut Self::Tx<'a>,
         event_id: Uuid,
         error: &str,
-        next_retry_at: SystemTime,
+        retry_in: Duration,
     ) -> Result<(), OutboxError> {
+        // The SQL adds this many seconds to the DB clock (#230); bind as f64.
         sqlx::query(&self.mark_failed_sql)
             .bind(error)
-            .bind(to_offset(next_retry_at))
+            .bind(retry_in.as_secs_f64())
             .bind(event_id)
             .execute(&mut **tx)
             .await
@@ -260,13 +280,14 @@ impl OutboxStore for PgOutboxStore {
         &self,
         tx: &mut Self::Tx<'a>,
         event_ids: &[Uuid],
-        lease_until: SystemTime,
+        lease_for: Duration,
     ) -> Result<(), OutboxError> {
         if event_ids.is_empty() {
             return Ok(());
         }
         let sql = DIALECT.claim_sql(&self.table_name, event_ids.len());
-        let mut query = sqlx::query(&sql).bind(to_offset(lease_until));
+        // The SQL adds this many seconds to the DB clock (#230); bind as f64.
+        let mut query = sqlx::query(&sql).bind(lease_for.as_secs_f64());
         for id in event_ids {
             query = query.bind(*id);
         }
@@ -513,10 +534,12 @@ impl PgOutboxWorkerBuilder {
         self
     }
 
-    /// Override the soft-lease duration for claimed envelopes (default 30 s).
+    /// Override the per-envelope handler deadline and soft-lease unit
+    /// (default 30 s).
     ///
-    /// Must exceed the worst-case handler duration to avoid spurious
-    /// re-delivery while a worker is still dispatching.
+    /// Each handler invocation is wrapped in a hard `tokio` timeout of this
+    /// duration; the batch lease is sized as `batch_size x dispatch_timeout`
+    /// internally. Set it to the worst-case duration of a single handler.
     #[must_use]
     pub fn dispatch_timeout(mut self, d: Duration) -> Self {
         self.config.dispatch_timeout = d;
@@ -640,7 +663,9 @@ mod tests {
         assert!(store.poll_sql.contains("FROM audit_outbox"));
         assert!(store.poll_sql.contains("FOR UPDATE SKIP LOCKED"));
         assert!(store.mark_delivered_sql.contains("UPDATE audit_outbox"));
-        assert!(store.mark_failed_sql.contains("attempts = attempts + 1"));
+        // The attempt increment lives in claim_sql now (see #213), so
+        // mark_failed must not increment again.
+        assert!(!store.mark_failed_sql.contains("attempts = attempts + 1"));
     }
 
     #[tokio::test]
@@ -753,7 +778,9 @@ mod tests {
     fn store_claim_sql_embeds_table_name_and_correct_placeholder_count() {
         let sql = DIALECT.claim_sql("audit_outbox", 3);
         assert!(sql.contains("UPDATE audit_outbox"));
-        assert!(sql.contains("next_retry_at = $1"));
+        assert!(sql.contains("next_retry_at = (NOW() +"));
+        assert!(sql.contains("$1"));
         assert!(sql.contains("$2, $3, $4"));
+        assert!(sql.contains("attempts = attempts + 1"));
     }
 }

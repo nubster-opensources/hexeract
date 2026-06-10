@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::SystemTime;
 
 use async_trait::async_trait;
 use hexeract_outbox::ErasedHandler;
@@ -27,10 +26,15 @@ use crate::DEFAULT_TABLE_NAME;
 use crate::dialect::Dialect;
 use crate::envelope::assemble_envelope;
 use crate::envelope::primitive_utc_to_system_time;
-use crate::envelope::to_primitive_utc;
 use crate::validate::validate_table_name;
 
 const DIALECT: Dialect = Dialect::MySql;
+
+/// Convert a backoff/lease [`Duration`] into whole microseconds for binding to
+/// a MySQL `INTERVAL ? MICROSECOND` expression, saturating at [`i64::MAX`].
+fn duration_to_micros(d: Duration) -> i64 {
+    i64::try_from(d.as_micros()).unwrap_or(i64::MAX)
+}
 
 fn database_error(error: impl std::error::Error + Send + Sync + 'static) -> OutboxError {
     OutboxError::Database(Box::new(error))
@@ -42,6 +46,35 @@ fn pool_error(error: sqlx::Error) -> OutboxError {
     } else {
         OutboxError::Database(Box::new(error))
     }
+}
+
+/// Decode one polled row into an [`OutboxEnvelope`].
+///
+/// Kept separate from the poll loop so a decode failure can be isolated to the
+/// offending row (logged and skipped) instead of aborting the whole batch.
+fn decode_mysql_row(row: &sqlx::mysql::MySqlRow) -> Result<OutboxEnvelope, OutboxError> {
+    let event_id: Uuid = row.try_get("event_id").map_err(database_error)?;
+    let event_type: String = row.try_get("event_type").map_err(database_error)?;
+    let payload: serde_json::Value = row.try_get("payload").map_err(database_error)?;
+    let subject_id: Option<Uuid> = row.try_get("subject_id").map_err(database_error)?;
+    let created_at: PrimitiveDateTime = row.try_get("created_at").map_err(database_error)?;
+    let attempts: i32 = row.try_get("attempts").map_err(database_error)?;
+    let last_error: Option<String> = row.try_get("last_error").map_err(database_error)?;
+    let next_retry_at: Option<PrimitiveDateTime> =
+        row.try_get("next_retry_at").map_err(database_error)?;
+
+    let payload = serde_json::to_vec(&payload)?;
+
+    Ok(assemble_envelope(
+        event_id,
+        event_type,
+        payload,
+        subject_id,
+        primitive_utc_to_system_time(created_at),
+        u32::try_from(attempts.max(0)).unwrap_or(u32::MAX),
+        last_error,
+        next_retry_at.map(primitive_utc_to_system_time),
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -165,29 +198,20 @@ impl OutboxStore for MySqlOutboxStore {
 
         let mut envelopes = Vec::with_capacity(rows.len());
         for row in rows {
-            let event_id: Uuid = row.try_get("event_id").map_err(database_error)?;
-            let event_type: String = row.try_get("event_type").map_err(database_error)?;
-            let payload: serde_json::Value = row.try_get("payload").map_err(database_error)?;
-            let subject_id: Option<Uuid> = row.try_get("subject_id").map_err(database_error)?;
-            let created_at: PrimitiveDateTime =
-                row.try_get("created_at").map_err(database_error)?;
-            let attempts: i32 = row.try_get("attempts").map_err(database_error)?;
-            let last_error: Option<String> = row.try_get("last_error").map_err(database_error)?;
-            let next_retry_at: Option<PrimitiveDateTime> =
-                row.try_get("next_retry_at").map_err(database_error)?;
-
-            let payload = serde_json::to_vec(&payload)?;
-
-            envelopes.push(assemble_envelope(
-                event_id,
-                event_type,
-                payload,
-                subject_id,
-                primitive_utc_to_system_time(created_at),
-                u32::try_from(attempts.max(0)).unwrap_or(u32::MAX),
-                last_error,
-                next_retry_at.map(primitive_utc_to_system_time),
-            ));
+            // A single undecodable row (schema drift, corrupt payload) must not
+            // abort the whole poll: that head-of-line poisons the queue forever
+            // (#214). Log it and skip so the rest of the batch keeps draining.
+            match decode_mysql_row(&row) {
+                Ok(envelope) => envelopes.push(envelope),
+                Err(error) => {
+                    let event_id = row.try_get::<Uuid, _>("event_id").ok();
+                    tracing::error!(
+                        ?event_id,
+                        error = %error,
+                        "skipping undecodable outbox row; the rest of the batch continues"
+                    );
+                }
+            }
         }
         Ok(envelopes)
     }
@@ -210,11 +234,12 @@ impl OutboxStore for MySqlOutboxStore {
         tx: &mut Self::Tx<'a>,
         event_id: Uuid,
         error: &str,
-        next_retry_at: SystemTime,
+        retry_in: Duration,
     ) -> Result<(), OutboxError> {
+        // The SQL adds this many microseconds to the DB clock (#230).
         sqlx::query(&self.mark_failed_sql)
             .bind(error)
-            .bind(to_primitive_utc(next_retry_at))
+            .bind(duration_to_micros(retry_in))
             .bind(event_id)
             .execute(&mut **tx)
             .await
@@ -252,13 +277,14 @@ impl OutboxStore for MySqlOutboxStore {
         &self,
         tx: &mut Self::Tx<'a>,
         event_ids: &[Uuid],
-        lease_until: SystemTime,
+        lease_for: Duration,
     ) -> Result<(), OutboxError> {
         if event_ids.is_empty() {
             return Ok(());
         }
         let sql = DIALECT.claim_sql(&self.table_name, event_ids.len());
-        let mut query = sqlx::query(&sql).bind(to_primitive_utc(lease_until));
+        // The SQL adds this many microseconds to the DB clock (#230).
+        let mut query = sqlx::query(&sql).bind(duration_to_micros(lease_for));
         for id in event_ids {
             query = query.bind(*id);
         }
@@ -493,10 +519,12 @@ impl MySqlOutboxWorkerBuilder {
         self
     }
 
-    /// Override the soft-lease duration for claimed envelopes (default 30 s).
+    /// Override the per-envelope handler deadline and soft-lease unit
+    /// (default 30 s).
     ///
-    /// Must exceed the worst-case handler duration to avoid spurious
-    /// re-delivery while a worker is still dispatching.
+    /// Each handler invocation is wrapped in a hard `tokio` timeout of this
+    /// duration; the batch lease is sized as `batch_size x dispatch_timeout`
+    /// internally. Set it to the worst-case duration of a single handler.
     #[must_use]
     pub fn dispatch_timeout(mut self, d: Duration) -> Self {
         self.config.dispatch_timeout = d;
@@ -624,7 +652,9 @@ mod tests {
         assert!(store.poll_sql.contains("FOR UPDATE SKIP LOCKED"));
         assert!(store.poll_sql.contains("UTC_TIMESTAMP(6)"));
         assert!(store.mark_delivered_sql.contains("UPDATE audit_outbox"));
-        assert!(store.mark_failed_sql.contains("attempts = attempts + 1"));
+        // The attempt increment lives in claim_sql now (see #213), so
+        // mark_failed must not increment again.
+        assert!(!store.mark_failed_sql.contains("attempts = attempts + 1"));
     }
 
     #[tokio::test]
@@ -679,7 +709,8 @@ mod tests {
     fn store_claim_sql_embeds_table_name_and_question_mark_placeholders() {
         let sql = DIALECT.claim_sql("audit_outbox", 2);
         assert!(sql.contains("UPDATE audit_outbox"));
-        assert!(sql.contains("next_retry_at = ?"));
+        assert!(sql.contains("next_retry_at = (UTC_TIMESTAMP(6) + INTERVAL ? MICROSECOND)"));
         assert!(sql.contains("WHERE event_id IN (?, ?)"));
+        assert!(sql.contains("attempts = attempts + 1"));
     }
 }

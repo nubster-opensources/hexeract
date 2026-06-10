@@ -197,6 +197,30 @@ impl Dialect {
         }
     }
 
+    /// SQL expression evaluating to the database current instant offset by a
+    /// bound interval, in a form comparable to the stored timestamps.
+    ///
+    /// The offset is taken from the bind parameter at `index` and is always
+    /// anchored to the **database** clock (`NOW()` / `UTC_TIMESTAMP(6)` /
+    /// `strftime('now')`), never the application clock. This keeps lease and
+    /// retry comparisons consistent even when the worker host and the database
+    /// host disagree on wall-clock time (#230).
+    ///
+    /// The bound value's unit differs per engine, so each store binds the
+    /// matching scalar: PostgreSQL binds seconds as `f64`, MySQL binds whole
+    /// microseconds as `i64`, and SQLite binds a `strftime` modifier string
+    /// such as `"+1.500 seconds"`.
+    pub(crate) fn now_plus_interval_expr(self, index: usize) -> String {
+        let ph = self.placeholder(index);
+        match self {
+            Self::Postgres => {
+                format!("(NOW() + (CAST({ph} AS DOUBLE PRECISION) * INTERVAL '1 second'))")
+            }
+            Self::MySql => format!("(UTC_TIMESTAMP(6) + INTERVAL {ph} MICROSECOND)"),
+            Self::Sqlite => format!("strftime('%Y-%m-%dT%H:%M:%fZ', 'now', {ph})"),
+        }
+    }
+
     /// `SELECT ... WHERE delivered_at IS NULL ... [FOR UPDATE SKIP LOCKED]`.
     pub(crate) fn poll_sql(self, table: &str) -> String {
         let max_attempts = self.placeholder(1);
@@ -226,14 +250,23 @@ impl Dialect {
         format!("UPDATE {table} SET delivered_at = {now} WHERE event_id = {event_id}")
     }
 
-    /// `UPDATE {table} SET attempts = attempts + 1, last_error, next_retry_at ...`.
+    /// `UPDATE {table} SET last_error, next_retry_at = {now + interval} ...`.
+    ///
+    /// `next_retry_at` is derived from the **database** clock plus the bound
+    /// backoff interval (parameter 2), not from an application-supplied
+    /// timestamp, so retry scheduling is immune to app/DB clock skew (#230).
+    ///
+    /// The attempt counter is **not** incremented here: it is consumed once
+    /// per dispatch attempt by [`Self::claim_sql`] at claim time, so that a
+    /// worker that crashes between claim and this call still burns one retry
+    /// slot. Incrementing again here would double-count every clean failure.
     pub(crate) fn mark_failed_sql(self, table: &str) -> String {
         let last_error = self.placeholder(1);
-        let next_retry_at = self.placeholder(2);
+        let next_retry_at = self.now_plus_interval_expr(2);
         let event_id = self.placeholder(3);
         format!(
             "UPDATE {table} \
-             SET attempts = attempts + 1, last_error = {last_error}, next_retry_at = {next_retry_at} \
+             SET last_error = {last_error}, next_retry_at = {next_retry_at} \
              WHERE event_id = {event_id}"
         )
     }
@@ -311,26 +344,40 @@ impl Dialect {
         format!("DELETE FROM {table} WHERE event_id = {event_id}")
     }
 
-    /// `UPDATE {table} SET next_retry_at = {p1} WHERE event_id IN ({p2..pN+1})`.
+    /// `UPDATE {table} SET next_retry_at = {now + interval}, attempts = attempts + 1 WHERE event_id IN ({p2..pN+1})`.
     ///
     /// Sets a soft lease on the given envelopes so competing workers skip
-    /// them until the lease expires. Parameter 1 is the lease timestamp;
-    /// parameters 2 through `n + 1` are the envelope `event_id` values.
+    /// them until the lease expires, and consumes one retry slot by
+    /// incrementing `attempts`. The lease expiry is computed from the
+    /// **database** clock plus the bound lease interval (parameter 1), not an
+    /// application timestamp, so the lease window is immune to app/DB clock
+    /// skew (#230). Parameters 2 through `n + 1` are the envelope `event_id`
+    /// values.
+    ///
+    /// Incrementing `attempts` at claim time (rather than only on failure in
+    /// [`Self::mark_failed_sql`]) is what makes a worker crash between claim
+    /// and acknowledgement safe: the attempt is already counted, so the
+    /// envelope cannot be redelivered forever without ever reaching the
+    /// dead-letter threshold.
     ///
     /// The query is generated dynamically because the `IN` clause length
     /// varies with the actual batch size. Call frequency is low (once per
     /// poll cycle) so the allocation is negligible.
-    // Only the competing-consumers postgres and mysql stores issue claims;
-    // a sqlite-only build never calls this, so the method is dead there.
-    #[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+    // Every store issues a claim now (postgres/mysql for the competing-consumer
+    // lease, sqlite to increment attempts); only a feature-less build leaves it
+    // unused.
+    #[cfg_attr(
+        not(any(feature = "postgres", feature = "mysql", feature = "sqlite")),
+        allow(dead_code)
+    )]
     pub(crate) fn claim_sql(self, table: &str, n: usize) -> String {
-        let lease = self.placeholder(1);
+        let lease = self.now_plus_interval_expr(1);
         let placeholders = (2..=n + 1)
             .map(|i| self.placeholder(i))
             .collect::<Vec<_>>()
             .join(", ");
         format!(
-            "UPDATE {table} SET next_retry_at = {lease} \
+            "UPDATE {table} SET next_retry_at = {lease}, attempts = attempts + 1 \
              WHERE event_id IN ({placeholders})"
         )
     }
@@ -396,12 +443,18 @@ mod tests {
     }
 
     #[test]
-    fn postgres_mark_failed_increments_attempts_with_three_binds() {
+    fn postgres_mark_failed_does_not_increment_attempts_with_three_binds() {
         let sql = Dialect::Postgres.mark_failed_sql("audit_outbox");
-        assert!(sql.contains("attempts = attempts + 1"));
-        assert!(sql.contains("$1"));
+        // The increment moved to claim_sql so a crash between claim and
+        // mark_failed still consumes a retry slot; mark_failed must not
+        // double-count.
+        assert!(!sql.contains("attempts = attempts + 1"));
+        assert!(sql.contains("last_error = $1"));
+        // next_retry_at is computed from the DB clock plus the bound interval
+        // ($2), never an app timestamp (#230).
+        assert!(sql.contains("next_retry_at = (NOW() +"));
         assert!(sql.contains("$2"));
-        assert!(sql.contains("$3"));
+        assert!(sql.contains("WHERE event_id = $3"));
     }
 
     #[test]
@@ -555,7 +608,9 @@ mod tests {
     fn postgres_claim_sql_uses_positional_placeholders() {
         let sql = Dialect::Postgres.claim_sql("audit_outbox", 3);
         assert!(sql.contains("UPDATE audit_outbox"));
-        assert!(sql.contains("SET next_retry_at = $1"));
+        // Lease anchored to the DB clock plus the bound interval ($1), #230.
+        assert!(sql.contains("SET next_retry_at = (NOW() +"));
+        assert!(sql.contains("$1"));
         assert!(sql.contains("$2, $3, $4"));
         assert!(sql.contains("WHERE event_id IN"));
     }
@@ -564,7 +619,7 @@ mod tests {
     fn mysql_claim_sql_uses_question_marks() {
         let sql = Dialect::MySql.claim_sql("audit_outbox", 2);
         assert!(sql.contains("UPDATE audit_outbox"));
-        assert!(sql.contains("SET next_retry_at = ?"));
+        assert!(sql.contains("SET next_retry_at = (UTC_TIMESTAMP(6) + INTERVAL ? MICROSECOND)"));
         assert!(sql.contains("WHERE event_id IN (?, ?)"));
     }
 
@@ -572,7 +627,39 @@ mod tests {
     fn sqlite_claim_sql_uses_question_marks() {
         let sql = Dialect::Sqlite.claim_sql("audit_outbox", 1);
         assert!(sql.contains("UPDATE audit_outbox"));
-        assert!(sql.contains("SET next_retry_at = ?"));
+        assert!(sql.contains("SET next_retry_at = strftime("));
+        assert!(sql.contains("'now', ?)"));
         assert!(sql.contains("WHERE event_id IN (?)"));
+    }
+
+    #[test]
+    fn now_plus_interval_uses_db_clock_per_dialect() {
+        // Regression guard for #230: the lease/retry anchor is the database
+        // clock, never an application timestamp bound by the worker.
+        assert!(
+            Dialect::Postgres
+                .now_plus_interval_expr(1)
+                .contains("NOW()")
+        );
+        assert!(
+            Dialect::MySql
+                .now_plus_interval_expr(1)
+                .contains("UTC_TIMESTAMP(6)")
+        );
+        assert!(Dialect::Sqlite.now_plus_interval_expr(1).contains("'now'"));
+    }
+
+    #[test]
+    fn claim_sql_increments_attempts_for_every_dialect() {
+        // Regression guard for #213: claiming an envelope must consume a
+        // retry slot so a crash between claim and mark_failed cannot
+        // redeliver a poison row forever.
+        for dialect in [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite] {
+            let sql = dialect.claim_sql("audit_outbox", 2);
+            assert!(
+                sql.contains("attempts = attempts + 1"),
+                "{dialect:?} claim_sql must increment attempts, got: {sql}"
+            );
+        }
     }
 }

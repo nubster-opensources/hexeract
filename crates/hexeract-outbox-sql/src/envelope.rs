@@ -3,32 +3,16 @@ use std::time::SystemTime;
 use hexeract_outbox::OutboxEnvelope;
 #[cfg(feature = "sqlite")]
 use hexeract_outbox::OutboxError;
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 use time::OffsetDateTime;
 #[cfg(any(feature = "mysql", feature = "sqlite"))]
 use time::PrimitiveDateTime;
 use uuid::Uuid;
 
-/// Convert a [`SystemTime`] into the `sqlx`-encodable [`OffsetDateTime`].
-#[cfg(feature = "postgres")]
-pub(crate) fn to_offset(t: SystemTime) -> OffsetDateTime {
-    OffsetDateTime::from(t)
-}
-
 /// Convert an [`OffsetDateTime`] decoded from the database back into a [`SystemTime`].
 #[cfg(feature = "postgres")]
 pub(crate) fn to_system_time(o: OffsetDateTime) -> SystemTime {
     SystemTime::from(o)
-}
-
-/// Convert a [`SystemTime`] into a UTC [`PrimitiveDateTime`] for a MySQL `DATETIME`.
-///
-/// MySQL `DATETIME` carries no time zone, so the value is normalized to UTC
-/// before the offset is dropped. The store reads it back with
-/// [`primitive_utc_to_system_time`].
-#[cfg(feature = "mysql")]
-pub(crate) fn to_primitive_utc(t: SystemTime) -> PrimitiveDateTime {
-    let odt = OffsetDateTime::from(t);
-    PrimitiveDateTime::new(odt.date(), odt.time())
 }
 
 /// Interpret a [`PrimitiveDateTime`] read from a MySQL `DATETIME` as UTC and
@@ -56,7 +40,11 @@ pub(crate) fn primitive_utc_to_system_time(p: PrimitiveDateTime) -> SystemTime {
 /// # Errors
 ///
 /// Returns [`OutboxError::Internal`] if the value cannot be formatted.
-#[cfg(feature = "sqlite")]
+///
+/// Only used by the round-trip tests: the stores write `next_retry_at` and
+/// `created_at` through the database `strftime(...)` expressions, never this
+/// Rust helper.
+#[cfg(all(feature = "sqlite", test))]
 pub(crate) fn format_sqlite_utc(t: SystemTime) -> Result<String, OutboxError> {
     let fmt = time::macros::format_description!(
         "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
@@ -66,24 +54,40 @@ pub(crate) fn format_sqlite_utc(t: SystemTime) -> Result<String, OutboxError> {
         .map_err(|e| OutboxError::Internal(format!("sqlite timestamp format failed: {e}")))
 }
 
-/// Parse a SQLite `TEXT` timestamp written by [`format_sqlite_utc`] (or by the
-/// `strftime` column default) back into a [`SystemTime`], interpreting it as UTC.
+/// Parse a SQLite `TEXT` timestamp into a [`SystemTime`], interpreting it as UTC.
 ///
-/// The stored text carries millisecond precision, so the returned
+/// Two layouts are accepted so the outbox keeps draining when rows are written
+/// by something other than [`format_sqlite_utc`]:
+///
+/// - the canonical millisecond RFC 3339 form this crate writes,
+///   `YYYY-MM-DDTHH:MM:SS.mmmZ`;
+/// - the SQLite native `datetime('now')` form `YYYY-MM-DD HH:MM:SS` (space
+///   separator, no fractional seconds), which a hand-written migration or an
+///   external writer commonly produces.
+///
+/// The stored text carries at most millisecond precision, so the returned
 /// [`SystemTime`] is aligned to a whole millisecond: any sub-millisecond part of
 /// the original value was already truncated by [`format_sqlite_utc`].
 ///
 /// # Errors
 ///
-/// Returns [`OutboxError::Internal`] if the text does not match the expected
-/// `YYYY-MM-DDTHH:MM:SS.mmmZ` layout.
+/// Returns [`OutboxError::Internal`] if the text matches neither accepted
+/// layout.
 #[cfg(feature = "sqlite")]
 pub(crate) fn parse_sqlite_utc(s: &str) -> Result<SystemTime, OutboxError> {
-    let fmt = time::macros::format_description!(
+    let rfc3339_millis = time::macros::format_description!(
         "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
     );
-    let parsed = PrimitiveDateTime::parse(s, fmt)
-        .map_err(|e| OutboxError::Internal(format!("sqlite timestamp parse failed: {e}")))?;
+    if let Ok(parsed) = PrimitiveDateTime::parse(s, rfc3339_millis) {
+        return Ok(SystemTime::from(parsed.assume_utc()));
+    }
+
+    // SQLite canonical datetime('now') form: "YYYY-MM-DD HH:MM:SS".
+    let sqlite_canonical =
+        time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+    let parsed = PrimitiveDateTime::parse(s, sqlite_canonical).map_err(|e| {
+        OutboxError::Internal(format!("sqlite timestamp parse failed for {s:?}: {e}"))
+    })?;
     Ok(SystemTime::from(parsed.assume_utc()))
 }
 
@@ -125,7 +129,7 @@ mod tests {
     #[test]
     fn system_time_round_trips_through_offset_date_time() {
         let original = SystemTime::UNIX_EPOCH + Duration::new(1_750_000_000, 123_456_789);
-        let restored = to_system_time(to_offset(original));
+        let restored = to_system_time(OffsetDateTime::from(original));
         assert_eq!(restored, original);
     }
 
@@ -162,11 +166,30 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn parse_sqlite_utc_accepts_canonical_datetime_now_form() {
+        // datetime('now') / CURRENT_TIMESTAMP write a space separator with no
+        // fractional seconds; the parser must accept it so an externally
+        // written row does not poison the poll loop (#214).
+        let parsed = parse_sqlite_utc("2024-01-01 12:00:00").expect("canonical form must parse");
+        let expected = SystemTime::UNIX_EPOCH + Duration::from_secs(1_704_110_400);
+        assert_eq!(parsed, expected);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn parse_sqlite_utc_rejects_garbage() {
+        assert!(parse_sqlite_utc("not a timestamp").is_err());
+    }
+
     #[cfg(feature = "mysql")]
     #[test]
     fn system_time_round_trips_through_primitive_utc() {
         let original = SystemTime::UNIX_EPOCH + Duration::new(1_750_000_000, 123_456_000);
-        let restored = primitive_utc_to_system_time(to_primitive_utc(original));
+        let odt = OffsetDateTime::from(original);
+        let primitive = PrimitiveDateTime::new(odt.date(), odt.time());
+        let restored = primitive_utc_to_system_time(primitive);
         assert_eq!(restored, original);
     }
 

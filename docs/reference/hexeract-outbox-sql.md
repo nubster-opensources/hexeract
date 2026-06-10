@@ -56,7 +56,7 @@ Production deployments should run their own migration tooling against `Dialect::
 | --- | --- |
 | `PgOutboxStore::new(pool, table_name)` | Construct a store. Caches the templated SQL. Validates the table name. |
 | `with_dead_letter(dlq_table)` | Enable dead-letter persistence: exhausted envelopes are moved to `dlq_table` (INSERT + DELETE in one transaction). |
-| Implements `OutboxStore` | `poll` runs `SELECT ... [FOR UPDATE SKIP LOCKED]` per dialect; `mark_delivered`, `mark_failed`, `claim` and `mark_dead_lettered` settle envelopes. |
+| Implements `OutboxStore` | `poll` runs `SELECT ... [FOR UPDATE SKIP LOCKED]` per dialect; `mark_delivered`, `mark_failed`, `claim` and `mark_dead_lettered` settle envelopes. `claim` advances the soft lease and consumes one retry slot. On PostgreSQL and MySQL it is the competing-consumer lease; on SQLite it only counts attempts and records the lease (no `SKIP LOCKED`, so SQLite stays single-writer). |
 
 ### Builder
 
@@ -73,7 +73,7 @@ Production deployments should run their own migration tooling against `Dialect::
 | `.retry_base_delay(d)` | Base delay for exponential backoff (default 1 s). |
 | `.retry_max_delay(d)` | Cap on the backoff delay (default 5 min). |
 | `.jitter(enabled)` | Full jitter on the backoff delay (default `true`). |
-| `.dispatch_timeout(d)` | Soft-lease duration for claimed envelopes (default 30 s). |
+| `.dispatch_timeout(d)` | Per-envelope handler deadline and soft-lease unit (default 30 s). Each handler invocation is wrapped in a hard `tokio` timeout of this duration; the batch lease is sized as `batch_size x dispatch_timeout` to cover the worst-case sequential dispatch of a whole claimed batch. |
 | `.build()?` | Returns `OutboxWorker<PgOutboxStore>`. Validates the table name. |
 
 ## Where to read next

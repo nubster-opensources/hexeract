@@ -1649,6 +1649,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-util",
+ "tracing",
  "uuid",
 ]
 

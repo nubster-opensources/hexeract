@@ -255,3 +255,140 @@ async fn future_next_retry_at_excludes_event_from_poll() {
     );
     assert_eq!(delivered_count(&pool, event_id).await, 0);
 }
+
+#[tokio::test]
+#[ignore = "runs in the integration workflow"]
+async fn undecodable_row_is_skipped_and_the_rest_of_the_batch_drains() {
+    // #214: a row whose created_at is in the SQLite canonical datetime('now')
+    // form (space separator, no millis) used to be parseable, but a truly
+    // garbage timestamp must not abort the whole poll. Insert one poison row
+    // ahead of a valid one and assert the valid one is still delivered.
+    let (_file, pool) = setup().await;
+    let publisher = SqliteOutboxPublisher::new(pool.clone(), TABLE).unwrap();
+    let store = SqliteOutboxStore::new(pool.clone(), TABLE).unwrap();
+
+    // Poison row: an unparseable created_at. event_id is a valid blob so the
+    // skip path can still log its id.
+    let poison_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO audit_outbox (event_id, event_type, payload, created_at) \
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(poison_id)
+    .bind(UserRegistered::EVENT_TYPE)
+    .bind("{\"user_id\":\"00000000-0000-0000-0000-000000000000\",\"email\":\"x\"}")
+    .bind("totally-not-a-timestamp")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let good_id = publisher
+        .publish(&sample("dora@example.com"))
+        .await
+        .unwrap();
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let worker = OutboxWorker::new(
+        store,
+        registry_with(RecordingHandler {
+            seen: Arc::clone(&seen),
+        }),
+        OutboxWorkerConfig {
+            poll_interval: Duration::from_millis(20),
+            ..OutboxWorkerConfig::default()
+        },
+    );
+    let cancel = CancellationToken::new();
+    let join = tokio::spawn(worker.run(cancel.clone()));
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    cancel.cancel();
+    join.await.unwrap().unwrap();
+
+    assert_eq!(
+        delivered_count(&pool, good_id).await,
+        1,
+        "the valid row behind the poison row must still be delivered"
+    );
+}
+
+#[tokio::test]
+#[ignore = "runs in the integration workflow"]
+async fn canonical_datetime_now_created_at_is_accepted() {
+    // #214: rows written with the SQLite native datetime('now') form (space
+    // separator, no fractional seconds) must be polled, not rejected.
+    let (_file, pool) = setup().await;
+    let store = SqliteOutboxStore::new(pool.clone(), TABLE).unwrap();
+
+    let event_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO audit_outbox (event_id, event_type, payload, created_at) \
+         VALUES (?, ?, ?, datetime('now'))",
+    )
+    .bind(event_id)
+    .bind(UserRegistered::EVENT_TYPE)
+    .bind("{\"user_id\":\"00000000-0000-0000-0000-000000000000\",\"email\":\"y\"}")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let worker = OutboxWorker::new(
+        store,
+        registry_with(RecordingHandler {
+            seen: Arc::clone(&seen),
+        }),
+        OutboxWorkerConfig {
+            poll_interval: Duration::from_millis(20),
+            ..OutboxWorkerConfig::default()
+        },
+    );
+    let cancel = CancellationToken::new();
+    let join = tokio::spawn(worker.run(cancel.clone()));
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    cancel.cancel();
+    join.await.unwrap().unwrap();
+
+    assert_eq!(
+        delivered_count(&pool, event_id).await,
+        1,
+        "a datetime('now') created_at must be parseable and the row delivered"
+    );
+}
+
+#[tokio::test]
+#[ignore = "runs in the integration workflow"]
+async fn claim_consumes_a_retry_slot_even_without_a_clean_failure() {
+    // #213: claiming a batch must increment attempts. We simulate a crash
+    // between claim and acknowledgement by claiming directly (no dispatch) and
+    // asserting attempts advanced from 0 to 1.
+    use hexeract_outbox::OutboxStore;
+
+    let (_file, pool) = setup().await;
+    let publisher = SqliteOutboxPublisher::new(pool.clone(), TABLE).unwrap();
+    let store = SqliteOutboxStore::new(pool.clone(), TABLE).unwrap();
+
+    let event_id = publisher
+        .publish(&sample("erin@example.com"))
+        .await
+        .unwrap();
+
+    let mut client = store.acquire().await.unwrap();
+    let mut tx = store.begin(&mut client).await.unwrap();
+    store
+        .claim(&mut tx, &[event_id], Duration::from_secs(30))
+        .await
+        .unwrap();
+    store.commit(tx).await.unwrap();
+
+    let attempts: i64 = sqlx::query_scalar("SELECT attempts FROM audit_outbox WHERE event_id = ?")
+        .bind(event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        attempts, 1,
+        "claim alone must consume one retry slot (crash safety, #213)"
+    );
+}
