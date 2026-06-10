@@ -30,6 +30,7 @@ default = []
 serde = ["dep:serde", "uuid/serde"]
 
 [dev-dependencies]
+hexeract-macros = { path = "../hexeract-macros", version = "0.4" }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
 

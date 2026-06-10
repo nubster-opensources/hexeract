@@ -23,4 +23,6 @@ fn ui() {
     t.compile_fail("tests/ui/fail_tuple_message.rs");
     t.compile_fail("tests/ui/fail_ctx_wrong_type.rs");
     t.compile_fail("tests/ui/fail_ctx_mut.rs");
+    // #234: generated public struct must not trigger missing_docs in user crates
+    t.pass("tests/ui/pass_pub_handler_missing_docs_allowed.rs");
 }
