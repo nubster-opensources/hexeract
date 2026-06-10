@@ -150,7 +150,11 @@ CREATE INDEX IF NOT EXISTS idx_{{table}}_subject
 /// (poll, mark-delivered, mark-failed, insert) and the canonical schema DDL
 /// for its engine, accounting for placeholder style, row locking, the
 /// "current instant" expression and per-engine column types.
+///
+/// Marked `#[non_exhaustive]` so a future SQL backend can be added in a minor
+/// version: downstream `match` arms must include a wildcard `_` arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Dialect {
     /// PostgreSQL (`sqlx::Postgres`).
     Postgres,

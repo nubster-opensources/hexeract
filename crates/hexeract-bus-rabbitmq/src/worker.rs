@@ -119,7 +119,11 @@ impl DeliveryDisposition {
 ///   to expect any ack (`no_ack`), so it removes the message the moment it is
 ///   sent. Highest throughput, but any handler failure or crash loses the
 ///   message. Use only when loss is acceptable.
+///
+/// Marked `#[non_exhaustive]` so a future ack discipline can be added in a
+/// minor version: downstream `match` arms must include a wildcard `_` arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AckMode {
     /// Ack only when the handler returns `Ok`. Handler failures are
     /// republished to the wait queue and retried after
@@ -160,7 +164,12 @@ const fn qos_applies(ack_mode: AckMode) -> bool {
 }
 
 /// Tuning parameters for a [`RabbitMqWorker`].
+///
+/// Marked `#[non_exhaustive]` so new tuning fields can be added in a minor
+/// version: construct it through [`RabbitMqWorkerBuilder`] rather than a
+/// struct literal.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RabbitMqWorkerConfig {
     /// Ack discipline applied to consumed deliveries.
     pub ack_mode: AckMode,
