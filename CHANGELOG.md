@@ -9,6 +9,10 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 ### Added
 - _Items in flight will be listed here until the next release._
 
+### Changed
+
+- `hexeract-bus-rabbitmq`: the worker no longer issues `basic.qos` under `AckMode::Unacknowledged`. A `no_ack` consumer never acknowledges, so the broker ignores prefetch for it: the call advertised a backpressure bound that does not exist. `RabbitMqWorkerConfig::prefetch`, the `prefetch` builder method and the `Unacknowledged` variant now document that prefetch has no effect and there is no broker-side flow control in that mode. (#162)
+
 ### Fixed
 
 - `hexeract-outbox-sql`: the MySQL `Dialect::now_expr` returned the whole-second `UTC_TIMESTAMP()` while the schema stores `DATETIME(6)` microsecond timestamps, so the poll predicate `next_retry_at <= now` could treat a due retry as not-yet-due and skip it for up to roughly one second. It now returns `UTC_TIMESTAMP(6)`, matching the bound sub-second precision for both polling and mark-delivered. (#166)
