@@ -372,11 +372,11 @@ impl Mediator {
     /// [`HexeractError`] when the handler itself fails.
     pub async fn send<C: Command>(&self, command: C) -> Result<C::Output, HexeractError> {
         let tid = TypeId::of::<C>();
-        let handler = self.inner.command_handlers.get(&tid).ok_or_else(|| {
-            HexeractError::HandlerNotFound {
-                message_type: type_name::<C>(),
-            }
-        })?;
+        let handler = self
+            .inner
+            .command_handlers
+            .get(&tid)
+            .ok_or_else(|| HexeractError::handler_not_found(type_name::<C>()))?;
 
         let message_id = MessageId::new();
         let correlation_id = CorrelationId::new();
@@ -407,13 +407,11 @@ impl Mediator {
     /// [`HexeractError`] when the handler itself fails.
     pub async fn query<Q: Query>(&self, query: Q) -> Result<Q::Output, HexeractError> {
         let tid = TypeId::of::<Q>();
-        let handler =
-            self.inner
-                .query_handlers
-                .get(&tid)
-                .ok_or_else(|| HexeractError::HandlerNotFound {
-                    message_type: type_name::<Q>(),
-                })?;
+        let handler = self
+            .inner
+            .query_handlers
+            .get(&tid)
+            .ok_or_else(|| HexeractError::handler_not_found(type_name::<Q>()))?;
 
         let message_id = MessageId::new();
         let correlation_id = CorrelationId::new();
@@ -696,7 +694,7 @@ mod tests {
             .expect_err("missing handler must fail");
         assert!(matches!(
             err,
-            HexeractError::HandlerNotFound { message_type } if message_type.ends_with("::Ping")
+            HexeractError::HandlerNotFound { message_type, .. } if message_type.ends_with("::Ping")
         ));
     }
 
@@ -719,7 +717,7 @@ mod tests {
             .expect_err("missing handler must fail");
         assert!(matches!(
             err,
-            HexeractError::HandlerNotFound { message_type } if message_type.ends_with("::GetCount")
+            HexeractError::HandlerNotFound { message_type, .. } if message_type.ends_with("::GetCount")
         ));
     }
 

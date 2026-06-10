@@ -218,9 +218,7 @@ mod tests {
 
     impl From<CustomError> for HexeractError {
         fn from(err: CustomError) -> Self {
-            HexeractError::HandlerFailed {
-                source: Box::new(err),
-            }
+            HexeractError::handler_failed(err)
         }
     }
 

@@ -11,6 +11,8 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 
 ### Changed
 
+- `hexeract-bus-rabbitmq` and `hexeract-outbox-sql`: **breaking**. `AckMode`, `Dialect` and `RabbitMqWorkerConfig` are now `#[non_exhaustive]`, matching the rest of the public API. Downstream exhaustive `match` arms on `AckMode` or `Dialect` must add a wildcard `_` arm, and external code constructing `RabbitMqWorkerConfig` must go through `RabbitMqWorkerBuilder` rather than a struct literal. `AckMode::default()` is still `Manual`. This freezes the enums and the config so future ack disciplines, SQL backends and tuning fields can be added without a major bump. (#163)
+- `hexeract-core`: **breaking**. The `HexeractError::HandlerNotFound` and `HexeractError::HandlerFailed` struct variants are now `#[non_exhaustive]`, matching `Timeout`, `DowncastFailed`, `Cancelled` and `PublishFailed`. Construct `HandlerNotFound` through the new `HexeractError::handler_not_found()` builder, mirroring `handler_failed()`, `timeout()` and `cancelled()`; external pattern matches on these variants must add `..`. This guards against a future field addition being breaking. (#164)
 - `hexeract-bus-rabbitmq`: the worker no longer issues `basic.qos` under `AckMode::Unacknowledged`. A `no_ack` consumer never acknowledges, so the broker ignores prefetch for it: the call advertised a backpressure bound that does not exist. `RabbitMqWorkerConfig::prefetch`, the `prefetch` builder method and the `Unacknowledged` variant now document that prefetch has no effect and there is no broker-side flow control in that mode. (#162)
 
 ### Fixed

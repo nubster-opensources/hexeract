@@ -10,6 +10,7 @@ use thiserror::Error;
 pub enum HexeractError {
     /// No handler was registered for the given message type.
     #[error("no handler registered for `{message_type}`")]
+    #[non_exhaustive]
     HandlerNotFound {
         /// The fully-qualified type name of the unregistered command, query or
         /// notification.
@@ -18,6 +19,7 @@ pub enum HexeractError {
 
     /// A handler returned an error. The original error is preserved as source.
     #[error("handler failed: {source}")]
+    #[non_exhaustive]
     HandlerFailed {
         /// The original error returned by the handler.
         #[source]
@@ -117,6 +119,15 @@ fn render_publish_failures(failures: &[NotificationFailure]) -> String {
 }
 
 impl HexeractError {
+    /// Builds a [`HexeractError::HandlerNotFound`] from the fully-qualified
+    /// type name of the unregistered message. This is the only way to
+    /// construct the variant from outside this crate, since it is marked
+    /// `#[non_exhaustive]`.
+    #[must_use]
+    pub fn handler_not_found(message_type: &'static str) -> Self {
+        Self::HandlerNotFound { message_type }
+    }
+
     /// Wraps any `Send + Sync` error as a [`HexeractError::HandlerFailed`].
     pub fn handler_failed(source: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self::HandlerFailed {
@@ -213,6 +224,15 @@ mod tests {
         let err = HexeractError::handler_failed(original);
         assert!(err.to_string().contains("handler failed"));
         assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn handler_not_found_names_the_message_type() {
+        let err = HexeractError::handler_not_found("my::RegisterUser");
+        assert!(
+            matches!(err, HexeractError::HandlerNotFound { message_type } if message_type == "my::RegisterUser")
+        );
+        assert!(err.to_string().contains("RegisterUser"));
     }
 
     #[test]
