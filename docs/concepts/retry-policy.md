@@ -13,7 +13,7 @@ stateDiagram-v2
     Decoded --> Dispatched
     Dispatched --> Delivered: Handler Ok
     Dispatched --> Failed: Handler Err
-    Failed --> Waiting: attempts < max_attempts<br/>basic_publish to wait queue<br/>basic_ack original
+    Failed --> Waiting: attempts < max_attempts<br/>confirmed mandatory basic_publish to wait queue<br/>basic_ack original
     Waiting --> Received: TTL expires, broker dead-letters<br/>back to the queue<br/>(x-death count += 1)
     Failed --> Parked: attempts == max_attempts<br/>+ DLR configured<br/>basic_publish to DLR<br/>basic_ack
     Failed --> Dropped: attempts == max_attempts<br/>+ no DLR<br/>basic_ack
@@ -63,7 +63,7 @@ let worker = RabbitMqWorkerBuilder::new(connection)
     .build()?;
 ```
 
-The dead-letter publish is hardened end to end: the worker channel runs with publisher confirms, the publish is `mandatory`, and the copy is forced to persistent delivery (`delivery_mode` 2) so it survives a broker restart. Success requires a broker ack without a returned message; any other outcome (a nack, an unroutable return, a missing confirm) leaves the original delivery unacked so the broker redelivers it instead of losing it.
+The dead-letter publish is hardened end to end: the worker channel runs with publisher confirms (enabled whenever a dead-letter routing key is set, regardless of ack mode, and always under `Manual`), the publish is `mandatory`, and the copy is forced to persistent delivery (`delivery_mode` 2) so it survives a broker restart. Success requires a broker ack without a returned message. Any other outcome (a nack, an unroutable return, a missing confirm) means the copy did not land, so the worker nacks the original to free its prefetch slot rather than leaving it unsettled: a transient transport failure requeues the delivery for another attempt, while an unroutable dead-letter queue drops it. Leaving the delivery unacked on a live channel would not trigger redelivery (brokers only redeliver after the channel or connection closes) and would silently consume a prefetch slot until the consumer stalled.
 
 The same hardened publish parks poison deliveries: a payload larger than `max_payload_bytes` or a delivery missing the AMQP `type` property never reaches a handler, skips the retry budget entirely, and is routed straight to the dead-letter queue when one is configured. Without a dead-letter queue, a `Manual` consume nacks the poison delivery without requeue, so a broker-level dead-letter exchange configured on the queue still receives it.
 

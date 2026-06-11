@@ -10,8 +10,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hexeract_core::{
-    BoxOutput, Command, CommandHandler, HandlerContext, HexeractError, MessageEnvelope, Middleware,
-    Next, Notification, NotificationHandler, Query, QueryHandler,
+    BoxOutput, Command, CommandHandler, CorrelationId, HandlerContext, HexeractError,
+    MessageEnvelope, Middleware, Next, Notification, NotificationHandler, Query, QueryHandler,
 };
 use hexeract_mediator::{Mediator, MediatorBuilder};
 
@@ -252,4 +252,219 @@ async fn middleware_handler_pipeline_end_to_end() {
     assert!(observed[0].ends_with("::GreetUser"));
     assert!(observed[1].ends_with("::GetAnswer"));
     assert!(observed[2].ends_with("::UserCreated"));
+}
+
+// ── Correlation-id propagation (issue #227) ──────────────────────────────────
+
+struct CapturingCommandHandler {
+    captured: Arc<Mutex<Option<CorrelationId>>>,
+}
+
+impl CommandHandler<GreetUser> for CapturingCommandHandler {
+    type Error = HexeractError;
+
+    async fn handle(&self, cmd: GreetUser, ctx: &HandlerContext) -> Result<String, Self::Error> {
+        *self.captured.lock().expect("mutex poisoned") = Some(ctx.correlation_id);
+        Ok(format!("hello {}", cmd.name))
+    }
+}
+
+struct CapturingQueryHandler {
+    captured: Arc<Mutex<Option<CorrelationId>>>,
+}
+
+impl QueryHandler<GetAnswer> for CapturingQueryHandler {
+    type Error = HexeractError;
+
+    async fn handle(&self, _q: GetAnswer, ctx: &HandlerContext) -> Result<u32, Self::Error> {
+        *self.captured.lock().expect("mutex poisoned") = Some(ctx.correlation_id);
+        Ok(42)
+    }
+}
+
+struct CapturingNotifHandler {
+    captured: Arc<Mutex<Vec<CorrelationId>>>,
+}
+
+impl NotificationHandler<UserCreated> for CapturingNotifHandler {
+    type Error = HexeractError;
+
+    async fn handle(&self, _n: Arc<UserCreated>, ctx: &HandlerContext) -> Result<(), Self::Error> {
+        self.captured
+            .lock()
+            .expect("mutex poisoned")
+            .push(ctx.correlation_id);
+        Ok(())
+    }
+}
+
+// AC-corr-1: send_with_correlation_id forwards the supplied id to the handler.
+#[tokio::test]
+async fn send_with_correlation_id_propagates_to_handler() {
+    let captured = Arc::new(Mutex::new(None));
+    let mediator = MediatorBuilder::new()
+        .register_command_handler::<GreetUser, _>(CapturingCommandHandler {
+            captured: Arc::clone(&captured),
+        })
+        .build()
+        .expect("build must succeed");
+
+    let known_id = CorrelationId::new();
+    mediator
+        .send_with_correlation_id(
+            GreetUser {
+                name: "world".into(),
+            },
+            known_id,
+        )
+        .await
+        .expect("send must succeed");
+
+    let observed = captured.lock().unwrap().expect("handler must have run");
+    assert_eq!(
+        observed, known_id,
+        "handler must receive the caller-supplied CorrelationId"
+    );
+}
+
+// AC-corr-2: send without a supplied id still generates a fresh one (regression).
+#[tokio::test]
+async fn send_without_correlation_id_generates_a_fresh_one() {
+    let captured = Arc::new(Mutex::new(None));
+    let mediator = MediatorBuilder::new()
+        .register_command_handler::<GreetUser, _>(CapturingCommandHandler {
+            captured: Arc::clone(&captured),
+        })
+        .build()
+        .expect("build must succeed");
+
+    mediator
+        .send(GreetUser {
+            name: "world".into(),
+        })
+        .await
+        .expect("send must succeed");
+
+    assert!(
+        captured.lock().unwrap().is_some(),
+        "handler must still receive a correlation id"
+    );
+}
+
+// AC-corr-3: query_with_correlation_id forwards the supplied id to the handler.
+#[tokio::test]
+async fn query_with_correlation_id_propagates_to_handler() {
+    let captured = Arc::new(Mutex::new(None));
+    let mediator = MediatorBuilder::new()
+        .register_query_handler::<GetAnswer, _>(CapturingQueryHandler {
+            captured: Arc::clone(&captured),
+        })
+        .build()
+        .expect("build must succeed");
+
+    let known_id = CorrelationId::new();
+    mediator
+        .query_with_correlation_id(GetAnswer, known_id)
+        .await
+        .expect("query must succeed");
+
+    let observed = captured.lock().unwrap().expect("handler must have run");
+    assert_eq!(
+        observed, known_id,
+        "handler must receive the caller-supplied CorrelationId"
+    );
+}
+
+// AC-corr-4: publish_with_correlation_id fans out the same id to all handlers.
+#[tokio::test]
+async fn publish_with_correlation_id_propagates_same_id_to_all_handlers() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let mediator = MediatorBuilder::new()
+        .register_notification_handler::<UserCreated, _>(CapturingNotifHandler {
+            captured: Arc::clone(&captured),
+        })
+        .register_notification_handler::<UserCreated, _>(CapturingNotifHandler {
+            captured: Arc::clone(&captured),
+        })
+        .build()
+        .expect("build must succeed");
+
+    let known_id = CorrelationId::new();
+    mediator
+        .publish_with_correlation_id(UserCreated { id: 1 }, known_id)
+        .await
+        .expect("publish must succeed");
+
+    let observed = captured.lock().unwrap().clone();
+    assert_eq!(observed.len(), 2, "both handlers must have run");
+    assert!(
+        observed.iter().all(|id| *id == known_id),
+        "all handlers must receive the same caller-supplied CorrelationId"
+    );
+}
+
+// Helper for AC-corr-5: a command handler that re-dispatches a notification
+// through the same mediator, forwarding its inbound correlation id.
+struct ChainedCommandHandler {
+    mediator: Arc<std::sync::OnceLock<Mediator>>,
+}
+
+impl CommandHandler<GreetUser> for ChainedCommandHandler {
+    type Error = HexeractError;
+
+    async fn handle(&self, cmd: GreetUser, ctx: &HandlerContext) -> Result<String, Self::Error> {
+        let mediator = self
+            .mediator
+            .get()
+            .expect("mediator must be set before dispatch");
+        // Forward the inbound correlation id to the follow-up notification.
+        mediator
+            .publish_with_correlation_id(UserCreated { id: 42 }, ctx.correlation_id)
+            .await
+            .expect("nested publish must succeed");
+        Ok(format!("hello {}", cmd.name))
+    }
+}
+
+// AC-corr-5: the causal chain can be threaded end-to-end through send -> publish.
+#[tokio::test]
+async fn causal_chain_can_be_threaded_from_command_handler_to_notification() {
+    // This simulates the documented production-checklist pattern: a command
+    // handler receives `ctx.correlation_id` and forwards it when publishing a
+    // follow-up notification, keeping the causal chain intact.
+    let notif_ids = Arc::new(Mutex::new(Vec::new()));
+    let notif_ids_for_mediator = Arc::clone(&notif_ids);
+
+    let mediator_cell: Arc<std::sync::OnceLock<Mediator>> = Arc::new(std::sync::OnceLock::new());
+    let mediator_cell_for_handler = Arc::clone(&mediator_cell);
+
+    let mediator = MediatorBuilder::new()
+        .register_command_handler::<GreetUser, _>(ChainedCommandHandler {
+            mediator: mediator_cell_for_handler,
+        })
+        .register_notification_handler::<UserCreated, _>(CapturingNotifHandler {
+            captured: notif_ids_for_mediator,
+        })
+        .build()
+        .expect("build must succeed");
+
+    mediator_cell.set(mediator.clone()).ok();
+
+    let chain_root = CorrelationId::new();
+    mediator
+        .send_with_correlation_id(
+            GreetUser {
+                name: "chain".into(),
+            },
+            chain_root,
+        )
+        .await
+        .expect("chained send must succeed");
+
+    let observed = notif_ids.lock().unwrap().clone();
+    assert_eq!(observed.len(), 1, "notification handler must have run");
+    assert_eq!(
+        observed[0], chain_root,
+        "notification must carry the same CorrelationId as the originating command"
+    );
 }

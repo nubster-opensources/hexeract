@@ -12,6 +12,13 @@
 //! fan out concurrently; every handler runs regardless of its siblings, and
 //! failures are aggregated so one handler's error never hides another.
 //!
+//! To propagate a [`CorrelationId`] across in-process dispatches (for example
+//! forwarding `ctx.correlation_id` from a command handler to a follow-up
+//! notification), use [`Mediator::send_with_correlation_id`],
+//! [`Mediator::query_with_correlation_id`] or
+//! [`Mediator::publish_with_correlation_id`]. The plain `send` / `query` /
+//! `publish` methods mint a fresh id each time.
+//!
 //! The three built-in middlewares (`TracingMiddleware`, `LoggingMiddleware`,
 //! `TimeoutMiddleware`) ship in a follow-up release; users can still wire
 //! their own [`Middleware`] implementations through
@@ -365,12 +372,40 @@ impl Mediator {
     /// Dispatches a [`Command`] to its registered handler and returns the
     /// handler's output.
     ///
+    /// A fresh [`CorrelationId`] is minted for this dispatch. To continue an
+    /// existing causal chain (e.g. from inside another handler), use
+    /// [`Mediator::send_with_correlation_id`] instead.
+    ///
     /// # Errors
     ///
     /// Returns [`HexeractError::HandlerNotFound`] if no handler is
     /// registered for `C`, or the handler's own error converted into
     /// [`HexeractError`] when the handler itself fails.
     pub async fn send<C: Command>(&self, command: C) -> Result<C::Output, HexeractError> {
+        self.send_with_correlation_id(command, CorrelationId::new())
+            .await
+    }
+
+    /// Dispatches a [`Command`] to its registered handler using the supplied
+    /// [`CorrelationId`], preserving the causal chain across in-process
+    /// dispatches.
+    ///
+    /// Use this variant when the caller already holds a [`CorrelationId`]
+    /// (for example `ctx.correlation_id` inside a handler) and wants all
+    /// follow-up messages to share the same identifier. The plain
+    /// [`Mediator::send`] method is equivalent to calling this with
+    /// `CorrelationId::new()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HexeractError::HandlerNotFound`] if no handler is
+    /// registered for `C`, or the handler's own error converted into
+    /// [`HexeractError`] when the handler itself fails.
+    pub async fn send_with_correlation_id<C: Command>(
+        &self,
+        command: C,
+        correlation_id: CorrelationId,
+    ) -> Result<C::Output, HexeractError> {
         let tid = TypeId::of::<C>();
         let handler = self
             .inner
@@ -379,7 +414,6 @@ impl Mediator {
             .ok_or_else(|| HexeractError::handler_not_found(type_name::<C>()))?;
 
         let message_id = MessageId::new();
-        let correlation_id = CorrelationId::new();
         let envelope = MessageEnvelope::for_command::<C>(message_id, correlation_id);
         let ctx = HandlerContext::new(message_id, correlation_id);
 
@@ -400,12 +434,40 @@ impl Mediator {
     /// Dispatches a [`Query`] to its registered handler and returns the
     /// handler's output.
     ///
+    /// A fresh [`CorrelationId`] is minted for this dispatch. To continue an
+    /// existing causal chain, use [`Mediator::query_with_correlation_id`]
+    /// instead.
+    ///
     /// # Errors
     ///
     /// Returns [`HexeractError::HandlerNotFound`] if no handler is
     /// registered for `Q`, or the handler's own error converted into
     /// [`HexeractError`] when the handler itself fails.
     pub async fn query<Q: Query>(&self, query: Q) -> Result<Q::Output, HexeractError> {
+        self.query_with_correlation_id(query, CorrelationId::new())
+            .await
+    }
+
+    /// Dispatches a [`Query`] to its registered handler using the supplied
+    /// [`CorrelationId`], preserving the causal chain across in-process
+    /// dispatches.
+    ///
+    /// Use this variant when the caller already holds a [`CorrelationId`]
+    /// (for example `ctx.correlation_id` inside a handler) and wants all
+    /// follow-up messages to share the same identifier. The plain
+    /// [`Mediator::query`] method is equivalent to calling this with
+    /// `CorrelationId::new()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HexeractError::HandlerNotFound`] if no handler is
+    /// registered for `Q`, or the handler's own error converted into
+    /// [`HexeractError`] when the handler itself fails.
+    pub async fn query_with_correlation_id<Q: Query>(
+        &self,
+        query: Q,
+        correlation_id: CorrelationId,
+    ) -> Result<Q::Output, HexeractError> {
         let tid = TypeId::of::<Q>();
         let handler = self
             .inner
@@ -414,7 +476,6 @@ impl Mediator {
             .ok_or_else(|| HexeractError::handler_not_found(type_name::<Q>()))?;
 
         let message_id = MessageId::new();
-        let correlation_id = CorrelationId::new();
         let envelope = MessageEnvelope::for_query::<Q>(message_id, correlation_id);
         let ctx = HandlerContext::new(message_id, correlation_id);
 
@@ -434,6 +495,10 @@ impl Mediator {
 
     /// Publishes a [`Notification`] to every handler registered for `N`.
     /// A notification with zero handlers is a no-op.
+    ///
+    /// A fresh [`CorrelationId`] is minted for this dispatch. To continue an
+    /// existing causal chain, use [`Mediator::publish_with_correlation_id`]
+    /// instead.
     ///
     /// Handlers are dispatched **concurrently**: every handler future is built
     /// up front and driven together with [`join_all`], so a slow handler no
@@ -459,6 +524,33 @@ impl Mediator {
     /// the error `source` chain so the caller can recover an individual
     /// failure instead of parsing a flattened string.
     pub async fn publish<N: Notification>(&self, notification: N) -> Result<(), HexeractError> {
+        self.publish_with_correlation_id(notification, CorrelationId::new())
+            .await
+    }
+
+    /// Publishes a [`Notification`] to every handler registered for `N` using
+    /// the supplied [`CorrelationId`], preserving the causal chain across
+    /// in-process dispatches.
+    ///
+    /// Use this variant when the caller already holds a [`CorrelationId`]
+    /// (for example `ctx.correlation_id` inside a handler) and wants all
+    /// follow-up messages to share the same identifier. Every handler in the
+    /// fan-out receives the same supplied id and a dedicated [`MessageId`].
+    /// The plain [`Mediator::publish`] method is equivalent to calling this
+    /// with `CorrelationId::new()`.
+    ///
+    /// # Ordering
+    ///
+    /// See [`Mediator::publish`] for ordering and concurrency guarantees.
+    ///
+    /// # Errors
+    ///
+    /// See [`Mediator::publish`] for error aggregation semantics.
+    pub async fn publish_with_correlation_id<N: Notification>(
+        &self,
+        notification: N,
+        correlation_id: CorrelationId,
+    ) -> Result<(), HexeractError> {
         let tid = TypeId::of::<N>();
         let Some(handlers) = self.inner.notification_handlers.get(&tid) else {
             return Ok(());
@@ -467,7 +559,6 @@ impl Mediator {
             return Ok(());
         }
 
-        let correlation_id = CorrelationId::new();
         let total = handlers.len();
 
         // Shared once across the fan-out: each handler receives a cheap

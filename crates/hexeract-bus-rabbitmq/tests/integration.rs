@@ -21,6 +21,7 @@ use hexeract_bus::Message;
 use hexeract_bus::Queue;
 use hexeract_bus::RoutingKey;
 use hexeract_bus::Transport;
+use hexeract_bus_rabbitmq::AckMode;
 use hexeract_bus_rabbitmq::RabbitMqConnection;
 use hexeract_bus_rabbitmq::RabbitMqTransport;
 use hexeract_bus_rabbitmq::RabbitMqWorkerBuilder;
@@ -1080,4 +1081,174 @@ async fn worker_delays_retries_and_retry_count_survives_restart() {
 
     second_cancel.cancel();
     second_handle.await.unwrap().unwrap();
+}
+
+/// Declare a durable queue for tests, as required on RabbitMQ 4 (a
+/// transient non-exclusive queue is rejected). Cleans nothing up: the
+/// container is torn down with the test.
+async fn declare_durable_queue(uri: &str, name: &str) {
+    let conn = Connection::connect(uri, ConnectionProperties::default())
+        .await
+        .expect("setup connection must open");
+    let channel = conn
+        .create_channel()
+        .await
+        .expect("setup channel must open");
+    channel
+        .queue_declare(
+            name.into(),
+            QueueDeclareOptions {
+                durable: true,
+                exclusive: false,
+                auto_delete: false,
+                ..QueueDeclareOptions::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .expect("durable queue declare must succeed");
+}
+
+/// Issue #212: under `AckMode::AckOnReceive` with a dead-letter routing
+/// key, a flood of poison deliveries must be dead-lettered and must NOT
+/// wedge the consumer. Before the fix, confirms / the DLQ were only set
+/// up for `Manual`, so every poison DLQ publish failed with
+/// `NotRequested`, the delivery was left unacked, and after `prefetch`
+/// poison messages the consumer stalled permanently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn ack_on_receive_dead_letters_poison_flood_without_wedging() {
+    let (_container, uri) = start_rabbit().await;
+    let queue_name = "worker.ackonreceive.poison.source";
+    let dlr_queue = "worker.ackonreceive.poison.parked";
+    declare_durable_queue(&uri, queue_name).await;
+
+    // Publish more poison messages than the prefetch window so a wedge
+    // would be observable: each lacks the AMQP `type` property.
+    let publisher = Connection::connect(&uri, ConnectionProperties::default())
+        .await
+        .unwrap();
+    let publish_channel = publisher.create_channel().await.unwrap();
+    let poison_count = 20u32;
+    for _ in 0..poison_count {
+        publish_channel
+            .basic_publish(
+                ShortString::from(""),
+                ShortString::from(queue_name),
+                BasicPublishOptions::default(),
+                b"{}",
+                BasicProperties::default(),
+            )
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+    }
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .ack_mode(AckMode::AckOnReceive)
+        .prefetch(8)
+        .dead_letter_routing_key(dlr_queue)
+        .register_handler::<OrderPlaced, _>(AlwaysFailingHandler {
+            attempts: Arc::clone(&attempts),
+        })
+        .build()
+        .unwrap();
+
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
+
+    // All poison messages must land in the DLQ. If the consumer wedged
+    // after `prefetch` messages, the count would stall below poison_count.
+    let probe = Connection::connect(&uri, ConnectionProperties::default())
+        .await
+        .unwrap();
+    let mut parked = 0u32;
+    for _ in 0..200 {
+        let probe_channel = probe.create_channel().await.unwrap();
+        if let Ok(Some(_msg)) = probe_channel
+            .basic_get(dlr_queue.into(), BasicGetOptions::default())
+            .await
+        {
+            parked += 1;
+            if parked == poison_count {
+                break;
+            }
+        } else {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    assert_eq!(
+        parked, poison_count,
+        "every poison delivery must be dead-lettered; a lower count means the consumer wedged on prefetch"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        0,
+        "the handler must never run for a delivery missing its `type` property"
+    );
+
+    cancel.cancel();
+    handle.await.unwrap().unwrap();
+}
+
+/// Issue #211: in `AckMode::Manual` WITHOUT a dead-letter routing key,
+/// publisher confirms must still be enabled so the retry copy's confirm
+/// is awaited before the original is acked. This test exercises the
+/// retry path (no DL key) end to end: a handler that fails once then
+/// succeeds must see the message redelivered and finally processed,
+/// proving the retry copy was durably stored (not lost) under the
+/// confirm-enabled path that the fix turns on for all Manual workers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn manual_without_dead_letter_enables_confirms_and_retries_safely() {
+    let (_container, uri) = start_rabbit().await;
+    let queue_name = "worker.manual.noconfirm.retry";
+    declare_durable_queue(&uri, queue_name).await;
+
+    let transport = RabbitMqTransport::new(&uri).await.unwrap();
+    transport
+        .publish(
+            queue_name,
+            &OrderPlaced {
+                order_id: Uuid::now_v7(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .ack_mode(AckMode::Manual)
+        .max_attempts(5)
+        .retry_delay(Duration::from_millis(200))
+        .register_handler::<OrderPlaced, _>(FailOnceHandler {
+            attempts: Arc::clone(&attempts),
+        })
+        .build()
+        .unwrap();
+
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
+
+    for _ in 0..100 {
+        if attempts.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        attempts.load(Ordering::SeqCst) >= 2,
+        "the message must be redelivered after the first failure, proving the confirmed retry copy was stored, not lost"
+    );
+
+    cancel.cancel();
+    handle.await.unwrap().unwrap();
 }

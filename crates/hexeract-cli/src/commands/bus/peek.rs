@@ -1,4 +1,5 @@
 use clap::Args;
+use clap::builder::RangedU64ValueParser;
 use hexeract_bus_rabbitmq::RabbitMqConnection;
 use lapin::options::BasicGetOptions;
 use lapin::options::BasicNackOptions;
@@ -15,8 +16,12 @@ pub(crate) struct PeekArgs {
     /// Queue name to peek into.
     #[arg(long)]
     queue: String,
-    /// Maximum number of messages to dump.
-    #[arg(long, default_value_t = DEFAULT_PEEK_COUNT)]
+    /// Maximum number of messages to dump. Must be at least 1.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PEEK_COUNT,
+        value_parser = RangedU64ValueParser::<u32>::new().range(1..)
+    )]
     count: u32,
 }
 
@@ -26,7 +31,13 @@ impl PeekArgs {
         let channel = connection.create_channel().await?;
         let queue = ShortString::from(self.queue.as_str());
 
-        let mut dumped = 0;
+        // Accumulate all delivery tags first, printing each message as we go.
+        // We nack them all at the end with `multiple: true` so that none are
+        // returned to the queue mid-loop; this ensures successive `basic_get`
+        // calls each see a different message rather than the same head message.
+        let mut last_delivery_tag: Option<u64> = None;
+        let mut dumped = 0u32;
+
         for _ in 0..self.count {
             let candidate = channel
                 .basic_get(queue.clone(), BasicGetOptions { no_ack: false })
@@ -35,18 +46,25 @@ impl PeekArgs {
                 break;
             };
             dumped += 1;
+            last_delivery_tag = Some(message.delivery_tag);
             print_delivery(dumped, &message);
-            // Re-queue so peek is non-destructive.
+        }
+
+        // Requeue everything we fetched in one atomic operation.
+        // Note: setting the `redelivered` flag is unavoidable with `basic_nack`;
+        // consumers using that flag for poison detection should be aware.
+        if let Some(tag) = last_delivery_tag {
             channel
                 .basic_nack(
-                    message.delivery_tag,
+                    tag,
                     BasicNackOptions {
-                        multiple: false,
+                        multiple: true,
                         requeue: true,
                     },
                 )
                 .await?;
         }
+
         if dumped == 0 {
             println!("(queue `{}` is empty)", self.queue);
         }
@@ -82,7 +100,7 @@ mod tests {
     use super::*;
     use crate::commands::bus::BusAction;
 
-    #[derive(Parser)]
+    #[derive(Debug, Parser)]
     #[command(name = "hexeract")]
     struct TestCli {
         #[command(subcommand)]
@@ -124,5 +142,28 @@ mod tests {
             panic!("expected peek subcommand");
         };
         assert_eq!(args.count, 10);
+    }
+
+    #[test]
+    fn peek_rejects_count_zero() {
+        let result = TestCli::try_parse_from([
+            "hexeract",
+            "peek",
+            "--conn",
+            "amqp://localhost:5672",
+            "--queue",
+            "orders.received",
+            "--count",
+            "0",
+        ]);
+        assert!(
+            result.is_err(),
+            "--count 0 must be rejected before connecting to the broker"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains('0') || err.contains("range"),
+            "error message should reference the invalid value or valid range: {err}"
+        );
     }
 }
