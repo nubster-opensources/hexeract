@@ -49,6 +49,20 @@ pub enum HexeractError {
         expected: &'static str,
     },
 
+    /// The boxed input passed to an erased handler could not be downcast to the
+    /// concrete message type the handler was registered for.
+    ///
+    /// Under normal operation this variant is unreachable: the mediator only
+    /// boxes a value of type `C`, `Q`, or `Arc<N>` immediately before calling
+    /// the matching typed adapter, so the downcast always succeeds. A mismatch
+    /// would indicate an internal invariant violation in the dispatch plumbing.
+    #[error("input downcast failed: expected `{expected}`")]
+    #[non_exhaustive]
+    InputDowncastFailed {
+        /// Fully-qualified name of the message type the adapter expected.
+        expected: &'static str,
+    },
+
     /// A dispatch was cancelled before the handler produced a result because
     /// its [`HandlerContext`](crate::HandlerContext) cancellation token fired.
     ///
@@ -156,6 +170,15 @@ impl HexeractError {
         Self::DowncastFailed { expected }
     }
 
+    /// Builds a [`HexeractError::InputDowncastFailed`] from the fully-qualified
+    /// name of the message type the erased adapter expected. This is the only
+    /// way to construct the variant from outside this crate, since it is marked
+    /// `#[non_exhaustive]`.
+    #[must_use]
+    pub fn input_downcast_failed(expected: &'static str) -> Self {
+        Self::InputDowncastFailed { expected }
+    }
+
     /// Builds a [`HexeractError::Cancelled`] from the fully-qualified name of
     /// the message whose dispatch was cancelled. This is the only way to
     /// construct the variant from outside this crate, since it is marked
@@ -241,6 +264,16 @@ mod tests {
         let rendered = err.to_string();
         assert!(rendered.contains("u32"));
         assert!(matches!(err, HexeractError::DowncastFailed { expected } if expected == "u32"));
+    }
+
+    #[test]
+    fn input_downcast_failed_names_the_expected_message_type() {
+        let err = HexeractError::input_downcast_failed("my::RegisterUser");
+        let rendered = err.to_string();
+        assert!(rendered.contains("my::RegisterUser"));
+        assert!(
+            matches!(err, HexeractError::InputDowncastFailed { expected } if expected == "my::RegisterUser")
+        );
     }
 
     #[test]
