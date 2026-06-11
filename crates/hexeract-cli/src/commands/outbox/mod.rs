@@ -4,6 +4,8 @@ pub(crate) mod apply;
 pub(crate) mod check;
 pub(crate) mod patch;
 
+use crate::error::CliError;
+
 /// Actions targeting the outbox storage.
 #[derive(Subcommand, Debug)]
 pub(crate) enum OutboxAction {
@@ -16,7 +18,7 @@ pub(crate) enum OutboxAction {
 }
 
 impl OutboxAction {
-    pub(crate) async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub(crate) async fn run(self) -> Result<(), CliError> {
         match self {
             Self::Patch(args) => args.run(),
             Self::Apply(args) => args.run().await,

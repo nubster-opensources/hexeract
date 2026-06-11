@@ -2,6 +2,7 @@ use clap::Parser;
 use clap::Subcommand;
 
 use crate::commands;
+use crate::error::CliError;
 
 /// Hexeract command-line interface.
 #[derive(Parser, Debug)]
@@ -27,7 +28,7 @@ enum Commands {
 }
 
 impl Cli {
-    pub(crate) async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub(crate) async fn run(self) -> Result<(), CliError> {
         match self.command {
             Commands::Outbox { action } => action.run().await,
             Commands::Bus { action } => action.run().await,

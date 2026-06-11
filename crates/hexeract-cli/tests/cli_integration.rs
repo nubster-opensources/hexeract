@@ -226,7 +226,26 @@ fn bus_purge_without_safety_flag_short_circuits_without_connecting() {
         ])
         .assert()
         .failure()
+        .code(2)
         .stderr(contains("yes-i-know"));
+}
+
+#[test]
+fn bus_purge_without_safety_flag_prints_guidance_to_stderr() {
+    Command::cargo_bin("hexeract")
+        .unwrap()
+        .args([
+            "bus",
+            "purge",
+            "--conn",
+            "amqp://127.0.0.1:1",
+            "--queue",
+            "orders.received",
+        ])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("Refusing to purge without --yes-i-know"));
 }
 
 /// Verify that `bus peek --count N` returns N distinct messages rather than

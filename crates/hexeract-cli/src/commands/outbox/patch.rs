@@ -1,6 +1,8 @@
 use clap::Args;
 use hexeract_outbox_sql::Dialect;
 
+use crate::error::CliError;
+
 /// Print the canonical outbox schema SQL templated with the given table name.
 #[derive(Args, Debug)]
 pub(crate) struct PatchArgs {
@@ -10,8 +12,10 @@ pub(crate) struct PatchArgs {
 }
 
 impl PatchArgs {
-    pub(crate) fn run(self) -> Result<(), Box<dyn std::error::Error>> {
-        let sql = Dialect::Postgres.schema_ddl(&self.table)?;
+    pub(crate) fn run(self) -> Result<(), CliError> {
+        let sql = Dialect::Postgres
+            .schema_ddl(&self.table)
+            .map_err(|e| CliError::Fatal(Box::new(e)))?;
         println!("{sql}");
         Ok(())
     }

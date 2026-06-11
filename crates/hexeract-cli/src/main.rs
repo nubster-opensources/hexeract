@@ -13,11 +13,11 @@ use tracing_subscriber::EnvFilter;
 
 mod cli;
 mod commands;
+mod error;
 
 use cli::Cli;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -27,5 +27,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .init();
 
-    Cli::parse().run().await
+    let result = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime must build")
+        .block_on(Cli::parse().run());
+
+    match result {
+        Ok(()) => {}
+        Err(err) => {
+            eprintln!("error: {err}");
+            std::process::exit(err.exit_code());
+        }
+    }
 }

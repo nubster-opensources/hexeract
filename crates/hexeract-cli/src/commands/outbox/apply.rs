@@ -4,6 +4,7 @@ use postgres_native_tls::MakeTlsConnector;
 use tokio_postgres::NoTls;
 
 use super::check::is_ssl_disabled;
+use crate::error::CliError;
 
 /// Apply the canonical outbox schema to a target PostgreSQL database.
 ///
@@ -18,13 +19,13 @@ pub(crate) struct ApplyArgs {
     /// Outbox table name. Must match `^[a-zA-Z_][a-zA-Z0-9_]*$`.
     #[arg(long, default_value = "audit_outbox", env = "HEXERACT_OUTBOX_TABLE")]
     table: String,
-    /// Skip the production safety prompt. Required to actually run the DDL.
+    /// Required to apply DDL; without it, the command refuses and prints guidance.
     #[arg(long = "yes-i-know")]
     yes_i_know: bool,
 }
 
 impl ApplyArgs {
-    pub(crate) async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub(crate) async fn run(self) -> Result<(), CliError> {
         if !self.yes_i_know {
             eprintln!("Refusing to apply DDL without --yes-i-know.");
             eprintln!();
@@ -36,16 +37,23 @@ impl ApplyArgs {
             );
             eprintln!();
             eprintln!("If you really mean to run the DDL now, re-run with --yes-i-know.");
-            std::process::exit(2);
+            return Err(CliError::SafetyFlagMissing(
+                "--yes-i-know is required to apply DDL".to_owned(),
+            ));
         }
 
-        let sql = Dialect::Postgres.schema_ddl(&self.table)?;
+        let sql = Dialect::Postgres
+            .schema_ddl(&self.table)
+            .map_err(|e| CliError::Fatal(Box::new(e)))?;
 
         tracing::info!(table = %self.table, "connecting to PostgreSQL");
         let client = connect(&self.conn).await?;
 
         tracing::info!(table = %self.table, "applying canonical outbox schema");
-        client.batch_execute(&sql).await?;
+        client
+            .batch_execute(&sql)
+            .await
+            .map_err(|e| CliError::Fatal(Box::new(e)))?;
 
         println!("Schema applied to table `{}`.", self.table);
         Ok(())
@@ -53,10 +61,12 @@ impl ApplyArgs {
 }
 
 /// Connect to PostgreSQL, using TLS unless `sslmode=disable` is present in the URL.
-async fn connect(url: &str) -> Result<tokio_postgres::Client, Box<dyn std::error::Error>> {
+async fn connect(url: &str) -> Result<tokio_postgres::Client, CliError> {
     if is_ssl_disabled(url) {
         tracing::warn!("TLS disabled via sslmode=disable; credentials will be sent in cleartext");
-        let (client, connection) = tokio_postgres::connect(url, NoTls).await?;
+        let (client, connection) = tokio_postgres::connect(url, NoTls)
+            .await
+            .map_err(|e| CliError::Fatal(Box::new(e)))?;
         tokio::spawn(async move {
             if let Err(err) = connection.await {
                 tracing::error!(error = %err, "PostgreSQL connection task error");
@@ -64,9 +74,13 @@ async fn connect(url: &str) -> Result<tokio_postgres::Client, Box<dyn std::error
         });
         Ok(client)
     } else {
-        let builder = native_tls::TlsConnector::builder().build()?;
+        let builder = native_tls::TlsConnector::builder()
+            .build()
+            .map_err(|e| CliError::Fatal(Box::new(e)))?;
         let connector = MakeTlsConnector::new(builder);
-        let (client, connection) = tokio_postgres::connect(url, connector).await?;
+        let (client, connection) = tokio_postgres::connect(url, connector)
+            .await
+            .map_err(|e| CliError::Fatal(Box::new(e)))?;
         tokio::spawn(async move {
             if let Err(err) = connection.await {
                 tracing::error!(error = %err, "PostgreSQL connection task error");
