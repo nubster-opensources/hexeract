@@ -37,14 +37,30 @@ use crate::DEFAULT_TABLE_NAME;
 use crate::dialect::Dialect;
 use crate::envelope::assemble_envelope;
 use crate::envelope::parse_sqlite_utc;
+use crate::validate::validate_event_type;
 use crate::validate::validate_table_name;
 
 const DIALECT: Dialect = Dialect::Sqlite;
 
+/// Maximum interval in seconds that can be safely passed to SQLite's strftime
+/// modifier (`"+N seconds"`).
+///
+/// SQLite's strftime modifier must parse to a finite value. Durations near
+/// [`Duration::MAX`] produce `"+inf seconds"` via [`f64::INFINITY`], which
+/// SQLite ignores silently, leaving `next_retry_at` as `NULL`. Capping at
+/// this value (roughly 292 years) keeps the result well within SQLite's
+/// datetime range while being far beyond any practical retry interval.
+const MAX_SQLITE_INTERVAL_SECS: u64 = 9_223_372_036; // i64::MAX seconds
+
 /// Render a backoff/lease [`Duration`] as a SQLite `strftime` modifier, e.g.
 /// `"+1.500 seconds"`, so `next_retry_at` is computed from the database clock.
+///
+/// The duration is capped at [`MAX_SQLITE_INTERVAL_SECS`] before conversion
+/// so that pathologically large values do not produce an `"+inf seconds"`
+/// modifier that SQLite would silently ignore.
 fn sqlite_seconds_modifier(d: Duration) -> String {
-    format!("+{:.3} seconds", d.as_secs_f64())
+    let capped = d.min(Duration::from_secs(MAX_SQLITE_INTERVAL_SECS));
+    format!("+{:.3} seconds", capped.as_secs_f64())
 }
 
 fn database_error(error: impl std::error::Error + Send + Sync + 'static) -> OutboxError {
@@ -365,6 +381,7 @@ impl OutboxPublisher for SqliteOutboxPublisher {
         tx: &mut Self::Tx<'_>,
         event: &E,
     ) -> Result<Uuid, OutboxError> {
+        validate_event_type(E::EVENT_TYPE)?;
         let event_id = Uuid::now_v7();
         let payload = serde_json::to_value(event)?;
         sqlx::query(&self.insert_sql)
@@ -384,6 +401,7 @@ impl OutboxPublisher for SqliteOutboxPublisher {
         subject_id: Uuid,
         event: &E,
     ) -> Result<Uuid, OutboxError> {
+        validate_event_type(E::EVENT_TYPE)?;
         let event_id = Uuid::now_v7();
         let payload = serde_json::to_value(event)?;
         sqlx::query(&self.insert_sql)
@@ -672,7 +690,7 @@ mod tests {
     async fn store_new_caches_sqlite_sql_without_skip_locked() {
         let store = SqliteOutboxStore::new(lazy_pool(), "audit_outbox").unwrap();
         assert_eq!(store.table_name(), "audit_outbox");
-        assert!(store.poll_sql.contains("FROM audit_outbox"));
+        assert!(store.poll_sql.contains("FROM \"audit_outbox\""));
         assert!(!store.poll_sql.contains("FOR UPDATE SKIP LOCKED"));
         assert!(store.poll_sql.contains("strftime"));
         // The attempt increment lives in claim_sql now (see #213), not in
@@ -684,8 +702,34 @@ mod tests {
     async fn publisher_new_caches_insert_sql_with_question_marks() {
         let publisher = SqliteOutboxPublisher::new(lazy_pool(), "audit_outbox").unwrap();
         assert_eq!(publisher.table_name(), "audit_outbox");
-        assert!(publisher.insert_sql.contains("INSERT INTO audit_outbox"));
+        assert!(
+            publisher
+                .insert_sql
+                .contains("INSERT INTO \"audit_outbox\"")
+        );
         assert!(publisher.insert_sql.contains("?, ?, ?, ?"));
+    }
+
+    #[test]
+    fn sqlite_seconds_modifier_caps_huge_duration() {
+        // Duration::MAX produces inf via as_secs_f64(); capping prevents an
+        // "+inf seconds" modifier that SQLite would silently ignore (#240).
+        let modifier = sqlite_seconds_modifier(Duration::MAX);
+        assert!(
+            !modifier.contains("inf"),
+            "Duration::MAX must not produce an inf modifier, got: {modifier}"
+        );
+        assert!(modifier.starts_with('+'), "modifier must start with '+'");
+        assert!(
+            modifier.ends_with(" seconds"),
+            "modifier must end with ' seconds'"
+        );
+    }
+
+    #[test]
+    fn sqlite_seconds_modifier_preserves_ordinary_values() {
+        let modifier = sqlite_seconds_modifier(Duration::from_millis(1_500));
+        assert_eq!(modifier, "+1.500 seconds");
     }
 
     #[tokio::test]
