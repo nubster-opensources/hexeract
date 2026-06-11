@@ -297,8 +297,8 @@ impl OutboxWorkerConfig {
             .min(self.retry_max_delay);
         if self.jitter {
             let nanos = capped.as_nanos();
-            // fastrand::u128 does not exist; use two u64 draws for wide ranges,
-            // or clamp to u64::MAX nanos (~584 years) which covers all practical caps.
+            // fastrand::u64 covers the full jitter range; clamp to u64::MAX nanos
+            // (~584 years) to handle theoretical caps beyond that bound.
             let nanos_u64 = u64::try_from(nanos).unwrap_or(u64::MAX);
             Duration::from_nanos(fastrand::u64(0..=nanos_u64))
         } else {

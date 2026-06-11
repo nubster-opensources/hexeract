@@ -23,12 +23,19 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// error type that the consumer worker converts back into a
 /// [`BusError`] when it records the failure.
 ///
-/// # Idempotency
+/// # Delivery guarantees and idempotency
 ///
-/// The bus offers at-least-once delivery semantics. Handlers MUST
-/// therefore be idempotent: the same message can be redelivered if a
-/// previous attempt crashed between the side effect and the consumer's
-/// ack.
+/// Delivery guarantees depend on the `AckMode` configured on the consumer
+/// worker (`hexeract-bus-rabbitmq::AckMode`):
+///
+/// - `AckMode::Manual` is **at-least-once**: the broker redelivers until the
+///   handler succeeds. Handlers MUST be idempotent because the same message
+///   can arrive more than once if a settle operation fails after the side
+///   effect ran.
+/// - `AckMode::AckOnReceive` is **at-most-once**: the delivery is acknowledged
+///   before the handler runs, so a crash after the ack drops the message.
+/// - `AckMode::Unacknowledged` is **at-most-once** (fire-and-forget): the
+///   broker removes the message on delivery without waiting for any ack.
 ///
 /// # Example
 ///

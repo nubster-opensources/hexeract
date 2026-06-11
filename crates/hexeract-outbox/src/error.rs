@@ -28,7 +28,15 @@ pub enum OutboxError {
         event_type: String,
     },
 
-    /// The envelope was retried more times than the configured maximum.
+    /// Reserved for future use. Not constructed by the current outbox
+    /// worker implementation.
+    ///
+    /// The worker today leaves exhausted events in the table (where they
+    /// are excluded from future polls by the `attempts < max_attempts`
+    /// predicate) or moves them to the dead-letter table when one is
+    /// configured. This variant is kept in the enum so a future release
+    /// can expose exhaustion as a typed error without a breaking change.
+    /// Do not match on it expecting to observe it in normal operation.
     #[error("event {event_id} reached max retries after {attempts} attempts")]
     MaxRetries {
         /// Identifier of the event that exhausted its retry budget.

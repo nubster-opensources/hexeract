@@ -1,9 +1,10 @@
-//! The 6-dimension Rust messaging framework.
+//! The Rust messaging framework for reliable event-driven services.
 //!
 //! Hexeract is an opinionated messaging framework for Rust. It unifies
-//! in-process mediator dispatch, multi-broker bus transport,
-//! transactional outbox, sagas, scheduler and request/reply in a
-//! single ergonomic crate.
+//! in-process mediator dispatch, multi-broker bus transport and a
+//! transactional outbox in a single ergonomic crate. Sagas, scheduler
+//! and request/reply are planned for future releases (see
+//! [ROADMAP.md](https://github.com/nubster-opensources/hexeract/blob/main/ROADMAP.md)).
 //!
 //! This facade re-exports every shipped sub-crate behind opt-in
 //! feature flags so consumers only compile what they actually use.

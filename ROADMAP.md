@@ -61,7 +61,7 @@ Released as v0.1.0 on crates.io. The seven shipped crates are `hexeract-core`, `
 **Scope:**
 
 - `MediatorBuilder` with `register_command_handler::<C, H>(handler)` API.
-- Built-in middlewares: `TracingMiddleware`, `LoggingMiddleware`, `TimeoutMiddleware`.
+- Built-in middlewares: `TracingMiddleware` and `TimeoutMiddleware` (in `hexeract-middleware`).
 - `#[handler]` procedural macro that wires a struct into the compile-time registry without boilerplate.
 - `hexeract` facade crate re-exports the curated surface.
 
