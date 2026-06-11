@@ -73,19 +73,6 @@ pub(crate) fn validate_event_type(event_type: &str) -> Result<(), OutboxError> {
     Ok(())
 }
 
-/// Wrap a validated identifier in ANSI double-quotes.
-///
-/// The identifier must have already been checked by [`validate_table_name`],
-/// which guarantees it contains only `[a-zA-Z0-9_]` characters. Double-
-/// quoting makes it case-sensitive and prevents reserved-word conflicts at
-/// runtime (e.g. a table named `user`, `order` or `select`).
-///
-/// This function is used when embedding the identifier inside SQL statement
-/// strings rather than when binding it as a parameter.
-pub(crate) fn quote_identifier(name: &str) -> String {
-    format!("\"{name}\"")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,13 +135,6 @@ mod tests {
                 "reserved word `{reserved}` passes character validation"
             );
         }
-    }
-
-    #[test]
-    fn quote_identifier_wraps_in_double_quotes() {
-        assert_eq!(quote_identifier("audit_outbox"), "\"audit_outbox\"");
-        assert_eq!(quote_identifier("user"), "\"user\"");
-        assert_eq!(quote_identifier("select"), "\"select\"");
     }
 
     #[test]

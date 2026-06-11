@@ -651,10 +651,10 @@ mod tests {
     async fn store_new_caches_mysql_sql_with_validated_table_name() {
         let store = MySqlOutboxStore::new(lazy_pool(), "audit_outbox").unwrap();
         assert_eq!(store.table_name(), "audit_outbox");
-        assert!(store.poll_sql.contains("FROM \"audit_outbox\""));
+        assert!(store.poll_sql.contains("FROM `audit_outbox`"));
         assert!(store.poll_sql.contains("FOR UPDATE SKIP LOCKED"));
         assert!(store.poll_sql.contains("UTC_TIMESTAMP(6)"));
-        assert!(store.mark_delivered_sql.contains("UPDATE \"audit_outbox\""));
+        assert!(store.mark_delivered_sql.contains("UPDATE `audit_outbox`"));
         // The attempt increment lives in claim_sql now (see #213), so
         // mark_failed must not increment again.
         assert!(!store.mark_failed_sql.contains("attempts = attempts + 1"));
@@ -664,11 +664,7 @@ mod tests {
     async fn publisher_new_caches_insert_sql_with_question_marks() {
         let publisher = MySqlOutboxPublisher::new(lazy_pool(), "audit_outbox").unwrap();
         assert_eq!(publisher.table_name(), "audit_outbox");
-        assert!(
-            publisher
-                .insert_sql
-                .contains("INSERT INTO \"audit_outbox\"")
-        );
+        assert!(publisher.insert_sql.contains("INSERT INTO `audit_outbox`"));
         assert!(publisher.insert_sql.contains("?, ?, ?, ?"));
     }
 
@@ -715,7 +711,7 @@ mod tests {
     #[test]
     fn store_claim_sql_embeds_table_name_and_question_mark_placeholders() {
         let sql = DIALECT.claim_sql("audit_outbox", 2);
-        assert!(sql.contains("UPDATE \"audit_outbox\""));
+        assert!(sql.contains("UPDATE `audit_outbox`"));
         assert!(sql.contains("next_retry_at = (UTC_TIMESTAMP(6) + INTERVAL ? MICROSECOND)"));
         assert!(sql.contains("WHERE event_id IN (?, ?)"));
         assert!(sql.contains("attempts = attempts + 1"));

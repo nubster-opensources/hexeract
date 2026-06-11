@@ -1,6 +1,5 @@
 use hexeract_outbox::OutboxError;
 
-use crate::validate::quote_identifier;
 use crate::validate::validate_table_name;
 
 /// Canonical PostgreSQL schema for an outbox table.
@@ -190,6 +189,21 @@ impl Dialect {
         }
     }
 
+    /// Wraps a validated identifier in this dialect's native quoting.
+    ///
+    /// PostgreSQL and SQLite use the SQL-standard double quote; MySQL uses
+    /// backticks because it does not enable `ANSI_QUOTES` by default, so a
+    /// double-quoted identifier is parsed as a string literal and rejected.
+    /// The name is assumed to have passed [`validate_table_name`], so it cannot
+    /// contain a quote character and quoting only restores reserved-word and
+    /// case handling.
+    pub(crate) fn quote_identifier(self, name: &str) -> String {
+        match self {
+            Self::Postgres | Self::Sqlite => format!("\"{name}\""),
+            Self::MySql => format!("`{name}`"),
+        }
+    }
+
     /// SQL expression evaluating to the current instant, in a form
     /// comparable to the stored timestamps.
     pub(crate) fn now_expr(self) -> &'static str {
@@ -229,7 +243,7 @@ impl Dialect {
 
     /// `SELECT ... WHERE delivered_at IS NULL ... [FOR UPDATE SKIP LOCKED]`.
     pub(crate) fn poll_sql(self, table: &str) -> String {
-        let qtable = quote_identifier(table);
+        let qtable = self.quote_identifier(table);
         let max_attempts = self.placeholder(1);
         let limit = self.placeholder(2);
         let now = self.now_expr();
@@ -252,7 +266,7 @@ impl Dialect {
 
     /// `UPDATE {qtable} SET delivered_at = {now} WHERE event_id = {ph}`.
     pub(crate) fn mark_delivered_sql(self, table: &str) -> String {
-        let qtable = quote_identifier(table);
+        let qtable = self.quote_identifier(table);
         let event_id = self.placeholder(1);
         let now = self.now_expr();
         format!("UPDATE {qtable} SET delivered_at = {now} WHERE event_id = {event_id}")
@@ -269,7 +283,7 @@ impl Dialect {
     /// worker that crashes between claim and this call still burns one retry
     /// slot. Incrementing again here would double-count every clean failure.
     pub(crate) fn mark_failed_sql(self, table: &str) -> String {
-        let qtable = quote_identifier(table);
+        let qtable = self.quote_identifier(table);
         let last_error = self.placeholder(1);
         let next_retry_at = self.now_plus_interval_expr(2);
         let event_id = self.placeholder(3);
@@ -282,7 +296,7 @@ impl Dialect {
 
     /// `INSERT INTO {qtable} (event_id, event_type, payload, subject_id) VALUES (...)`.
     pub(crate) fn insert_sql(self, table: &str) -> String {
-        let qtable = quote_identifier(table);
+        let qtable = self.quote_identifier(table);
         let p1 = self.placeholder(1);
         let p2 = self.placeholder(2);
         let p3 = self.placeholder(3);
@@ -336,8 +350,8 @@ impl Dialect {
     /// `exhausted_at` is not listed and gets its `DEFAULT` value (`NOW()` or
     /// equivalent). Called inside the same transaction as `mark_failed`.
     pub(crate) fn insert_dead_letter_sql(self, main: &str, dlq: &str) -> String {
-        let qmain = quote_identifier(main);
-        let qdlq = quote_identifier(dlq);
+        let qmain = self.quote_identifier(main);
+        let qdlq = self.quote_identifier(dlq);
         let event_id = self.placeholder(1);
         format!(
             "INSERT INTO {qdlq} \
@@ -354,7 +368,7 @@ impl Dialect {
     /// the dead-letter table. Called in the same transaction as
     /// [`Self::insert_dead_letter_sql`].
     pub(crate) fn delete_from_main_sql(self, table: &str) -> String {
-        let qtable = quote_identifier(table);
+        let qtable = self.quote_identifier(table);
         let event_id = self.placeholder(1);
         format!("DELETE FROM {qtable} WHERE event_id = {event_id}")
     }
@@ -386,7 +400,7 @@ impl Dialect {
         allow(dead_code)
     )]
     pub(crate) fn claim_sql(self, table: &str, n: usize) -> String {
-        let qtable = quote_identifier(table);
+        let qtable = self.quote_identifier(table);
         let lease = self.now_plus_interval_expr(1);
         match self {
             Self::Postgres => {
@@ -456,7 +470,10 @@ mod tests {
     #[test]
     fn mysql_poll_sql_locks_rows_with_question_marks() {
         let sql = Dialect::MySql.poll_sql("audit_outbox");
-        assert!(sql.contains("FROM \"audit_outbox\""));
+        // MySQL quotes identifiers with backticks, not the SQL-standard double
+        // quote (which it reads as a string literal unless ANSI_QUOTES is set).
+        assert!(sql.contains("FROM `audit_outbox`"));
+        assert!(!sql.contains('"'));
         assert!(sql.contains('?'));
         assert!(sql.contains("FOR UPDATE SKIP LOCKED"));
     }
@@ -506,6 +523,24 @@ mod tests {
         let sql = Dialect::Sqlite.insert_sql("audit_outbox");
         assert!(sql.contains("INSERT INTO \"audit_outbox\""));
         assert!(sql.contains("?, ?, ?, ?"));
+    }
+
+    #[test]
+    fn mysql_insert_sql_quotes_table_with_backticks() {
+        // Regression for the cross-dialect quoting bug: MySQL rejects a
+        // double-quoted identifier in DML (it reads it as a string literal),
+        // so the INSERT must use backticks.
+        let sql = Dialect::MySql.insert_sql("audit_outbox");
+        assert!(sql.contains("INSERT INTO `audit_outbox`"));
+        assert!(!sql.contains('"'));
+        assert!(sql.contains("?, ?, ?, ?"));
+    }
+
+    #[test]
+    fn quote_identifier_is_dialect_specific() {
+        assert_eq!(Dialect::Postgres.quote_identifier("t"), "\"t\"");
+        assert_eq!(Dialect::Sqlite.quote_identifier("t"), "\"t\"");
+        assert_eq!(Dialect::MySql.quote_identifier("t"), "`t`");
     }
 
     #[test]
@@ -678,7 +713,7 @@ mod tests {
     #[test]
     fn mysql_claim_sql_uses_question_marks() {
         let sql = Dialect::MySql.claim_sql("audit_outbox", 2);
-        assert!(sql.contains("UPDATE \"audit_outbox\""));
+        assert!(sql.contains("UPDATE `audit_outbox`"));
         assert!(sql.contains("SET next_retry_at = (UTC_TIMESTAMP(6) + INTERVAL ? MICROSECOND)"));
         assert!(sql.contains("WHERE event_id IN (?, ?)"));
     }
@@ -752,32 +787,35 @@ mod tests {
 
     #[test]
     fn sql_generation_quotes_identifiers() {
-        // All DML helpers must embed double-quoted identifiers so that reserved
-        // words (e.g. "user", "order") are safe without runtime errors.
+        // All DML helpers must embed the identifier quoted in the dialect's
+        // native style so reserved words (e.g. `user`, `order`) are safe
+        // without runtime errors. MySQL uses backticks; the others use the
+        // SQL-standard double quote.
         for dialect in [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite] {
             let table = "user";
+            let quoted = dialect.quote_identifier(table);
             assert!(
-                dialect.poll_sql(table).contains("\"user\""),
+                dialect.poll_sql(table).contains(&quoted),
                 "{dialect:?} poll_sql must quote the table name"
             );
             assert!(
-                dialect.mark_delivered_sql(table).contains("\"user\""),
+                dialect.mark_delivered_sql(table).contains(&quoted),
                 "{dialect:?} mark_delivered_sql must quote the table name"
             );
             assert!(
-                dialect.mark_failed_sql(table).contains("\"user\""),
+                dialect.mark_failed_sql(table).contains(&quoted),
                 "{dialect:?} mark_failed_sql must quote the table name"
             );
             assert!(
-                dialect.insert_sql(table).contains("\"user\""),
+                dialect.insert_sql(table).contains(&quoted),
                 "{dialect:?} insert_sql must quote the table name"
             );
             assert!(
-                dialect.claim_sql(table, 1).contains("\"user\""),
+                dialect.claim_sql(table, 1).contains(&quoted),
                 "{dialect:?} claim_sql must quote the table name"
             );
             assert!(
-                dialect.delete_from_main_sql(table).contains("\"user\""),
+                dialect.delete_from_main_sql(table).contains(&quoted),
                 "{dialect:?} delete_from_main_sql must quote the table name"
             );
         }
