@@ -9,6 +9,11 @@
 //! resolve. After the fix the absolute path `::hexeract_core` is emitted,
 //! which resolves correctly in all compilation contexts.
 
+#![allow(
+    clippy::unused_async,
+    reason = "the #[handler] macro requires an async fn signature even when the test body never awaits"
+)]
+
 use hexeract_core::{Command, HandlerContext, HexeractError};
 use hexeract_macros::handler;
 
@@ -32,5 +37,5 @@ fn handler_macro_compiles_and_handler_struct_exists() {
     // If the macro generated `crate::CommandHandler` instead of
     // `::hexeract_core::CommandHandler`, the file would not compile at all.
     // Reaching this point proves the generated paths resolve correctly.
-    let _h = GreetHandler;
+    let _ = GreetHandler;
 }
