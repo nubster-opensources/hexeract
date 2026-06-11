@@ -37,6 +37,8 @@ use lapin::options::QueueDeclareOptions;
 use lapin::types::AMQPValue;
 use lapin::types::FieldTable;
 use lapin::types::ShortString;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -168,6 +170,80 @@ const fn qos_applies(ack_mode: AckMode) -> bool {
     !matches!(ack_mode, AckMode::Unacknowledged)
 }
 
+/// Resolve the effective application-side in-flight bound for the run.
+///
+/// The bound only applies to a `no_ack` consumer
+/// ([`AckMode::Unacknowledged`]); the other modes get broker-side flow
+/// control through `basic.qos`, so an application-side semaphore would be
+/// redundant and is suppressed by returning `None`. A configured `Some(0)`
+/// is also flattened to `None`: a zero-permit semaphore can never grant a
+/// permit and would deadlock the consume loop, so it is treated as "no
+/// bound" rather than "block forever".
+const fn effective_bound(ack_mode: AckMode, max_buffered: Option<usize>) -> Option<usize> {
+    match (ack_mode, max_buffered) {
+        (AckMode::Unacknowledged, Some(n)) if n > 0 => Some(n),
+        _ => None,
+    }
+}
+
+/// Application-side flow control for `no_ack` consumers.
+///
+/// Wraps a [`Semaphore`] sized to the configured bound. Each in-flight
+/// delivery holds one permit for the lifetime of its dispatch; the
+/// consume loop parks on [`Self::acquire`] once every permit is taken,
+/// which stops it pulling new deliveries from the lapin stream until a
+/// handler completes and returns its permit. This caps the number of
+/// concurrently buffered deliveries at the bound without any broker
+/// support, mirroring what `basic.qos` does for acked consumers.
+#[derive(Clone)]
+struct BoundedInFlight {
+    semaphore: Arc<Semaphore>,
+    #[allow(
+        dead_code,
+        reason = "read by in_flight(), which is broker-free test introspection"
+    )]
+    bound: usize,
+}
+
+impl BoundedInFlight {
+    /// Build a flow controller that allows at most `bound` in-flight
+    /// deliveries. `bound` is guaranteed non-zero by [`effective_bound`].
+    fn new(bound: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(bound)),
+            bound,
+        }
+    }
+
+    /// Acquire one in-flight slot, parking until one is free.
+    ///
+    /// The returned [`OwnedSemaphorePermit`] must be held for the whole
+    /// dispatch and dropped only once it completes, so the slot is
+    /// released exactly when the delivery is fully handled. The semaphore
+    /// is never closed, so acquisition cannot fail; the error arm is
+    /// mapped to a [`BusError`] to keep the consume loop alive rather than
+    /// panicking.
+    async fn acquire(&self) -> Result<OwnedSemaphorePermit, BusError> {
+        Arc::clone(&self.semaphore)
+            .acquire_owned()
+            .await
+            .map_err(|err| BusError::Internal(format!("in-flight semaphore closed: {err}")))
+    }
+
+    /// Number of in-flight slots currently taken (bound minus available).
+    ///
+    /// Exposed so a test can assert the bound is never exceeded without a
+    /// live broker.
+    #[allow(
+        dead_code,
+        reason = "broker-free test introspection for the bound accounting"
+    )]
+    fn in_flight(&self) -> usize {
+        self.bound
+            .saturating_sub(self.semaphore.available_permits())
+    }
+}
+
 /// Tuning parameters for a [`RabbitMqWorker`].
 ///
 /// Marked `#[non_exhaustive]` so new tuning fields can be added in a minor
@@ -213,6 +289,24 @@ pub struct RabbitMqWorkerConfig {
     /// bounds the consumer's work, not the network: pair it with the
     /// broker-side `max_message_size` to bound ingress.
     pub max_payload_bytes: usize,
+    /// Optional application-side bound on the number of in-flight
+    /// deliveries, simulating prefetch for a `no_ack` consumer.
+    ///
+    /// A `no_ack` consumer ([`AckMode::Unacknowledged`]) gets no
+    /// broker-side `QoS` bound (see [`Self::prefetch`]), so a fast
+    /// producer paired with a slow handler can let deliveries pile up in
+    /// the client buffer without limit. When this is `Some(n)`, the
+    /// worker gates dispatch behind a semaphore of `n` permits: it stops
+    /// pulling new deliveries from the consumer stream until an in-flight
+    /// handler completes and frees a slot, capping in-flight deliveries
+    /// at `n`. A value of `Some(0)` is treated as no bound, matching
+    /// `None`, because a zero-permit semaphore would deadlock the loop.
+    ///
+    /// `None` (the default) preserves the historical behaviour exactly:
+    /// no application-side flow control. The bound is only consulted
+    /// under [`AckMode::Unacknowledged`]; the other modes already get
+    /// broker-side flow control through `basic.qos`.
+    pub max_buffered: Option<usize>,
 }
 
 impl Default for RabbitMqWorkerConfig {
@@ -224,6 +318,7 @@ impl Default for RabbitMqWorkerConfig {
             dead_letter_routing_key: None,
             retry_delay: DEFAULT_RETRY_DELAY,
             max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
+            max_buffered: None,
         }
     }
 }
@@ -324,6 +419,19 @@ impl RabbitMqWorkerBuilder {
     #[must_use]
     pub fn max_payload_bytes(mut self, bytes: usize) -> Self {
         self.config.max_payload_bytes = bytes;
+        self
+    }
+
+    /// Bound the number of in-flight deliveries to `n` under
+    /// [`AckMode::Unacknowledged`], simulating prefetch for a `no_ack`
+    /// consumer that the broker leaves unbounded.
+    ///
+    /// See [`RabbitMqWorkerConfig::max_buffered`]. Has no effect under
+    /// the other ack modes, which already get broker-side flow control
+    /// through `basic.qos`.
+    #[must_use]
+    pub fn max_buffered(mut self, n: usize) -> Self {
+        self.config.max_buffered = Some(n);
         self
     }
 
@@ -430,17 +538,18 @@ impl RabbitMqWorker {
     /// (queue declaration, `confirm_select` or
     /// [`Channel::basic_consume`]).
     pub async fn run(self, cancel: CancellationToken) -> Result<(), BusError> {
-        let channel = self.connection.create_channel().await?;
-        if qos_applies(self.config.ack_mode) {
+        let this = Arc::new(self);
+        let channel = this.connection.create_channel().await?;
+        if qos_applies(this.config.ack_mode) {
             channel
-                .basic_qos(self.config.prefetch, BasicQosOptions::default())
+                .basic_qos(this.config.prefetch, BasicQosOptions::default())
                 .await
                 .map_err(|err| BusError::Transport(Box::new(err)))?;
         }
         // The retry wait queue is specific to Manual mode (the only mode
         // that republishes failed deliveries for a delayed retry).
-        if matches!(self.config.ack_mode, AckMode::Manual) {
-            Self::declare_retry_queue(&channel, &self.queue, self.config.retry_delay).await?;
+        if matches!(this.config.ack_mode, AckMode::Manual) {
+            Self::declare_retry_queue(&channel, &this.queue, this.config.retry_delay).await?;
         }
         // Dead-letter setup and publisher confirms are independent of the
         // ack mode. They were previously gated on Manual, which silently
@@ -449,9 +558,9 @@ impl RabbitMqWorker {
         // resolve as `NotRequested`. Enable confirms whenever a confirmed
         // publish can occur: Manual always republishes (retry copy), and
         // any mode with a dead-letter routing key publishes to the DLQ.
-        let needs_confirms = matches!(self.config.ack_mode, AckMode::Manual)
-            || self.config.dead_letter_routing_key.is_some();
-        if let Some(dead_letter_queue) = self.config.dead_letter_routing_key.as_deref() {
+        let needs_confirms = matches!(this.config.ack_mode, AckMode::Manual)
+            || this.config.dead_letter_routing_key.is_some();
+        if let Some(dead_letter_queue) = this.config.dead_letter_routing_key.as_deref() {
             Self::declare_dead_letter_queue(&channel, dead_letter_queue).await?;
         }
         if needs_confirms {
@@ -460,10 +569,25 @@ impl RabbitMqWorker {
                 .await
                 .map_err(|err| BusError::Transport(Box::new(err)))?;
         }
-        let no_ack = matches!(self.config.ack_mode, AckMode::Unacknowledged);
+
+        // Resolve application-side flow control. It is only meaningful for
+        // a `no_ack` consumer; for every other mode `basic.qos` already
+        // bounds in-flight deliveries broker-side.
+        let flow_control = effective_bound(this.config.ack_mode, this.config.max_buffered)
+            .map(BoundedInFlight::new);
+        if matches!(this.config.ack_mode, AckMode::Unacknowledged) && flow_control.is_none() {
+            tracing::warn!(
+                queue = %this.queue,
+                "rabbitmq worker running AckMode::Unacknowledged (no_ack) without max_buffered: \
+                 no flow control is active, a fast producer with a slow handler can grow the \
+                 client buffer without limit; set RabbitMqWorkerBuilder::max_buffered to bound it"
+            );
+        }
+
+        let no_ack = matches!(this.config.ack_mode, AckMode::Unacknowledged);
         let mut consumer = channel
             .basic_consume(
-                to_short_string(self.queue.as_str(), "queue name")?,
+                to_short_string(this.queue.as_str(), "queue name")?,
                 to_short_string(
                     format!("hexeract-{}", Uuid::now_v7()).as_str(),
                     "consumer tag",
@@ -480,7 +604,7 @@ impl RabbitMqWorker {
         loop {
             tokio::select! {
                 () = cancel.cancelled() => {
-                    tracing::info!(queue = %self.queue, "rabbitmq worker cancelled");
+                    tracing::info!(queue = %this.queue, "rabbitmq worker cancelled");
                     break;
                 }
                 next = consumer.next() => {
@@ -495,9 +619,26 @@ impl RabbitMqWorker {
                     };
                     match item {
                         Ok(delivery) => {
-                            let disposition = self.dispatch(&channel, delivery).await;
-                            if !disposition.keep_running() {
-                                break;
+                            if let Some(flow_control) = flow_control.as_ref() {
+                                // Bounded path (no_ack only). Park until an
+                                // in-flight slot is free, then dispatch on a
+                                // spawned task that holds the permit until the
+                                // handler completes, capping concurrency at the
+                                // bound. The broker already removed the message
+                                // (no_ack), so a dropped task never strands an
+                                // unacked delivery and there is nothing to settle.
+                                let permit = flow_control.acquire().await?;
+                                let worker = Arc::clone(&this);
+                                let channel = channel.clone();
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    let _ = worker.dispatch(&channel, delivery).await;
+                                });
+                            } else {
+                                let disposition = this.dispatch(&channel, delivery).await;
+                                if !disposition.keep_running() {
+                                    break;
+                                }
                             }
                         }
                         Err(err) => {
@@ -1280,6 +1421,60 @@ mod tests {
         assert!(qos_applies(AckMode::Manual));
         assert!(qos_applies(AckMode::AckOnReceive));
         assert!(!qos_applies(AckMode::Unacknowledged));
+    }
+
+    #[test]
+    fn config_default_has_no_application_side_bound() {
+        assert!(
+            RabbitMqWorkerConfig::default().max_buffered.is_none(),
+            "the default must preserve the historical unbounded behaviour"
+        );
+    }
+
+    #[test]
+    fn effective_bound_only_applies_to_unacknowledged() {
+        // The acked modes get broker-side flow control via basic.qos, so
+        // an application-side bound is suppressed even when configured.
+        assert_eq!(effective_bound(AckMode::Manual, Some(16)), None);
+        assert_eq!(effective_bound(AckMode::AckOnReceive, Some(16)), None);
+        assert_eq!(effective_bound(AckMode::Unacknowledged, Some(16)), Some(16));
+    }
+
+    #[test]
+    fn effective_bound_flattens_none_and_zero_to_no_bound() {
+        // A missing bound and a zero bound both mean "no flow control":
+        // a zero-permit semaphore would deadlock the consume loop.
+        assert_eq!(effective_bound(AckMode::Unacknowledged, None), None);
+        assert_eq!(effective_bound(AckMode::Unacknowledged, Some(0)), None);
+    }
+
+    #[tokio::test]
+    async fn bounded_in_flight_caps_concurrent_permits_at_the_bound() {
+        let flow_control = BoundedInFlight::new(2);
+        assert_eq!(flow_control.in_flight(), 0);
+
+        // Take both slots: in-flight reaches the bound and no more.
+        let first = flow_control.acquire().await.expect("permit one");
+        let second = flow_control.acquire().await.expect("permit two");
+        assert_eq!(flow_control.in_flight(), 2);
+
+        // A third acquire must not resolve while the bound is saturated.
+        let blocked = flow_control.acquire();
+        tokio::pin!(blocked);
+        assert!(
+            futures_util::poll!(blocked.as_mut()).is_pending(),
+            "acquiring beyond the bound must park until a slot frees"
+        );
+
+        // Free one slot: the parked acquire now resolves and the count
+        // never exceeds the bound.
+        drop(first);
+        let third = blocked.await.expect("third permit after a slot freed");
+        assert_eq!(flow_control.in_flight(), 2);
+
+        drop(second);
+        drop(third);
+        assert_eq!(flow_control.in_flight(), 0);
     }
 
     #[test]
