@@ -19,6 +19,7 @@ use lapin::types::ShortString;
 
 use crate::connection::RabbitMqConnection;
 use crate::transport::exchange_kind_to_lapin;
+use crate::transport::to_short_string;
 
 /// Declare `exchange` on the broker.
 ///
@@ -117,8 +118,8 @@ async fn declare_exchange_on(channel: &Channel, exchange: &Exchange) -> Result<(
     };
     channel
         .exchange_declare(
-            ShortString::from(exchange.name.as_str()),
-            exchange_kind_to_lapin(exchange.kind),
+            to_short_string(exchange.name.as_str(), "exchange name")?,
+            exchange_kind_to_lapin(exchange.kind)?,
             options,
             FieldTable::default(),
         )

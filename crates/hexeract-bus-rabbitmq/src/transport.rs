@@ -25,6 +25,29 @@ use crate::pool::DEFAULT_POOL_MAX_SIZE;
 /// MIME type used for the JSON payloads carried by [`BusEnvelope`].
 const JSON_CONTENT_TYPE: &str = "application/json";
 
+/// Convert a user-supplied string into an AMQP [`ShortString`] without
+/// panicking.
+///
+/// `ShortString::from`/`try_new` cap names at 255 bytes. The blanket
+/// `From<&str>` impl panics via `.expect(...)` on an oversize input, and
+/// on the publish / consume hot path that input is attacker-influenced
+/// (routing keys, header keys, queue names). A panic there aborts the
+/// async task and drops the whole connection, taking down every consumer
+/// sharing it. This helper maps the overflow to a graceful
+/// [`BusError::InvalidTopology`] instead.
+///
+/// `field` names the offending value for the error message.
+///
+/// # Errors
+///
+/// Returns [`BusError::InvalidTopology`] when `value` exceeds the
+/// AMQP `ShortString` limit of 255 bytes.
+pub(crate) fn to_short_string(value: &str, field: &str) -> Result<ShortString, BusError> {
+    ShortString::try_new(value).map_err(|err| BusError::InvalidTopology {
+        reason: format!("{field} exceeds the AMQP short-string limit of 255 bytes: {err}"),
+    })
+}
+
 /// [`Transport`] implementation backed by RabbitMQ via [`lapin`].
 ///
 /// A transport instance is bound to one logical AMQP exchange. The
@@ -100,7 +123,7 @@ impl RabbitMqTransport {
             DEFAULT_RETRY_BASE_DELAY,
         )
         .await?;
-        let exchange_kind = exchange_kind_to_lapin(exchange.kind);
+        let exchange_kind = exchange_kind_to_lapin(exchange.kind)?;
         let options = ExchangeDeclareOptions {
             durable: exchange.durable,
             auto_delete: exchange.auto_delete,
@@ -109,9 +132,10 @@ impl RabbitMqTransport {
         let exchange_name = exchange.name;
         connection
             .with_channel(|channel| async move {
+                let exchange_short = to_short_string(exchange_name.as_str(), "exchange name")?;
                 channel
                     .exchange_declare(
-                        ShortString::from(exchange_name.as_str()),
+                        exchange_short,
                         exchange_kind,
                         options,
                         FieldTable::default(),
@@ -179,13 +203,15 @@ impl RabbitMqTransport {
         envelope: &BusEnvelope,
     ) -> Result<Uuid, BusError> {
         let pooled = self.pool.acquire().await?;
-        let properties = envelope_to_properties(envelope);
+        let properties = envelope_to_properties(envelope)?;
+        let exchange = to_short_string(self.exchange.as_str(), "exchange name")?;
+        let routing_key_short = to_short_string(routing_key, "routing key")?;
         let confirms = self.pool.confirms();
         let confirmation = pooled
             .channel()
             .basic_publish(
-                ShortString::from(self.exchange.as_str()),
-                ShortString::from(routing_key),
+                exchange,
+                routing_key_short,
                 BasicPublishOptions {
                     mandatory: confirms,
                     ..BasicPublishOptions::default()
@@ -232,25 +258,27 @@ impl Transport for RabbitMqTransport {
     }
 }
 
-pub(crate) fn exchange_kind_to_lapin(kind: ExchangeKind) -> lapin::ExchangeKind {
-    // `ExchangeKind` is `#[non_exhaustive]`; unknown future variants
-    // fall back to the AMQP `direct` kind. New variants should be
-    // mapped explicitly when introduced.
-    #[allow(clippy::match_same_arms)]
+pub(crate) fn exchange_kind_to_lapin(kind: ExchangeKind) -> Result<lapin::ExchangeKind, BusError> {
+    // `ExchangeKind` is `#[non_exhaustive]`; an unknown future variant
+    // must not be silently declared as `direct` (which would route every
+    // message wrong). Reject it as invalid topology so the mismatch
+    // surfaces at declare time instead of corrupting routing at runtime.
     match kind {
-        ExchangeKind::Direct => lapin::ExchangeKind::Direct,
-        ExchangeKind::Topic => lapin::ExchangeKind::Topic,
-        ExchangeKind::Fanout => lapin::ExchangeKind::Fanout,
-        ExchangeKind::Headers => lapin::ExchangeKind::Headers,
-        _ => lapin::ExchangeKind::Direct,
+        ExchangeKind::Direct => Ok(lapin::ExchangeKind::Direct),
+        ExchangeKind::Topic => Ok(lapin::ExchangeKind::Topic),
+        ExchangeKind::Fanout => Ok(lapin::ExchangeKind::Fanout),
+        ExchangeKind::Headers => Ok(lapin::ExchangeKind::Headers),
+        other => Err(BusError::InvalidTopology {
+            reason: format!("unsupported exchange kind {other:?}"),
+        }),
     }
 }
 
-fn envelope_to_properties(envelope: &BusEnvelope) -> BasicProperties {
+fn envelope_to_properties(envelope: &BusEnvelope) -> Result<BasicProperties, BusError> {
     let mut amqp_headers = FieldTable::default();
     for (k, v) in &envelope.headers {
         amqp_headers.insert(
-            ShortString::from(k.as_str()),
+            to_short_string(k.as_str(), "header key")?,
             AMQPValue::LongString(v.as_str().into()),
         );
     }
@@ -263,14 +291,17 @@ fn envelope_to_properties(envelope: &BusEnvelope) -> BasicProperties {
         .with_message_id(envelope.message_id.to_string().into())
         .with_correlation_id(envelope.correlation_id.to_string().into())
         .with_content_type(JSON_CONTENT_TYPE.into())
-        .with_type(envelope.message_type.as_str().into())
+        .with_type(to_short_string(
+            envelope.message_type.as_str(),
+            "message type",
+        )?)
         .with_delivery_mode(2)
         .with_timestamp(published_at_secs)
         .with_headers(amqp_headers);
     if let Some(reply_to) = &envelope.reply_to {
-        properties = properties.with_reply_to(reply_to.as_str().into());
+        properties = properties.with_reply_to(to_short_string(reply_to.as_str(), "reply_to")?);
     }
-    properties
+    Ok(properties)
 }
 
 #[cfg(test)]
@@ -294,21 +325,58 @@ mod tests {
     #[test]
     fn exchange_kind_maps_to_lapin_variants() {
         assert!(matches!(
-            exchange_kind_to_lapin(ExchangeKind::Direct),
+            exchange_kind_to_lapin(ExchangeKind::Direct).unwrap(),
             lapin::ExchangeKind::Direct
         ));
         assert!(matches!(
-            exchange_kind_to_lapin(ExchangeKind::Topic),
+            exchange_kind_to_lapin(ExchangeKind::Topic).unwrap(),
             lapin::ExchangeKind::Topic
         ));
         assert!(matches!(
-            exchange_kind_to_lapin(ExchangeKind::Fanout),
+            exchange_kind_to_lapin(ExchangeKind::Fanout).unwrap(),
             lapin::ExchangeKind::Fanout
         ));
         assert!(matches!(
-            exchange_kind_to_lapin(ExchangeKind::Headers),
+            exchange_kind_to_lapin(ExchangeKind::Headers).unwrap(),
             lapin::ExchangeKind::Headers
         ));
+    }
+
+    #[test]
+    fn to_short_string_rejects_oversize_value() {
+        let oversize = "a".repeat(256);
+        let err = to_short_string(&oversize, "routing key")
+            .expect_err("a 256-byte value must be rejected, not panic");
+        match err {
+            BusError::InvalidTopology { reason } => assert!(reason.contains("routing key")),
+            other => panic!("expected InvalidTopology, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_short_string_accepts_value_at_limit() {
+        let at_limit = "a".repeat(255);
+        assert!(to_short_string(&at_limit, "routing key").is_ok());
+    }
+
+    #[test]
+    fn envelope_to_properties_rejects_oversize_header_key() {
+        let mut headers = HashMap::new();
+        headers.insert("k".repeat(256), "v".to_owned());
+        let envelope = BusEnvelope::with_headers(
+            Uuid::from_u128(1),
+            headers,
+            &OrderPlaced {
+                order_id: Uuid::from_u128(9),
+            },
+        )
+        .unwrap();
+        // Must return an error rather than panic inside ShortString::from.
+        let result = envelope_to_properties(&envelope);
+        assert!(
+            matches!(result, Err(BusError::InvalidTopology { .. })),
+            "an oversize header key must surface as InvalidTopology"
+        );
     }
 
     #[test]
@@ -320,7 +388,7 @@ mod tests {
             },
         )
         .unwrap();
-        let properties = envelope_to_properties(&envelope);
+        let properties = envelope_to_properties(&envelope).unwrap();
         assert_eq!(
             properties.content_type().as_ref().map(ShortString::as_str),
             Some(JSON_CONTENT_TYPE)
@@ -355,7 +423,7 @@ mod tests {
             },
         )
         .unwrap();
-        let properties = envelope_to_properties(&envelope);
+        let properties = envelope_to_properties(&envelope).unwrap();
         let table = properties.headers().as_ref().expect("headers must be set");
         let value = table.inner().get(&ShortString::from("tenant"));
         match value {
@@ -376,7 +444,7 @@ mod tests {
             },
         )
         .unwrap();
-        let properties = envelope_to_properties(&envelope);
+        let properties = envelope_to_properties(&envelope).unwrap();
         assert_eq!(*properties.delivery_mode(), Some(2));
     }
 
@@ -394,7 +462,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let properties = envelope_to_properties(&envelope);
+        let properties = envelope_to_properties(&envelope).unwrap();
         assert_eq!(*properties.timestamp(), Some(expected));
     }
 

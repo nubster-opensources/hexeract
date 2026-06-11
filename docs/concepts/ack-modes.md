@@ -10,7 +10,7 @@ The `RabbitMqWorker` reacts to handler outcomes differently depending on the [`A
 
 ## Manual: ack on success, delayed retry on failure
 
-In `AckMode::Manual`, the broker keeps the delivery until the worker settles it. On handler failure the worker republishes the delivery to a durable wait queue (`<queue>.retry`, declared by the worker at startup) and acks the original. The wait queue carries a per-queue TTL equal to `retry_delay` and a dead-letter route back to the consumed queue, so the broker redelivers the message after the delay and increments the `x-death` header that the worker reads as the attempt count.
+In `AckMode::Manual`, the broker keeps the delivery until the worker settles it. On handler failure the worker republishes the delivery to a durable wait queue (`<queue>.retry`, declared by the worker at startup) through a mandatory, confirmed and persistent publish, then acks the original only once that publisher confirm proves the copy is durably stored. Publisher confirms are enabled for every `Manual` worker (not only when a dead-letter routing key is set), so the original is never acked ahead of the retry copy. The wait queue carries a per-queue TTL equal to `retry_delay` and a dead-letter route back to the consumed queue, so the broker redelivers the message after the delay and increments the `x-death` header that the worker reads as the attempt count.
 
 ```mermaid
 sequenceDiagram
@@ -30,7 +30,8 @@ sequenceDiagram
         Handler-->>Worker: Err(_)
         Note over Worker: attempts = x-death count + 1
         alt attempts < max_attempts
-            Worker->>WaitQ: basic_publish(payload, props)
+            Worker->>WaitQ: basic_publish("", retry, mandatory,<br/>persistent, payload)
+            WaitQ-->>Worker: publisher confirm
             Worker->>Broker: basic_ack(delivery_tag)
             Note over WaitQ,Broker: TTL expires, the broker dead-letters<br/>the message back to the queue<br/>and increments x-death
         else attempts == max_attempts
@@ -43,7 +44,7 @@ sequenceDiagram
     end
 ```
 
-The attempt count travels with the message in the broker-maintained `x-death` header instead of living in process memory, so it survives worker restarts and is shared by every consumer of the queue. Exhausted deliveries go to a durable dead-letter queue declared by the worker at startup, through a mandatory, confirmed and persistent publish; a failed publish leaves the original unacked for redelivery. See the [retry policy](retry-policy.md) for the full state machine and operational caveats.
+The attempt count travels with the message in the broker-maintained `x-death` header instead of living in process memory, so it survives worker restarts and is shared by every consumer of the queue. Exhausted deliveries go to a durable dead-letter queue declared by the worker at startup, through a mandatory, confirmed and persistent publish. When that publish fails on a live channel the worker nacks the original to free its prefetch slot rather than leaving it unsettled (which would stall the consumer): a transient failure requeues for another attempt, an unroutable dead-letter queue drops the delivery. See the [retry policy](retry-policy.md) for the full state machine and operational caveats.
 
 Deliveries that fail to decode into an envelope (a payload larger than `max_payload_bytes`, a missing AMQP `type` property) never reach a handler and skip the retry budget entirely. With a dead-letter queue configured they are parked immediately through the same hardened publish, whatever the ack mode (best-effort under `Unacknowledged`, which cannot settle). Without one, `Manual` nacks them without requeue so a broker-level dead-letter exchange still applies, and the other modes drop them with a warning.
 
