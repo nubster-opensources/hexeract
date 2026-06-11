@@ -5,7 +5,12 @@
 //! for Rust. It ships four building blocks:
 //!
 //! - [`RabbitMqConnection`]: a thin wrapper over [`lapin::Connection`]
-//!   that exposes a bounded reconnect loop.
+//!   that exposes a bounded retry loop for the **initial** connection.
+//!   Once connected, there is no automatic reconnect: if the broker
+//!   drops the connection the worker surfaces
+//!   [`hexeract_bus::BusError::Connection`] and the caller rebuilds the
+//!   worker (see [`worker::RabbitMqWorker::run`] for the recommended
+//!   supervisor loop).
 //! - [`ChannelPool`]: a small per-publisher pool of [`lapin::Channel`]
 //!   handles, reusing channels across publishes instead of opening one
 //!   per call.

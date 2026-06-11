@@ -11,6 +11,25 @@ use crate::OutboxError;
 /// the worker to poll, dispatch and retry the event. Backend crates map
 /// this struct to and from their physical schema.
 ///
+/// # Timestamp precision
+///
+/// The precision of [`Self::created_at`], [`Self::next_retry_at`] and
+/// [`Self::delivered_at`] depends on the storage backend:
+///
+/// - **PostgreSQL** stores `TIMESTAMPTZ` with microsecond precision.
+/// - **MySQL** stores `DATETIME(6)` with microsecond precision.
+/// - **SQLite** stores UTC RFC 3339 strings at **millisecond** precision.
+///   Sub-millisecond components are **truncated** (not rounded) on write.
+///   Round-tripping a `SystemTime` with nanosecond precision through the
+///   SQLite backend yields a value truncated to the nearest millisecond.
+///
+/// # Identifier limits (hexeract-outbox-sql)
+///
+/// The SQL backends enforce the following column widths:
+///
+/// - `event_type` is limited to **64 bytes**.
+/// - Table-name identifiers passed to the builder are limited to **63 bytes**.
+///
 /// The `Debug` implementation masks the payload bytes to avoid leaking
 /// potentially sensitive event data into logs and tracing output.
 #[derive(Clone)]

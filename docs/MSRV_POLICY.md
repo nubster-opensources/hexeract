@@ -2,7 +2,7 @@
 
 The current MSRV is **Rust 1.88** (stable channel).
 
-The MSRV is pinned in `rust-toolchain.toml` at the repository root and declared in every workspace crate via `rust-version = "1.88"`.
+The MSRV is pinned in `rust-toolchain.toml` at the repository root and declared in every workspace crate via `rust-version = "1.88"` (or `rust-version.workspace = true`). The `hexeract-umbrella-tests` integration-test crate inherits the MSRV through the workspace table.
 
 ## How the MSRV evolves
 
@@ -17,9 +17,7 @@ The MSRV is pinned in `rust-toolchain.toml` at the repository root and declared 
 
 ## How we verify the MSRV in CI
 
-The repository CI pins `rust-toolchain.toml` to `1.88.0`. The `Format`, `Clippy` and `Build and test` jobs all run on this exact toolchain, which guarantees that nothing newer slips in.
-
-A dedicated MSRV check on a future Rust release (e.g. running `cargo build --workspace` on stable) may be added later if we want early warning on breakage introduced by upstream changes.
+The repository CI pins `rust-toolchain.toml` to `1.88.0`. The `Format`, `Clippy` and `Build and test` jobs all run on this exact toolchain, which guarantees that nothing newer slips in. A dedicated MSRV job in `ci.yml` runs `cargo build --workspace` on the pinned toolchain to catch regressions introduced by dependency updates.
 
 ## Downstream impact
 

@@ -19,10 +19,10 @@
 //! [`Mediator::publish_with_correlation_id`]. The plain `send` / `query` /
 //! `publish` methods mint a fresh id each time.
 //!
-//! The three built-in middlewares (`TracingMiddleware`, `LoggingMiddleware`,
-//! `TimeoutMiddleware`) ship in a follow-up release; users can still wire
-//! their own [`Middleware`] implementations through
-//! [`MediatorBuilder::with_middleware`] in the meantime.
+//! The `hexeract-middleware` crate ships two built-in middlewares:
+//! `TracingMiddleware` and `TimeoutMiddleware`. Wire them through
+//! [`MediatorBuilder::with_middleware`], or supply your own [`Middleware`]
+//! implementations for other cross-cutting concerns.
 //!
 //! # Example
 //!

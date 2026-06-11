@@ -50,7 +50,7 @@ TracingMiddleware: entering
 TracingMiddleware: completed (with elapsed_ms) or failed (with error)
 ```
 
-The recommended order is `Tracing` first, then `Timeout`. With this order, the tracing span observes the entry, the timeout, and the resulting failure. With the inverse, the span never opens when the timeout fires, which makes the failure harder to debug.
+The recommended order is `Tracing` first, then `Timeout`. With this order, the tracing span observes the full lifetime of the dispatch. With the inverse order, `TracingMiddleware` sits inside `TimeoutMiddleware`: the span still opens and "entering" is emitted, but when the timeout fires the inner future is dropped, so the "completed" or "failed" exit events are never emitted.
 
 ## Building your own
 

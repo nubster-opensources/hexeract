@@ -8,7 +8,7 @@ This document explains how the Hexeract Outbox is structured, what guarantees it
 |---|---|---|
 | `Event` | `hexeract-outbox` | Marker trait carried by every domain event flowing through the outbox. Each implementor declares a stable `EVENT_TYPE` string used for routing. |
 | `OutboxEnvelope` | `hexeract-outbox` | Row representation of a persisted event. Holds `event_id`, `event_type`, JSON payload, optional `subject_id`, retry bookkeeping (`attempts`, `last_error`, `next_retry_at`) and `delivered_at`. |
-| `OutboxError` | `hexeract-outbox` | Unified error type with variants for `Serialization`, `Database`, `MissingHandler`, `MaxRetries`, `TypeMismatch` and `Internal`. |
+| `OutboxError` | `hexeract-outbox` | Unified error type with variants for `Serialization`, `Database`, `MissingHandler`, `TypeMismatch`, `PoolTimeout`, `DispatchTimeout` and `Internal`. (`MaxRetries` exists in the enum but is reserved and not constructed by the current worker.) |
 | `Handler<E>` | `hexeract-outbox` | Asynchronous handler dispatched for each event of type `E`. Returns `Result<(), Self::Error>` where `Self::Error: Into<OutboxError>`. |
 | `OutboxPublisher` | `hexeract-outbox` | Backend-agnostic trait for inserting events into the outbox storage. The associated `Tx<'tx>` GAT lets backends expose lifetime-bound transaction handles. |
 | `OutboxStore` | `hexeract-outbox` | Backend-agnostic trait for the storage operations the worker needs: `acquire`, `begin`, `poll`, `mark_delivered`, `mark_failed`, `commit`. |

@@ -8,10 +8,13 @@
 //!
 //! # Recommended order
 //!
-//! Wire `TracingMiddleware` first so that the span observes the entry, the
-//! timeout, and the resulting failure with the typed error in the exit
-//! event. With the inverse order, the span never opens when the timeout
-//! fires, which makes the failure harder to debug.
+//! Wire `TracingMiddleware` first (outermost) so that the span observes
+//! the entry, the timeout, and the resulting failure. With the inverse
+//! order, `TracingMiddleware` sits inside `TimeoutMiddleware`: the span
+//! still opens and emits "entering", but when the timeout fires the inner
+//! future is dropped at its next await point, so the "completed" or
+//! "failed" exit events from `TracingMiddleware` are never emitted. The
+//! recommended order keeps the full entry-to-exit record in the span.
 //!
 //! ```ignore
 //! use std::time::Duration;

@@ -10,12 +10,21 @@ The crate ships two built-in middlewares. Both implement the `Middleware` trait 
 pub struct TracingMiddleware { /* ... */ }
 
 impl TracingMiddleware {
-    pub fn new() -> Self;                                 // Level::INFO
-    pub fn with_level(level: tracing::Level) -> Self;
+    pub fn new() -> Self;                                            // Level::INFO
+    pub fn with_level(self, level: tracing::Level) -> Self;         // consuming, chainable
 }
 
 impl Default for TracingMiddleware { /* INFO */ }
 impl Middleware for TracingMiddleware { /* ... */ }
+```
+
+Usage:
+
+```rust
+use tracing::Level;
+use hexeract_middleware::TracingMiddleware;
+
+let middleware = TracingMiddleware::new().with_level(Level::DEBUG);
 ```
 
 Opens a `tracing::Span` around every dispatch and emits a structured event on entry and on completion or failure.
@@ -52,7 +61,7 @@ Wraps the inner pipeline in `tokio::time::timeout`. On expiration returns `Hexer
 
 ## Recommended order
 
-Wire `TracingMiddleware` first so that the span observes the entry, the timeout, and the resulting failure with the typed error in the exit event:
+Wire `TracingMiddleware` first (outermost) so that the span observes the full lifetime of the dispatch, including the timeout:
 
 ```rust
 use std::time::Duration;
@@ -67,7 +76,7 @@ let mediator = MediatorBuilder::new()
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-With the inverse order, the span never opens when the timeout fires, which makes the failure harder to debug.
+With the inverse order, `TracingMiddleware` sits inside `TimeoutMiddleware`: the span still opens and the "entering" event is emitted, but when the timeout fires the inner future is dropped, so the "completed" or "failed" exit events from `TracingMiddleware` are never emitted. The recommended order keeps the full entry-to-exit record in the span.
 
 ## Error variant
 

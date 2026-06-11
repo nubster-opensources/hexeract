@@ -94,6 +94,20 @@ sequenceDiagram
 
 Use `Unacknowledged` only when loss is acceptable and throughput is paramount, for example metrics or fan-out to non-critical sinks, and the producer side already enforces durability through another mechanism (an outbox, a replayable log, ...).
 
+### Flow control under Unacknowledged
+
+Because `no_ack` is set, the broker applies no `QoS` bound and delivers messages as fast as it can. A slow handler paired with a fast producer can let deliveries pile up in the client buffer without limit. Use `RabbitMqWorkerBuilder::max_buffered(n)` to cap in-flight deliveries at `n` on the application side: the worker gates dispatch behind a semaphore of `n` permits and stops pulling from the consumer stream while every permit is taken.
+
+```rust
+let worker = RabbitMqWorkerBuilder::new(conn)
+    .queue("metrics.events")
+    .ack_mode(AckMode::Unacknowledged)
+    .max_buffered(128)     // at most 128 concurrent in-flight handlers
+    .build()?;
+```
+
+Without `max_buffered`, a warning is logged at startup to surface the unbounded risk. `None` (the default) preserves the historical behaviour. A value of `Some(0)` is treated as no bound, matching `None`, because a zero-permit semaphore would deadlock the loop.
+
 ## Choosing a mode
 
 | Question | Pick |

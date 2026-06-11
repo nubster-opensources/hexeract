@@ -13,8 +13,14 @@ use crate::Message;
 /// `correlation_id` for distributed tracing, an optional `reply_to`
 /// queue for request-reply patterns, and free-form `headers`.
 ///
-/// The `Debug` implementation masks the payload bytes to avoid leaking
-/// potentially sensitive event data into logs and tracing output.
+/// # Observability note
+///
+/// The `Debug` implementation masks `payload` (rendered as `<N bytes>`)
+/// to avoid leaking sensitive event data into logs and tracing output.
+/// However, `headers` are printed verbatim. If your application uses
+/// headers to carry tenancy identifiers, authorization tokens or other
+/// sensitive metadata, filter them at the subscriber level before they
+/// reach persistent storage.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct BusEnvelope {

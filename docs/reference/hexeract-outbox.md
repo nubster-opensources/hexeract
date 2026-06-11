@@ -1,6 +1,6 @@
 # `hexeract-outbox` API reference
 
-Backend-agnostic core of the outbox feature. Pair with [`hexeract-outbox-postgres`](hexeract-outbox-postgres.md) for the PostgreSQL backend.
+Backend-agnostic core of the outbox feature. Pair with [`hexeract-outbox-sql`](hexeract-outbox-sql.md) for the PostgreSQL, MySQL and SQLite backends. (`hexeract-outbox-postgres` is deprecated since 0.4.0.)
 
 The full rustdoc lives at <https://docs.rs/hexeract-outbox>.
 
@@ -21,7 +21,7 @@ The full rustdoc lives at <https://docs.rs/hexeract-outbox>.
 | `OutboxEnvelope::with_subject(event_id, subject_id, &E)` | Builds a fresh envelope tagged with a subject for partial ordering. |
 | `OutboxEnvelope::restore(...)` | Backend hook to rebuild an envelope from a database row. |
 | `OutboxEnvelope::decode::<E>()` | Deserialises the payload and validates `event_type` matches `E::EVENT_TYPE`. |
-| `OutboxError` | Non-exhaustive error enum: `Serialization`, `Database(Box<...>)`, `MissingHandler { event_type }`, `MaxRetries { event_id, attempts }`, `TypeMismatch { expected, actual }`, `Internal(String)`. |
+| `OutboxError` | Non-exhaustive error enum: `Serialization`, `Database(Box<...>)`, `MissingHandler { event_type }`, `TypeMismatch { expected, actual }`, `PoolTimeout`, `DispatchTimeout { event_id, event_type, timeout }`, `Internal(String)`. (`MaxRetries { event_id, attempts }` is declared but reserved; the current worker never constructs it.) |
 
 ### Publisher contract
 
