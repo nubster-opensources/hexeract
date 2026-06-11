@@ -18,10 +18,10 @@ workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
+futures-util = { workspace = true, features = ["std"] }
 hexeract-bus = { path = "../hexeract-bus", version = "0.4" }
 hexeract-core = { path = "../hexeract-core", version = "0.4" }
-lapin = "4"
+lapin = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
@@ -31,8 +31,8 @@ uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]
 serde = { workspace = true }
-testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["rabbitmq"] }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true, features = ["rabbitmq"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true }
 
