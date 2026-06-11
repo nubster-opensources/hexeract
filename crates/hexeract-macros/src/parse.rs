@@ -95,9 +95,21 @@ pub(crate) fn parse_handler_item(
     kind: HandlerKindArg,
     item: TokenStream,
 ) -> syn::Result<HandlerItem> {
-    if let Ok(item_impl) = syn::parse2::<ItemImpl>(item.clone()) {
+    // Peek at the first token: if it is the `impl` keyword the user intends an
+    // impl block. Propagate the `ItemImpl` parse error verbatim so the
+    // diagnostic points at the real mistake inside the block rather than
+    // falling through to the generic "must annotate an impl or a fn" message.
+    let leading_impl = item
+        .clone()
+        .into_iter()
+        .next()
+        .is_some_and(|tt| matches!(tt, proc_macro2::TokenTree::Ident(ref i) if i == "impl"));
+
+    if leading_impl {
+        let item_impl: ItemImpl = syn::parse2(item)?;
         return parse_impl(kind, item_impl).map(HandlerItem::Impl);
     }
+
     let item_fn: ItemFn = syn::parse2(item).map_err(|err| {
         syn::Error::new(
             err.span(),
@@ -667,6 +679,35 @@ mod tests {
             }
             HandlerItem::Impl(_) => panic!("must be parsed as FreeFn"),
         }
+    }
+
+    /// When the token stream starts with `impl` but the impl body contains a
+    /// genuine syntax error, the error must originate from `ItemImpl` parsing
+    /// and must NOT be replaced by the generic fallback message.
+    #[test]
+    fn parse_handler_item_propagates_impl_parse_error_verbatim() {
+        // "impl H { async fn handle(&self) -> }" is valid outer impl syntax
+        // that syn can start parsing, but the malformed method body causes
+        // an ItemImpl parse failure.  The fix must propagate that error
+        // rather than swapping in the generic "must annotate an impl or fn"
+        // message.
+        let item = quote! {
+            impl H {
+                async fn handle(&self, cmd: C, ctx: &HandlerContext) -> {
+                    // missing return type — malformed
+                }
+            }
+        };
+        let err = expect_parse_err(
+            HandlerKindArg::Command,
+            item,
+            "malformed impl body must produce an error",
+        );
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("must annotate an inherent `impl` block or a free `async fn`"),
+            "generic fallback message must not appear for a clearly-impl token stream; got: {msg}"
+        );
     }
 
     #[test]

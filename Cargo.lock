@@ -1548,6 +1548,7 @@ dependencies = [
 name = "hexeract-core"
 version = "0.4.0"
 dependencies = [
+ "hexeract-macros",
  "inventory",
  "serde",
  "thiserror",
