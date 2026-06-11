@@ -55,7 +55,7 @@ use hexeract::outbox_sql::PgOutboxWorkerBuilder;
 use hexeract::outbox_sql::postgres::ensure_schema;
 
 let pool = sqlx::PgPool::connect(&database_url).await?;
-ensure_schema(&pool, "audit_outbox").await?;
+ensure_schema(&pool, "audit_outbox").await?; // POC/tests only; production applies Dialect::schema_ddl via migration tooling
 let worker = PgOutboxWorkerBuilder::new(pool)
     .register_handler::<MyEvent, _>(my_handler)
     .build()?;

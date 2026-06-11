@@ -26,7 +26,7 @@ Expected behaviour: at-least-once delivery permits duplicates on crash or `max_a
 | Likely cause | How to confirm | Fix |
 | --- | --- | --- |
 | `next_retry_at` in the future | `SELECT event_id, next_retry_at FROM <table> WHERE delivered_at IS NULL` shows future timestamps | Wait `retry_delay` (default 5 s); reset the timestamp manually only for emergency dispatch |
-| Pool exhausted | Worker logs `acquire` errors or hangs | Raise `deadpool_postgres` `max_size` or check for connection leaks in the caller code |
+| Pool exhausted | Worker logs `acquire` errors or hangs | Raise `max_connections` on `sqlx::postgres::PgPoolOptions` or check for connection leaks in the caller code |
 | Cancellation token already cancelled | Worker exited on startup with `Ok(())` | Re-issue a fresh `CancellationToken` |
 
 ## Bus (RabbitMQ)

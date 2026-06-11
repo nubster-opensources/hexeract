@@ -10,11 +10,11 @@ The outbox pattern (write the event row in the same transaction as the business 
 ## Recipe
 
 ```rust
-use deadpool_postgres::Pool;
 use hexeract::core::{Command, CommandHandler, HandlerContext, HexeractError};
 use hexeract::outbox::{Event, OutboxPublisher};
-use hexeract::outbox_postgres::PgOutboxPublisher;
+use hexeract::outbox_sql::PgOutboxPublisher;
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -35,7 +35,7 @@ impl Command for RegisterUser {
 }
 
 pub struct RegisterUserHandler {
-    pool: Pool,
+    pool: PgPool,
     publisher: PgOutboxPublisher,
 }
 
@@ -47,23 +47,19 @@ impl CommandHandler<RegisterUser> for RegisterUserHandler {
         cmd: RegisterUser,
         _ctx: &HandlerContext,
     ) -> Result<Uuid, HexeractError> {
-        let mut client = self
+        let mut tx = self
             .pool
-            .get()
-            .await
-            .map_err(HexeractError::handler_failed)?;
-        let mut tx = client
-            .transaction()
+            .begin()
             .await
             .map_err(HexeractError::handler_failed)?;
 
-        let id = Uuid::new_v4();
-        tx.execute(
-            "INSERT INTO users (id, email) VALUES ($1, $2)",
-            &[&id, &cmd.email],
-        )
-        .await
-        .map_err(HexeractError::handler_failed)?;
+        let id = Uuid::now_v7();
+        sqlx::query("INSERT INTO users (id, email) VALUES ($1, $2)")
+            .bind(id)
+            .bind(&cmd.email)
+            .execute(&mut *tx)
+            .await
+            .map_err(HexeractError::handler_failed)?;
 
         self.publisher
             .publish_in_tx(&mut tx, &UserRegistered { id })
@@ -95,38 +91,35 @@ This loses atomicity. If the process crashes between `send` and `publish`, the u
 ```rust,ignore
 use std::time::Duration;
 use hexeract::mediator::MediatorBuilder;
-use hexeract::outbox_postgres::{PgOutboxPublisher, PgOutboxWorkerBuilder};
+use hexeract::outbox_sql::{PgOutboxPublisher, PgOutboxWorkerBuilder};
+use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
-# struct AuditWriter;
-# impl hexeract::outbox::Handler<UserRegistered> for AuditWriter {
-#     type Error = hexeract::outbox::OutboxError;
-#     async fn handle(&self, _event: UserRegistered, _ctx: &hexeract::core::HandlerContext) -> Result<(), Self::Error> { Ok(()) }
-# }
-# async fn run(pool: deadpool_postgres::Pool) -> Result<(), Box<dyn std::error::Error>> {
-let publisher = PgOutboxPublisher::new(pool.clone(), "user_outbox")?;
+async fn run(pool: PgPool) -> Result<(), Box<dyn std::error::Error>> {
+    let publisher = PgOutboxPublisher::new(pool.clone(), "user_outbox")?;
 
-let mediator = MediatorBuilder::new()
-    .register_command_handler::<RegisterUser, _>(RegisterUserHandler {
-        pool: pool.clone(),
-        publisher: publisher.clone(),
-    })
-    .build()?;
+    let mediator = MediatorBuilder::new()
+        .register_command_handler::<RegisterUser, _>(RegisterUserHandler {
+            pool: pool.clone(),
+            publisher: publisher.clone(),
+        })
+        .build()?;
 
-let worker = PgOutboxWorkerBuilder::new(pool.clone())
-    .table_name("user_outbox")
-    .register_handler::<UserRegistered, _>(AuditWriter)
-    .poll_interval(Duration::from_millis(100))
-    .build()?;
+    let worker = PgOutboxWorkerBuilder::new(pool.clone())
+        .table_name("user_outbox")
+        .register_handler::<UserRegistered, _>(AuditWriter)
+        .poll_interval(Duration::from_millis(100))
+        .build()?;
 
-let cancel = CancellationToken::new();
-let worker_join = tokio::spawn(worker.run(cancel.clone()));
+    let cancel = CancellationToken::new();
+    let worker_join = tokio::spawn(worker.run(cancel.clone()));
 
-// ... application runs, mediator.send(RegisterUser { ... }) is called ...
+    // ... application runs, mediator.send(RegisterUser { ... }) is called ...
 
-cancel.cancel();
-worker_join.await??;
-# Ok(()) }
+    cancel.cancel();
+    worker_join.await??;
+    Ok(())
+}
 ```
 
 Two long-running concerns coexist:

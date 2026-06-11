@@ -64,7 +64,7 @@ Stable artefacts that operators reach for.
 - [`hexeract-macros` API](reference/hexeract-macros.md)
 - [`hexeract-outbox` API](reference/hexeract-outbox.md)
 - [`hexeract-outbox-sql` API](reference/hexeract-outbox-sql.md) (PostgreSQL, MySQL, SQLite on `sqlx`)
-- [`hexeract-outbox-postgres` API](reference/hexeract-outbox-postgres.md) (deprecated since 0.4.0)
+- [`hexeract-outbox-postgres` migration](reference/hexeract-outbox-postgres.md) (removed in 0.5.0, redirect to `hexeract-outbox-sql`)
 - [`hexeract-bus` API](reference/hexeract-bus.md)
 - [`hexeract-bus-rabbitmq` API](reference/hexeract-bus-rabbitmq.md)
 - [Outbox PostgreSQL schema](reference/outbox-postgres-schema.md)
