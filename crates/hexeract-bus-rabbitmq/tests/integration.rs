@@ -487,6 +487,37 @@ impl Handler<OrderPlaced> for PanickingHandler {
     }
 }
 
+/// Handler that tracks how many invocations are running concurrently.
+///
+/// It increments a live counter on entry, records the running maximum,
+/// sleeps to simulate a slow handler, then decrements on exit. The peak
+/// counter lets a flow-control test assert the worker never lets more
+/// than `max_buffered` deliveries run at once.
+#[derive(Debug)]
+struct ConcurrencyProbeHandler {
+    live: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+    completed: Arc<AtomicUsize>,
+    work: Duration,
+}
+
+impl Handler<OrderPlaced> for ConcurrencyProbeHandler {
+    type Error = hexeract_bus::BusError;
+
+    async fn handle(
+        &self,
+        _message: OrderPlaced,
+        _ctx: &HandlerContext,
+    ) -> Result<(), Self::Error> {
+        let current = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(current, Ordering::SeqCst);
+        tokio::time::sleep(self.work).await;
+        self.live.fetch_sub(1, Ordering::SeqCst);
+        self.completed.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 async fn start_rabbit() -> (testcontainers::ContainerAsync<RabbitMq>, String) {
     let container = RabbitMq::default()
         .start()
@@ -525,6 +556,85 @@ async fn declare_temporary_queue(uri: &str, name: &str) {
         )
         .await
         .expect("queue declare must succeed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker"]
+async fn unacknowledged_worker_bounds_in_flight_deliveries_with_max_buffered() {
+    // A no_ack consumer gets no broker-side QoS bound, so without
+    // max_buffered a fast producer with a slow handler would let every
+    // delivery run at once. With max_buffered = 16 the worker must cap
+    // concurrent in-flight handlers at 16, even while 500 messages wait.
+    const MESSAGE_COUNT: usize = 500;
+    const MAX_BUFFERED: usize = 16;
+
+    let (_container, uri) = start_rabbit().await;
+    let queue_name = "worker.bounded.unack";
+    declare_temporary_queue(&uri, queue_name).await;
+
+    let transport = RabbitMqTransport::new(&uri)
+        .await
+        .expect("transport must connect");
+    for index in 0..MESSAGE_COUNT {
+        transport
+            .publish(
+                queue_name,
+                &OrderPlaced {
+                    order_id: Uuid::from_u128(index as u128),
+                },
+            )
+            .await
+            .expect("publish must succeed");
+    }
+
+    let live = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .ack_mode(AckMode::Unacknowledged)
+        .max_buffered(MAX_BUFFERED)
+        .register_handler::<OrderPlaced, _>(ConcurrencyProbeHandler {
+            live: Arc::clone(&live),
+            peak: Arc::clone(&peak),
+            completed: Arc::clone(&completed),
+            work: Duration::from_millis(100),
+        })
+        .build()
+        .unwrap();
+
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
+
+    // Let several batches drain so the peak has time to reach the bound.
+    for _ in 0..200 {
+        if completed.load(Ordering::SeqCst) >= MESSAGE_COUNT {
+            break;
+        }
+        assert!(
+            live.load(Ordering::SeqCst) <= MAX_BUFFERED,
+            "in-flight deliveries must never exceed max_buffered while running"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    cancel.cancel();
+    handle
+        .await
+        .expect("worker task joins")
+        .expect("worker run returns Ok on cancellation");
+
+    assert!(
+        peak.load(Ordering::SeqCst) <= MAX_BUFFERED,
+        "peak concurrent in-flight handlers ({}) must stay within the bound ({MAX_BUFFERED})",
+        peak.load(Ordering::SeqCst)
+    );
+    assert!(
+        peak.load(Ordering::SeqCst) > 1,
+        "the bound must allow real concurrency, not serialize to one at a time"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
