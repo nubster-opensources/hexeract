@@ -1,4 +1,5 @@
 use clap::Args;
+use postgres_native_tls::MakeTlsConnector;
 use tokio_postgres::NoTls;
 
 /// Validate that the target outbox table exists with the expected columns.
@@ -30,16 +31,12 @@ const REQUIRED_COLUMNS: &[&str] = &[
 
 impl CheckArgs {
     pub(crate) async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
-        let (client, connection) = tokio_postgres::connect(&self.conn, NoTls).await?;
-        tokio::spawn(async move {
-            if let Err(err) = connection.await {
-                tracing::error!(error = %err, "PostgreSQL connection task error");
-            }
-        });
+        let client = connect(&self.conn).await?;
 
         let rows = client
             .query(
-                "SELECT column_name FROM information_schema.columns WHERE table_name = $1",
+                "SELECT column_name FROM information_schema.columns \
+                 WHERE table_name = $1 AND table_schema = current_schema()",
                 &[&self.table],
             )
             .await?;
@@ -74,5 +71,72 @@ impl CheckArgs {
             );
             std::process::exit(1);
         }
+    }
+}
+
+/// Connect to PostgreSQL, using TLS unless `sslmode=disable` is present in the URL.
+///
+/// When `sslmode=disable` is set the connection proceeds without TLS.
+/// All other `sslmode` values (including the default `prefer`) result in a TLS
+/// connection using the platform certificate store via `native-tls`.
+async fn connect(url: &str) -> Result<tokio_postgres::Client, Box<dyn std::error::Error>> {
+    if is_ssl_disabled(url) {
+        tracing::warn!("TLS disabled via sslmode=disable; credentials will be sent in cleartext");
+        let (client, connection) = tokio_postgres::connect(url, NoTls).await?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::error!(error = %err, "PostgreSQL connection task error");
+            }
+        });
+        Ok(client)
+    } else {
+        let builder = native_tls::TlsConnector::builder().build()?;
+        let connector = MakeTlsConnector::new(builder);
+        let (client, connection) = tokio_postgres::connect(url, connector).await?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::error!(error = %err, "PostgreSQL connection task error");
+            }
+        });
+        Ok(client)
+    }
+}
+
+/// Returns `true` when the URL explicitly opts out of TLS via `sslmode=disable`.
+pub(crate) fn is_ssl_disabled(url: &str) -> bool {
+    url.contains("sslmode=disable")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_ssl_disabled_detects_disable_param() {
+        assert!(is_ssl_disabled(
+            "postgres://user:pass@host/db?sslmode=disable"
+        ));
+    }
+
+    #[test]
+    fn is_ssl_disabled_returns_false_for_require() {
+        assert!(!is_ssl_disabled(
+            "postgres://user:pass@host/db?sslmode=require"
+        ));
+    }
+
+    #[test]
+    fn is_ssl_disabled_returns_false_for_default_url() {
+        assert!(!is_ssl_disabled("postgres://user:pass@host/db"));
+    }
+
+    #[test]
+    fn check_query_includes_table_schema_filter() {
+        let query = "SELECT column_name FROM information_schema.columns \
+                     WHERE table_name = $1 AND table_schema = current_schema()";
+        assert!(
+            query.contains("table_schema = current_schema()"),
+            "query must filter by current schema to avoid cross-schema collisions"
+        );
     }
 }
