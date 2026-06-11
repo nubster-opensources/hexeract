@@ -58,12 +58,9 @@ where
         ctx: &'a HandlerContext,
     ) -> BoxFuture<'a, Result<BoxOutput, HexeractError>> {
         Box::pin(async move {
-            let command = *input.downcast::<C>().map_err(|_| {
-                HexeractError::Dispatch(format!(
-                    "command input downcast failed for {}",
-                    type_name::<C>()
-                ))
-            })?;
+            let command = *input
+                .downcast::<C>()
+                .map_err(|_| HexeractError::input_downcast_failed(type_name::<C>()))?;
             let output = self
                 .handler
                 .handle(command, ctx)
@@ -111,12 +108,9 @@ where
         ctx: &'a HandlerContext,
     ) -> BoxFuture<'a, Result<BoxOutput, HexeractError>> {
         Box::pin(async move {
-            let query = *input.downcast::<Q>().map_err(|_| {
-                HexeractError::Dispatch(format!(
-                    "query input downcast failed for {}",
-                    type_name::<Q>()
-                ))
-            })?;
+            let query = *input
+                .downcast::<Q>()
+                .map_err(|_| HexeractError::input_downcast_failed(type_name::<Q>()))?;
             let output = self.handler.handle(query, ctx).await.map_err(Into::into)?;
             Ok(Box::new(output) as BoxOutput)
         })
@@ -165,12 +159,9 @@ where
         ctx: &'a HandlerContext,
     ) -> BoxFuture<'a, Result<(), HexeractError>> {
         Box::pin(async move {
-            let notification = *input.downcast::<Arc<N>>().map_err(|_| {
-                HexeractError::Dispatch(format!(
-                    "notification input downcast failed for {}",
-                    type_name::<N>()
-                ))
-            })?;
+            let notification = *input
+                .downcast::<Arc<N>>()
+                .map_err(|_| HexeractError::input_downcast_failed(type_name::<N>()))?;
             self.handler
                 .handle(notification, ctx)
                 .await
@@ -256,14 +247,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_command_handler_reports_downcast_failure() {
+    async fn typed_command_handler_reports_input_downcast_failure() {
         let typed = TypedCommandHandler::<Ping, _>::new(PingHandler);
         let ctx = fresh_ctx();
         let err = typed
             .handle(Box::new(42_u64) as BoxAny, &ctx)
             .await
             .expect_err("wrong input type should fail");
-        assert!(matches!(err, HexeractError::Dispatch(_)));
+        assert!(
+            matches!(err, HexeractError::InputDowncastFailed { .. }),
+            "expected InputDowncastFailed, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_query_handler_reports_input_downcast_failure() {
+        let typed = TypedQueryHandler::<GetCount, _>::new(CountHandler { value: 0 });
+        let ctx = fresh_ctx();
+        let err = typed
+            .handle(Box::new(42_u64) as BoxAny, &ctx)
+            .await
+            .expect_err("wrong input type should fail");
+        assert!(
+            matches!(err, HexeractError::InputDowncastFailed { .. }),
+            "expected InputDowncastFailed, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_notification_handler_reports_input_downcast_failure() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let typed = TypedNotificationHandler::<UserSignedUp, _>::new(RecordingNotifHandler {
+            seen: std::sync::Arc::clone(&seen),
+        });
+        let ctx = fresh_ctx();
+        let err = typed
+            .handle(Box::new(42_u64) as BoxAny, &ctx)
+            .await
+            .expect_err("wrong input type should fail");
+        assert!(
+            matches!(err, HexeractError::InputDowncastFailed { .. }),
+            "expected InputDowncastFailed, got {err:?}"
+        );
     }
 
     struct GetCount;

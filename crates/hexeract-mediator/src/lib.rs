@@ -83,7 +83,11 @@ use crate::terminal::{CommandTerminal, NotificationTerminal, QueryTerminal};
 /// Errors raised by [`MediatorBuilder::build`] when the requested
 /// configuration is inconsistent. Handler failures at dispatch time keep
 /// flowing through [`HexeractError`].
+///
+/// Marked `#[non_exhaustive]` so that new variants can be added in minor
+/// versions without breaking downstream `match` arms.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum MediatorBuildError {
     /// A second handler was registered for a [`Command`] or [`Query`] that
     /// already had one. Commands and queries are single-handler by contract;
@@ -108,7 +112,11 @@ pub struct MissingHandler {
 }
 
 /// Errors raised by [`MediatorBuilder::verify_handlers`].
+///
+/// Marked `#[non_exhaustive]` so that new variants can be added in minor
+/// versions without breaking downstream `match` arms.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum HandlersVerificationError {
     /// One or more handlers declared via the `#[handler]` macro were not
     /// registered through the fluent builder.
@@ -245,6 +253,27 @@ impl MediatorBuilder {
     /// is a sanity guard for typos and forgotten wirings; it does not
     /// auto-populate the registry, since stateful handlers cannot be
     /// constructed from metadata alone.
+    ///
+    /// # Known limitations
+    ///
+    /// **Type-name matching is not guaranteed unique.** Matching is performed
+    /// by comparing `std::any::type_name()` strings, which are not guaranteed
+    /// to be unique across different crates in the same build. Two distinct
+    /// types with the same short name in different crates but identical paths
+    /// would be treated as the same handler. This is unlikely in practice but
+    /// callers should be aware that the check is a best-effort heuristic, not a
+    /// formal proof. `type_name` output is also not stable across compiler
+    /// versions, so the strings should never be persisted or compared across
+    /// compilation units.
+    ///
+    /// **`inventory::iter` is process-global.** All `#[handler]`-annotated
+    /// items in the current process are visible to `inventory`, regardless of
+    /// which `MediatorBuilder` instance they were intended for. In a single
+    /// process that constructs two or more mediators each covering a subset of
+    /// handlers, both builders will see every registered declaration from every
+    /// crate. Each builder will therefore report the handlers it does not cover
+    /// as `Missing`. Use this method only when a single mediator is expected to
+    /// cover all declared handlers in the process.
     ///
     /// # Ordering
     ///

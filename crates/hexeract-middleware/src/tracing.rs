@@ -14,8 +14,15 @@ use tracing::Level;
 /// converted to a string at [`Level::ERROR`] regardless of the configured
 /// level.
 ///
-/// The level defaults to [`Level::INFO`] and can be tuned through
-/// [`Self::with_level`].
+/// The level defaults to [`Level::INFO`] and can be changed with the chainable
+/// [`Self::with_level`] method:
+///
+/// ```
+/// use tracing::Level;
+/// use hexeract_middleware::TracingMiddleware;
+///
+/// let middleware = TracingMiddleware::new().with_level(Level::DEBUG);
+/// ```
 pub struct TracingMiddleware {
     level: Level,
 }
@@ -27,10 +34,15 @@ impl TracingMiddleware {
         Self { level: Level::INFO }
     }
 
-    /// Builds a middleware at the requested level.
+    /// Sets the tracing level and returns `self`, enabling method chaining.
+    ///
+    /// The configured level controls the span macro and structured events for
+    /// normal dispatch (entry and completion). Failure events are always
+    /// emitted at [`Level::ERROR`] regardless of this setting.
     #[must_use]
-    pub fn with_level(level: Level) -> Self {
-        Self { level }
+    pub fn with_level(mut self, level: Level) -> Self {
+        self.level = level;
+        self
     }
 }
 
@@ -220,11 +232,24 @@ mod tests {
     #[traced_test]
     async fn with_level_changes_the_emitted_level() {
         let _ = run_through(
-            TracingMiddleware::with_level(tracing::Level::DEBUG),
+            TracingMiddleware::new().with_level(tracing::Level::DEBUG),
             Arc::new(StaticTerminal),
         )
         .await
         .expect("dispatch must succeed");
+        assert!(logs_contain("entering"));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn with_level_is_chainable_from_new() {
+        // Verifies that `with_level` is a consuming builder method, not an
+        // associated constructor, so `new().with_level(...)` compiles and
+        // produces the correct behavior.
+        let middleware = TracingMiddleware::new().with_level(tracing::Level::WARN);
+        let _ = run_through(middleware, Arc::new(StaticTerminal))
+            .await
+            .expect("dispatch must succeed");
         assert!(logs_contain("entering"));
     }
 
