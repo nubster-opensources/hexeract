@@ -4,6 +4,8 @@ pub(crate) mod declare;
 pub(crate) mod peek;
 pub(crate) mod purge;
 
+use crate::error::CliError;
+
 /// Actions targeting the bus broker (RabbitMQ).
 #[derive(Subcommand, Debug)]
 pub(crate) enum BusAction {
@@ -16,7 +18,7 @@ pub(crate) enum BusAction {
 }
 
 impl BusAction {
-    pub(crate) async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub(crate) async fn run(self) -> Result<(), CliError> {
         match self {
             Self::Declare(args) => args.run().await,
             Self::Peek(args) => args.run().await,

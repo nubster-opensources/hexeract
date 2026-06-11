@@ -5,6 +5,8 @@ use lapin::options::BasicGetOptions;
 use lapin::options::BasicNackOptions;
 use lapin::types::ShortString;
 
+use crate::error::CliError;
+
 const DEFAULT_PEEK_COUNT: u32 = 1;
 
 /// CLI arguments for `hexeract bus peek`.
@@ -26,9 +28,14 @@ pub(crate) struct PeekArgs {
 }
 
 impl PeekArgs {
-    pub(crate) async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
-        let connection = RabbitMqConnection::connect(&self.conn).await?;
-        let channel = connection.create_channel().await?;
+    pub(crate) async fn run(self) -> Result<(), CliError> {
+        let connection = RabbitMqConnection::connect(&self.conn)
+            .await
+            .map_err(|e| CliError::Fatal(Box::new(e)))?;
+        let channel = connection
+            .create_channel()
+            .await
+            .map_err(|e| CliError::Fatal(Box::new(e)))?;
         let queue = ShortString::from(self.queue.as_str());
 
         // Accumulate all delivery tags first, printing each message as we go.
@@ -41,7 +48,8 @@ impl PeekArgs {
         for _ in 0..self.count {
             let candidate = channel
                 .basic_get(queue.clone(), BasicGetOptions { no_ack: false })
-                .await?;
+                .await
+                .map_err(|e| CliError::Fatal(Box::new(e)))?;
             let Some(message) = candidate else {
                 break;
             };
@@ -62,7 +70,8 @@ impl PeekArgs {
                         requeue: true,
                     },
                 )
-                .await?;
+                .await
+                .map_err(|e| CliError::Fatal(Box::new(e)))?;
         }
 
         if dumped == 0 {

@@ -11,6 +11,8 @@ use hexeract_bus_rabbitmq::RabbitMqConnection;
 use hexeract_bus_rabbitmq::ensure_topology;
 use serde::Deserialize;
 
+use crate::error::CliError;
+
 /// CLI arguments for `hexeract bus declare`.
 #[derive(Args, Debug)]
 pub(crate) struct DeclareArgs {
@@ -23,13 +25,21 @@ pub(crate) struct DeclareArgs {
 }
 
 impl DeclareArgs {
-    pub(crate) async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
-        let raw = std::fs::read_to_string(&self.topology)?;
-        let document: TopologyDocument = toml::from_str(&raw)?;
-        let (exchanges, queues, bindings) = document.into_bus_values()?;
+    pub(crate) async fn run(self) -> Result<(), CliError> {
+        let raw =
+            std::fs::read_to_string(&self.topology).map_err(|e| CliError::Fatal(Box::new(e)))?;
+        let document: TopologyDocument =
+            toml::from_str(&raw).map_err(|e| CliError::Fatal(Box::new(e)))?;
+        let (exchanges, queues, bindings) = document
+            .into_bus_values()
+            .map_err(|e| CliError::Fatal(Box::new(e)))?;
 
-        let connection = RabbitMqConnection::connect(&self.conn).await?;
-        ensure_topology(&connection, &exchanges, &queues, &bindings).await?;
+        let connection = RabbitMqConnection::connect(&self.conn)
+            .await
+            .map_err(|e| CliError::Fatal(Box::new(e)))?;
+        ensure_topology(&connection, &exchanges, &queues, &bindings)
+            .await
+            .map_err(|e| CliError::Fatal(Box::new(e)))?;
 
         println!(
             "declared {} exchange(s), {} queue(s), {} binding(s)",

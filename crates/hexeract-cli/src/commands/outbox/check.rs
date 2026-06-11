@@ -2,6 +2,8 @@ use clap::Args;
 use postgres_native_tls::MakeTlsConnector;
 use tokio_postgres::NoTls;
 
+use crate::error::CliError;
+
 /// Validate that the target outbox table exists with the expected columns.
 ///
 /// Returns exit code 0 on success, 1 when the table is missing or
@@ -30,7 +32,7 @@ const REQUIRED_COLUMNS: &[&str] = &[
 ];
 
 impl CheckArgs {
-    pub(crate) async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub(crate) async fn run(self) -> Result<(), CliError> {
         let client = connect(&self.conn).await?;
 
         let rows = client
@@ -39,7 +41,8 @@ impl CheckArgs {
                  WHERE table_name = $1 AND table_schema = current_schema()",
                 &[&self.table],
             )
-            .await?;
+            .await
+            .map_err(|e| CliError::Fatal(Box::new(e)))?;
 
         if rows.is_empty() {
             eprintln!("Table `{}` does not exist.", self.table);
@@ -47,7 +50,9 @@ impl CheckArgs {
                 "Run `hexeract outbox patch --table {}` to get the canonical SQL.",
                 self.table
             );
-            std::process::exit(1);
+            return Err(CliError::Fatal(
+                format!("table `{}` does not exist", self.table).into(),
+            ));
         }
 
         let actual: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
@@ -69,7 +74,13 @@ impl CheckArgs {
                 "Run `hexeract outbox patch --table {}` to compare against the canonical schema.",
                 self.table
             );
-            std::process::exit(1);
+            Err(CliError::Fatal(
+                format!(
+                    "table `{}` is missing required columns: {missing:?}",
+                    self.table
+                )
+                .into(),
+            ))
         }
     }
 }
@@ -79,10 +90,12 @@ impl CheckArgs {
 /// When `sslmode=disable` is set the connection proceeds without TLS.
 /// All other `sslmode` values (including the default `prefer`) result in a TLS
 /// connection using the platform certificate store via `native-tls`.
-async fn connect(url: &str) -> Result<tokio_postgres::Client, Box<dyn std::error::Error>> {
+async fn connect(url: &str) -> Result<tokio_postgres::Client, CliError> {
     if is_ssl_disabled(url) {
         tracing::warn!("TLS disabled via sslmode=disable; credentials will be sent in cleartext");
-        let (client, connection) = tokio_postgres::connect(url, NoTls).await?;
+        let (client, connection) = tokio_postgres::connect(url, NoTls)
+            .await
+            .map_err(|e| CliError::Fatal(Box::new(e)))?;
         tokio::spawn(async move {
             if let Err(err) = connection.await {
                 tracing::error!(error = %err, "PostgreSQL connection task error");
@@ -90,9 +103,13 @@ async fn connect(url: &str) -> Result<tokio_postgres::Client, Box<dyn std::error
         });
         Ok(client)
     } else {
-        let builder = native_tls::TlsConnector::builder().build()?;
+        let builder = native_tls::TlsConnector::builder()
+            .build()
+            .map_err(|e| CliError::Fatal(Box::new(e)))?;
         let connector = MakeTlsConnector::new(builder);
-        let (client, connection) = tokio_postgres::connect(url, connector).await?;
+        let (client, connection) = tokio_postgres::connect(url, connector)
+            .await
+            .map_err(|e| CliError::Fatal(Box::new(e)))?;
         tokio::spawn(async move {
             if let Err(err) = connection.await {
                 tracing::error!(error = %err, "PostgreSQL connection task error");
