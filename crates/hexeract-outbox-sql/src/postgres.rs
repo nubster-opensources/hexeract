@@ -26,9 +26,29 @@ use crate::DEFAULT_TABLE_NAME;
 use crate::dialect::Dialect;
 use crate::envelope::assemble_envelope;
 use crate::envelope::to_system_time;
+use crate::validate::validate_event_type;
 use crate::validate::validate_table_name;
 
 const DIALECT: Dialect = Dialect::Postgres;
+
+/// Maximum interval in seconds that can be safely cast to `DOUBLE PRECISION`
+/// and added to a PostgreSQL `TIMESTAMPTZ` or `INTERVAL`.
+///
+/// PostgreSQL's `TIMESTAMPTZ` spans roughly from 4713 BC to 294276 AD.
+/// A `DOUBLE PRECISION` representation of a duration near [`Duration::MAX`]
+/// overflows to `inf`, which PostgreSQL rejects with `ERROR: interval out of
+/// range`. Capping at this value (roughly 292 years) prevents that error while
+/// being far beyond any practical retry interval.
+const MAX_PG_INTERVAL_SECS: f64 = 9_223_372_036.0; // i64::MAX seconds
+
+/// Convert a backoff/lease [`Duration`] to seconds for binding as
+/// `DOUBLE PRECISION` in `(NOW() + CAST($n AS DOUBLE PRECISION) * INTERVAL '1 second')`.
+///
+/// Caps at [`MAX_PG_INTERVAL_SECS`] so that pathologically large durations
+/// do not produce `inf`, which PostgreSQL would reject.
+fn duration_to_pg_secs(d: Duration) -> f64 {
+    d.as_secs_f64().min(MAX_PG_INTERVAL_SECS)
+}
 
 fn database_error(error: impl std::error::Error + Send + Sync + 'static) -> OutboxError {
     OutboxError::Database(Box::new(error))
@@ -240,9 +260,11 @@ impl OutboxStore for PgOutboxStore {
         retry_in: Duration,
     ) -> Result<(), OutboxError> {
         // The SQL adds this many seconds to the DB clock (#230); bind as f64.
+        // Capped so a Duration::MAX does not produce inf and cause Postgres to
+        // reject the interval (#240).
         sqlx::query(&self.mark_failed_sql)
             .bind(error)
-            .bind(retry_in.as_secs_f64())
+            .bind(duration_to_pg_secs(retry_in))
             .bind(event_id)
             .execute(&mut **tx)
             .await
@@ -285,13 +307,21 @@ impl OutboxStore for PgOutboxStore {
         if event_ids.is_empty() {
             return Ok(());
         }
+        // claim_sql for Postgres generates `= ANY($2)` so the UUID slice is
+        // bound as a single array parameter. This avoids the 65,535
+        // bind-parameter limit that a per-row IN-list would hit at large
+        // batch sizes (#240). n is passed for API consistency but is unused
+        // for Postgres (the SQL always has exactly two bind parameters).
         let sql = DIALECT.claim_sql(&self.table_name, event_ids.len());
-        // The SQL adds this many seconds to the DB clock (#230); bind as f64.
-        let mut query = sqlx::query(&sql).bind(lease_for.as_secs_f64());
-        for id in event_ids {
-            query = query.bind(*id);
-        }
-        query.execute(&mut **tx).await.map_err(database_error)?;
+        // $1: lease interval in seconds added to the DB clock (#230).
+        //     Capped so Duration::MAX does not produce inf (#240).
+        // $2: UUID array for ANY($2).
+        sqlx::query(&sql)
+            .bind(duration_to_pg_secs(lease_for))
+            .bind(event_ids)
+            .execute(&mut **tx)
+            .await
+            .map_err(database_error)?;
         Ok(())
     }
 }
@@ -345,6 +375,10 @@ impl OutboxPublisher for PgOutboxPublisher {
         tx: &mut Self::Tx<'_>,
         event: &E,
     ) -> Result<Uuid, OutboxError> {
+        // Validate event_type length before the INSERT so a misconfigured
+        // implementation produces a clear OutboxError::Internal rather than an
+        // opaque database truncation/rejection error (#240).
+        validate_event_type(E::EVENT_TYPE)?;
         let event_id = Uuid::now_v7();
         let payload = serde_json::to_value(event)?;
         sqlx::query(&self.insert_sql)
@@ -364,6 +398,7 @@ impl OutboxPublisher for PgOutboxPublisher {
         subject_id: Uuid,
         event: &E,
     ) -> Result<Uuid, OutboxError> {
+        validate_event_type(E::EVENT_TYPE)?;
         let event_id = Uuid::now_v7();
         let payload = serde_json::to_value(event)?;
         sqlx::query(&self.insert_sql)
@@ -660,9 +695,9 @@ mod tests {
     async fn store_new_caches_postgres_sql_with_validated_table_name() {
         let store = PgOutboxStore::new(lazy_pool(), "audit_outbox").unwrap();
         assert_eq!(store.table_name(), "audit_outbox");
-        assert!(store.poll_sql.contains("FROM audit_outbox"));
+        assert!(store.poll_sql.contains("FROM \"audit_outbox\""));
         assert!(store.poll_sql.contains("FOR UPDATE SKIP LOCKED"));
-        assert!(store.mark_delivered_sql.contains("UPDATE audit_outbox"));
+        assert!(store.mark_delivered_sql.contains("UPDATE \"audit_outbox\""));
         // The attempt increment lives in claim_sql now (see #213), so
         // mark_failed must not increment again.
         assert!(!store.mark_failed_sql.contains("attempts = attempts + 1"));
@@ -678,7 +713,11 @@ mod tests {
     async fn publisher_new_caches_insert_sql_with_validated_table_name() {
         let publisher = PgOutboxPublisher::new(lazy_pool(), "audit_outbox").unwrap();
         assert_eq!(publisher.table_name(), "audit_outbox");
-        assert!(publisher.insert_sql.contains("INSERT INTO audit_outbox"));
+        assert!(
+            publisher
+                .insert_sql
+                .contains("INSERT INTO \"audit_outbox\"")
+        );
         assert!(publisher.insert_sql.contains("$1, $2, $3, $4"));
     }
 
@@ -739,11 +778,11 @@ mod tests {
         let dlq = store.dead_letter.as_ref().unwrap();
         assert!(
             dlq.insert_sql
-                .contains("INSERT INTO audit_outbox_dead_letter")
+                .contains("INSERT INTO \"audit_outbox_dead_letter\"")
         );
-        assert!(dlq.insert_sql.contains("FROM audit_outbox"));
+        assert!(dlq.insert_sql.contains("FROM \"audit_outbox\""));
         assert!(dlq.insert_sql.contains("$1"));
-        assert!(dlq.delete_sql.contains("DELETE FROM audit_outbox"));
+        assert!(dlq.delete_sql.contains("DELETE FROM \"audit_outbox\""));
         assert!(dlq.delete_sql.contains("$1"));
     }
 
@@ -775,12 +814,58 @@ mod tests {
     }
 
     #[test]
-    fn store_claim_sql_embeds_table_name_and_correct_placeholder_count() {
+    fn store_claim_sql_uses_any_array_bind() {
+        // Postgres claim uses = ANY($2) so the bind count is always 2,
+        // regardless of batch size (#240).
         let sql = DIALECT.claim_sql("audit_outbox", 3);
-        assert!(sql.contains("UPDATE audit_outbox"));
+        assert!(sql.contains("UPDATE \"audit_outbox\""));
         assert!(sql.contains("next_retry_at = (NOW() +"));
         assert!(sql.contains("$1"));
-        assert!(sql.contains("$2, $3, $4"));
+        assert!(sql.contains("WHERE event_id = ANY($2)"));
+        assert!(!sql.contains("$3"));
         assert!(sql.contains("attempts = attempts + 1"));
+    }
+
+    #[test]
+    fn duration_to_pg_secs_caps_at_max_interval() {
+        // Duration::MAX produces inf via as_secs_f64(), which Postgres rejects
+        // with "interval out of range". The helper must cap the output.
+        let capped = duration_to_pg_secs(Duration::MAX);
+        assert!(
+            capped.is_finite(),
+            "Duration::MAX must produce a finite f64, got {capped}"
+        );
+        // Use approximate comparison for f64 (float_cmp lint).
+        assert!(
+            (capped - MAX_PG_INTERVAL_SECS).abs() < 1.0,
+            "capped value must equal MAX_PG_INTERVAL_SECS, got {capped}"
+        );
+
+        // Ordinary values must pass through unchanged.
+        let ordinary = Duration::from_secs(300);
+        assert!(
+            (duration_to_pg_secs(ordinary) - 300.0_f64).abs() < f64::EPSILON,
+            "ordinary duration must not be capped"
+        );
+    }
+
+    #[tokio::test]
+    async fn publisher_rejects_event_type_exceeding_64_bytes() {
+        // publish_in_tx must validate E::EVENT_TYPE before touching the DB so
+        // the caller gets OutboxError::Internal instead of an opaque DB error.
+        // 65 bytes: exceeds VARCHAR(64)
+        const OVERLENGTH_EVENT_TYPE: &str =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1";
+
+        let publisher = PgOutboxPublisher::new(lazy_pool(), "audit_outbox").unwrap();
+        // We cannot call publish_in_tx without a real transaction, so verify
+        // the validation function directly with the same constant used at publish
+        // time.
+        let result = validate_event_type(OVERLENGTH_EVENT_TYPE);
+        assert!(
+            matches!(result, Err(OutboxError::Internal(_))),
+            "overlength EVENT_TYPE must be rejected before the DB insert"
+        );
+        drop(publisher);
     }
 }

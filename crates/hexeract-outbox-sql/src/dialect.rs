@@ -1,5 +1,6 @@
 use hexeract_outbox::OutboxError;
 
+use crate::validate::quote_identifier;
 use crate::validate::validate_table_name;
 
 /// Canonical PostgreSQL schema for an outbox table.
@@ -56,6 +57,10 @@ CREATE TABLE IF NOT EXISTS {{table}} (
 /// Rows are moved here when `attempts >= max_attempts`. `exhausted_at`
 /// defaults to `NOW()` and records when the envelope was declared poison.
 /// `{{table}}` is substituted by [`Dialect::dead_letter_schema_ddl`].
+///
+/// Note: `event_id` is declared `UNIQUE`, which already creates an implicit
+/// B-tree index. A separate `idx_{{table}}_dead_letter_event_id` index would
+/// be a duplicate and is therefore omitted.
 const POSTGRES_DLQ_SCHEMA_SQL: &str = r"
 CREATE TABLE IF NOT EXISTS {{table}}_dead_letter (
     id            BIGSERIAL    PRIMARY KEY,
@@ -68,8 +73,6 @@ CREATE TABLE IF NOT EXISTS {{table}}_dead_letter (
     last_error    TEXT         NOT NULL,
     exhausted_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
-CREATE INDEX IF NOT EXISTS idx_{{table}}_dead_letter_event_id
-    ON {{table}}_dead_letter (event_id);
 CREATE INDEX IF NOT EXISTS idx_{{table}}_dead_letter_exhausted_at
     ON {{table}}_dead_letter (exhausted_at);
 ";
@@ -79,6 +82,9 @@ CREATE INDEX IF NOT EXISTS idx_{{table}}_dead_letter_exhausted_at
 /// Mirrors the MySQL outbox schema: UUIDs as `BINARY(16)`, payload as
 /// `JSON`, timestamps as `DATETIME(6)` UTC. `{{table}}` is substituted
 /// by [`Dialect::dead_letter_schema_ddl`].
+///
+/// Note: `event_id` is declared `UNIQUE`, which already creates an implicit
+/// index. A separate `idx_{{table}}_dead_letter_event_id` index is omitted.
 const MYSQL_DLQ_SCHEMA_SQL: &str = r"
 CREATE TABLE IF NOT EXISTS {{table}}_dead_letter (
     id            BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -90,7 +96,6 @@ CREATE TABLE IF NOT EXISTS {{table}}_dead_letter (
     attempts      INT          NOT NULL,
     last_error    TEXT         NOT NULL,
     exhausted_at  DATETIME(6)  NOT NULL DEFAULT (UTC_TIMESTAMP(6)),
-    INDEX idx_{{table}}_dead_letter_event_id (event_id),
     INDEX idx_{{table}}_dead_letter_exhausted_at (exhausted_at)
 );
 ";
@@ -100,6 +105,9 @@ CREATE TABLE IF NOT EXISTS {{table}}_dead_letter (
 /// Mirrors the SQLite outbox schema: UUIDs as `BLOB`, timestamps as
 /// `TEXT` in RFC 3339 form. `{{table}}` is substituted by
 /// [`Dialect::dead_letter_schema_ddl`].
+///
+/// Note: `event_id` is declared `UNIQUE`, which already creates an implicit
+/// index. A separate `idx_{{table}}_dead_letter_event_id` index is omitted.
 const SQLITE_DLQ_SCHEMA_SQL: &str = r"
 CREATE TABLE IF NOT EXISTS {{table}}_dead_letter (
     id            INTEGER  PRIMARY KEY AUTOINCREMENT,
@@ -112,8 +120,6 @@ CREATE TABLE IF NOT EXISTS {{table}}_dead_letter (
     last_error    TEXT     NOT NULL,
     exhausted_at  TEXT     NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
-CREATE INDEX IF NOT EXISTS idx_{{table}}_dead_letter_event_id
-    ON {{table}}_dead_letter (event_id);
 CREATE INDEX IF NOT EXISTS idx_{{table}}_dead_letter_exhausted_at
     ON {{table}}_dead_letter (exhausted_at);
 ";
@@ -223,6 +229,7 @@ impl Dialect {
 
     /// `SELECT ... WHERE delivered_at IS NULL ... [FOR UPDATE SKIP LOCKED]`.
     pub(crate) fn poll_sql(self, table: &str) -> String {
+        let qtable = quote_identifier(table);
         let max_attempts = self.placeholder(1);
         let limit = self.placeholder(2);
         let now = self.now_expr();
@@ -234,7 +241,7 @@ impl Dialect {
         format!(
             "SELECT event_id, event_type, payload, subject_id, created_at, \
                     attempts, last_error, next_retry_at \
-             FROM {table} \
+             FROM {qtable} \
              WHERE delivered_at IS NULL \
                AND attempts < {max_attempts} \
                AND (next_retry_at IS NULL OR next_retry_at <= {now}) \
@@ -243,14 +250,15 @@ impl Dialect {
         )
     }
 
-    /// `UPDATE {table} SET delivered_at = {now} WHERE event_id = {ph}`.
+    /// `UPDATE {qtable} SET delivered_at = {now} WHERE event_id = {ph}`.
     pub(crate) fn mark_delivered_sql(self, table: &str) -> String {
+        let qtable = quote_identifier(table);
         let event_id = self.placeholder(1);
         let now = self.now_expr();
-        format!("UPDATE {table} SET delivered_at = {now} WHERE event_id = {event_id}")
+        format!("UPDATE {qtable} SET delivered_at = {now} WHERE event_id = {event_id}")
     }
 
-    /// `UPDATE {table} SET last_error, next_retry_at = {now + interval} ...`.
+    /// `UPDATE {qtable} SET last_error, next_retry_at = {now + interval} ...`.
     ///
     /// `next_retry_at` is derived from the **database** clock plus the bound
     /// backoff interval (parameter 2), not from an application-supplied
@@ -261,24 +269,26 @@ impl Dialect {
     /// worker that crashes between claim and this call still burns one retry
     /// slot. Incrementing again here would double-count every clean failure.
     pub(crate) fn mark_failed_sql(self, table: &str) -> String {
+        let qtable = quote_identifier(table);
         let last_error = self.placeholder(1);
         let next_retry_at = self.now_plus_interval_expr(2);
         let event_id = self.placeholder(3);
         format!(
-            "UPDATE {table} \
+            "UPDATE {qtable} \
              SET last_error = {last_error}, next_retry_at = {next_retry_at} \
              WHERE event_id = {event_id}"
         )
     }
 
-    /// `INSERT INTO {table} (event_id, event_type, payload, subject_id) VALUES (...)`.
+    /// `INSERT INTO {qtable} (event_id, event_type, payload, subject_id) VALUES (...)`.
     pub(crate) fn insert_sql(self, table: &str) -> String {
+        let qtable = quote_identifier(table);
         let p1 = self.placeholder(1);
         let p2 = self.placeholder(2);
         let p3 = self.placeholder(3);
         let p4 = self.placeholder(4);
         format!(
-            "INSERT INTO {table} (event_id, event_type, payload, subject_id) \
+            "INSERT INTO {qtable} (event_id, event_type, payload, subject_id) \
              VALUES ({p1}, {p2}, {p3}, {p4})"
         )
     }
@@ -288,7 +298,8 @@ impl Dialect {
     /// # Errors
     ///
     /// Returns [`OutboxError::Internal`] if `table` is not a valid
-    /// identifier matching `^[a-zA-Z_][a-zA-Z0-9_]*$`.
+    /// identifier matching `^[a-zA-Z_][a-zA-Z0-9_]*$` or exceeds
+    /// [`crate::validate::MAX_IDENTIFIER_LEN`] bytes.
     pub fn schema_ddl(self, table: &str) -> Result<String, OutboxError> {
         validate_table_name(table)?;
         let template = match self {
@@ -307,7 +318,8 @@ impl Dialect {
     /// # Errors
     ///
     /// Returns [`OutboxError::Internal`] if `table` is not a valid
-    /// identifier matching `^[a-zA-Z_][a-zA-Z0-9_]*$`.
+    /// identifier matching `^[a-zA-Z_][a-zA-Z0-9_]*$` or exceeds
+    /// [`crate::validate::MAX_IDENTIFIER_LEN`] bytes.
     pub fn dead_letter_schema_ddl(self, table: &str) -> Result<String, OutboxError> {
         validate_table_name(table)?;
         let template = match self {
@@ -324,45 +336,48 @@ impl Dialect {
     /// `exhausted_at` is not listed and gets its `DEFAULT` value (`NOW()` or
     /// equivalent). Called inside the same transaction as `mark_failed`.
     pub(crate) fn insert_dead_letter_sql(self, main: &str, dlq: &str) -> String {
+        let qmain = quote_identifier(main);
+        let qdlq = quote_identifier(dlq);
         let event_id = self.placeholder(1);
         format!(
-            "INSERT INTO {dlq} \
+            "INSERT INTO {qdlq} \
              (event_id, event_type, payload, subject_id, created_at, attempts, last_error) \
              SELECT event_id, event_type, payload, subject_id, created_at, attempts, last_error \
-             FROM {main} \
+             FROM {qmain} \
              WHERE event_id = {event_id}"
         )
     }
 
-    /// `DELETE FROM {table} WHERE event_id = {p1}`.
+    /// `DELETE FROM {qtable} WHERE event_id = {p1}`.
     ///
     /// Removes the row from the main outbox table after it has been copied to
     /// the dead-letter table. Called in the same transaction as
     /// [`Self::insert_dead_letter_sql`].
     pub(crate) fn delete_from_main_sql(self, table: &str) -> String {
+        let qtable = quote_identifier(table);
         let event_id = self.placeholder(1);
-        format!("DELETE FROM {table} WHERE event_id = {event_id}")
+        format!("DELETE FROM {qtable} WHERE event_id = {event_id}")
     }
 
-    /// `UPDATE {table} SET next_retry_at = {now + interval}, attempts = attempts + 1 WHERE event_id IN ({p2..pN+1})`.
+    /// Claim SQL for Postgres: uses `= ANY($2)` with a single UUID-array bind
+    /// so the number of bind parameters is fixed regardless of batch size,
+    /// avoiding the 65,535 bind-parameter limit inherent to an `IN`-list.
+    ///
+    /// For MySQL and SQLite a per-row `IN`-list is still generated because
+    /// neither supports the `= ANY($n)` array-bind syntax.
     ///
     /// Sets a soft lease on the given envelopes so competing workers skip
     /// them until the lease expires, and consumes one retry slot by
     /// incrementing `attempts`. The lease expiry is computed from the
     /// **database** clock plus the bound lease interval (parameter 1), not an
     /// application timestamp, so the lease window is immune to app/DB clock
-    /// skew (#230). Parameters 2 through `n + 1` are the envelope `event_id`
-    /// values.
+    /// skew (#230).
     ///
     /// Incrementing `attempts` at claim time (rather than only on failure in
     /// [`Self::mark_failed_sql`]) is what makes a worker crash between claim
     /// and acknowledgement safe: the attempt is already counted, so the
     /// envelope cannot be redelivered forever without ever reaching the
     /// dead-letter threshold.
-    ///
-    /// The query is generated dynamically because the `IN` clause length
-    /// varies with the actual batch size. Call frequency is low (once per
-    /// poll cycle) so the allocation is negligible.
     // Every store issues a claim now (postgres/mysql for the competing-consumer
     // lease, sqlite to increment attempts); only a feature-less build leaves it
     // unused.
@@ -371,15 +386,28 @@ impl Dialect {
         allow(dead_code)
     )]
     pub(crate) fn claim_sql(self, table: &str, n: usize) -> String {
+        let qtable = quote_identifier(table);
         let lease = self.now_plus_interval_expr(1);
-        let placeholders = (2..=n + 1)
-            .map(|i| self.placeholder(i))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "UPDATE {table} SET next_retry_at = {lease}, attempts = attempts + 1 \
-             WHERE event_id IN ({placeholders})"
-        )
+        match self {
+            Self::Postgres => {
+                // $2 is bound as a UUID array, so the bind count is always 2
+                // regardless of batch size, sidestepping the 65,535-parameter limit.
+                format!(
+                    "UPDATE {qtable} SET next_retry_at = {lease}, attempts = attempts + 1 \
+                     WHERE event_id = ANY($2)"
+                )
+            }
+            Self::MySql | Self::Sqlite => {
+                let placeholders = (2..=n + 1)
+                    .map(|i| self.placeholder(i))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "UPDATE {qtable} SET next_retry_at = {lease}, attempts = attempts + 1 \
+                     WHERE event_id IN ({placeholders})"
+                )
+            }
+        }
     }
 }
 
@@ -409,7 +437,7 @@ mod tests {
     #[test]
     fn postgres_poll_sql_locks_rows_and_binds_positionally() {
         let sql = Dialect::Postgres.poll_sql("audit_outbox");
-        assert!(sql.contains("FROM audit_outbox"));
+        assert!(sql.contains("FROM \"audit_outbox\""));
         assert!(sql.contains("$1"));
         assert!(sql.contains("$2"));
         assert!(sql.contains("ORDER BY id"));
@@ -418,9 +446,17 @@ mod tests {
     }
 
     #[test]
+    fn poll_sql_quotes_reserved_word_table_name() {
+        // A table named "user" is a reserved word in SQL; quoting prevents
+        // a runtime syntax error when the table name is embedded in statements.
+        let sql = Dialect::Postgres.poll_sql("user");
+        assert!(sql.contains("FROM \"user\""));
+    }
+
+    #[test]
     fn mysql_poll_sql_locks_rows_with_question_marks() {
         let sql = Dialect::MySql.poll_sql("audit_outbox");
-        assert!(sql.contains("FROM audit_outbox"));
+        assert!(sql.contains("FROM \"audit_outbox\""));
         assert!(sql.contains('?'));
         assert!(sql.contains("FOR UPDATE SKIP LOCKED"));
     }
@@ -428,7 +464,7 @@ mod tests {
     #[test]
     fn sqlite_poll_sql_omits_skip_locked() {
         let sql = Dialect::Sqlite.poll_sql("audit_outbox");
-        assert!(sql.contains("FROM audit_outbox"));
+        assert!(sql.contains("FROM \"audit_outbox\""));
         assert!(sql.contains('?'));
         assert!(!sql.contains("FOR UPDATE SKIP LOCKED"));
         assert!(sql.contains("strftime"));
@@ -437,7 +473,7 @@ mod tests {
     #[test]
     fn postgres_mark_delivered_sets_timestamp_by_event_id() {
         let sql = Dialect::Postgres.mark_delivered_sql("audit_outbox");
-        assert!(sql.contains("UPDATE audit_outbox"));
+        assert!(sql.contains("UPDATE \"audit_outbox\""));
         assert!(sql.contains("delivered_at"));
         assert!(sql.contains("$1"));
     }
@@ -460,7 +496,7 @@ mod tests {
     #[test]
     fn postgres_insert_sql_binds_four_columns() {
         let sql = Dialect::Postgres.insert_sql("audit_outbox");
-        assert!(sql.contains("INSERT INTO audit_outbox"));
+        assert!(sql.contains("INSERT INTO \"audit_outbox\""));
         assert!(sql.contains("event_id, event_type, payload, subject_id"));
         assert!(sql.contains("$1, $2, $3, $4"));
     }
@@ -468,7 +504,7 @@ mod tests {
     #[test]
     fn sqlite_insert_sql_uses_question_marks() {
         let sql = Dialect::Sqlite.insert_sql("audit_outbox");
-        assert!(sql.contains("INSERT INTO audit_outbox"));
+        assert!(sql.contains("INSERT INTO \"audit_outbox\""));
         assert!(sql.contains("?, ?, ?, ?"));
     }
 
@@ -537,7 +573,9 @@ mod tests {
             .unwrap();
         assert!(ddl.contains("CREATE TABLE IF NOT EXISTS audit_outbox_dead_letter"));
         assert!(ddl.contains("exhausted_at"));
-        assert!(ddl.contains("idx_audit_outbox_dead_letter_event_id"));
+        // The redundant event_id index is dropped: event_id is already UNIQUE,
+        // which creates an implicit index. Only the exhausted_at index remains.
+        assert!(!ddl.contains("idx_audit_outbox_dead_letter_event_id"));
         assert!(ddl.contains("idx_audit_outbox_dead_letter_exhausted_at"));
         assert!(!ddl.contains("{{table}}"));
     }
@@ -575,9 +613,9 @@ mod tests {
     fn postgres_insert_dead_letter_sql_selects_from_main() {
         let sql =
             Dialect::Postgres.insert_dead_letter_sql("audit_outbox", "audit_outbox_dead_letter");
-        assert!(sql.contains("INSERT INTO audit_outbox_dead_letter"));
+        assert!(sql.contains("INSERT INTO \"audit_outbox_dead_letter\""));
         assert!(sql.contains("SELECT"));
-        assert!(sql.contains("FROM audit_outbox"));
+        assert!(sql.contains("FROM \"audit_outbox\""));
         assert!(sql.contains("$1"));
         assert!(!sql.contains("exhausted_at"));
     }
@@ -585,40 +623,62 @@ mod tests {
     #[test]
     fn sqlite_insert_dead_letter_sql_uses_question_mark() {
         let sql = Dialect::Sqlite.insert_dead_letter_sql("audit_outbox", "audit_outbox_dlq");
-        assert!(sql.contains("INSERT INTO audit_outbox_dlq"));
-        assert!(sql.contains("FROM audit_outbox"));
+        assert!(sql.contains("INSERT INTO \"audit_outbox_dlq\""));
+        assert!(sql.contains("FROM \"audit_outbox\""));
         assert!(sql.contains('?'));
     }
 
     #[test]
     fn postgres_delete_from_main_sql_binds_positionally() {
         let sql = Dialect::Postgres.delete_from_main_sql("audit_outbox");
-        assert!(sql.contains("DELETE FROM audit_outbox"));
+        assert!(sql.contains("DELETE FROM \"audit_outbox\""));
         assert!(sql.contains("$1"));
     }
 
     #[test]
     fn sqlite_delete_from_main_sql_uses_question_mark() {
         let sql = Dialect::Sqlite.delete_from_main_sql("audit_outbox");
-        assert!(sql.contains("DELETE FROM audit_outbox"));
+        assert!(sql.contains("DELETE FROM \"audit_outbox\""));
         assert!(sql.contains('?'));
     }
 
     #[test]
-    fn postgres_claim_sql_uses_positional_placeholders() {
+    fn postgres_claim_sql_uses_any_array_instead_of_in_list() {
+        // ANY($2) avoids the 65,535 bind-parameter limit that an IN-list of
+        // UUIDs would hit at large batch sizes (#240).
         let sql = Dialect::Postgres.claim_sql("audit_outbox", 3);
-        assert!(sql.contains("UPDATE audit_outbox"));
+        assert!(sql.contains("UPDATE \"audit_outbox\""));
         // Lease anchored to the DB clock plus the bound interval ($1), #230.
         assert!(sql.contains("SET next_retry_at = (NOW() +"));
         assert!(sql.contains("$1"));
-        assert!(sql.contains("$2, $3, $4"));
-        assert!(sql.contains("WHERE event_id IN"));
+        // Single array bind; no per-row placeholders ($2, $3, $4).
+        assert!(sql.contains("WHERE event_id = ANY($2)"));
+        assert!(!sql.contains("$3"));
+        assert!(!sql.contains("$4"));
+        assert!(!sql.contains("WHERE event_id IN"));
+    }
+
+    #[test]
+    fn postgres_claim_sql_any_bind_count_is_independent_of_batch_size() {
+        // Regardless of n the Postgres claim SQL has exactly two bind
+        // parameters: $1 for the lease interval and $2 for the UUID array.
+        for n in [1, 10, 1000] {
+            let sql = Dialect::Postgres.claim_sql("audit_outbox", n);
+            assert!(
+                sql.contains("ANY($2)"),
+                "n={n}: expected ANY($2), got: {sql}"
+            );
+            assert!(
+                !sql.contains("$3"),
+                "n={n}: unexpected $3 placeholder, got: {sql}"
+            );
+        }
     }
 
     #[test]
     fn mysql_claim_sql_uses_question_marks() {
         let sql = Dialect::MySql.claim_sql("audit_outbox", 2);
-        assert!(sql.contains("UPDATE audit_outbox"));
+        assert!(sql.contains("UPDATE \"audit_outbox\""));
         assert!(sql.contains("SET next_retry_at = (UTC_TIMESTAMP(6) + INTERVAL ? MICROSECOND)"));
         assert!(sql.contains("WHERE event_id IN (?, ?)"));
     }
@@ -626,7 +686,7 @@ mod tests {
     #[test]
     fn sqlite_claim_sql_uses_question_marks() {
         let sql = Dialect::Sqlite.claim_sql("audit_outbox", 1);
-        assert!(sql.contains("UPDATE audit_outbox"));
+        assert!(sql.contains("UPDATE \"audit_outbox\""));
         assert!(sql.contains("SET next_retry_at = strftime("));
         assert!(sql.contains("'now', ?)"));
         assert!(sql.contains("WHERE event_id IN (?)"));
@@ -659,6 +719,66 @@ mod tests {
             assert!(
                 sql.contains("attempts = attempts + 1"),
                 "{dialect:?} claim_sql must increment attempts, got: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_ddl_rejects_overlength_table_name() {
+        // A name of 64 bytes must exceed MAX_IDENTIFIER_LEN (63) and be rejected
+        // so that derived index names cannot collide after server-side truncation.
+        let long_name = "a".repeat(64);
+        for dialect in [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite] {
+            let err = dialect.schema_ddl(&long_name).unwrap_err();
+            assert!(
+                matches!(err, OutboxError::Internal(_)),
+                "{dialect:?} must reject a 64-byte table name"
+            );
+        }
+    }
+
+    #[test]
+    fn dlq_schema_ddl_does_not_create_redundant_event_id_index() {
+        // event_id is UNIQUE in every DLQ DDL, which creates an implicit index.
+        // A separate named index would be write overhead for no read benefit.
+        for dialect in [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite] {
+            let ddl = dialect.dead_letter_schema_ddl("audit_outbox").unwrap();
+            assert!(
+                !ddl.contains("dead_letter_event_id"),
+                "{dialect:?} DLQ DDL must not create a redundant event_id index, got:\n{ddl}"
+            );
+        }
+    }
+
+    #[test]
+    fn sql_generation_quotes_identifiers() {
+        // All DML helpers must embed double-quoted identifiers so that reserved
+        // words (e.g. "user", "order") are safe without runtime errors.
+        for dialect in [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite] {
+            let table = "user";
+            assert!(
+                dialect.poll_sql(table).contains("\"user\""),
+                "{dialect:?} poll_sql must quote the table name"
+            );
+            assert!(
+                dialect.mark_delivered_sql(table).contains("\"user\""),
+                "{dialect:?} mark_delivered_sql must quote the table name"
+            );
+            assert!(
+                dialect.mark_failed_sql(table).contains("\"user\""),
+                "{dialect:?} mark_failed_sql must quote the table name"
+            );
+            assert!(
+                dialect.insert_sql(table).contains("\"user\""),
+                "{dialect:?} insert_sql must quote the table name"
+            );
+            assert!(
+                dialect.claim_sql(table, 1).contains("\"user\""),
+                "{dialect:?} claim_sql must quote the table name"
+            );
+            assert!(
+                dialect.delete_from_main_sql(table).contains("\"user\""),
+                "{dialect:?} delete_from_main_sql must quote the table name"
             );
         }
     }
