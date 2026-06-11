@@ -4,7 +4,6 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::SystemTime;
 
 use hexeract_core::CorrelationId;
 use hexeract_core::HandlerContext;
@@ -66,13 +65,19 @@ pub trait OutboxStore: Send + Sync + 'static {
         event_id: Uuid,
     ) -> Result<(), OutboxError>;
 
-    /// Mark an envelope as failed, incrementing attempts and setting next retry.
+    /// Mark an envelope as failed, recording the error and the backoff delay
+    /// before the next retry.
+    ///
+    /// `retry_in` is the delay from *now*; the backend adds it to its own
+    /// database clock when persisting `next_retry_at`, so retry scheduling is
+    /// not affected by skew between the worker host and the database host.
+    /// The attempt counter is advanced by [`Self::claim`], not here.
     async fn mark_failed<'a>(
         &self,
         tx: &mut Self::Tx<'a>,
         event_id: Uuid,
         error: &str,
-        next_retry_at: SystemTime,
+        retry_in: Duration,
     ) -> Result<(), OutboxError>;
 
     /// Commit the transaction.
@@ -94,24 +99,30 @@ pub trait OutboxStore: Send + Sync + 'static {
         Ok(())
     }
 
-    /// Advance the soft lease on a batch of envelopes by setting their
-    /// `next_retry_at` to `lease_until`.
+    /// Claim a batch of envelopes: advance the soft lease and consume one
+    /// retry slot.
     ///
     /// Called within the same transaction as [`Self::poll`], immediately
-    /// after the batch is fetched. The worker commits the transaction right
-    /// after this call so `FOR UPDATE SKIP LOCKED` row-level locks are
-    /// released promptly. Competing workers skip envelopes whose
-    /// `next_retry_at` is in the future, so the claiming worker can
+    /// after the batch is fetched. The backend sets `next_retry_at` to its own
+    /// database clock plus `lease_for` (so the lease window is immune to
+    /// app/DB clock skew) and increments `attempts` by one. The worker commits
+    /// the transaction right after this call so `FOR UPDATE SKIP LOCKED`
+    /// row-level locks are released promptly. Competing workers skip envelopes
+    /// whose `next_retry_at` is in the future, so the claiming worker can
     /// dispatch outside the lock without risking concurrent re-delivery.
     ///
-    /// The default implementation is a no-op. Single-writer backends
-    /// (e.g. SQLite) and any backend that implements its own concurrency
-    /// control do not need to override it.
+    /// Incrementing `attempts` here (rather than only on failure) is what
+    /// makes a worker crash between claim and acknowledgement safe: the
+    /// attempt is already counted, so a poison envelope eventually reaches the
+    /// dead-letter threshold instead of being redelivered forever.
+    ///
+    /// The default implementation is a no-op. Backends that neither lease nor
+    /// track attempts in storage need not override it.
     async fn claim<'a>(
         &self,
         _tx: &mut Self::Tx<'a>,
         _event_ids: &[Uuid],
-        _lease_until: SystemTime,
+        _lease_for: Duration,
     ) -> Result<(), OutboxError> {
         Ok(())
     }
@@ -227,19 +238,28 @@ pub struct OutboxWorkerConfig {
     /// [`Self::poll_interval`]). Set it to [`Duration::ZERO`] to disable
     /// pacing and restore the previous tight-loop behavior.
     pub min_cycle_delay: Duration,
-    /// Soft-lease duration for envelopes claimed by this worker.
+    /// Per-envelope handler deadline and soft-lease unit.
     ///
-    /// After polling a batch, the worker sets `next_retry_at = now +
-    /// dispatch_timeout` on every envelope and commits the transaction
-    /// immediately. This releases the `FOR UPDATE SKIP LOCKED` row-level
-    /// locks before handler dispatch begins, allowing competing workers to
-    /// make progress on other envelopes.
+    /// Two related roles:
     ///
-    /// If the worker crashes or is killed after claiming but before
-    /// acknowledging an envelope, the lease expires and the envelope
-    /// becomes eligible for re-dispatch. The value must therefore exceed
-    /// the worst-case handler duration to avoid spurious re-delivery under
-    /// normal operation.
+    /// - **Hard timeout.** Each handler invocation is wrapped in a
+    ///   `tokio::time::timeout` of this duration. A handler that exceeds it has
+    ///   its cancellation token signalled and the dispatch is recorded as a
+    ///   failed attempt ([`OutboxError::DispatchTimeout`]), so a hung handler
+    ///   cannot stall the worker.
+    /// - **Lease unit.** After polling a batch, the worker leases the whole
+    ///   batch by setting `next_retry_at` to the database clock plus
+    ///   `batch_size x dispatch_timeout`, then commits immediately. This
+    ///   releases the `FOR UPDATE SKIP LOCKED` row-level locks before dispatch
+    ///   begins while keeping the lease alive across the worst-case sequential
+    ///   dispatch of every envelope in the batch, so competing workers do not
+    ///   re-pick a tail envelope mid-batch.
+    ///
+    /// Set it to the worst-case duration of a *single* handler; the
+    /// `batch_size` multiplier for the lease is applied internally, so do not
+    /// pre-multiply it yourself.
+    ///
+    /// [`OutboxError::DispatchTimeout`]: crate::OutboxError::DispatchTimeout
     pub dispatch_timeout: Duration,
 }
 
@@ -364,7 +384,13 @@ where
                     }
                 };
                 if let Some(delay) = sleep_for {
-                    tokio::time::sleep(delay).await;
+                    // Race the sleep against cancellation so a shutdown during
+                    // a long poll_interval is observed promptly instead of
+                    // after the full delay elapses (#231).
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => {}
+                        () = cancel.cancelled() => break,
+                    }
                 }
             }
             Ok(())
@@ -384,9 +410,10 @@ where
                 .poll(&mut tx, self.config.batch_size, self.config.max_attempts)
                 .await?;
             if !batch.is_empty() {
-                let lease_until = SystemTime::now() + self.config.dispatch_timeout;
                 let ids: Vec<Uuid> = batch.iter().map(|e| e.event_id).collect();
-                self.store.claim(&mut tx, &ids, lease_until).await?;
+                self.store
+                    .claim(&mut tx, &ids, self.lease_for(ids.len()))
+                    .await?;
             }
             self.store.commit(tx).await?;
             batch
@@ -395,46 +422,81 @@ where
 
         // Phase 2 — dispatch + ack (one transaction per envelope, outside the poll lock)
         for envelope in &envelopes {
-            let next_retry_at = SystemTime::now() + self.config.next_retry_delay(envelope.attempts);
-            match self.dispatch(envelope, cancel).await {
-                Ok(()) => {
-                    let mut client = self.store.acquire().await?;
-                    let mut tx = self.store.begin(&mut client).await?;
-                    self.store
-                        .mark_delivered(&mut tx, envelope.event_id)
-                        .await?;
-                    self.store.commit(tx).await?;
-                }
-                Err(err) => {
-                    let message = err.to_string();
-                    tracing::warn!(
-                        event_id = %envelope.event_id,
-                        event_type = %envelope.event_type,
-                        error = %message,
-                        "outbox handler dispatch failed"
-                    );
-                    let mut client = self.store.acquire().await?;
-                    let mut tx = self.store.begin(&mut client).await?;
-                    self.store
-                        .mark_failed(&mut tx, envelope.event_id, &message, next_retry_at)
-                        .await?;
-                    if envelope.attempts + 1 >= self.config.max_attempts {
-                        tracing::error!(
-                            event_id = %envelope.event_id,
-                            event_type = %envelope.event_type,
-                            attempts = envelope.attempts + 1,
-                            "outbox envelope exhausted retry budget, moving to dead letter"
-                        );
-                        self.store
-                            .mark_dead_lettered(&mut tx, envelope.event_id, &message)
-                            .await?;
-                    }
-                    self.store.commit(tx).await?;
-                }
+            // Isolate per-envelope settle failures: a transient DB error while
+            // acking one envelope must not abandon the rest of the claimed
+            // batch (those rows would otherwise wait out the whole lease before
+            // being retried). Log and continue (#231).
+            if let Err(err) = self.dispatch_and_settle(envelope, cancel).await {
+                tracing::error!(
+                    event_id = %envelope.event_id,
+                    event_type = %envelope.event_type,
+                    error = ?err,
+                    "failed to settle outbox envelope; continuing with the rest of the batch"
+                );
             }
         }
 
         Ok(count)
+    }
+
+    /// Soft-lease duration covering the worst-case sequential dispatch of a
+    /// whole claimed batch.
+    ///
+    /// A single batch is claimed once, then its envelopes are dispatched
+    /// sequentially. The lease must therefore outlast `batch_len` back-to-back
+    /// dispatches, each bounded by `dispatch_timeout`; sizing it as merely
+    /// `dispatch_timeout` lets the tail envelopes' lease expire mid-batch and a
+    /// competing worker double-dispatch them (#215).
+    fn lease_for(&self, batch_len: usize) -> Duration {
+        let factor = u32::try_from(batch_len.max(1)).unwrap_or(u32::MAX);
+        self.config.dispatch_timeout.saturating_mul(factor)
+    }
+
+    /// Dispatch a single envelope and settle its outcome in its own
+    /// transaction.
+    async fn dispatch_and_settle(
+        &self,
+        envelope: &OutboxEnvelope,
+        cancel: &CancellationToken,
+    ) -> Result<(), OutboxError> {
+        match self.dispatch(envelope, cancel).await {
+            Ok(()) => {
+                let mut client = self.store.acquire().await?;
+                let mut tx = self.store.begin(&mut client).await?;
+                self.store
+                    .mark_delivered(&mut tx, envelope.event_id)
+                    .await?;
+                self.store.commit(tx).await?;
+            }
+            Err(err) => {
+                let message = err.to_string();
+                tracing::warn!(
+                    event_id = %envelope.event_id,
+                    event_type = %envelope.event_type,
+                    error = %message,
+                    "outbox handler dispatch failed"
+                );
+                let retry_in = self.config.next_retry_delay(envelope.attempts);
+                let mut client = self.store.acquire().await?;
+                let mut tx = self.store.begin(&mut client).await?;
+                self.store
+                    .mark_failed(&mut tx, envelope.event_id, &message, retry_in)
+                    .await?;
+                if envelope.attempts + 1 >= self.config.max_attempts {
+                    tracing::error!(
+                        event_id = %envelope.event_id,
+                        event_type = %envelope.event_type,
+                        attempts = envelope.attempts + 1,
+                        "outbox envelope exhausted retry budget, moving to dead letter"
+                    );
+                    self.store
+                        .mark_dead_lettered(&mut tx, envelope.event_id, &message)
+                        .await?;
+                }
+                self.store.commit(tx).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn dispatch(
@@ -451,11 +513,15 @@ where
         // Stable across retries: both IDs are pinned to the envelope's
         // immutable event_id so every dispatch attempt of the same row
         // presents an identical context to the handler.
+        //
+        // A child token lets a dispatch timeout cancel only this handler
+        // without tearing down the worker's shared token; the child is still
+        // cancelled if the parent (worker) token is cancelled.
         let ctx = HandlerContext::new(
             MessageId::from(envelope.event_id),
             CorrelationId::from(envelope.event_id),
         )
-        .with_cancellation(cancel.clone());
+        .with_cancellation(cancel.child_token());
 
         tracing::debug!(
             event_id = %envelope.event_id,
@@ -463,7 +529,23 @@ where
             "dispatching outbox envelope"
         );
 
-        handler.handle(envelope, &ctx).await
+        // Enforce dispatch_timeout as a hard deadline so a hung handler cannot
+        // stall the worker forever (#229). The cancellation token is signalled
+        // first so a cooperative handler can unwind before the future is
+        // dropped.
+        match tokio::time::timeout(self.config.dispatch_timeout, handler.handle(envelope, &ctx))
+            .await
+        {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                ctx.cancellation.cancel();
+                Err(OutboxError::DispatchTimeout {
+                    event_id: envelope.event_id,
+                    event_type: envelope.event_type.clone(),
+                    timeout: self.config.dispatch_timeout,
+                })
+            }
+        }
     }
 }
 
@@ -709,7 +791,7 @@ mod tests {
             _tx: &mut Self::Tx<'a>,
             _event_id: Uuid,
             _error: &str,
-            _next_retry_at: SystemTime,
+            _retry_in: Duration,
         ) -> Result<(), OutboxError> {
             Ok(())
         }
@@ -771,6 +853,9 @@ mod tests {
         dead_lettered: Arc<Mutex<Vec<Uuid>>>,
         claimed: Arc<Mutex<Vec<Uuid>>>,
         fail_claim: Arc<AtomicBool>,
+        /// When set, `mark_delivered` returns an error for this event id once,
+        /// simulating a transient ack failure (used to test batch isolation).
+        fail_mark_delivered_for: Arc<Mutex<Option<Uuid>>>,
     }
 
     impl MockStore {
@@ -782,6 +867,7 @@ mod tests {
                 dead_lettered: Arc::new(Mutex::new(Vec::new())),
                 claimed: Arc::new(Mutex::new(Vec::new())),
                 fail_claim: Arc::new(AtomicBool::new(false)),
+                fail_mark_delivered_for: Arc::new(Mutex::new(None)),
             }
         }
     }
@@ -821,6 +907,13 @@ mod tests {
             _tx: &mut Self::Tx<'a>,
             event_id: Uuid,
         ) -> Result<(), OutboxError> {
+            {
+                let mut slot = self.fail_mark_delivered_for.lock().unwrap();
+                if *slot == Some(event_id) {
+                    *slot = None;
+                    return Err(OutboxError::PoolTimeout);
+                }
+            }
             self.delivered.lock().unwrap().push(event_id);
             Ok(())
         }
@@ -830,7 +923,7 @@ mod tests {
             _tx: &mut Self::Tx<'a>,
             event_id: Uuid,
             error: &str,
-            _next_retry_at: SystemTime,
+            _retry_in: Duration,
         ) -> Result<(), OutboxError> {
             self.failed
                 .lock()
@@ -857,7 +950,7 @@ mod tests {
             &self,
             _tx: &mut Self::Tx<'a>,
             event_ids: &[Uuid],
-            _lease_until: SystemTime,
+            _lease_for: Duration,
         ) -> Result<(), OutboxError> {
             if self.fail_claim.load(Ordering::Relaxed) {
                 return Err(OutboxError::Internal("claim failed".into()));
@@ -1161,5 +1254,145 @@ mod tests {
             "worker took {:?} to stop",
             started.elapsed()
         );
+    }
+
+    /// Handler that never resolves, used to prove `dispatch_timeout` is
+    /// enforced as a hard deadline (#229).
+    struct HangingHandler;
+    impl Handler<UserRegistered> for HangingHandler {
+        type Error = OutboxError;
+        async fn handle(
+            &self,
+            _event: UserRegistered,
+            _ctx: &HandlerContext,
+        ) -> Result<(), Self::Error> {
+            std::future::pending::<()>().await;
+            unreachable!("hanging handler never resolves")
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn worker_enforces_dispatch_timeout_on_a_hung_handler() {
+        // #229: a handler that never returns must not stall the worker. With
+        // dispatch_timeout enforced, the envelope is marked failed instead.
+        let envelope = fresh_envelope(Uuid::from_u128(1));
+        let event_id = envelope.event_id;
+        let store = MockStore::new(vec![envelope]);
+
+        let handler: Arc<dyn ErasedHandler> = Arc::new(TypedHandler::new(HangingHandler));
+        let registry = registry_with(vec![handler]);
+
+        let config = OutboxWorkerConfig {
+            dispatch_timeout: Duration::from_millis(50),
+            batch_size: 1,
+            ..OutboxWorkerConfig::default()
+        };
+        let worker = OutboxWorker::new(store.clone(), registry, config);
+        let cancel = CancellationToken::new();
+        let join = tokio::spawn(worker.run(cancel.clone()));
+
+        // Advance virtual time well past the dispatch timeout.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        cancel.cancel();
+        join.await.unwrap().unwrap();
+
+        let failed = store.failed.lock().unwrap();
+        assert_eq!(failed.len(), 1, "hung handler must be recorded as failed");
+        assert_eq!(failed[0].0, event_id);
+        assert!(
+            failed[0].1.contains("timed out"),
+            "failure must be the dispatch timeout, got {:?}",
+            failed[0].1
+        );
+        assert!(
+            store.delivered.lock().unwrap().is_empty(),
+            "a timed-out envelope must not be marked delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_settles_remaining_batch_when_one_ack_fails() {
+        // #231: a transient ack failure on one envelope must not abandon the
+        // rest of the claimed batch.
+        let e1 = fresh_envelope(Uuid::from_u128(1));
+        let e2 = fresh_envelope(Uuid::from_u128(2));
+        let id1 = e1.event_id;
+        let id2 = e2.event_id;
+        let store = MockStore::new(vec![e1, e2]);
+        *store.fail_mark_delivered_for.lock().unwrap() = Some(id1);
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let handler: Arc<dyn ErasedHandler> = Arc::new(TypedHandler::new(RecordingHandler {
+            seen: Arc::clone(&seen),
+        }));
+        let registry = registry_with(vec![handler]);
+
+        let config = OutboxWorkerConfig {
+            batch_size: 2,
+            ..OutboxWorkerConfig::default()
+        };
+        let worker = OutboxWorker::new(store.clone(), registry, config);
+        let cancel = CancellationToken::new();
+        let join = tokio::spawn(worker.run(cancel.clone()));
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        cancel.cancel();
+        join.await.unwrap().unwrap();
+
+        // The first envelope's ack failed (transient), but the second must
+        // still have been dispatched and marked delivered.
+        let delivered = store.delivered.lock().unwrap();
+        assert!(
+            delivered.contains(&id2),
+            "second envelope must be delivered despite the first ack failing, got {delivered:?}"
+        );
+        assert!(
+            seen.lock().unwrap().len() >= 2,
+            "both envelopes must have been dispatched to the handler"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn worker_observes_cancellation_during_a_long_poll_interval() {
+        // #231 defect 1: cancellation arriving during the poll sleep must be
+        // observed promptly, not after the full poll_interval elapses.
+        let store = MockStore::new(Vec::new());
+        let registry = HashMap::new();
+        let config = OutboxWorkerConfig {
+            poll_interval: Duration::from_secs(3600),
+            ..OutboxWorkerConfig::default()
+        };
+        let worker = OutboxWorker::new(store, registry, config);
+        let cancel = CancellationToken::new();
+        let join = tokio::spawn(worker.run(cancel.clone()));
+
+        // Let the worker reach the sleep, then cancel mid-sleep.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        cancel.cancel();
+
+        // Without racing the sleep against cancellation this would hang for the
+        // full hour of virtual time; with the fix it returns immediately.
+        tokio::time::timeout(Duration::from_secs(1), join)
+            .await
+            .expect("worker must stop without waiting out the poll interval")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn lease_for_scales_with_batch_size() {
+        // #215: the batch lease must cover the worst-case sequential dispatch
+        // of the whole batch, i.e. batch_len * dispatch_timeout.
+        let config = OutboxWorkerConfig {
+            dispatch_timeout: Duration::from_secs(30),
+            ..OutboxWorkerConfig::default()
+        };
+        let store = MockStore::new(Vec::new());
+        let worker = OutboxWorker::new(store, HashMap::new(), config);
+
+        assert_eq!(worker.lease_for(1), Duration::from_secs(30));
+        assert_eq!(worker.lease_for(10), Duration::from_secs(300));
+        // An empty batch is never claimed, but the helper must stay safe.
+        assert_eq!(worker.lease_for(0), Duration::from_secs(30));
     }
 }

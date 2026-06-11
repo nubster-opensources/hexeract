@@ -13,7 +13,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::SystemTime;
 
 use async_trait::async_trait;
 use hexeract_outbox::ErasedHandler;
@@ -37,11 +36,16 @@ use uuid::Uuid;
 use crate::DEFAULT_TABLE_NAME;
 use crate::dialect::Dialect;
 use crate::envelope::assemble_envelope;
-use crate::envelope::format_sqlite_utc;
 use crate::envelope::parse_sqlite_utc;
 use crate::validate::validate_table_name;
 
 const DIALECT: Dialect = Dialect::Sqlite;
+
+/// Render a backoff/lease [`Duration`] as a SQLite `strftime` modifier, e.g.
+/// `"+1.500 seconds"`, so `next_retry_at` is computed from the database clock.
+fn sqlite_seconds_modifier(d: Duration) -> String {
+    format!("+{:.3} seconds", d.as_secs_f64())
+}
 
 fn database_error(error: impl std::error::Error + Send + Sync + 'static) -> OutboxError {
     OutboxError::Database(Box::new(error))
@@ -53,6 +57,36 @@ fn pool_error(error: sqlx::Error) -> OutboxError {
     } else {
         OutboxError::Database(Box::new(error))
     }
+}
+
+/// Decode one polled row into an [`OutboxEnvelope`].
+///
+/// Kept separate from the poll loop so a decode failure (notably a timestamp
+/// that does not match either accepted SQLite layout) can be isolated to the
+/// offending row (logged and skipped) instead of aborting the whole batch.
+fn decode_sqlite_row(row: &sqlx::sqlite::SqliteRow) -> Result<OutboxEnvelope, OutboxError> {
+    let event_id: Uuid = row.try_get("event_id").map_err(database_error)?;
+    let event_type: String = row.try_get("event_type").map_err(database_error)?;
+    let payload: serde_json::Value = row.try_get("payload").map_err(database_error)?;
+    let subject_id: Option<Uuid> = row.try_get("subject_id").map_err(database_error)?;
+    let created_at: String = row.try_get("created_at").map_err(database_error)?;
+    let attempts: i64 = row.try_get("attempts").map_err(database_error)?;
+    let last_error: Option<String> = row.try_get("last_error").map_err(database_error)?;
+    let next_retry_at: Option<String> = row.try_get("next_retry_at").map_err(database_error)?;
+
+    let payload = serde_json::to_vec(&payload)?;
+    let next_retry_at = next_retry_at.as_deref().map(parse_sqlite_utc).transpose()?;
+
+    Ok(assemble_envelope(
+        event_id,
+        event_type,
+        payload,
+        subject_id,
+        parse_sqlite_utc(&created_at)?,
+        u32::try_from(attempts.max(0)).unwrap_or(u32::MAX),
+        last_error,
+        next_retry_at,
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -177,29 +211,21 @@ impl OutboxStore for SqliteOutboxStore {
 
         let mut envelopes = Vec::with_capacity(rows.len());
         for row in rows {
-            let event_id: Uuid = row.try_get("event_id").map_err(database_error)?;
-            let event_type: String = row.try_get("event_type").map_err(database_error)?;
-            let payload: serde_json::Value = row.try_get("payload").map_err(database_error)?;
-            let subject_id: Option<Uuid> = row.try_get("subject_id").map_err(database_error)?;
-            let created_at: String = row.try_get("created_at").map_err(database_error)?;
-            let attempts: i64 = row.try_get("attempts").map_err(database_error)?;
-            let last_error: Option<String> = row.try_get("last_error").map_err(database_error)?;
-            let next_retry_at: Option<String> =
-                row.try_get("next_retry_at").map_err(database_error)?;
-
-            let payload = serde_json::to_vec(&payload)?;
-            let next_retry_at = next_retry_at.as_deref().map(parse_sqlite_utc).transpose()?;
-
-            envelopes.push(assemble_envelope(
-                event_id,
-                event_type,
-                payload,
-                subject_id,
-                parse_sqlite_utc(&created_at)?,
-                u32::try_from(attempts.max(0)).unwrap_or(u32::MAX),
-                last_error,
-                next_retry_at,
-            ));
+            // A single undecodable row (e.g. an externally written timestamp in
+            // an unexpected layout) must not abort the whole poll: that
+            // head-of-line poisons the queue forever (#214). Log it and skip so
+            // the rest of the batch keeps draining.
+            match decode_sqlite_row(&row) {
+                Ok(envelope) => envelopes.push(envelope),
+                Err(error) => {
+                    let event_id = row.try_get::<Uuid, _>("event_id").ok();
+                    tracing::error!(
+                        ?event_id,
+                        error = %error,
+                        "skipping undecodable outbox row; the rest of the batch continues"
+                    );
+                }
+            }
         }
         Ok(envelopes)
     }
@@ -222,12 +248,13 @@ impl OutboxStore for SqliteOutboxStore {
         tx: &mut Self::Tx<'a>,
         event_id: Uuid,
         error: &str,
-        next_retry_at: SystemTime,
+        retry_in: Duration,
     ) -> Result<(), OutboxError> {
-        let next_retry_at = format_sqlite_utc(next_retry_at)?;
+        // next_retry_at is computed as strftime('now', ?modifier) against the
+        // DB clock (#230); bind the backoff as a strftime seconds modifier.
         sqlx::query(&self.mark_failed_sql)
             .bind(error)
-            .bind(next_retry_at)
+            .bind(sqlite_seconds_modifier(retry_in))
             .bind(event_id)
             .execute(&mut **tx)
             .await
@@ -258,6 +285,33 @@ impl OutboxStore for SqliteOutboxStore {
             .execute(&mut **tx)
             .await
             .map_err(database_error)?;
+        Ok(())
+    }
+
+    /// Set the soft lease and consume one retry slot on the claimed batch.
+    ///
+    /// SQLite has no `FOR UPDATE SKIP LOCKED`, so this does **not** provide a
+    /// competing-consumer claim: the store remains single-writer (see the
+    /// [module documentation](self)). The override exists so that `attempts`
+    /// is incremented at claim time on SQLite too. Without it, a worker that
+    /// crashed between claim and acknowledgement would never advance
+    /// `attempts` and would redeliver a poison row forever (#213).
+    async fn claim<'a>(
+        &self,
+        tx: &mut Self::Tx<'a>,
+        event_ids: &[Uuid],
+        lease_for: Duration,
+    ) -> Result<(), OutboxError> {
+        if event_ids.is_empty() {
+            return Ok(());
+        }
+        // Lease anchored to the DB clock via strftime('now', ?modifier) (#230).
+        let sql = DIALECT.claim_sql(&self.table_name, event_ids.len());
+        let mut query = sqlx::query(&sql).bind(sqlite_seconds_modifier(lease_for));
+        for id in event_ids {
+            query = query.bind(*id);
+        }
+        query.execute(&mut **tx).await.map_err(database_error)?;
         Ok(())
     }
 }
@@ -490,9 +544,12 @@ impl SqliteOutboxWorkerBuilder {
 
     /// Override the soft-lease duration for claimed envelopes (default 30 s).
     ///
-    /// SQLite serializes writes through a single writer, so competing workers
-    /// cannot re-pick the same envelope concurrently; this value is stored in
-    /// the config for API uniformity but has no effect on SQLite dispatch.
+    /// SQLite has no `FOR UPDATE SKIP LOCKED` and therefore no
+    /// competing-consumer claim, so this store is meant for a **single
+    /// worker** (see the [module documentation](self)); running several workers
+    /// against one database can still double-dispatch. The lease is recorded on
+    /// claim alongside the attempt increment, but with a single writer it only
+    /// affects when a crashed-and-restarted worker re-picks an in-flight row.
     #[must_use]
     pub fn dispatch_timeout(mut self, d: Duration) -> Self {
         self.config.dispatch_timeout = d;
@@ -618,7 +675,9 @@ mod tests {
         assert!(store.poll_sql.contains("FROM audit_outbox"));
         assert!(!store.poll_sql.contains("FOR UPDATE SKIP LOCKED"));
         assert!(store.poll_sql.contains("strftime"));
-        assert!(store.mark_failed_sql.contains("attempts = attempts + 1"));
+        // The attempt increment lives in claim_sql now (see #213), not in
+        // mark_failed.
+        assert!(!store.mark_failed_sql.contains("attempts = attempts + 1"));
     }
 
     #[tokio::test]

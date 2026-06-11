@@ -156,6 +156,8 @@ async fn run_service(
 }
 ```
 
+> **Sizing `dispatch_timeout`.** Each handler invocation is wrapped in a hard timeout of `dispatch_timeout` (default 30 s): a hung handler is cancelled and the envelope is retried rather than stalling the worker. The same value drives the claim lease, which is sized as `batch_size x dispatch_timeout` so the lease covers the worst-case sequential dispatch of a whole claimed batch. Set `dispatch_timeout` to your worst-case single-handler duration; do not multiply it by `batch_size` yourself.
+
 ## 7. Verify
 
 `hexeract outbox check --conn "postgres://..." --table audit_outbox` validates that the table contains every required column. Exit code 0 means you are ready to go.

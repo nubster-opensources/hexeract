@@ -28,6 +28,7 @@ hexeract-outbox = { path = "../hexeract-outbox", version = "0.4" }
 sqlx = { workspace = true, features = ["uuid", "json", "time"] }
 time = { workspace = true }
 serde_json = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]

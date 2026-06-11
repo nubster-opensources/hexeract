@@ -22,6 +22,13 @@ another poller claims a different subset. If two workers poll the same SQLite
 database, both can read the same pending rows before either marks them
 delivered, and the same envelope is dispatched more than once.
 
+The SQLite store does implement `claim`, but only to advance the soft lease and
+count the attempt at claim time (so a worker that crashes between claim and
+acknowledgement does not redeliver a poison row forever). It is **not** a
+competing-consumer claim: without `SKIP LOCKED` there is nothing to stop a
+second poller from reading the same rows, so the single-worker rule below still
+holds.
+
 Because of this, the SQLite backend assumes **one `OutboxWorker` per database**.
 This matches how SQLite is normally used: a single process, embedded or in
 tests, rather than a shared server fronting many workers.

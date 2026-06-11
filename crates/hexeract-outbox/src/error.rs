@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -63,6 +65,26 @@ pub enum OutboxError {
     /// [`OutboxWorkerConfig::poll_interval`]: crate::OutboxWorkerConfig::poll_interval
     #[error("connection pool acquire timed out")]
     PoolTimeout,
+
+    /// The handler did not complete within
+    /// [`OutboxWorkerConfig::dispatch_timeout`].
+    ///
+    /// The worker enforces `dispatch_timeout` as a hard deadline around each
+    /// handler invocation. When it elapses the dispatch is treated as a failed
+    /// attempt (recorded via [`crate::OutboxStore::mark_failed`] and retried or
+    /// dead-lettered like any other error) and the handler's cancellation token
+    /// is signalled so cooperative handlers can unwind.
+    ///
+    /// [`OutboxWorkerConfig::dispatch_timeout`]: crate::OutboxWorkerConfig::dispatch_timeout
+    #[error("handler for event {event_id} ({event_type}) timed out after {timeout:?}")]
+    DispatchTimeout {
+        /// Identifier of the event whose handler timed out.
+        event_id: Uuid,
+        /// The unrouted event type read from the envelope.
+        event_type: String,
+        /// The configured dispatch timeout that elapsed.
+        timeout: Duration,
+    },
 
     /// An invariant of the outbox machinery was violated.
     ///
