@@ -3,7 +3,7 @@ use std::time::SystemTime;
 use hexeract_outbox::OutboxEnvelope;
 #[cfg(feature = "sqlite")]
 use hexeract_outbox::OutboxError;
-#[cfg(any(feature = "postgres", feature = "mysql"))]
+#[cfg(feature = "postgres")]
 use time::OffsetDateTime;
 #[cfg(any(feature = "mysql", feature = "sqlite"))]
 use time::PrimitiveDateTime;
