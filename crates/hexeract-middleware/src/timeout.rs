@@ -35,7 +35,10 @@ impl Middleware for TimeoutMiddleware {
     ) -> Result<BoxOutput, HexeractError> {
         match tokio::time::timeout(self.duration, next.run(envelope, ctx)).await {
             Ok(result) => result,
-            Err(_elapsed) => Err(HexeractError::timeout(envelope.type_name(), self.duration)),
+            Err(_elapsed) => {
+                ctx.cancellation.cancel();
+                Err(HexeractError::timeout(envelope.type_name(), self.duration))
+            }
         }
     }
 }
@@ -162,5 +165,52 @@ mod tests {
             HexeractError::Dispatch(msg) => assert_eq!(msg, "handler bailed out early"),
             other => panic!("expected Dispatch variant, got {other:?}"),
         }
+    }
+
+    // RED test for #226: on timeout the context cancellation token must be
+    // signalled so that handlers following the documented select! pattern can
+    // observe the abort and stop escaped work.
+    #[tokio::test(start_paused = true)]
+    async fn cancels_context_token_on_timeout() {
+        let env = fresh_env();
+        let ctx = fresh_ctx();
+        let next = Next::new(
+            Vec::new(),
+            Arc::new(SlowTerminal {
+                delay: Duration::from_millis(500),
+            }),
+        );
+        let middleware = TimeoutMiddleware::new(Duration::from_millis(50));
+        let result = middleware.execute(&env, &ctx, next).await;
+        assert!(
+            matches!(result, Err(HexeractError::Timeout { .. })),
+            "expected Timeout error"
+        );
+        assert!(
+            ctx.is_cancelled(),
+            "cancellation token must be cancelled when the dispatch times out"
+        );
+    }
+
+    // Cancellation must NOT be triggered when the dispatch completes in time.
+    #[tokio::test(start_paused = true)]
+    async fn does_not_cancel_context_token_on_success() {
+        let env = fresh_env();
+        let ctx = fresh_ctx();
+        let next = Next::new(
+            Vec::new(),
+            Arc::new(SlowTerminal {
+                delay: Duration::from_millis(10),
+            }),
+        );
+        let middleware = TimeoutMiddleware::new(Duration::from_secs(10));
+        let _ = middleware
+            .execute(&env, &ctx, next)
+            .await
+            .expect("must succeed");
+        assert!(
+            !ctx.is_cancelled(),
+            "cancellation token must remain uncancelled when dispatch completes in time"
+        );
     }
 }

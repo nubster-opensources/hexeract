@@ -78,22 +78,27 @@ macro_rules! impl_run_at {
             ctx: &HandlerContext,
             next: Next,
         ) -> Result<BoxOutput, HexeractError> {
+            use tracing::Instrument as _;
+
             let span = tracing::$span_macro!(
                 "hexeract.dispatch",
                 type_name = envelope.type_name(),
                 message_id = %envelope.message_id(),
                 correlation_id = %envelope.correlation_id(),
             );
-            let _enter = span.enter();
-            tracing::$event_macro!("entering");
-            let started = Instant::now();
-            let result = next.run(envelope, ctx).await;
-            let elapsed_ms = elapsed_ms(started);
-            match &result {
-                Ok(_) => tracing::$event_macro!(elapsed_ms, "completed"),
-                Err(err) => log_failure(elapsed_ms, err),
+            async move {
+                tracing::$event_macro!("entering");
+                let started = Instant::now();
+                let result = next.run(envelope, ctx).await;
+                let elapsed_ms = elapsed_ms(started);
+                match &result {
+                    Ok(_) => tracing::$event_macro!(elapsed_ms, "completed"),
+                    Err(err) => log_failure(elapsed_ms, err),
+                }
+                result
             }
-            result
+            .instrument(span)
+            .await
         }
     };
 }
@@ -221,5 +226,45 @@ mod tests {
         .await
         .expect("dispatch must succeed");
         assert!(logs_contain("entering"));
+    }
+
+    // RED test for #225: the dispatch future must be wrapped with
+    // `Instrument` so the span is not held across await suspension
+    // points. On a multi-threaded runtime, holding `Span::enter()` across
+    // `.await` corrupts trace attribution because the guard stays entered on
+    // the yielding thread while other tasks run there.
+    //
+    // This test uses `flavor = "multi_thread"` with a terminal that yields
+    // via `tokio::task::yield_now()` to force a real suspension and thread
+    // handoff, then asserts that events are still attributed to the span
+    // (which only works correctly when `instrument()` is used instead of a
+    // held `Entered` guard).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[traced_test]
+    async fn span_not_held_across_await_on_multi_thread_runtime() {
+        struct YieldingTerminal;
+        impl Terminal for YieldingTerminal {
+            fn dispatch<'a>(
+                &'a self,
+                _envelope: &'a MessageEnvelope,
+                _ctx: &'a HandlerContext,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<BoxOutput, HexeractError>> + Send + 'a>,
+            > {
+                Box::pin(async move {
+                    // Force a yield so Tokio may move us to another thread.
+                    tokio::task::yield_now().await;
+                    Ok(Box::new(99_i32) as BoxOutput)
+                })
+            }
+        }
+
+        let _ = run_through(TracingMiddleware::new(), Arc::new(YieldingTerminal))
+            .await
+            .expect("dispatch must succeed");
+        // With `instrument()`, span events are still emitted correctly even
+        // after the future resumes on a different thread.
+        assert!(logs_contain("entering"));
+        assert!(logs_contain("completed"));
     }
 }
