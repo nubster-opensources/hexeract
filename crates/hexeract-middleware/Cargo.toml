@@ -9,6 +9,7 @@ authors.workspace = true
 rust-version.workspace = true
 description = "Built-in middlewares for the Hexeract messaging framework: tracing spans and dispatch timeouts."
 readme = "../../README.md"
+exclude = ["/tests", "/examples", "/benches"]
 keywords = ["messaging", "middleware", "tracing", "timeout", "hexeract"]
 categories = ["asynchronous"]
 

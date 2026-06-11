@@ -145,11 +145,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await?;
 
     let recorded = Arc::new(Mutex::new(Vec::new()));
-    let mediator = MediatorBuilder::new()
-        .register_command_handler::<ProcessPayment, _>(PaymentBook {
+    let builder =
+        MediatorBuilder::new().register_command_handler::<ProcessPayment, _>(PaymentBook {
             recorded: Arc::clone(&recorded),
-        })
-        .build()?;
+        });
+    builder.verify_handlers()?;
+    let mediator = builder.build()?;
 
     let worker_conn = RabbitMqConnection::connect(&uri).await?;
     let worker = RabbitMqWorkerBuilder::new(worker_conn)
@@ -159,8 +160,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let cancel = CancellationToken::new();
     let cancel_for_task = cancel.clone();
     let worker_handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let order_id = Uuid::now_v7();
     let publisher = RabbitMqTransport::with_exchange(&uri, exchange).await?;

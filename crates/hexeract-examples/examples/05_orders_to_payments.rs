@@ -207,11 +207,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Mediator + bus consumer.
     let recorded = Arc::new(Mutex::new(Vec::new()));
-    let mediator = MediatorBuilder::new()
-        .register_command_handler::<ProcessPayment, _>(PaymentBook {
+    let builder =
+        MediatorBuilder::new().register_command_handler::<ProcessPayment, _>(PaymentBook {
             recorded: Arc::clone(&recorded),
-        })
-        .build()?;
+        });
+    builder.verify_handlers()?;
+    let mediator = builder.build()?;
     let worker_conn = RabbitMqConnection::connect(&uri).await?;
     let bus_worker = RabbitMqWorkerBuilder::new(worker_conn)
         .queue(queue.name.as_str())
@@ -220,7 +221,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let bus_cancel = CancellationToken::new();
     let bus_cancel_task = bus_cancel.clone();
     let bus_handle = tokio::spawn(async move { bus_worker.run(bus_cancel_task).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Outbox worker forwarding to the bus.
     let transport = RabbitMqTransport::with_exchange(&uri, exchange).await?;

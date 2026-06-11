@@ -12,8 +12,8 @@ body:
     id: version
     attributes:
       label: Hexeract crate(s) and version
-      description: e.g. `hexeract-outbox 0.1.0`, `hexeract-outbox-postgres 0.1.0`
-      placeholder: hexeract-outbox-postgres 0.1.0
+      description: e.g. `hexeract-outbox 0.1.0`, `hexeract-outbox-sql 0.1.0`
+      placeholder: hexeract-outbox-sql 0.1.0
     validations:
       required: true
 
