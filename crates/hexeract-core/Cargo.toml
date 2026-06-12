@@ -30,7 +30,14 @@ default = []
 serde = ["dep:serde", "uuid/serde"]
 
 [dev-dependencies]
-hexeract-macros = { path = "../hexeract-macros", version = "0.5" }
+# Path-only (no version) on purpose: this is a dev-dependency cycle
+# (hexeract-macros dev-depends back on hexeract-core), and hexeract-core
+# publishes first. A versioned requirement would force cargo to resolve
+# hexeract-macros from crates.io at publish time, before it exists there.
+# Cargo drops a version-less dev-dependency from the published manifest, so
+# the cycle never reaches the registry. The macro self-test that needs it
+# is excluded from the package anyway (see `exclude`).
+hexeract-macros = { path = "../hexeract-macros" }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
 

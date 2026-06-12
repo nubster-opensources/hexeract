@@ -16,6 +16,10 @@ ignore = ["RUSTSEC-2023-0071"]
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace-internal path dependencies may omit a version requirement
+# (needed to break the hexeract-core <-> hexeract-macros dev-dependency
+# cycle at publish time). Registry dependencies must still be pinned.
+allow-wildcard-paths = true
 deny = []
 skip = []
 skip-tree = []
