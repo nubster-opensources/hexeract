@@ -41,7 +41,7 @@ The `elapsed_ms` measures the wall-clock time spent inside the middleware (which
 
 ## Variants
 
-**Lower verbosity.** Replace `TracingMiddleware::new()` with `TracingMiddleware::with_level(tracing::Level::DEBUG)` to drop the `entering` / `completed` events out of INFO-level logs while keeping `failed` at ERROR.
+**Lower verbosity.** Replace `TracingMiddleware::new()` with `TracingMiddleware::new().with_level(tracing::Level::DEBUG)` to drop the `entering` / `completed` events out of INFO-level logs while keeping `failed` at ERROR.
 
 **Per-channel filtering.** The events use the default target (module path `hexeract_middleware::tracing`). Filter with `RUST_LOG=hexeract_middleware=warn` in production to see only failures, `=info` in staging for full visibility.
 

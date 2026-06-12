@@ -33,7 +33,7 @@ Override at runtime with `RUST_LOG=hexeract_bus_rabbitmq=debug,hexeract_outbox=d
 
 ## Metrics to derive
 
-Hexeract does not export Prometheus metrics natively in v0.2.0 (planned for v0.10.0). Until then, instrument the call sites where Hexeract hands control back to your code.
+Hexeract does not export Prometheus metrics natively (planned for a future release). Until then, instrument the call sites where Hexeract hands control back to your code.
 
 | Metric | Where to measure | Useful labels |
 | --- | --- | --- |
@@ -61,10 +61,10 @@ A single grep across log streams reconstructs the chain. For automated propagati
 
 ## OpenTelemetry
 
-OpenTelemetry span coverage is a v0.10.0 milestone item. Today the recommended setup is:
+OpenTelemetry span coverage is planned for a future release. Today the recommended setup is:
 
 1. Add `tracing-opentelemetry` to your application crate.
 2. Wrap your handler bodies in a span: `let _span = tracing::info_span!("handle", message_type, ...).entered();`.
 3. Propagate the W3C `traceparent` through the bus headers (set on `publish_with_headers`, read on the consumer side before entering the span).
 
-When v0.10.0 ships, Hexeract will instrument its own internal spans (publish, consume, dispatch) so this manual layer is no longer needed.
+When that future release ships, Hexeract will instrument its own internal spans (publish, consume, dispatch) so this manual layer is no longer needed.

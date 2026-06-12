@@ -56,7 +56,8 @@ AMQP `BasicProperties` set on every publish: `message_id`, `correlation_id`, `co
 | `AckMode::Manual` | Default. At-least-once. Retries per `message_id` up to `max_attempts`, then DLR or drop. |
 | `AckMode::AckOnReceive` | At-most-once. Explicit `basic_ack` on receive before the handler runs (`no_ack = false`). |
 | `AckMode::Unacknowledged` | Fire-and-forget. Consumer-side `no_ack = true`, lossy on handler failure or crash. |
-| `RabbitMqWorkerConfig` | Tunable knobs: `ack_mode`, `max_attempts`, `prefetch`, `dead_letter_routing_key`. |
+| `RabbitMqWorkerConfig` | Tunable knobs: `ack_mode`, `max_attempts`, `prefetch`, `dead_letter_routing_key`, `max_buffered: Option<usize>`. |
+| `.max_buffered(n)` | Bounds the in-memory delivery buffer under `AckMode::Unacknowledged` (`None` = unbounded, not recommended). Has no effect under `AckMode::Manual` or `AckMode::AckOnReceive`, which are already bounded by `basic.qos` prefetch. |
 
 See the [worker concept](../concepts/worker.md), the [ack modes](../concepts/ack-modes.md) and the [retry policy](../concepts/retry-policy.md).
 

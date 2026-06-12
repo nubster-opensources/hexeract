@@ -63,7 +63,7 @@ let worker = PgOutboxWorkerBuilder::new(pool)
 
 The same crate now also covers MySQL (`outbox-sql-mysql`) and SQLite (`outbox-sql-sqlite`) behind their own features. SQLite is single-worker only; for competing-consumers fan-out across many workers, stay on PostgreSQL or MySQL. See [SQLite outbox concurrency](../concepts/sqlite-outbox-concurrency.md).
 
-`hexeract-outbox-postgres` keeps its `deadpool_postgres` implementation for the 0.4.x cycle, but it is deprecated and scheduled for removal in 0.5.0. Migrate now to avoid a forced change later.
+`hexeract-outbox-postgres` keeps its `deadpool_postgres` implementation for the 0.4.x cycle, but it is deprecated in 0.4.x and has since been removed in 0.5.0. Migrate before upgrading to 0.5.
 
 ## 3. Bus ack modes: `AckMode::Auto` removed
 

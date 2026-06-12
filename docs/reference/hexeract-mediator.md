@@ -53,6 +53,7 @@ impl Mediator {
 ## `MediatorBuildError`
 
 ```rust
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum MediatorBuildError {
     #[error("duplicate handler registered for {type_name}")]
@@ -60,11 +61,12 @@ pub enum MediatorBuildError {
 }
 ```
 
-Only one variant ships in v0.3.0. The enum is not currently marked `#[non_exhaustive]`; that attribute is planned for v1.0 alongside the broader API freeze, so that adding future variants will remain a non-breaking change.
+The enum is `#[non_exhaustive]`, so external `match` expressions must include a wildcard arm to remain forward-compatible as new variants are added.
 
 ## `HandlersVerificationError`
 
 ```rust
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum HandlersVerificationError {
     #[error("{} handler(s) declared via #[handler] are missing from the registry", missing.len())]
@@ -79,7 +81,7 @@ pub struct MissingHandler {
 }
 ```
 
-Returned by `MediatorBuilder::verify_handlers`. The `missing` list iterates in `inventory` collection order (effectively link order, which is stable per platform but not portable).
+Returned by `MediatorBuilder::verify_handlers`. The enum is `#[non_exhaustive]`; match on it with a wildcard arm. The `missing` list iterates in `inventory` collection order (effectively link order, which is stable per platform but not portable).
 
 ## Type relationships
 

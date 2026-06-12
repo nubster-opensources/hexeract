@@ -61,10 +61,16 @@ pub trait OutboxStore: Send + Sync + 'static {
     async fn begin<'a>(&self, client: &'a mut Self::Client) -> Result<Self::Tx<'a>, OutboxError>;
     async fn poll<'a>(&self, tx: &mut Self::Tx<'a>, batch_size: usize, max_attempts: u32) -> Result<Vec<OutboxEnvelope>, OutboxError>;
     async fn mark_delivered<'a>(&self, tx: &mut Self::Tx<'a>, event_id: Uuid) -> Result<(), OutboxError>;
-    async fn mark_failed<'a>(&self, tx: &mut Self::Tx<'a>, event_id: Uuid, error: &str, next_retry_at: SystemTime) -> Result<(), OutboxError>;
+    async fn mark_failed<'a>(&self, tx: &mut Self::Tx<'a>, event_id: Uuid, error: &str, retry_in: Duration) -> Result<(), OutboxError>;
     async fn commit<'a>(&self, tx: Self::Tx<'a>) -> Result<(), OutboxError>;
+
+    // Default no-op implementations; SQL backends override both.
+    async fn mark_dead_lettered<'a>(&self, tx: &mut Self::Tx<'a>, event_id: Uuid, error: &str) -> Result<(), OutboxError> { Ok(()) }
+    async fn claim<'a>(&self, tx: &mut Self::Tx<'a>, event_ids: &[Uuid], lease_for: Duration) -> Result<(), OutboxError> { Ok(()) }
 }
 ```
+
+`mark_failed` receives `retry_in: Duration`, a relative duration from now that the backend adds to the database clock when scheduling the next attempt. `mark_dead_lettered` and `claim` have default no-op implementations; the SQL backends override them.
 
 Implemented through `async_trait` (boxed futures) to work around `rust-lang/rust#100013` until GAT inference for HRTB lands.
 
@@ -86,7 +92,7 @@ Symmetric with `hexeract_bus::Handler<M>`.
 | --- | --- |
 | `OutboxWorker::new(store, handlers, config)` | Build a generic worker over any `OutboxStore` impl. |
 | `OutboxWorker::run(cancel)` | Boxed `Send` future the caller spawns. Honours `CancellationToken`. |
-| `OutboxWorkerConfig` | `poll_interval` (100 ms), `batch_size` (10), `max_attempts` (5), `retry_delay` (5 s). |
+| `OutboxWorkerConfig` | `poll_interval` (100 ms), `batch_size` (10), `max_attempts` (5), `retry_base_delay` (1 s), `retry_max_delay` (300 s / 5 min), `jitter` (true), `dispatch_timeout` (30 s), `min_cycle_delay` (5 ms). Retries use bounded exponential backoff with full jitter: `min(retry_max_delay, retry_base_delay x 2^attempts)`. |
 | `ErasedHandler` + `TypedHandler<E, H>` | Adapter pair lifting a typed handler into the dyn-safe form. |
 | `BoxFuture<'a, T>` | Pinned, boxed, Send future returned by trait-object methods. |
 

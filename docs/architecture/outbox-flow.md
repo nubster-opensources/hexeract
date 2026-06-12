@@ -64,7 +64,7 @@ sequenceDiagram
             else Err
                 Handler-->>Worker: Err(_)
                 Worker->>Store: mark_failed(event_id, error, next_retry_at)
-                Store->>DB: UPDATE ... SET attempts = attempts + 1,<br/>last_error = ?, next_retry_at = NOW() + retry_delay
+                Store->>DB: UPDATE ... SET attempts = attempts + 1,<br/>last_error = ?, next_retry_at = NOW() + <backoff_duration>
             end
         end
         Worker->>Store: commit()
@@ -80,7 +80,7 @@ sequenceDiagram
 | Dispatch | At-least-once. Handlers MUST be idempotent. |
 | Partial ordering by subject | Events sharing a `subject_id` are polled in `id` order; the partial index `idx_<table>_subject` keeps the lookup cheap. |
 | Multi-worker safety | `SELECT ... FOR UPDATE SKIP LOCKED` prevents double dispatch across an arbitrary number of concurrent workers. |
-| Retry | Implicit on the next poll; `next_retry_at` enforces a constant `retry_delay` after each failure. Exponential backoff is on the roadmap for v0.5. |
+| Retry | Bounded exponential backoff with full jitter: `min(retry_max_delay, retry_base_delay x 2^n)`; defaults `retry_base_delay = 1 s`, `retry_max_delay = 300 s`. |
 | Backpressure | The worker reads at most `batch_size` rows per poll and sleeps `poll_interval` between empty polls. Sustained throughput scales horizontally by adding workers. |
 
 ## Performance
@@ -93,7 +93,7 @@ Targets validated on a developer laptop against a local PostgreSQL 16 container:
 | Dispatch p99 (publish → handler call) | < 200 ms | Default `poll_interval = 100 ms`. Lower the interval (e.g. `50 ms`) to halve the upper bound at the cost of CPU. |
 | Sustained throughput | 100 events/s with default tuning | Linear with the number of workers. |
 
-The publish latency was measured with a `criterion` benchmark against the PostgreSQL backend; the benchmark retired with the `hexeract-outbox-postgres` crate and has not yet been ported to `hexeract-outbox-sql`.
+The numbers in the table above are design targets pending re-measurement against `hexeract-outbox-sql`; the `criterion` benchmark that validated them was retired with `hexeract-outbox-postgres` and has not yet been ported. Do not treat them as validated measurements.
 
 ## Tuning knobs
 

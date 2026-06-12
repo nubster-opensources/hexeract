@@ -106,7 +106,7 @@ let worker = RabbitMqWorkerBuilder::new(conn)
     .build()?;
 ```
 
-Without `max_buffered`, a warning is logged at startup to surface the unbounded risk. `None` (the default) preserves the historical behaviour. A value of `Some(0)` is treated as no bound, matching `None`, because a zero-permit semaphore would deadlock the loop.
+Without `max_buffered`, a warning is logged at startup to surface the unbounded risk. `None` (the default) preserves the historical behaviour. A value of `Some(0)` is treated as no bound, matching `None`, because a zero-permit semaphore would deadlock the loop. Setting `max_buffered` under `AckMode::Manual` or `AckMode::AckOnReceive` has no effect, since those modes are already bounded by the `basic.qos` prefetch count.
 
 ## Choosing a mode
 

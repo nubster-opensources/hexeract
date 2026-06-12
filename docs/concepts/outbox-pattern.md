@@ -47,7 +47,7 @@ sequenceDiagram
 | **Delivery** | At-least-once. Handlers must be idempotent. |
 | **Ordering per aggregate** | Optional, via `subject_id`. Events sharing a `subject_id` are polled in `event_id` order. |
 | **Multi-worker safety** | `SELECT ... FOR UPDATE SKIP LOCKED` lets an arbitrary number of workers consume the same outbox without double-dispatching. |
-| **Crash recovery** | The lock held by a crashed worker is released by PostgreSQL automatically. The next poll picks the envelope up. |
+| **Crash recovery** | PostgreSQL and MySQL release the row lock automatically on worker crash (`SELECT ... FOR UPDATE SKIP LOCKED`); the next poll picks the envelope up. SQLite uses a soft lease that expires after its configured duration before another worker can reclaim the row. |
 
 ## What an outbox is NOT
 
@@ -71,9 +71,9 @@ The [`hexeract-outbox`](../reference/hexeract-outbox.md) crate ships the backend
 
 - [`Event`](message-envelope.md) marker trait and `OutboxEnvelope` row representation.
 - [`OutboxPublisher`](../reference/hexeract-outbox.md) trait with `publish_in_tx(&mut tx, &event)`. Each backend implements its own `Tx<'tx>`.
-- [`OutboxStore`](../reference/hexeract-outbox.md) trait that the worker drives (`acquire`, `begin`, `poll`, `mark_delivered`, `mark_failed`, `commit`).
+- [`OutboxStore`](../reference/hexeract-outbox.md) trait that the worker drives (`acquire`, `begin`, `poll`, `mark_delivered`, `mark_failed`, `commit`, `claim`, `mark_dead_lettered`).
 - [`OutboxWorker`](worker.md) generic over a store, with a `CancellationToken`-aware poll loop.
 
-The [`hexeract-outbox-sql`](../reference/hexeract-outbox-sql.md) crate provides SQL backends for PostgreSQL, MySQL and SQLite. For each backend it exposes a canonical schema strategy: `Dialect::schema_ddl(table)` returns the DDL string to feed into your migration tooling, and `ensure_schema(&pool, table)` is an idempotent dev/test helper. The fluent builder (`PgOutboxWorkerBuilder`, `MySqlOutboxWorkerBuilder`, `SqliteOutboxWorkerBuilder`) wires store, handlers and worker together. The legacy [`hexeract-outbox-postgres`](../reference/hexeract-outbox-postgres.md) crate is deprecated since 0.4.0 and removed in 0.5.0.
+The [`hexeract-outbox-sql`](../reference/hexeract-outbox-sql.md) crate provides SQL backends for PostgreSQL, MySQL and SQLite. For each backend it exposes a canonical schema strategy: `Dialect::schema_ddl(table)` returns the DDL string to feed into your migration tooling, and `ensure_schema(&pool, table)` is an idempotent dev/test helper. The fluent builder (`PgOutboxWorkerBuilder`, `MySqlOutboxWorkerBuilder`, `SqliteOutboxWorkerBuilder`) wires store, handlers and worker together. The legacy [`hexeract-outbox-sql`](../reference/hexeract-outbox-sql.md) crate supersedes `hexeract-outbox-postgres`, which was deprecated since 0.4.0 and removed in 0.5.0.
 
 For a deeper dive into the SQL and the row lifecycle, see the [outbox flow architecture](../architecture/outbox-flow.md).
