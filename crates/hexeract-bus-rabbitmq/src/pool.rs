@@ -1,13 +1,18 @@
 use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::PoisonError;
 
 use hexeract_bus::BusError;
 use lapin::Channel;
 use lapin::options::ConfirmSelectOptions;
-use tokio::sync::Mutex;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::Semaphore;
 
 use crate::connection::RabbitMqConnection;
 
-/// Default maximum number of idle channels cached per pool.
+/// Default maximum number of channels a pool keeps live at once.
 pub const DEFAULT_POOL_MAX_SIZE: usize = 8;
 
 /// Small bounded pool of [`lapin::Channel`] handles for a single publisher.
@@ -18,6 +23,12 @@ pub const DEFAULT_POOL_MAX_SIZE: usize = 8;
 /// demand. Channels whose connection has dropped are discarded and a
 /// fresh one is opened.
 ///
+/// `max_size` is a hard cap on the number of channels that can be live
+/// at the same time: [`Self::acquire`] parks on a semaphore once the cap
+/// is reached, so a burst of concurrent publishers reuses a bounded set
+/// of channels instead of opening one per publish. The same bound limits
+/// the idle cache.
+///
 /// By default every channel the pool opens has publisher confirms
 /// enabled (`confirm_select`), so publishes through pooled channels
 /// can await a broker acknowledgement. Confirm mode is sticky for the
@@ -27,6 +38,7 @@ pub const DEFAULT_POOL_MAX_SIZE: usize = 8;
 pub struct ChannelPool {
     connection: RabbitMqConnection,
     idle: Mutex<VecDeque<Channel>>,
+    live: Arc<Semaphore>,
     max_size: usize,
     confirms: bool,
 }
@@ -34,16 +46,17 @@ pub struct ChannelPool {
 impl ChannelPool {
     /// Build a new pool backed by `connection`.
     ///
-    /// `max_size` caps the number of idle channels cached between
-    /// publishes. `0` is normalised to `1` so the pool always has room
-    /// for at least one channel. Channels are opened with publisher
-    /// confirms enabled.
+    /// `max_size` caps both the number of channels live at once and the
+    /// number of idle channels cached between publishes. `0` is
+    /// normalised to `1` so the pool always has room for at least one
+    /// channel. Channels are opened with publisher confirms enabled.
     #[must_use]
     pub fn new(connection: RabbitMqConnection, max_size: usize) -> Self {
         let max_size = max_size.max(1);
         Self {
             connection,
             idle: Mutex::new(VecDeque::with_capacity(max_size)),
+            live: Arc::new(Semaphore::new(max_size)),
             max_size,
             confirms: true,
         }
@@ -72,13 +85,20 @@ impl ChannelPool {
         &self.connection
     }
 
-    /// Maximum number of idle channels the pool retains.
+    /// Maximum number of channels the pool keeps live at once, which is
+    /// also the cap on idle channels it retains.
     #[must_use]
     pub fn max_size(&self) -> usize {
         self.max_size
     }
 
     /// Acquire a channel, opening a fresh one if the cache is empty.
+    ///
+    /// The number of channels handed out at the same time is capped at
+    /// [`Self::max_size`]: when the cap is reached this awaits until an
+    /// outstanding [`PooledChannel`] is dropped and frees a slot, so a
+    /// burst of concurrent callers cannot open an unbounded number of
+    /// channels.
     ///
     /// A fresh channel is put in confirm mode before being handed out,
     /// unless the pool was built with [`Self::without_confirms`]. The
@@ -90,8 +110,13 @@ impl ChannelPool {
     /// Returns [`BusError::Connection`] if no cached channel is
     /// available and opening or configuring a new one fails.
     pub async fn acquire(&self) -> Result<PooledChannel<'_>, BusError> {
+        let permit = Arc::clone(&self.live)
+            .acquire_owned()
+            .await
+            .map_err(|err| BusError::Connection(Box::new(err)))?;
+
         let cached = {
-            let mut idle = self.idle.lock().await;
+            let mut idle = self.lock_idle();
             let mut found = None;
             while let Some(channel) = idle.pop_front() {
                 if channel.status().connected() {
@@ -116,25 +141,41 @@ impl ChannelPool {
         Ok(PooledChannel {
             channel: Some(channel),
             pool: self,
+            _permit: permit,
         })
     }
 
     /// Number of idle channels currently cached. Useful for tests.
     #[must_use]
-    pub async fn idle_len(&self) -> usize {
-        self.idle.lock().await.len()
+    pub fn idle_len(&self) -> usize {
+        self.lock_idle().len()
+    }
+
+    /// Lock the idle cache, recovering the guard if a previous holder
+    /// panicked. The critical section only pushes or pops a `VecDeque`,
+    /// so it is never held across an await and a blocking lock here stays
+    /// cheap.
+    fn lock_idle(&self) -> MutexGuard<'_, VecDeque<Channel>> {
+        self.idle.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 /// RAII guard returned by [`ChannelPool::acquire`].
 ///
-/// Returns the underlying channel to the pool when dropped, on a
-/// best-effort basis: if the pool mutex is contended at drop time the
-/// channel is simply released and the broker will close it.
+/// Returns the underlying channel to the pool when dropped, and releases
+/// the live-channel slot it holds so a caller parked in
+/// [`ChannelPool::acquire`] can proceed. The return is reliable: it takes
+/// the pool lock unconditionally rather than skipping on contention, so a
+/// channel is only discarded when its connection has already dropped.
 #[derive(Debug)]
 pub struct PooledChannel<'a> {
     channel: Option<Channel>,
     pool: &'a ChannelPool,
+    #[allow(
+        dead_code,
+        reason = "held to bound live channels; released on drop to free a slot"
+    )]
+    _permit: OwnedSemaphorePermit,
 }
 
 impl PooledChannel<'_> {
@@ -155,10 +196,9 @@ impl Drop for PooledChannel<'_> {
         if !channel.status().connected() {
             return;
         }
-        if let Ok(mut idle) = self.pool.idle.try_lock() {
-            if idle.len() < self.pool.max_size {
-                idle.push_back(channel);
-            }
+        let mut idle = self.pool.lock_idle();
+        if idle.len() < self.pool.max_size {
+            idle.push_back(channel);
         }
     }
 }

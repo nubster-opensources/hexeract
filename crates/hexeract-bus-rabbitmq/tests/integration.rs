@@ -22,6 +22,7 @@ use hexeract_bus::Queue;
 use hexeract_bus::RoutingKey;
 use hexeract_bus::Transport;
 use hexeract_bus_rabbitmq::AckMode;
+use hexeract_bus_rabbitmq::ChannelPool;
 use hexeract_bus_rabbitmq::RabbitMqConnection;
 use hexeract_bus_rabbitmq::RabbitMqTransport;
 use hexeract_bus_rabbitmq::RabbitMqWorkerBuilder;
@@ -1361,4 +1362,60 @@ async fn manual_without_dead_letter_enables_confirms_and_retries_safely() {
 
     cancel.cancel();
     handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker"]
+async fn channel_pool_bounds_live_channels_and_returns_them_under_contention() {
+    let (_container, uri) = start_rabbit().await;
+    let connection = RabbitMqConnection::connect(&uri)
+        .await
+        .expect("pool connection must open");
+
+    let max_size = 4;
+    let pool = Arc::new(ChannelPool::new(connection, max_size));
+
+    // Drive far more concurrent acquirers than the pool's bound so the
+    // semaphore is the only thing keeping live channels in check. Each
+    // task holds its channel briefly to force real overlap.
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let peak_in_flight = Arc::new(AtomicUsize::new(0));
+
+    let tasks: Vec<_> = (0..64)
+        .map(|_| {
+            let pool = Arc::clone(&pool);
+            let in_flight = Arc::clone(&in_flight);
+            let peak_in_flight = Arc::clone(&peak_in_flight);
+            tokio::spawn(async move {
+                let channel = pool.acquire().await.expect("acquire must succeed");
+                let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak_in_flight.fetch_max(current, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                drop(channel);
+            })
+        })
+        .collect();
+
+    for task in tasks {
+        task.await.expect("acquirer task must not panic");
+    }
+
+    // Bound: the semaphore must cap concurrently live channels at
+    // max_size. Without it, acquire never blocks and a burst opens one
+    // channel per task.
+    let peak = peak_in_flight.load(Ordering::SeqCst);
+    assert!(
+        peak <= max_size,
+        "live channels must stay bounded by max_size ({max_size}), observed peak {peak}"
+    );
+
+    // Reliable return: channels must be handed back to the idle cache
+    // rather than dropped on a contended lock. After the burst the cache
+    // is warmed to its full capacity.
+    let idle = pool.idle_len();
+    assert_eq!(
+        idle, max_size,
+        "all live channels must be returned to the pool; cache holds {idle} of {max_size}"
+    );
 }
