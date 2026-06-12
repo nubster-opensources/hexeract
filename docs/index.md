@@ -1,6 +1,6 @@
 # Hexeract Documentation
 
-Hexeract is a six-dimension Rust messaging framework: **Mediator**, **Bus**, **Outbox**, **Sagas**, **Scheduler**, **Request/Reply**. This index points at the documentation that is shipped today (v0.4.0).
+Hexeract is a six-dimension Rust messaging framework: **Mediator**, **Bus**, **Outbox**, **Sagas**, **Scheduler**, **Request/Reply**. This index points at the documentation that is shipped today (v0.5.0).
 
 ## Start here
 
@@ -9,6 +9,7 @@ Hexeract is a six-dimension Rust messaging framework: **Mediator**, **Bus**, **O
 | Dispatch commands, queries and notifications in process | [Mediator quick start](getting-started/mediator-quick-start.md) |
 | Persist outgoing events transactionally with PostgreSQL, MySQL or SQLite | [Outbox quick start](getting-started/outbox-quick-start.md) |
 | Publish and consume messages on RabbitMQ | [Bus quick start](getting-started/bus-quick-start.md) |
+| Migrate an existing project from v0.4.0 to v0.5.0 | [Migration v0.4 to v0.5](operations/migration-v0.4-v0.5.md) |
 | Migrate an existing project from v0.3.0 to v0.4.0 | [Migration v0.3 to v0.4](operations/migration-v0.3-v0.4.md) |
 | Migrate an existing project from v0.1.0 to v0.2.0 | [Migration v0.1 to v0.2](operations/migration-v0.1-v0.2.md) |
 | Operate Hexeract services in production | [Production checklist](operations/production-checklist.md) |
@@ -77,6 +78,7 @@ How to run Hexeract services after the SDK leaves your hands.
 - [Production checklist](operations/production-checklist.md)
 - [Observability](operations/observability.md)
 - [Troubleshooting](operations/troubleshooting.md)
+- [Migration v0.4 to v0.5](operations/migration-v0.4-v0.5.md)
 - [Migration v0.3 to v0.4](operations/migration-v0.3-v0.4.md)
 - [Migration v0.1 to v0.2](operations/migration-v0.1-v0.2.md)
 

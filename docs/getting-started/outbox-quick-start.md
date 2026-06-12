@@ -10,8 +10,8 @@ The outbox runs on PostgreSQL, MySQL or SQLite through the `sqlx`-backed `hexera
 
 ```toml
 [dependencies]
-hexeract-outbox = "0.4"
-hexeract-outbox-sql = { version = "0.4", features = ["postgres"] }
+hexeract-outbox = "0.5"
+hexeract-outbox-sql = { version = "0.5", features = ["postgres"] }
 
 # Already in most async Rust services:
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls-ring", "postgres", "uuid"] }
@@ -22,7 +22,7 @@ serde_json = "1"
 uuid = { version = "1", features = ["v7"] }
 ```
 
-> The legacy `hexeract-outbox-postgres` crate (built on `deadpool_postgres`) is deprecated since 0.4.0 and will be removed in 0.5.0. New projects should start on `hexeract-outbox-sql`.
+> The legacy `hexeract-outbox-postgres` crate (built on `deadpool_postgres`) has been removed in 0.5.0. New projects should start on `hexeract-outbox-sql`. See the [v0.4 to v0.5 migration guide](../operations/migration-v0.4-v0.5.md) to port an existing project.
 
 ## 2. Apply the canonical schema
 

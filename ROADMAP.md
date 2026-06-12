@@ -75,16 +75,17 @@ Released as v0.1.0 on crates.io. The seven shipped crates are `hexeract-core`, `
 - A shared `Dialect` centralizing statement templating, row locking and the per-engine schema DDL. The PostgreSQL schema stays byte-for-byte identical to `hexeract-outbox-postgres`, so no data migration is required.
 - Integration tests via `testcontainers` covering each engine.
 
-## v0.5.0: Reliability
+## v0.5.0: Reliability (DONE)
 
 **Goal.** Configurable resilience for handlers and workers. Failures become predictable, not catastrophic.
 
 **Scope:**
 
-- Per-handler retry policies with exponential backoff and jitter.
-- Dead-letter queue for poison messages, observable via SQL or CLI.
-- Deadline propagation on message envelopes.
-- Cancellation-safe handler execution and graceful shutdown.
+- Bounded exponential backoff with jitter for outbox retries (`retry_base_delay`, `retry_max_delay`, `jitter`).
+- Opt-in durable dead-letter handling for poison messages, observable via SQL or CLI.
+- Crash-safe claim (attempt counted at claim time) and dispatch outside the database transaction.
+- `dispatch_timeout` enforced as a hard per-handler deadline; deadline and cancellation-safe graceful shutdown.
+- Bus hardening: publisher confirms, bounded consumer buffer (`max_buffered`) and payload cap, plus a security sweep on the AMQP surface and the release CI.
 
 ## v0.6.0: Scheduler
 

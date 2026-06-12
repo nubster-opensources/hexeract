@@ -9,25 +9,81 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 ### Added
 - _Items in flight will be listed here until the next release._
 
+## [0.5.0] - 2026-06-12
+
+Reliability release. This cycle closes the delivery-reliability gaps in the transactional outbox and the RabbitMQ bus, hardens the security surface of the bus and the release CI, and freezes the remaining public enums and error types before 1.0. The legacy `hexeract-outbox-postgres` crate is removed in favour of `hexeract-outbox-sql`. See [`docs/operations/migration-v0.4-v0.5.md`](docs/operations/migration-v0.4-v0.5.md) for the upgrade path.
+
+### Added
+
+- `hexeract-outbox`: opt-in durable dead-letter handling. The new `OutboxStore::mark_dead_lettered` hook (default no-op) moves an envelope that has exhausted its retry budget to a dead-letter store, inside the same transaction as `mark_failed`, so a poison envelope eventually leaves the poll set instead of being redelivered forever. (#117, #194)
+- `hexeract-outbox`: the worker now dispatches handlers **outside** the claiming database transaction. A batch is claimed (lease advanced, attempt counter incremented) and committed first, then dispatched, so `FOR UPDATE SKIP LOCKED` row locks are released promptly and a slow handler no longer holds a transaction open. (#116)
+- `hexeract-outbox`: bounded exponential backoff with optional jitter. `OutboxWorkerConfig` gains `retry_base_delay` (default 1 s), `retry_max_delay` (default 300 s) and `jitter` (default `true`); the next retry waits `min(retry_max_delay, retry_base_delay × 2^attempts)`. (#118)
+- `hexeract-outbox`: `dispatch_timeout` (default 30 s) is enforced as a hard per-handler deadline. A hung handler is cancelled and the envelope retried instead of stalling the worker forever, reported through the new `OutboxError::DispatchTimeout` variant. (#229)
+- `hexeract-bus-rabbitmq`: publisher confirms. The transport waits for broker acknowledgement before reporting a publish as successful, so a dropped publish surfaces as an error rather than silent loss. (#119)
+- `hexeract-bus-rabbitmq`: `RabbitMqWorkerConfig::max_buffered` (opt-in, builder method `max_buffered`) bounds the number of in-flight deliveries buffered under `AckMode::Unacknowledged`, closing the unbounded-memory path. (#223)
+- `hexeract-bus-rabbitmq`: a per-consumer payload size cap. `RabbitMqWorkerConfig::max_payload_bytes` (default `DEFAULT_MAX_PAYLOAD_BYTES`, 1 MiB) rejects oversized deliveries with `BusError::PayloadTooLarge` instead of decoding untrusted input unboundedly. (#138)
+- `hexeract-bus-rabbitmq`: a bounded connection-pool acquire timeout so a starved pool fails fast instead of hanging the caller. (#135)
+- `hexeract-bus-rabbitmq`: a fixed-size retry-attempts map bounds memory under sustained poison traffic. (#137)
+- `hexeract-mediator`: concurrent notification fan-out. Notification handlers now run concurrently rather than strictly sequentially, while keeping the fail-safe aggregation (every handler runs even if a sibling fails). (#129)
+- `hexeract-mediator`: `CorrelationId` propagation across in-process dispatches through `Mediator::send_with_correlation_id`, `query_with_correlation_id` and `publish_with_correlation_id`, so a causal chain is observable end to end. The plain `send` / `query` / `publish` mint a fresh `CorrelationId`. (#133, #227)
+- `hexeract-core`: structured `HexeractError::InputDowncastFailed { expected }` variant and `input_downcast_failed` constructor, replacing an opaque failure when a dispatched input does not downcast to the handler's message type. (#239)
+- `hexeract-core`: the `HexeractError::Cancelled` variant is now wired through dispatch (it was declared but unreachable). (#165)
+- `hexeract-cli`: distinct process exit codes. `2` for a safety-flag refusal, `1` for a fatal error, `0` for success; `process::exit` is no longer called from async paths. (#241)
+
 ### Changed
 
-- `hexeract-bus-rabbitmq` and `hexeract-outbox-sql`: **breaking**. `AckMode`, `Dialect` and `RabbitMqWorkerConfig` are now `#[non_exhaustive]`, matching the rest of the public API. Downstream exhaustive `match` arms on `AckMode` or `Dialect` must add a wildcard `_` arm, and external code constructing `RabbitMqWorkerConfig` must go through `RabbitMqWorkerBuilder` rather than a struct literal. `AckMode::default()` is still `Manual`. This freezes the enums and the config so future ack disciplines, SQL backends and tuning fields can be added without a major bump. (#163)
-- `hexeract-core`: **breaking**. The `HexeractError::HandlerNotFound` and `HexeractError::HandlerFailed` struct variants are now `#[non_exhaustive]`, matching `Timeout`, `DowncastFailed`, `Cancelled` and `PublishFailed`. Construct `HandlerNotFound` through the new `HexeractError::handler_not_found()` builder, mirroring `handler_failed()`, `timeout()` and `cancelled()`; external pattern matches on these variants must add `..`. This guards against a future field addition being breaking. (#164)
+- `hexeract-outbox`: **breaking**. The `OutboxStore` trait is reshaped for crash-safe reliability. `mark_failed` now takes `retry_in: Duration` (a delay from now that the backend adds to its own database clock) instead of an absolute application timestamp, so retry scheduling is immune to app/DB clock skew. A new `claim(lease_for: Duration)` method (default no-op) advances the lease and increments the attempt counter at claim time, and `mark_dead_lettered` (default no-op) persists exhausted envelopes. Custom `OutboxStore` implementers must update these signatures; backends that neither lease nor dead-letter can keep the defaults. (#215, #230, #213)
+- `hexeract-outbox`: **breaking**. `OutboxWorkerConfig::retry_delay` is removed in favour of `retry_base_delay`, `retry_max_delay` and `jitter`. Replace a fixed `retry_delay` with `retry_base_delay` (and optionally cap with `retry_max_delay`). (#118)
+- `hexeract-middleware`: **breaking**. `TracingMiddleware::with_level` is no longer a constructor; it is a chainable consuming method on a built middleware (`TracingMiddleware::new().with_level(Level::DEBUG)`), aligning the builder shape with the rest of the API. (#239)
+- `hexeract-mediator`: **breaking**. `MediatorBuildError` and `HandlersVerificationError` are now `#[non_exhaustive]`. Downstream exhaustive `match` arms must add a wildcard. (#239)
+- `hexeract-core`: **breaking**. The `HexeractError::HandlerNotFound` and `HexeractError::HandlerFailed` struct variants are now `#[non_exhaustive]`, matching `Timeout`, `DowncastFailed`, `Cancelled` and `PublishFailed`. Construct `HandlerNotFound` through the new `HexeractError::handler_not_found()` builder, mirroring `handler_failed()`, `timeout()` and `cancelled()`; external pattern matches on these variants must add `..`. (#164)
+- `hexeract-bus-rabbitmq` and `hexeract-outbox-sql`: **breaking**. `AckMode`, `Dialect` and `RabbitMqWorkerConfig` are now `#[non_exhaustive]`. Downstream exhaustive `match` arms on `AckMode` or `Dialect` must add a wildcard `_` arm, and external code constructing `RabbitMqWorkerConfig` must go through `RabbitMqWorkerBuilder` rather than a struct literal. `AckMode::default()` is still `Manual`. (#163)
+- `hexeract-outbox`: **breaking**. `event_type` is now validated to be at most 64 bytes at the envelope boundary, matching the documented and schema-bound limit. An over-long `EVENT_TYPE` is rejected rather than silently truncated downstream. (#240)
+- `hexeract-bus-rabbitmq`: **mini-breaking**. `ChannelPool::idle_len` is now synchronous (`fn idle_len(&self) -> usize`), since reporting the idle count never needed to await. (#140)
 - `hexeract-bus-rabbitmq`: the worker no longer issues `basic.qos` under `AckMode::Unacknowledged`. A `no_ack` consumer never acknowledges, so the broker ignores prefetch for it: the call advertised a backpressure bound that does not exist. `RabbitMqWorkerConfig::prefetch`, the `prefetch` builder method and the `Unacknowledged` variant now document that prefetch has no effect and there is no broker-side flow control in that mode. (#162)
+
+### Removed
+
+- `hexeract-outbox-postgres` and the `hexeract` `outbox-postgres` facade feature are removed. They were deprecated in 0.4.0. Use `hexeract-outbox-sql` with the `postgres` feature (the `outbox-sql-postgres` facade feature), which keeps the byte-for-byte PostgreSQL schema, so no data migration is required. The release workflow no longer attempts to publish the removed crate. (#175, #210)
 
 ### Fixed
 
-- `hexeract-macros`: the `#[handler(notification)]` macro now validates that the message argument is a standard-library `Arc<N>` (`Arc`, `std::sync::Arc`, `alloc::sync::Arc` and their leading-colon forms). A different path whose final segment is `Arc` (a module re-export such as `foo::Arc`, or a shadowed local alias) was silently accepted and then forwarded as `::std::sync::Arc`, producing a confusing type-mismatch error on macro-generated code. It is now rejected with a clear diagnostic at the argument span. (#172)
-- `hexeract-outbox-sql`: the MySQL `Dialect::now_expr` returned the whole-second `UTC_TIMESTAMP()` while the schema stores `DATETIME(6)` microsecond timestamps, so the poll predicate `next_retry_at <= now` could treat a due retry as not-yet-due and skip it for up to roughly one second. It now returns `UTC_TIMESTAMP(6)`, matching the bound sub-second precision for both polling and mark-delivered. (#166)
-- `hexeract-outbox-sql`: clarified in the rustdoc that the SQLite backend stores timestamps at millisecond resolution and truncates (rather than rounds) any sub-millisecond component, while PostgreSQL and MySQL keep microsecond resolution. Added a characterization test that asserts the truncation on a value past the half-millisecond mark, replacing a case that masked it. (#168)
+- `hexeract-outbox`: **[P0]** the per-batch lease plus sequential dispatch caused routine double-dispatch, and the documented lease-sizing rule was wrong. The lease is now sized `batch_size × dispatch_timeout` so it covers the worst-case sequential dispatch of a whole claimed batch. (#215)
+- `hexeract-outbox`: **[P0]** a single undecodable row no longer permanently halts polling (head-of-line poisoning). (#214)
+- `hexeract-outbox`: **[P0]** a worker crash now counts an attempt (the increment happens at claim time), so poison envelopes reach the dead-letter threshold instead of being redelivered forever. (#213)
+- `hexeract-bus-rabbitmq`: **[P0]** dead-letter publishing is fixed for non-`Manual` ack modes; an `AckOnReceive` consumer no longer wedges permanently on a poison message. (#212)
+- `hexeract-bus-rabbitmq`: **[P0]** `schedule_retry` no longer acks the original delivery before the retry copy is confirmed, closing a message-loss window that contradicted the documented at-least-once guarantee. (#211)
+- `hexeract-bus-rabbitmq`: undecodable deliveries are no longer nack-dropped silently; the disposition is classified and surfaced. (#197)
+- `hexeract-bus-rabbitmq`: delivery-metadata and error-path fixes (`published_at`, context/envelope ID mismatch, `BusError::Internal` misuse, `MissingHandler` retry budget, `ExchangeKind` fallback, `connect_with_retry` panic). (#236)
+- `hexeract-bus-rabbitmq`: unacked deliveries no longer starve prefetch and stall the consumer on a live channel. (#228)
+- `hexeract-outbox`: the poll sleep is now raced against cancellation, and one failed ack no longer abandons the rest of the claimed batch. (#231)
+- `hexeract-outbox`: lease and backoff timestamps no longer mix the application clock with the database clock. (#230)
+- `hexeract-middleware`: `TimeoutMiddleware` now cancels `ctx.cancellation` on expiry, so escaped work no longer leaks past the timeout, matching the `HandlerContext` docs. (#226)
+- `hexeract-middleware`: `TracingMiddleware` no longer holds a `Span::enter()` guard across an `.await`, fixing corrupted trace attribution on multi-threaded runtimes. (#225)
+- `hexeract-cli`: `bus peek --count N` now dumps the first `N` distinct messages instead of repeatedly dumping the same one. (#224)
+- `hexeract-cli`: `outbox check` filters `information_schema` by `table_schema`, so it validates the right table on cross-schema name collisions. (#233)
+- `hexeract-outbox-sql`: corrected the contradictory SQLite multi-worker claims; `SqliteOutboxStore` is documented as single-writer (no claim/lease). (#232)
+- `hexeract-macros`: clearer diagnostics for malformed `impl` blocks, the generated handler struct no longer breaks crates under `deny(missing_docs)`, and `FoundCrate::Itself` no longer emits `crate` paths that break in tests, examples and doctests of the runtime crates. (#234, #235)
+- `hexeract-macros`: the `#[handler(notification)]` macro now validates that the message argument is a standard-library `Arc<N>` (`Arc`, `std::sync::Arc`, `alloc::sync::Arc` and their leading-colon forms). A re-export or shadowed alias whose final segment is `Arc` was silently accepted and forwarded as `::std::sync::Arc`, producing a confusing type-mismatch error; it is now rejected at the argument span. (#172)
+- `hexeract-outbox-sql`: the MySQL `Dialect::now_expr` now returns `UTC_TIMESTAMP(6)` instead of the whole-second `UTC_TIMESTAMP()`, matching the `DATETIME(6)` microsecond schema so a due retry is no longer skipped for up to roughly one second. (#166)
+- `hexeract-bus-rabbitmq`: the supervised reconnect contract is honoured, and a transient broker error in the consumer loop is contained instead of panicking the worker. (#136, #161)
+
+### Security
+
+- `hexeract-bus-rabbitmq`: **[P1]** `AckMode::Unacknowledged` no longer buffers deliveries without bound, closing a memory-DoS vector (paired with the new `max_buffered`). (#223)
+- `hexeract-bus-rabbitmq`: **[P1]** a forged `x-death` header can no longer overflow the retry counter, which previously caused infinite retries in release builds or a worker-killing panic in debug. (#218)
+- `hexeract-bus-rabbitmq`: **[P1]** AMQP `ShortString` length is validated, so an oversized routing key, header key or queue name no longer corrupts the whole connection in release builds. (#219)
+- `hexeract-cli`: **[P1]** the outbox commands no longer hardcode `NoTls`, which silently downgraded remote PostgreSQL connections to cleartext. (#217)
+- `hexeract-bus-rabbitmq`: **[P1]** a malformed AMQP URI is no longer echoed into logs and errors with the password included. (#216)
+- CI: **[P1]** third-party actions and reusable workflows are pinned to commit SHAs, the crates.io token is passed via `CARGO_REGISTRY_TOKEN` instead of the command line, and `workflow_dispatch` and tag-derived inputs in the bump and release workflows are no longer interpolated unsafely into shell. (#220, #221, #222)
 
 ### Documentation
 
-- Refreshed the outbox documentation for the v0.4 multi-database backend. The outbox quick start, the docs index, the README and the architecture overview now steer adopters to `hexeract-outbox-sql` (built on `sqlx`) instead of the deprecated `hexeract-outbox-postgres` (`deadpool_postgres`). Stale example paths left by the `hexeract-examples` consolidation are corrected throughout. (#167, #176)
-- Added a `hexeract-outbox-sql` API reference page covering the three backends, the `Dialect`, the publisher, the store and the worker builder, and a deprecation notice on the `hexeract-outbox-postgres` reference page. (#167)
-- Added a v0.3 to v0.4 migration guide (`docs/operations/migration-v0.3-v0.4.md`) covering the switch to `hexeract-outbox-sql` and the three breaking changes: the `AckMode::Auto` removal, the `HandlerNotFound` field rename and notifications taking `Arc<N>`. (#170)
-- Marked v0.3.0 and v0.4.0 as done in `ROADMAP.md` and corrected the planned outbox layout to the single `hexeract-outbox-sql` crate with one feature per backend. (#171)
-- Documented the MySQL 8.0.13 minimum (required by the `(UTC_TIMESTAMP(6))` schema default) in the SQLite outbox concurrency concept. (#173)
+- Added the v0.4 to v0.5 migration guide (`docs/operations/migration-v0.4-v0.5.md`) and a v0.3 to v0.4 guide (`docs/operations/migration-v0.3-v0.4.md`). (#170)
+- Retired `hexeract-outbox-postgres` from the guides and reference pages, steering adopters to `hexeract-outbox-sql`; refreshed the README, the docs index and the architecture overview. (#167, #176, #196)
+- Added a `hexeract-outbox-sql` API reference page covering the three backends, the `Dialect`, the publisher, the store and the worker builder. (#167)
+- Stated the MySQL 8.0.13 minimum and the SQLite millisecond timestamp precision in the outbox concepts. (#168, #173)
+- Aligned the outbox schema guidance with the SQL backend (no `ensure_schema` in production), refreshed the contradictory and stale documentation across crates, fixed the `SECURITY.md` supported-versions table and the MSRV policy, and corrected the unresolved rustdoc link to `ErasedHandler`. (#237, #238, #260, #198)
 
 ## [0.4.0] - 2026-06-02
 
@@ -240,8 +296,9 @@ First public release. Ships the transactional outbox feature end to end against 
 
 This is the first published version, so no upgrade path applies.
 
-[Unreleased]: https://github.com/nubster-opensources/hexeract/compare/v0.4.0...HEAD
-[0.4.0]: https://github.com/nubster-opensources/hexeract/releases/tag/v0.4.0
+[Unreleased]: https://github.com/nubster-opensources/hexeract/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/nubster-opensources/hexeract/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/nubster-opensources/hexeract/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/nubster-opensources/hexeract/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/nubster-opensources/hexeract/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/nubster-opensources/hexeract/compare/v0.1.0...v0.2.0

@@ -10,7 +10,7 @@ publish = false
 workspace = true
 
 [dependencies]
-hexeract = { path = "../hexeract", version = "0.4", features = [
+hexeract = { path = "../hexeract", version = "0.5", features = [
   "core",
   "macros",
   "mediator",
