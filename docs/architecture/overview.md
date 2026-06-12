@@ -13,7 +13,7 @@ graph TD
     facade["hexeract<br/>curated re-exports"]
 
     outbox["hexeract-outbox<br/>backend-agnostic core"]
-    pg["hexeract-outbox-postgres<br/>lapin/deadpool_postgres"]
+    sql["hexeract-outbox-sql<br/>sqlx · postgres/mysql/sqlite"]
 
     bus["hexeract-bus<br/>backend-agnostic core"]
     rmq["hexeract-bus-rabbitmq<br/>lapin"]
@@ -21,11 +21,11 @@ graph TD
     cli["hexeract-cli<br/>binary `hexeract`"]
 
     outbox --> core
-    pg --> outbox
+    sql --> outbox
     bus --> core
     rmq --> bus
     cli --> outbox
-    cli --> pg
+    cli --> sql
     cli --> bus
     cli --> rmq
     facade --> outbox
@@ -44,7 +44,7 @@ graph TD
 | --- | --- | --- |
 | `hexeract-core` | Cross-cutting primitives: `MessageId`, `CorrelationId`, `HandlerContext`, middleware traits. | Stable |
 | `hexeract-outbox` | Outbox pattern building blocks: `Event`, `OutboxEnvelope`, `OutboxPublisher`, `OutboxStore`, `OutboxWorker`. | Stable |
-| `hexeract-outbox-postgres` | PostgreSQL backend powered by `deadpool_postgres`, BYO-schema strategy. | Stable |
+| `hexeract-outbox-sql` | PostgreSQL, MySQL and SQLite backends powered by `sqlx`, one backend per Cargo feature; canonical schema via `Dialect::schema_ddl`. | Stable |
 | `hexeract-bus` | Bus pattern building blocks: `Message`, `BusEnvelope`, `Transport`, `Handler`, topology types. | Stable |
 | `hexeract-bus-rabbitmq` | RabbitMQ backend powered by `lapin`. `RabbitMqTransport`, `RabbitMqWorker`, topology helpers. | Stable |
 | `hexeract-cli` | Binary `hexeract`. Subcommands `outbox patch/apply/check` and `bus declare/peek/purge`. | Stable |
@@ -55,8 +55,8 @@ graph TD
 
 ## Layering principles
 
-1. **Each feature has a backend-agnostic core crate** (`hexeract-bus`, `hexeract-outbox`). Backends live in companion crates (`hexeract-bus-rabbitmq`, `hexeract-outbox-postgres`) so MSRV and dependency churn stay scoped.
-2. **No backend crate depends on another backend crate.** A project that only needs the outbox never compiles `lapin`; a project that only needs the bus never compiles `tokio-postgres`.
+1. **Each feature has a backend-agnostic core crate** (`hexeract-bus`, `hexeract-outbox`). Backends live in companion crates (`hexeract-bus-rabbitmq`, `hexeract-outbox-sql`) so MSRV and dependency churn stay scoped.
+2. **No backend crate depends on another backend crate.** A project that only needs the outbox never compiles `lapin`; a project that only needs the bus never compiles `sqlx`.
 3. **Symmetry between features.** `OutboxWorker` and `RabbitMqWorker` expose mirrored fluent builders, `OutboxPublisher` and `Transport` mirror their publish APIs. Once you know one, the other reads itself.
 4. **The CLI is a thin operator-facing wrapper.** Every CLI subcommand maps one-to-one to a library API. Anything the CLI can do can also be done from code.
 
@@ -75,8 +75,6 @@ crates/
 │   └── src/{envelope,error,event,handler,publisher,worker}.rs
 ├── hexeract-outbox-sql/
 │   └── src/{dialect,envelope,validate,postgres,mysql,sqlite}.rs
-├── hexeract-outbox-postgres/
-│   └── src/{builder,publisher,schema,store}.rs
 ├── hexeract-examples/
 │   └── examples/{01_command_handler,02_outbox_transactional,03_bus_pubsub,04_bus_mediator,05_orders_to_payments}.rs
 └── hexeract-cli/

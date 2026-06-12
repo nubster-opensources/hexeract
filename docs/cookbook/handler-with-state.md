@@ -9,8 +9,8 @@ This page is the recipe for that wiring.
 ```rust
 use std::sync::Arc;
 
-use deadpool_postgres::Pool;
 use hexeract::core::{Command, CommandHandler, HandlerContext, HexeractError};
+use sqlx::PgPool;
 
 pub struct AppConfig {
     pub feature_send_welcome_email: bool,
@@ -26,12 +26,12 @@ impl Command for CreateUser {
 }
 
 pub struct CreateUserHandler {
-    pool: Pool,
+    pool: PgPool,
     config: Arc<AppConfig>,
 }
 
 impl CreateUserHandler {
-    pub fn new(pool: Pool, config: Arc<AppConfig>) -> Self {
+    pub fn new(pool: PgPool, config: Arc<AppConfig>) -> Self {
         Self { pool, config }
     }
 }
@@ -85,7 +85,7 @@ let mediator = MediatorBuilder::new()
 
 ```rust,ignore
 struct AppState {
-    pool: Pool,
+    pool: PgPool,
     config: Arc<AppConfig>,
     audit: Arc<AuditLog>,
 }
@@ -113,7 +113,7 @@ If your configuration is reloadable (config files watched at runtime), store it 
 use arc_swap::ArcSwap;
 
 pub struct CreateUserHandler {
-    pool: Pool,
+    pool: PgPool,
     config: Arc<ArcSwap<AppConfig>>,
 }
 
@@ -131,7 +131,7 @@ The reload mechanism (file watcher, signal handler, admin endpoint) calls `self.
 
 ## Connection pool sizing
 
-Hexeract is `Send + Sync` and clonable. Once the mediator is built, you can clone it freely and dispatch concurrently. Connection pool sizing decisions live in the pool itself (`deadpool_postgres`, `sqlx::PgPool`, etc.), not in the mediator. The standard `5 * num_cpus` heuristic for `deadpool_postgres` is a reasonable starting point.
+Hexeract is `Send + Sync` and clonable. Once the mediator is built, you can clone it freely and dispatch concurrently. Connection pool sizing decisions live in the pool itself, not in the mediator. For `sqlx::PgPool`, set the limit via `sqlx::postgres::PgPoolOptions::new().max_connections(n)`. The standard `5 * num_cpus` heuristic is a reasonable starting point; adjust upward if your handlers are I/O-bound and hold connections briefly.
 
 ## What about per-request state?
 
@@ -142,6 +142,6 @@ If you need per-dispatch state (a request id from an HTTP middleware, a user ide
 
 ## Pitfalls
 
-**Holding a `Pool` directly rather than an `Arc<Pool>` is fine.** `deadpool_postgres::Pool` already clones cheaply through an internal `Arc`. Same for `sqlx::PgPool`. Wrapping it in another `Arc` is harmless but redundant.
+**Holding a `PgPool` directly rather than an `Arc<PgPool>` is fine.** `sqlx::PgPool` already clones cheaply through an internal `Arc`. Wrapping it in another `Arc` is harmless but redundant.
 
 **`tokio::sync::Mutex` in a handler.** Acceptable but be aware: an `async fn handle` that locks a `tokio::sync::Mutex` will serialize all dispatches for that handler. For commands with single-handler semantics this might be exactly what you want; for queries it serializes reads, which is rarely what you want. Prefer interior mutability through `arc_swap` or `dashmap` for read-heavy paths.

@@ -65,7 +65,7 @@ git push origin v<TARGET>
 
 The tag push triggers [`.github/workflows/release.yml`](../.github/workflows/release.yml) which:
 
-1. Publishes the seven workspace crates to crates.io in dependency order (`hexeract-core` → `hexeract-outbox` → `hexeract-outbox-postgres` → `hexeract-macros` → `hexeract-mediator` → `hexeract-cli` → `hexeract` facade), with 30 s sleeps between each to let the crates.io index propagate.
+1. Publishes the ten workspace crates to crates.io in dependency order (`hexeract-core` → `hexeract-outbox` → `hexeract-outbox-sql` → `hexeract-bus` → `hexeract-bus-rabbitmq` → `hexeract-mediator` → `hexeract-middleware` → `hexeract-macros` → `hexeract-cli` → `hexeract` facade), with 30 s sleeps between each to let the crates.io index propagate.
 2. Creates a GitHub Release whose notes are extracted from the `[<TARGET>]` section of `CHANGELOG.md`.
 
 Tagging is deliberately a manual step so the human reviewing the PR is also the one who triggers the publish, with full awareness of what is about to leave the workshop.

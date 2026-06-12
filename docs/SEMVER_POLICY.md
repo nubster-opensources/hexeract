@@ -26,7 +26,7 @@ The public API consists of every item that is reachable from a crate's root thro
 - Public types, traits, functions, constants and modules.
 - Trait method signatures and associated types.
 - Public re-exports from sibling crates (the facade crate `hexeract` re-exports curated items).
-- The on-disk schema produced by `hexeract-outbox-postgres::POSTGRES_SCHEMA_SQL`. Schema changes that require migration are treated as breaking changes.
+- The on-disk schema produced by `hexeract_outbox_sql::Dialect::schema_ddl` (and its predecessors). Schema changes that require migration are treated as breaking changes.
 
 Items that are explicitly NOT part of the public API:
 

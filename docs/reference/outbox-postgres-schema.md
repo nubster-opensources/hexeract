@@ -10,12 +10,12 @@ Generate the canonical SQL with the `hexeract` CLI:
 hexeract outbox patch --table audit_outbox
 ```
 
-You can also pull it from the `POSTGRES_SCHEMA_SQL` constant in `hexeract-outbox-postgres` if you prefer programmatic access:
+You can also generate it programmatically via `Dialect::schema_ddl`:
 
 ```rust
-use hexeract_outbox_postgres::render_schema;
+use hexeract_outbox_sql::Dialect;
 
-let sql = render_schema("audit_outbox")?;
+let sql = Dialect::Postgres.schema_ddl("audit_outbox")?;
 ```
 
 The rendered SQL is:

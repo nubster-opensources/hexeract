@@ -4,8 +4,8 @@ Run through this list before letting a Hexeract-powered service answer a real wo
 
 ## Outbox
 
-- [ ] **Schema applied.** Either `POSTGRES_SCHEMA_SQL` rendered with your table name or `ensure_schema(pool, "<table>")` ran at startup. See [outbox PostgreSQL schema](../reference/outbox-postgres-schema.md).
-- [ ] **Pool sized for both writers and the worker.** Each `OutboxWorker` instance holds one connection per poll cycle; size your `deadpool_postgres::Pool` at least `business_writers + workers + headroom`.
+- [ ] **Schema applied via migration tooling.** Generate the canonical DDL with `hexeract outbox patch --table <name>` (or programmatically via `Dialect::Postgres.schema_ddl("<name>")?`) and apply it through your versioned migration tool before deployment. `hexeract_outbox_sql::postgres::ensure_schema(&pool, "<name>")` is an idempotent helper reserved for POC and integration tests; do not call it at production startup (the runtime role should not hold DDL privileges). See [outbox PostgreSQL schema](../reference/outbox-postgres-schema.md).
+- [ ] **Pool sized for both writers and the worker.** Each `OutboxWorker` instance holds one connection per poll cycle; size your `sqlx::PgPool` at least `business_writers + workers + headroom` (configure via `sqlx::postgres::PgPoolOptions::new().max_connections(n)`).
 - [ ] **Idempotency wired on the handler side.** Handlers can be redelivered. Store a `processed_event_id` table or short-circuit on a deduplication key.
 - [ ] **Tuning matches your latency target.** Default `poll_interval = 100 ms` gives a publish-to-dispatch p99 around 200 ms. Drop to `20-50 ms` for tighter SLOs, scale workers horizontally before lowering further.
 - [ ] **`max_attempts` not silently absorbing bugs.** A row past `max_attempts` stops being polled. Audit pending failures with `SELECT event_id, last_error FROM audit_outbox WHERE delivered_at IS NULL AND attempts >= 5`.
