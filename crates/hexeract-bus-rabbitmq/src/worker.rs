@@ -2,7 +2,7 @@
 //!
 //! The worker mirrors `hexeract_outbox::OutboxWorker`: it consumes
 //! from a queue, decodes each delivery into the matching typed
-//! handler via [`ErasedHandler`], and applies ack / nack semantics
+//! handler via [`ErasedHandler`](hexeract_bus::ErasedHandler), and applies ack / nack semantics
 //! based on the configured [`AckMode`].
 //!
 //! See [`RabbitMqWorkerBuilder`] for the entry point.
