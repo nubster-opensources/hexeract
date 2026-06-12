@@ -1,6 +1,6 @@
 # Bus flow
 
-The bus carries messages between processes through a broker (RabbitMQ in v0.2.0). Producers serialize a typed [`Message`](../concepts/message-envelope.md) into a [`BusEnvelope`](../concepts/message-envelope.md), publish through a [`Transport`](../reference/hexeract-bus.md), and consumers receive deliveries through a [`Worker`](../concepts/worker.md) that dispatches to a typed [`Handler`](../concepts/worker.md).
+The bus carries messages between processes through a broker (RabbitMQ). Producers serialize a typed [`Message`](../concepts/message-envelope.md) into a [`BusEnvelope`](../concepts/message-envelope.md), publish through a [`Transport`](../reference/hexeract-bus.md), and consumers receive deliveries through a [`Worker`](../concepts/worker.md) that dispatches to a typed [`Handler`](../concepts/worker.md).
 
 ## Publish then consume
 

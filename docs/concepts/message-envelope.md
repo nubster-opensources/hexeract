@@ -25,9 +25,9 @@ Each side wraps the user payload in an envelope. The envelope is what crosses th
 | `message_id` / `event_id` | UUIDv7, minted by the publisher | UUIDv7, minted by the publisher | Stable identifier for the unit of work |
 | `message_type` / `event_type` | `M::MESSAGE_TYPE` | `E::EVENT_TYPE` | Dispatch key on the consumer side |
 | `payload` | JSON bytes | JSON bytes | Serialised body of the user struct |
-| `correlation_id` | UUIDv7 (required) | not applicable in v0.1.0 | Causal chain identifier |
+| `correlation_id` | UUIDv7 (required) | not applicable | Causal chain identifier |
 | `reply_to` | `Option<String>` (AMQP property) | not applicable | Request-reply hint |
-| `headers` | `HashMap<String, String>` | not applicable in v0.1.0 | Trace context, tenancy, custom metadata |
+| `headers` | `HashMap<String, String>` | not applicable | Trace context, tenancy, custom metadata |
 | `subject_id` | not applicable | `Option<Uuid>` | Aggregate identifier for partial ordering |
 | `attempts` | not exposed (in-memory) | `i32` (persisted) | Retry counter |
 | `next_retry_at` | not applicable | `Option<SystemTime>` | Cooldown for the next dispatch |
