@@ -17,14 +17,14 @@ categories = ["asynchronous", "network-programming"]
 workspace = true
 
 [dependencies]
-hexeract-bus = { path = "../hexeract-bus", version = "0.4", optional = true }
-hexeract-bus-rabbitmq = { path = "../hexeract-bus-rabbitmq", version = "0.4", optional = true }
-hexeract-core = { path = "../hexeract-core", version = "0.4", optional = true }
-hexeract-macros = { path = "../hexeract-macros", version = "0.4", optional = true }
-hexeract-mediator = { path = "../hexeract-mediator", version = "0.4", optional = true }
-hexeract-middleware = { path = "../hexeract-middleware", version = "0.4", optional = true }
-hexeract-outbox = { path = "../hexeract-outbox", version = "0.4", optional = true }
-hexeract-outbox-sql = { path = "../hexeract-outbox-sql", version = "0.4", optional = true, default-features = false }
+hexeract-bus = { path = "../hexeract-bus", version = "0.5", optional = true }
+hexeract-bus-rabbitmq = { path = "../hexeract-bus-rabbitmq", version = "0.5", optional = true }
+hexeract-core = { path = "../hexeract-core", version = "0.5", optional = true }
+hexeract-macros = { path = "../hexeract-macros", version = "0.5", optional = true }
+hexeract-mediator = { path = "../hexeract-mediator", version = "0.5", optional = true }
+hexeract-middleware = { path = "../hexeract-middleware", version = "0.5", optional = true }
+hexeract-outbox = { path = "../hexeract-outbox", version = "0.5", optional = true }
+hexeract-outbox-sql = { path = "../hexeract-outbox-sql", version = "0.5", optional = true, default-features = false }
 
 [features]
 default = []

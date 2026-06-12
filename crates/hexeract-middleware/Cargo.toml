@@ -17,11 +17,11 @@ categories = ["asynchronous"]
 workspace = true
 
 [dependencies]
-hexeract-core = { path = "../hexeract-core", version = "0.4" }
+hexeract-core = { path = "../hexeract-core", version = "0.5" }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
-hexeract-mediator = { path = "../hexeract-mediator", version = "0.4" }
+hexeract-mediator = { path = "../hexeract-mediator", version = "0.5" }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }
 tracing-test = { workspace = true }

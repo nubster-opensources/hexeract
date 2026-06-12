@@ -8,7 +8,7 @@ This guide wires a mediator with one handler per channel and dispatches each one
 
 ```toml
 [dependencies]
-hexeract = { version = "0.3", features = ["mediator"] }
+hexeract = { version = "0.5", features = ["mediator"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

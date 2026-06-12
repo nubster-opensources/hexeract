@@ -15,21 +15,21 @@
 //!
 //! ```toml
 //! [dependencies]
-//! hexeract = { version = "0.4", features = ["outbox-sql-postgres"] }
+//! hexeract = { version = "0.5", features = ["outbox-sql-postgres"] }
 //! ```
 //!
 //! Bus over RabbitMQ:
 //!
 //! ```toml
 //! [dependencies]
-//! hexeract = { version = "0.4", features = ["bus-rabbitmq"] }
+//! hexeract = { version = "0.5", features = ["bus-rabbitmq"] }
 //! ```
 //!
 //! Both together:
 //!
 //! ```toml
 //! [dependencies]
-//! hexeract = { version = "0.4", features = ["outbox-sql-postgres", "bus-rabbitmq"] }
+//! hexeract = { version = "0.5", features = ["outbox-sql-postgres", "bus-rabbitmq"] }
 //! ```
 //!
 //! # Feature matrix
