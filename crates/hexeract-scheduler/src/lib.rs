@@ -16,6 +16,9 @@
 //!   current occurrence.
 //! - [`OccurrenceId`] is the stable, content-derived identity of a single
 //!   firing, used downstream as the deduplication key.
+//! - [`ScheduleStore`] is the backend-agnostic persistence contract, with
+//!   its crash-safe claim and lease protocol. [`InMemoryScheduleStore`] is
+//!   a reference implementation for tests.
 //! - [`SchedulerError`] is the unified error type.
 //!
 //! # Time zone
@@ -25,17 +28,29 @@
 
 /// The unified scheduler error type.
 pub mod error;
+/// A due occurrence claimed under a lease.
+pub mod lease;
+/// An in-memory reference implementation of [`ScheduleStore`].
+pub mod memory;
 /// Stable identity of a single firing of a schedule.
 pub mod occurrence;
 /// A message persisted for future delivery.
 pub mod schedule;
+/// A read-only view of a schedule's state.
+pub mod snapshot;
+/// The backend-agnostic persistence contract.
+pub mod store;
 /// The dispatch target of a scheduled message.
 pub mod target;
 /// When a scheduled message fires.
 pub mod trigger;
 
 pub use error::SchedulerError;
+pub use lease::LeasedOccurrence;
+pub use memory::InMemoryScheduleStore;
 pub use occurrence::OccurrenceId;
 pub use schedule::ScheduledMessage;
+pub use snapshot::{ScheduleSnapshot, ScheduleStatus};
+pub use store::ScheduleStore;
 pub use target::Target;
 pub use trigger::{CronExpression, Trigger};
