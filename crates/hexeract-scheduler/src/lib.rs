@@ -1,0 +1,41 @@
+//! Backend-agnostic scheduling primitives for the Hexeract messaging framework.
+//!
+//! The scheduler is the outbox plus time: it persists a message together
+//! with the instant it is due and an optional recurrence rule, then relays
+//! it once that instant is reached. This crate ships the domain layer only:
+//! the value types that backends and dispatch targets build upon. It pulls
+//! in no database driver and runs entirely in isolation.
+//!
+//! # Building blocks
+//!
+//! - [`Trigger`] describes when a message fires: once at an instant
+//!   ([`Trigger::delay`]) or repeatedly on a UTC cron expression
+//!   ([`Trigger::cron`]).
+//! - [`ScheduledMessage`] wraps the serialized event, its dispatch
+//!   [`Target`] and its [`Trigger`] together with the instant of the
+//!   current occurrence.
+//! - [`OccurrenceId`] is the stable, content-derived identity of a single
+//!   firing, used downstream as the deduplication key.
+//! - [`SchedulerError`] is the unified error type.
+//!
+//! # Time zone
+//!
+//! All instants are UTC. Per-schedule time zones are an explicit non-goal
+//! of this version.
+
+/// The unified scheduler error type.
+pub mod error;
+/// Stable identity of a single firing of a schedule.
+pub mod occurrence;
+/// A message persisted for future delivery.
+pub mod schedule;
+/// The dispatch target of a scheduled message.
+pub mod target;
+/// When a scheduled message fires.
+pub mod trigger;
+
+pub use error::SchedulerError;
+pub use occurrence::OccurrenceId;
+pub use schedule::ScheduledMessage;
+pub use target::Target;
+pub use trigger::{CronExpression, Trigger};

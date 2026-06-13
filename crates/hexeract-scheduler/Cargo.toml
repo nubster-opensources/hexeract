@@ -1,0 +1,30 @@
+[package]
+name = "hexeract-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Backend-agnostic scheduling primitives for the Hexeract messaging framework"
+readme = "../../README.md"
+exclude = ["/tests", "/examples", "/benches"]
+keywords = ["messaging", "scheduler", "cron", "outbox", "events"]
+categories = ["asynchronous", "date-and-time"]
+
+[lints]
+workspace = true
+
+[dependencies]
+hexeract-outbox = { path = "../hexeract-outbox", version = "0.5" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true, features = ["v5", "v7"] }
+
+[dev-dependencies]
+serde = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
