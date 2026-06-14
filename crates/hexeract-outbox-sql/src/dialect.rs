@@ -182,7 +182,13 @@ impl Dialect {
     /// Render the bind placeholder for the 1-based parameter `index`.
     ///
     /// PostgreSQL uses positional `$1`, `$2`; MySQL and SQLite use `?`.
-    pub(crate) fn placeholder(self, index: usize) -> String {
+    ///
+    /// Exposed for sibling SQL backend crates (such as the scheduler) that
+    /// render their own statements against the same dialects. Not part of the
+    /// stable public API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn placeholder(self, index: usize) -> String {
         match self {
             Self::Postgres => format!("${index}"),
             Self::MySql | Self::Sqlite => "?".to_owned(),
@@ -197,7 +203,13 @@ impl Dialect {
     /// The name is assumed to have passed [`validate_table_name`], so it cannot
     /// contain a quote character and quoting only restores reserved-word and
     /// case handling.
-    pub(crate) fn quote_identifier(self, name: &str) -> String {
+    ///
+    /// Exposed for sibling SQL backend crates (such as the scheduler) so the
+    /// injection-safe quoting rule has a single source of truth. Not part of
+    /// the stable public API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn quote_identifier(self, name: &str) -> String {
         match self {
             Self::Postgres | Self::Sqlite => format!("\"{name}\""),
             Self::MySql => format!("`{name}`"),
@@ -206,7 +218,12 @@ impl Dialect {
 
     /// SQL expression evaluating to the current instant, in a form
     /// comparable to the stored timestamps.
-    pub(crate) fn now_expr(self) -> &'static str {
+    ///
+    /// Exposed for sibling SQL backend crates (such as the scheduler). Not
+    /// part of the stable public API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn now_expr(self) -> &'static str {
         match self {
             Self::Postgres => "NOW()",
             // UTC_TIMESTAMP(6) is independent of the server session time zone
@@ -230,7 +247,13 @@ impl Dialect {
     /// matching scalar: PostgreSQL binds seconds as `f64`, MySQL binds whole
     /// microseconds as `i64`, and SQLite binds a `strftime` modifier string
     /// such as `"+1.500 seconds"`.
-    pub(crate) fn now_plus_interval_expr(self, index: usize) -> String {
+    ///
+    /// Exposed for sibling SQL backend crates (such as the scheduler) so the
+    /// database-clock lease anchoring (#230) has a single source of truth. Not
+    /// part of the stable public API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn now_plus_interval_expr(self, index: usize) -> String {
         let ph = self.placeholder(index);
         match self {
             Self::Postgres => {

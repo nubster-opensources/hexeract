@@ -13,9 +13,10 @@
 //! - `mysql`
 //! - `sqlite`
 //!
-//! This module ships the schema DDL ([`schema`]); the `sqlx`-backed
-//! [`hexeract_scheduler::ScheduleStore`] implementations are added on top of
-//! it.
+//! This module ships the schema DDL ([`schema`]) and a `sqlx`-backed
+//! [`hexeract_scheduler::ScheduleStore`] per backend: [`PgScheduleStore`],
+//! [`MySqlScheduleStore`] and [`SqliteScheduleStore`], each gated by its
+//! Cargo feature.
 //!
 //! [`Dialect`]: hexeract_outbox_sql::Dialect
 
@@ -24,11 +25,28 @@ compile_error!(
     "hexeract-scheduler-sql requires at least one backend feature: `postgres`, `mysql` or `sqlite`"
 );
 
+mod mapping;
 /// Canonical schema DDL for the `scheduled_messages` table.
 pub mod schema;
+mod statements;
+mod timestamp;
 mod validate;
 
+#[cfg(feature = "mysql")]
+mod mysql;
+#[cfg(feature = "postgres")]
+mod postgres;
+#[cfg(feature = "sqlite")]
+mod sqlite;
+
 pub use hexeract_outbox_sql::Dialect;
+
+#[cfg(feature = "mysql")]
+pub use mysql::MySqlScheduleStore;
+#[cfg(feature = "postgres")]
+pub use postgres::PgScheduleStore;
+#[cfg(feature = "sqlite")]
+pub use sqlite::SqliteScheduleStore;
 
 /// Default scheduler table name used when a table name is not set.
 pub const DEFAULT_TABLE_NAME: &str = "scheduled_messages";
