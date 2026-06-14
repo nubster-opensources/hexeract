@@ -38,6 +38,13 @@ pub enum SchedulerError {
         schedule_id: Uuid,
     },
 
+    /// A sink failed to dispatch a due occurrence.
+    ///
+    /// The original error is preserved as a boxed source. The worker treats
+    /// it as a failed attempt and retries or dead-letters the occurrence.
+    #[error("failed to dispatch occurrence to sink")]
+    Dispatch(#[source] Box<dyn std::error::Error + Send + Sync>),
+
     /// An invariant of the scheduler machinery was violated.
     ///
     /// Signals a bug in the framework itself, not a recoverable error.
@@ -64,6 +71,12 @@ impl SchedulerError {
     #[must_use]
     pub fn schedule_not_found(schedule_id: Uuid) -> Self {
         Self::ScheduleNotFound { schedule_id }
+    }
+
+    /// Build an [`SchedulerError::Dispatch`] from a sink error.
+    #[must_use]
+    pub fn dispatch(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Dispatch(Box::new(source))
     }
 
     /// Build an [`SchedulerError::Internal`] from a message.
@@ -108,5 +121,14 @@ mod tests {
         let error = SchedulerError::schedule_not_found(schedule_id);
         assert!(error.to_string().contains(&schedule_id.to_string()));
         assert!(matches!(error, SchedulerError::ScheduleNotFound { .. }));
+    }
+
+    #[test]
+    fn dispatch_error_preserves_source_chain() {
+        let inner = std::io::Error::other("sink unreachable");
+        let error = SchedulerError::dispatch(inner);
+        let source = std::error::Error::source(&error).expect("source must be set");
+        assert_eq!(source.to_string(), "sink unreachable");
+        assert!(matches!(error, SchedulerError::Dispatch(_)));
     }
 }

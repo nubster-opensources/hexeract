@@ -19,6 +19,8 @@
 //! - [`ScheduleStore`] is the backend-agnostic persistence contract, with
 //!   its crash-safe claim and lease protocol. [`InMemoryScheduleStore`] is
 //!   a reference implementation for tests.
+//! - [`ScheduleSink`] is the contract a due occurrence is dispatched
+//!   through, with at-least-once delivery semantics.
 //! - [`SchedulerError`] is the unified error type.
 //!
 //! # Time zone
@@ -36,6 +38,8 @@ pub mod memory;
 pub mod occurrence;
 /// A message persisted for future delivery.
 pub mod schedule;
+/// The contract a due occurrence is dispatched through.
+pub mod sink;
 /// A read-only view of a schedule's state.
 pub mod snapshot;
 /// The backend-agnostic persistence contract.
@@ -50,6 +54,7 @@ pub use lease::LeasedOccurrence;
 pub use memory::InMemoryScheduleStore;
 pub use occurrence::OccurrenceId;
 pub use schedule::ScheduledMessage;
+pub use sink::ScheduleSink;
 pub use snapshot::{ScheduleSnapshot, ScheduleStatus};
 pub use store::ScheduleStore;
 pub use target::Target;
