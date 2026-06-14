@@ -26,6 +26,20 @@ fn false_literal(dialect: Dialect) -> &'static str {
     }
 }
 
+/// Prefix each comma-separated column in `columns` with the quoted table name.
+///
+/// PostgreSQL's claim joins the target table against a `due` CTE that also
+/// exposes `schedule_id`, so a bare `RETURNING schedule_id` is ambiguous. The
+/// columns are qualified to disambiguate them against the CTE.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+fn qualify_columns(qtable: &str, columns: &str) -> String {
+    columns
+        .split(", ")
+        .map(|column| format!("{qtable}.{column}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The eligibility predicate shared by every claim variant (without a leading
 /// `WHERE`).
 ///
@@ -76,18 +90,21 @@ pub(crate) fn claim_returning_sql(dialect: Dialect, table: &str) -> String {
     let limit = dialect.placeholder(2);
     let eligible = eligible_predicate(dialect);
     match dialect {
-        Dialect::Postgres => format!(
-            "WITH due AS ( \
-                 SELECT schedule_id FROM {qtable} \
-                 WHERE {eligible} \
-                 ORDER BY scheduled_for \
-                 LIMIT {limit} \
-                 FOR UPDATE SKIP LOCKED \
-             ) \
-             UPDATE {qtable} SET leased_until = {lease}, attempts = attempts + 1 \
-             FROM due WHERE {qtable}.schedule_id = due.schedule_id \
-             RETURNING {CLAIM_COLUMNS}"
-        ),
+        Dialect::Postgres => {
+            let returning = qualify_columns(&qtable, CLAIM_COLUMNS);
+            format!(
+                "WITH due AS ( \
+                     SELECT schedule_id FROM {qtable} \
+                     WHERE {eligible} \
+                     ORDER BY scheduled_for \
+                     LIMIT {limit} \
+                     FOR UPDATE SKIP LOCKED \
+                 ) \
+                 UPDATE {qtable} SET leased_until = {lease}, attempts = attempts + 1 \
+                 FROM due WHERE {qtable}.schedule_id = due.schedule_id \
+                 RETURNING {returning}"
+            )
+        }
         _ => format!(
             "UPDATE {qtable} SET leased_until = {lease}, attempts = attempts + 1 \
              WHERE schedule_id IN ( \
