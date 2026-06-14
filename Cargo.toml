@@ -9,6 +9,7 @@ members = [
     "crates/hexeract-outbox",
     "crates/hexeract-outbox-sql",
     "crates/hexeract-scheduler",
+    "crates/hexeract-scheduler-sql",
     "crates/hexeract-bus",
     "crates/hexeract-bus-rabbitmq",
     "crates/hexeract-cli",
