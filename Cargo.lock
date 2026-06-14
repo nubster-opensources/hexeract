@@ -1685,6 +1685,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "hexeract-scheduler-sql"
+version = "0.5.0"
+dependencies = [
+ "hexeract-outbox",
+ "hexeract-outbox-sql",
+ "hexeract-scheduler",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "testcontainers",
+ "testcontainers-modules",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "hexeract-umbrella-tests"
 version = "0.5.0"
 dependencies = [

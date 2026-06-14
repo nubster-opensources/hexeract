@@ -1,0 +1,43 @@
+[package]
+name = "hexeract-scheduler-sql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "SQL backends for the Hexeract scheduler via sqlx with postgres, mysql and sqlite feature flags"
+readme = "../../README.md"
+exclude = ["/tests", "/examples", "/benches"]
+keywords = ["messaging", "scheduler", "sqlx", "postgres", "cron"]
+categories = ["asynchronous", "database"]
+
+[lints]
+workspace = true
+
+[features]
+default = ["postgres"]
+postgres = ["hexeract-outbox-sql/postgres", "sqlx/postgres"]
+mysql = ["hexeract-outbox-sql/mysql", "sqlx/mysql"]
+sqlite = ["hexeract-outbox-sql/sqlite", "sqlx/sqlite"]
+
+[dependencies]
+hexeract-scheduler = { path = "../hexeract-scheduler", version = "0.5" }
+hexeract-outbox-sql = { path = "../hexeract-outbox-sql", version = "0.5", default-features = false }
+sqlx = { workspace = true, features = ["uuid", "json", "time"] }
+time = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+hexeract-outbox = { path = "../hexeract-outbox", version = "0.5" }
+serde = { workspace = true }
+tokio = { workspace = true }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true, features = ["postgres", "mysql"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
