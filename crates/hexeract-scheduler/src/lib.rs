@@ -21,6 +21,8 @@
 //!   a reference implementation for tests.
 //! - [`ScheduleSink`] is the contract a due occurrence is dispatched
 //!   through, with at-least-once delivery semantics.
+//! - [`SchedulerWorker`] drives the loop: it claims due occurrences, dispatches
+//!   them, then delivers, reschedules, retries with backoff or dead-letters.
 //! - [`SchedulerError`] is the unified error type.
 //!
 //! # Time zone
@@ -48,6 +50,8 @@ pub mod store;
 pub mod target;
 /// When a scheduled message fires.
 pub mod trigger;
+/// The polling worker that drives schedules to their sink.
+pub mod worker;
 
 pub use error::SchedulerError;
 pub use lease::LeasedOccurrence;
@@ -59,3 +63,4 @@ pub use snapshot::{ScheduleSnapshot, ScheduleStatus};
 pub use store::ScheduleStore;
 pub use target::Target;
 pub use trigger::{CronExpression, Trigger};
+pub use worker::{SchedulerWorker, SchedulerWorkerConfig};

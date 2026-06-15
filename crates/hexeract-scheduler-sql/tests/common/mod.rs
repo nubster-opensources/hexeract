@@ -296,6 +296,68 @@ pub(crate) async fn mark_delivered_excludes<S: ScheduleStore>(store: &S) {
     assert_eq!(snapshot.status, ScheduleStatus::Delivered);
 }
 
+/// A failed occurrence is deferred until `retry_at`: it is not reclaimable
+/// before that instant, becomes reclaimable at or after it, and the snapshot
+/// retains the error string. `attempts` is not incremented by `mark_failed`
+/// itself (it was already counted at claim time).
+pub(crate) async fn mark_failed_defers_reclaim_until_retry_at<S: ScheduleStore>(store: &S) {
+    let message = delay_message(past(60));
+    let schedule_id = message.schedule_id;
+    store.insert(&message, MAX_ATTEMPTS).await.expect("insert");
+
+    // Claim the occurrence: attempts advances to 1.
+    let first = store
+        .claim_due(SystemTime::now(), 10, Duration::from_secs(30))
+        .await
+        .expect("claim");
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].attempts, 1);
+
+    // Defer retry to 2 seconds in the future.
+    let retry_at = SystemTime::now() + Duration::from_secs(2);
+    store
+        .mark_failed(schedule_id, retry_at, "connection refused")
+        .await
+        .expect("mark_failed");
+
+    // Before retry_at: the occurrence must not be reclaimable.
+    let too_early = store
+        .claim_due(SystemTime::now(), 10, Duration::from_secs(30))
+        .await
+        .expect("claim before retry_at");
+    assert!(
+        too_early.is_empty(),
+        "a failed schedule must not be reclaimable before retry_at"
+    );
+
+    // The snapshot must reflect the error but remain Pending.
+    let snapshot = store
+        .inspect(schedule_id)
+        .await
+        .expect("inspect")
+        .expect("schedule exists");
+    assert_eq!(snapshot.status, ScheduleStatus::Pending);
+    assert_eq!(snapshot.last_error.as_deref(), Some("connection refused"));
+    // attempts must NOT have changed (still 1 from the claim, not 2).
+    assert_eq!(snapshot.attempts, 1);
+
+    // Wait past retry_at.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+
+    // At or after retry_at: the occurrence is reclaimable and attempts advance.
+    let reclaimed = store
+        .claim_due(SystemTime::now(), 10, Duration::from_secs(30))
+        .await
+        .expect("claim after retry_at");
+    assert_eq!(
+        reclaimed.len(),
+        1,
+        "must be reclaimable once retry_at has passed"
+    );
+    assert_eq!(reclaimed[0].attempts, 2, "attempts must advance on reclaim");
+    assert_eq!(reclaimed[0].message.schedule_id, schedule_id);
+}
+
 /// Insert `count` due one-shot schedules and return their identifiers. Used by
 /// the competing-consumer contention test, which needs raw access to the ids.
 pub(crate) async fn insert_due_batch<S: ScheduleStore>(store: &S, count: usize) -> Vec<Uuid> {
