@@ -106,6 +106,27 @@ pub trait ScheduleStore: Send + Sync + 'static {
     /// Returns [`SchedulerError::Database`] if the backend fails to update.
     async fn reschedule(&self, schedule_id: Uuid, next: SystemTime) -> Result<(), SchedulerError>;
 
+    /// Record a failed delivery attempt and defer the next claim until
+    /// `retry_at`, keeping the occurrence pending and its attempt counter
+    /// untouched.
+    ///
+    /// The attempt is advanced at claim time, not here, so a failed
+    /// occurrence keeps the attempt already consumed; this method only pushes
+    /// the lease out to `retry_at` (the worker's backoff deadline) and records
+    /// the error. The occurrence is reclaimed once `retry_at` has passed, as
+    /// long as it still has attempt budget. Idempotent: a no-op when no
+    /// schedule matches `schedule_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchedulerError::Database`] if the backend fails to update.
+    async fn mark_failed(
+        &self,
+        schedule_id: Uuid,
+        retry_at: SystemTime,
+        error: &str,
+    ) -> Result<(), SchedulerError>;
+
     /// Move a schedule to the dead-letter state, recording the last error
     /// and releasing the lease.
     ///

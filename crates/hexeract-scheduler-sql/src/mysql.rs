@@ -125,6 +125,7 @@ pub struct MySqlScheduleStore {
     claim_select_sql: Arc<str>,
     mark_delivered_sql: Arc<str>,
     reschedule_sql: Arc<str>,
+    mark_failed_sql: Arc<str>,
     mark_dead_lettered_sql: Arc<str>,
     cancel_sql: Arc<str>,
     set_paused_sql: Arc<str>,
@@ -148,6 +149,7 @@ impl MySqlScheduleStore {
             claim_select_sql: Arc::from(statements::mysql_claim_select_sql(&table_name)),
             mark_delivered_sql: Arc::from(statements::mark_delivered_sql(DIALECT, &table_name)),
             reschedule_sql: Arc::from(statements::reschedule_sql(DIALECT, &table_name)),
+            mark_failed_sql: Arc::from(statements::mark_failed_sql(DIALECT, &table_name)),
             mark_dead_lettered_sql: Arc::from(statements::mark_dead_lettered_sql(
                 DIALECT,
                 &table_name,
@@ -280,6 +282,22 @@ impl ScheduleStore for MySqlScheduleStore {
     async fn reschedule(&self, schedule_id: Uuid, next: SystemTime) -> Result<(), SchedulerError> {
         sqlx::query(&self.reschedule_sql)
             .bind(timestamp::to_primitive_utc(next))
+            .bind(schedule_id)
+            .execute(&self.pool)
+            .await
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    async fn mark_failed(
+        &self,
+        schedule_id: Uuid,
+        retry_at: SystemTime,
+        error: &str,
+    ) -> Result<(), SchedulerError> {
+        sqlx::query(&self.mark_failed_sql)
+            .bind(timestamp::to_primitive_utc(retry_at))
+            .bind(error)
             .bind(schedule_id)
             .execute(&self.pool)
             .await

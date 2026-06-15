@@ -125,6 +125,22 @@ impl ScheduleStore for InMemoryScheduleStore {
         Ok(())
     }
 
+    async fn mark_failed(
+        &self,
+        schedule_id: Uuid,
+        retry_at: SystemTime,
+        error: &str,
+    ) -> Result<(), SchedulerError> {
+        let mut schedules = self.lock()?;
+        if let Some(stored) = schedules.get_mut(&schedule_id) {
+            if stored.status == ScheduleStatus::Pending {
+                stored.leased_until = Some(retry_at);
+                stored.last_error = Some(error.to_owned());
+            }
+        }
+        Ok(())
+    }
+
     async fn mark_dead_lettered(
         &self,
         schedule_id: Uuid,
@@ -360,6 +376,36 @@ mod tests {
         let claimed = store.claim_due(next, 10, LEASE).await.unwrap();
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn mark_failed_defers_reclaim_until_retry_at() {
+        let store = InMemoryScheduleStore::default();
+        let schedule_id = insert_delay(&store, base(), 5).await;
+        let first = store.claim_due(base(), 10, LEASE).await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].attempts, 1);
+
+        let retry_at = base() + Duration::from_secs(120);
+        store
+            .mark_failed(schedule_id, retry_at, "boom")
+            .await
+            .unwrap();
+
+        let early = store
+            .claim_due(base() + Duration::from_secs(60), 10, LEASE)
+            .await
+            .unwrap();
+        assert!(early.is_empty());
+
+        let reclaimed = store.claim_due(retry_at, 10, LEASE).await.unwrap();
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].attempts, 2);
+        assert_eq!(reclaimed[0].occurrence_id(), first[0].occurrence_id());
+
+        let snapshot = store.inspect(schedule_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.last_error.as_deref(), Some("boom"));
+        assert_eq!(snapshot.status, ScheduleStatus::Pending);
     }
 
     #[tokio::test]

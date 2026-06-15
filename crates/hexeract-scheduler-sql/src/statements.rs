@@ -198,6 +198,30 @@ pub(crate) fn reschedule_sql(dialect: Dialect, table: &str) -> String {
     )
 }
 
+/// Defer the next claim of a failed occurrence by pushing `leased_until`
+/// forward to `retry_at` (parameter 1) and recording the last error
+/// (parameter 2).
+///
+/// Semantics:
+/// - Sets `leased_until = retry_at` so `claim_due` skips the row until that
+///   instant passes.
+/// - Sets `last_error = error` for observability.
+/// - Does NOT touch `attempts`, `scheduled_for`, or `status`: the attempt was
+///   already counted at claim time, and the schedule stays pending.
+/// - Idempotent: a zero-row UPDATE when no pending schedule matches is fine.
+pub(crate) fn mark_failed_sql(dialect: Dialect, table: &str) -> String {
+    let qtable = dialect.quote_identifier(table);
+    let retry_at = dialect.placeholder(1);
+    let error = dialect.placeholder(2);
+    let id = dialect.placeholder(3);
+    format!(
+        "UPDATE {qtable} \
+         SET leased_until = {retry_at}, last_error = {error} \
+         WHERE schedule_id = {id} \
+           AND delivered_at IS NULL AND cancelled_at IS NULL AND dead_lettered_at IS NULL"
+    )
+}
+
 /// Move a schedule to the dead-letter state with the last error (parameter 1),
 /// only if it is not already terminal or cancelled.
 pub(crate) fn mark_dead_lettered_sql(dialect: Dialect, table: &str) -> String {
@@ -344,6 +368,7 @@ mod tests {
                 mark_delivered_sql(dialect, "scheduled_messages"),
                 reschedule_sql(dialect, "scheduled_messages"),
                 mark_dead_lettered_sql(dialect, "scheduled_messages"),
+                mark_failed_sql(dialect, "scheduled_messages"),
             ] {
                 assert!(
                     sql.contains("delivered_at IS NULL")
@@ -353,6 +378,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn mark_failed_sets_lease_and_error_without_touching_attempts() {
+        let sql = mark_failed_sql(Dialect::Postgres, "scheduled_messages");
+        assert!(
+            sql.contains("leased_until = $1"),
+            "must defer via leased_until: {sql}"
+        );
+        assert!(sql.contains("last_error = $2"), "must record error: {sql}");
+        assert!(!sql.contains("attempts"), "must not modify attempts: {sql}");
+        assert!(
+            !sql.contains("scheduled_for"),
+            "must not modify scheduled_for: {sql}"
+        );
+        assert!(
+            sql.contains("WHERE schedule_id = $3"),
+            "must filter by schedule_id: {sql}"
+        );
     }
 
     #[test]

@@ -57,4 +57,5 @@ backend_scenarios!(
     pause_excludes_then_resume_reenables,
     dead_letter_excludes_and_records_error,
     mark_delivered_excludes,
+    mark_failed_defers_reclaim_until_retry_at,
 );
