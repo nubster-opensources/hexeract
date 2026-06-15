@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 ## [Unreleased]
 
 ### Added
-- _Items in flight will be listed here until the next release._
+- `hexeract-scheduler`: cron trigger engine backed by the `isochron` crate. `CronExpression::parse` now fully validates expressions (field-level ranges, steps, lists, named months and days, and macros such as `@daily`) and rejects malformed ones at schedule time with a typed `SchedulerError::InvalidTrigger`. `CronExpression::next_occurrence` computes the next UTC occurrence strictly after an instant, and `CronExpression::next_due` applies the fire-once misfire policy by anchoring the search on `max(now, previous due)`, so occurrences missed during downtime collapse into a single fire. (#274)
 
 ## [0.5.0] - 2026-06-12
 

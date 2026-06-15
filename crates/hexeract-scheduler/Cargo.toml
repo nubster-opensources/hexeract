@@ -18,8 +18,10 @@ workspace = true
 
 [dependencies]
 hexeract-outbox = { path = "../hexeract-outbox", version = "0.5" }
+isochron = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+time = { workspace = true }
 trait-variant = { workspace = true }
 uuid = { workspace = true, features = ["v5", "v7"] }
 

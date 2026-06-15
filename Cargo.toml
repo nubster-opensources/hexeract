@@ -57,6 +57,7 @@ syn = { version = "2", features = ["full"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring"] }
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 fastrand = "2"
+isochron = "0.1"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
