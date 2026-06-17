@@ -17,6 +17,7 @@ use hexeract_core::HandlerContext;
 use hexeract_outbox::ErasedHandler;
 use hexeract_outbox::Event;
 use hexeract_outbox::Handler;
+use hexeract_outbox::IdempotentOutboxEnqueue;
 use hexeract_outbox::OutboxError;
 use hexeract_outbox::OutboxPublisher;
 use hexeract_outbox::OutboxWorker;
@@ -259,4 +260,78 @@ async fn multi_worker_skip_locked_prevents_double_dispatch() {
             .await
             .unwrap();
     assert_eq!(delivered, i64::try_from(event_count).unwrap());
+}
+
+#[tokio::test]
+#[ignore = "runs in the integration workflow"]
+async fn enqueue_idempotent_twice_inserts_one_row() {
+    let (_container, pool) = setup().await;
+    let publisher = PgOutboxPublisher::new(pool.clone(), TABLE).unwrap();
+
+    let event_id = Uuid::now_v7();
+    let inserted = publisher
+        .enqueue_idempotent(event_id, "x.due", b"{\"k\":1}")
+        .await
+        .unwrap();
+    assert!(inserted, "first enqueue must insert a new row");
+
+    let duplicate = publisher
+        .enqueue_idempotent(event_id, "x.due", b"{\"k\":1}")
+        .await
+        .unwrap();
+    assert!(
+        !duplicate,
+        "second enqueue with same event_id must be a no-op"
+    );
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_outbox WHERE event_id = $1")
+        .bind(event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "exactly one row must exist after two enqueues");
+}
+
+#[tokio::test]
+#[ignore = "runs in the integration workflow"]
+async fn idempotent_enqueue_delivered_once_by_worker() {
+    let (_container, pool) = setup().await;
+    let publisher = PgOutboxPublisher::new(pool.clone(), TABLE).unwrap();
+    let store = PgOutboxStore::new(pool.clone(), TABLE).unwrap();
+
+    let event_id = Uuid::now_v7();
+    publisher
+        .enqueue_idempotent(event_id, "users.registered", b"{\"user_id\":\"00000000-0000-0000-0000-000000000001\",\"email\":\"idem@example.com\"}")
+        .await
+        .unwrap();
+    publisher
+        .enqueue_idempotent(event_id, "users.registered", b"{\"user_id\":\"00000000-0000-0000-0000-000000000001\",\"email\":\"idem@example.com\"}")
+        .await
+        .unwrap();
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let worker = OutboxWorker::new(
+        store,
+        registry_with(RecordingHandler {
+            seen: Arc::clone(&seen),
+        }),
+        OutboxWorkerConfig::default(),
+    );
+    let cancel = CancellationToken::new();
+    let join = tokio::spawn(worker.run(cancel.clone()));
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    cancel.cancel();
+    join.await.unwrap().unwrap();
+
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "the event must be dispatched exactly once despite two enqueues"
+    );
+    assert_eq!(
+        delivered_count(&pool, event_id).await,
+        1,
+        "the row must be marked delivered exactly once"
+    );
 }
