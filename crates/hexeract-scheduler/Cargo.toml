@@ -16,10 +16,17 @@ categories = ["asynchronous", "date-and-time"]
 [lints]
 workspace = true
 
+[features]
+default = []
+mediator = ["dep:hexeract-core", "dep:hexeract-mediator", "dep:serde"]
+
 [dependencies]
 fastrand = { workspace = true }
+hexeract-core = { path = "../hexeract-core", version = "0.5", optional = true }
+hexeract-mediator = { path = "../hexeract-mediator", version = "0.5", optional = true }
 hexeract-outbox = { path = "../hexeract-outbox", version = "0.5" }
 isochron = { workspace = true }
+serde = { workspace = true, optional = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }

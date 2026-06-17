@@ -34,6 +34,9 @@
 pub mod error;
 /// A due occurrence claimed under a lease.
 pub mod lease;
+/// In-process sink that republishes a due occurrence through the mediator.
+#[cfg(feature = "mediator")]
+pub mod mediator_sink;
 /// An in-memory reference implementation of [`ScheduleStore`].
 pub mod memory;
 /// Stable identity of a single firing of a schedule.
@@ -55,6 +58,8 @@ pub mod worker;
 
 pub use error::SchedulerError;
 pub use lease::LeasedOccurrence;
+#[cfg(feature = "mediator")]
+pub use mediator_sink::{MediatorSink, MediatorSinkBuilder};
 pub use memory::InMemoryScheduleStore;
 pub use occurrence::OccurrenceId;
 pub use schedule::ScheduledMessage;
