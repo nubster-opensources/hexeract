@@ -19,6 +19,7 @@ workspace = true
 [features]
 default = []
 mediator = ["dep:hexeract-core", "dep:hexeract-mediator", "dep:serde"]
+outbox = []
 
 [dependencies]
 fastrand = { workspace = true }

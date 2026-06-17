@@ -330,6 +330,50 @@ impl Dialect {
         )
     }
 
+    /// Idempotent insert: inserts a row keyed on `event_id` and silently
+    /// no-ops when the key already exists.
+    ///
+    /// `subject_id` is hard-coded to `NULL` in the statement because the raw
+    /// enqueue path carries no subject.
+    ///
+    /// Placeholder count and binding order differ by dialect:
+    ///
+    /// - Postgres: three positional placeholders (`$1` `$2` `$3`), using
+    ///   `ON CONFLICT (event_id) DO NOTHING`. `rows_affected` is 1 on insert,
+    ///   0 on duplicate.
+    /// - SQLite: three `?` placeholders, same `ON CONFLICT` clause.
+    /// - MySQL: four `?` placeholders (`event_id` appears twice). The statement
+    ///   uses `INSERT INTO ... SELECT ... FROM DUAL WHERE NOT EXISTS (...)` so
+    ///   that `rows_affected` is unambiguously 1 on insert and 0 on duplicate,
+    ///   independent of `CLIENT_FOUND_ROWS`. `INSERT IGNORE` is intentionally
+    ///   avoided because it silently suppresses unrelated errors such as a NOT
+    ///   NULL violation.
+    ///
+    /// Callers must bind `event_id` a second time (as the fourth parameter)
+    /// when targeting MySQL. The other two dialects bind three parameters only.
+    pub(crate) fn insert_idempotent_sql(self, table: &str) -> String {
+        let qtable = self.quote_identifier(table);
+        let p1 = self.placeholder(1);
+        let p2 = self.placeholder(2);
+        let p3 = self.placeholder(3);
+        match self {
+            Self::Postgres | Self::Sqlite => {
+                format!(
+                    "INSERT INTO {qtable} (event_id, event_type, payload, subject_id) \
+                     VALUES ({p1}, {p2}, {p3}, NULL) ON CONFLICT (event_id) DO NOTHING"
+                )
+            }
+            Self::MySql => {
+                let p4 = self.placeholder(4);
+                format!(
+                    "INSERT INTO {qtable} (event_id, event_type, payload, subject_id) \
+                     SELECT {p1}, {p2}, {p3}, NULL FROM DUAL \
+                     WHERE NOT EXISTS (SELECT 1 FROM {qtable} WHERE event_id = {p4})"
+                )
+            }
+        }
+    }
+
     /// Canonical schema DDL (table + indexes) rendered for this dialect.
     ///
     /// # Errors
@@ -557,6 +601,36 @@ mod tests {
         assert!(sql.contains("INSERT INTO `audit_outbox`"));
         assert!(!sql.contains('"'));
         assert!(sql.contains("?, ?, ?, ?"));
+    }
+
+    #[test]
+    fn postgres_insert_idempotent_sql_uses_on_conflict_do_nothing() {
+        let sql = Dialect::Postgres.insert_idempotent_sql("audit_outbox");
+        assert!(sql.contains("INSERT INTO \"audit_outbox\""));
+        assert!(sql.contains("event_id, event_type, payload, subject_id"));
+        assert!(sql.contains("$1, $2, $3, NULL"));
+        assert!(sql.contains("ON CONFLICT (event_id) DO NOTHING"));
+    }
+
+    #[test]
+    fn sqlite_insert_idempotent_sql_uses_on_conflict_do_nothing() {
+        let sql = Dialect::Sqlite.insert_idempotent_sql("audit_outbox");
+        assert!(sql.contains("INSERT INTO \"audit_outbox\""));
+        assert!(sql.contains("?, ?, ?, NULL"));
+        assert!(sql.contains("ON CONFLICT (event_id) DO NOTHING"));
+    }
+
+    #[test]
+    fn mysql_insert_idempotent_sql_uses_where_not_exists_and_backticks() {
+        let sql = Dialect::MySql.insert_idempotent_sql("audit_outbox");
+        assert!(sql.contains("INSERT INTO `audit_outbox`"));
+        assert!(!sql.contains('"'));
+        // Four ? placeholders: event_id, event_type, payload, event_id (for WHERE NOT EXISTS)
+        assert!(sql.contains("FROM DUAL"));
+        assert!(sql.contains("WHERE NOT EXISTS"));
+        assert!(sql.contains("SELECT 1 FROM `audit_outbox` WHERE event_id = ?"));
+        assert!(!sql.contains("INSERT IGNORE"));
+        assert!(!sql.contains("ON DUPLICATE KEY"));
     }
 
     #[test]

@@ -41,6 +41,9 @@ pub mod mediator_sink;
 pub mod memory;
 /// Stable identity of a single firing of a schedule.
 pub mod occurrence;
+/// Sink that enqueues a due occurrence into the transactional outbox.
+#[cfg(feature = "outbox")]
+pub mod outbox_sink;
 /// A message persisted for future delivery.
 pub mod schedule;
 /// The contract a due occurrence is dispatched through.
@@ -62,6 +65,8 @@ pub use lease::LeasedOccurrence;
 pub use mediator_sink::{MediatorSink, MediatorSinkBuilder};
 pub use memory::InMemoryScheduleStore;
 pub use occurrence::OccurrenceId;
+#[cfg(feature = "outbox")]
+pub use outbox_sink::OutboxSink;
 pub use schedule::ScheduledMessage;
 pub use sink::ScheduleSink;
 pub use snapshot::{ScheduleSnapshot, ScheduleStatus};

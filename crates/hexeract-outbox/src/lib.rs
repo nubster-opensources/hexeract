@@ -18,6 +18,8 @@ pub mod error;
 pub mod event;
 /// Asynchronous handler contract dispatched by the worker.
 pub mod handler;
+/// Contract for inserting a raw event into the outbox idempotently.
+pub mod idempotent;
 /// Backend-agnostic contract for inserting events into the outbox.
 pub mod publisher;
 /// Poll loop worker, type-erased dispatch and store abstraction.
@@ -27,6 +29,7 @@ pub use envelope::OutboxEnvelope;
 pub use error::OutboxError;
 pub use event::Event;
 pub use handler::Handler;
+pub use idempotent::IdempotentOutboxEnqueue;
 pub use publisher::OutboxPublisher;
 pub use worker::{
     BoxFuture, ErasedHandler, OutboxStore, OutboxWorker, OutboxWorkerConfig, TypedHandler,

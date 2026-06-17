@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use hexeract_outbox::ErasedHandler;
 use hexeract_outbox::Event;
 use hexeract_outbox::Handler;
+use hexeract_outbox::IdempotentOutboxEnqueue;
 use hexeract_outbox::OutboxEnvelope;
 use hexeract_outbox::OutboxError;
 use hexeract_outbox::OutboxPublisher;
@@ -340,6 +341,7 @@ pub struct SqliteOutboxPublisher {
     pool: SqlitePool,
     table_name: Arc<str>,
     insert_sql: Arc<str>,
+    idempotent_insert_sql: Arc<str>,
 }
 
 impl SqliteOutboxPublisher {
@@ -353,10 +355,12 @@ impl SqliteOutboxPublisher {
         let table_name = table_name.into();
         validate_table_name(&table_name)?;
         let insert_sql = DIALECT.insert_sql(&table_name);
+        let idempotent_insert_sql = DIALECT.insert_idempotent_sql(&table_name);
         Ok(Self {
             pool,
             table_name: Arc::from(table_name),
             insert_sql: Arc::from(insert_sql),
+            idempotent_insert_sql: Arc::from(idempotent_insert_sql),
         })
     }
 
@@ -420,6 +424,28 @@ impl OutboxPublisher for SqliteOutboxPublisher {
         let event_id = self.publish_in_tx(&mut tx, event).await?;
         tx.commit().await.map_err(database_error)?;
         Ok(event_id)
+    }
+}
+
+impl IdempotentOutboxEnqueue for SqliteOutboxPublisher {
+    async fn enqueue_idempotent(
+        &self,
+        event_id: Uuid,
+        event_type: &str,
+        payload: &[u8],
+    ) -> Result<bool, OutboxError> {
+        validate_event_type(event_type)?;
+        let payload_value = serde_json::from_slice::<serde_json::Value>(payload)?;
+        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        let result = sqlx::query(&self.idempotent_insert_sql)
+            .bind(event_id)
+            .bind(event_type)
+            .bind(payload_value)
+            .execute(&mut *tx)
+            .await
+            .map_err(database_error)?;
+        tx.commit().await.map_err(database_error)?;
+        Ok(result.rows_affected() > 0)
     }
 }
 

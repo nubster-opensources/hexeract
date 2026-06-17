@@ -17,6 +17,7 @@ use hexeract_core::HandlerContext;
 use hexeract_outbox::ErasedHandler;
 use hexeract_outbox::Event;
 use hexeract_outbox::Handler;
+use hexeract_outbox::IdempotentOutboxEnqueue;
 use hexeract_outbox::OutboxError;
 use hexeract_outbox::OutboxPublisher;
 use hexeract_outbox::OutboxWorker;
@@ -259,4 +260,34 @@ async fn multi_worker_skip_locked_prevents_double_dispatch() {
             .await
             .unwrap();
     assert_eq!(delivered, i64::try_from(event_count).unwrap());
+}
+
+#[tokio::test]
+#[ignore = "runs in the integration workflow"]
+async fn enqueue_idempotent_twice_inserts_one_row() {
+    let (_container, pool) = setup().await;
+    let publisher = MySqlOutboxPublisher::new(pool.clone(), TABLE).unwrap();
+
+    let event_id = Uuid::now_v7();
+    let inserted = publisher
+        .enqueue_idempotent(event_id, "x.due", b"{\"k\":1}")
+        .await
+        .unwrap();
+    assert!(inserted, "first enqueue must insert a new row");
+
+    let duplicate = publisher
+        .enqueue_idempotent(event_id, "x.due", b"{\"k\":1}")
+        .await
+        .unwrap();
+    assert!(
+        !duplicate,
+        "second enqueue with same event_id must be a no-op"
+    );
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_outbox WHERE event_id = ?")
+        .bind(event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "exactly one row must exist after two enqueues");
 }
