@@ -25,6 +25,8 @@ hexeract-mediator = { path = "../hexeract-mediator", version = "0.5", optional =
 hexeract-middleware = { path = "../hexeract-middleware", version = "0.5", optional = true }
 hexeract-outbox = { path = "../hexeract-outbox", version = "0.5", optional = true }
 hexeract-outbox-sql = { path = "../hexeract-outbox-sql", version = "0.5", optional = true, default-features = false }
+hexeract-scheduler = { path = "../hexeract-scheduler", version = "0.5", optional = true }
+hexeract-scheduler-sql = { path = "../hexeract-scheduler-sql", version = "0.5", optional = true, default-features = false }
 
 [features]
 default = []
@@ -49,6 +51,15 @@ macros = ["core", "dep:hexeract-macros"]
 
 # Built-in middlewares: tracing spans and dispatch timeouts.
 middleware = ["core", "dep:hexeract-middleware"]
+
+# Scheduler: time-based dispatch with validated worker configuration.
+scheduler = ["core", "dep:hexeract-scheduler"]
+scheduler-mediator = ["scheduler", "mediator", "hexeract-scheduler/mediator"]
+scheduler-bus = ["scheduler", "bus", "hexeract-scheduler/bus"]
+scheduler-outbox = ["scheduler", "hexeract-scheduler/outbox"]
+scheduler-sql-postgres = ["scheduler", "dep:hexeract-scheduler-sql", "hexeract-scheduler-sql/postgres"]
+scheduler-sql-mysql = ["scheduler", "dep:hexeract-scheduler-sql", "hexeract-scheduler-sql/mysql"]
+scheduler-sql-sqlite = ["scheduler", "dep:hexeract-scheduler-sql", "hexeract-scheduler-sql/sqlite"]
 
 [package.metadata.docs.rs]
 all-features = true

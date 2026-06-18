@@ -24,12 +24,15 @@
 //! - [`SchedulerWorker`] drives the loop: it claims due occurrences, dispatches
 //!   them, then delivers, reschedules, retries with backoff or dead-letters.
 //! - [`SchedulerError`] is the unified error type.
+//! - [`SchedulerBuilder`] is the entry point for assembling a validated worker.
 //!
 //! # Time zone
 //!
 //! All instants are UTC. Per-schedule time zones are an explicit non-goal
 //! of this version.
 
+/// Fluent assembly of a validated [`SchedulerWorker`].
+pub mod builder;
 /// Sink that publishes a due occurrence on the message bus.
 #[cfg(feature = "bus")]
 pub mod bus_sink;
@@ -62,6 +65,7 @@ pub mod trigger;
 /// The polling worker that drives schedules to their sink.
 pub mod worker;
 
+pub use builder::SchedulerBuilder;
 #[cfg(feature = "bus")]
 pub use bus_sink::BusSink;
 pub use error::SchedulerError;

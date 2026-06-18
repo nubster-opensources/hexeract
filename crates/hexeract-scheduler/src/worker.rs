@@ -87,6 +87,12 @@ where
         }
     }
 
+    /// Borrow the worker configuration.
+    #[must_use]
+    pub fn config(&self) -> &SchedulerWorkerConfig {
+        &self.config
+    }
+
     /// Run the polling loop until `cancel` is triggered.
     ///
     /// Each iteration claims and settles one batch, then waits: `poll_interval`
