@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use hexeract_bus::BusEnvelope;
@@ -7,6 +8,7 @@ use hexeract_bus::BusError;
 use hexeract_bus::Exchange;
 use hexeract_bus::ExchangeKind;
 use hexeract_bus::Message;
+use hexeract_bus::RawBusPublish;
 use hexeract_bus::Transport;
 use lapin::BasicProperties;
 use lapin::options::BasicPublishOptions;
@@ -255,6 +257,30 @@ impl Transport for RabbitMqTransport {
     ) -> Result<Uuid, BusError> {
         let envelope = BusEnvelope::new(correlation_id, message)?;
         self.publish_envelope(routing_key, &envelope).await
+    }
+}
+
+#[async_trait]
+impl RawBusPublish for RabbitMqTransport {
+    async fn publish_raw(
+        &self,
+        routing_key: &str,
+        message_id: Uuid,
+        message_type: &str,
+        payload: &[u8],
+    ) -> Result<(), BusError> {
+        let envelope = BusEnvelope::restore(
+            message_id,
+            message_type.to_owned(),
+            payload.to_vec(),
+            message_id,
+            None,
+            HashMap::new(),
+            SystemTime::now(),
+        );
+        self.publish_envelope(routing_key, &envelope)
+            .await
+            .map(drop)
     }
 }
 

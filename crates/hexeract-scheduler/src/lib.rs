@@ -30,6 +30,9 @@
 //! All instants are UTC. Per-schedule time zones are an explicit non-goal
 //! of this version.
 
+/// Sink that publishes a due occurrence on the message bus.
+#[cfg(feature = "bus")]
+pub mod bus_sink;
 /// The unified scheduler error type.
 pub mod error;
 /// A due occurrence claimed under a lease.
@@ -59,6 +62,8 @@ pub mod trigger;
 /// The polling worker that drives schedules to their sink.
 pub mod worker;
 
+#[cfg(feature = "bus")]
+pub use bus_sink::BusSink;
 pub use error::SchedulerError;
 pub use lease::LeasedOccurrence;
 #[cfg(feature = "mediator")]

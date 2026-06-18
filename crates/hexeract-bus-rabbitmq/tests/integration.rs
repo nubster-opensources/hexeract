@@ -19,6 +19,7 @@ use hexeract_bus::ExchangeKind;
 use hexeract_bus::Handler;
 use hexeract_bus::Message;
 use hexeract_bus::Queue;
+use hexeract_bus::RawBusPublish;
 use hexeract_bus::RoutingKey;
 use hexeract_bus::Transport;
 use hexeract_bus_rabbitmq::AckMode;
@@ -1192,6 +1193,80 @@ async fn worker_delays_retries_and_retry_count_survives_restart() {
 
     second_cancel.cancel();
     second_handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn publish_raw_round_trips_with_supplied_message_id() {
+    let (_container, uri) = start_rabbit().await;
+    let queue_name = "raw.publish.round_trip";
+
+    let consumer_conn = Connection::connect(&uri, ConnectionProperties::default())
+        .await
+        .expect("consumer connection must open");
+    let consumer_channel = consumer_conn
+        .create_channel()
+        .await
+        .expect("consumer channel must open");
+    consumer_channel
+        .queue_declare(
+            queue_name.into(),
+            QueueDeclareOptions {
+                durable: false,
+                exclusive: false,
+                auto_delete: true,
+                ..QueueDeclareOptions::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .expect("queue declare must succeed");
+
+    let transport = RabbitMqTransport::new(&uri)
+        .await
+        .expect("transport must connect");
+    let known_id = Uuid::now_v7();
+    let raw_payload = b"{\"label\":\"x\"}";
+    transport
+        .publish_raw(queue_name, known_id, "reminders.due", raw_payload)
+        .await
+        .expect("publish_raw must succeed");
+
+    let mut delivery = None;
+    for _ in 0..20 {
+        let candidate = consumer_channel
+            .basic_get(queue_name.into(), BasicGetOptions::default())
+            .await
+            .expect("basic_get must succeed");
+        if candidate.is_some() {
+            delivery = candidate;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let delivery = delivery.expect("must receive at least one delivery");
+
+    assert_eq!(
+        delivery.data.as_slice(),
+        raw_payload,
+        "payload must arrive byte-for-byte unchanged"
+    );
+    let observed_message_id = delivery
+        .properties
+        .message_id()
+        .as_ref()
+        .map(ShortString::as_str)
+        .expect("AMQP message_id property must be set");
+    assert_eq!(
+        observed_message_id,
+        known_id.to_string(),
+        "the AMQP message_id property must equal the caller-supplied id"
+    );
+    assert_eq!(
+        delivery.properties.kind().as_ref().map(ShortString::as_str),
+        Some("reminders.due"),
+        "the AMQP type property must carry the caller-supplied message_type"
+    );
 }
 
 /// Declare a durable queue for tests, as required on RabbitMQ 4 (a
