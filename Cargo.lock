@@ -1674,7 +1674,9 @@ dependencies = [
 name = "hexeract-scheduler"
 version = "0.5.0"
 dependencies = [
+ "async-trait",
  "fastrand",
+ "hexeract-bus",
  "hexeract-core",
  "hexeract-mediator",
  "hexeract-outbox",
