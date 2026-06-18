@@ -46,6 +46,13 @@
 //! | `mediator` | In-process CQRS mediator | [`hexeract_mediator`] |
 //! | `middleware` | Built-in tracing and timeout middlewares | [`hexeract_middleware`] |
 //! | `macros` | `#[handler]` attribute macro for handler registration | [`hexeract_macros`] + [`hexeract_core`] |
+//! | `scheduler` | Backend-agnostic scheduler traits and `SchedulerBuilder` | [`hexeract_scheduler`] |
+//! | `scheduler-mediator` | Scheduler sink that dispatches via the in-process mediator | [`hexeract_scheduler`] + mediator |
+//! | `scheduler-bus` | Scheduler sink that publishes via the message bus | [`hexeract_scheduler`] + bus |
+//! | `scheduler-outbox` | Scheduler sink that enqueues into the transactional outbox | [`hexeract_scheduler`] |
+//! | `scheduler-sql-postgres` | PostgreSQL schedule store via `sqlx` | [`hexeract_scheduler`] + [`hexeract_scheduler_sql`] |
+//! | `scheduler-sql-mysql` | MySQL schedule store via `sqlx` | [`hexeract_scheduler`] + [`hexeract_scheduler_sql`] |
+//! | `scheduler-sql-sqlite` | SQLite schedule store via `sqlx` | [`hexeract_scheduler`] + [`hexeract_scheduler_sql`] |
 //!
 //! Every feature transitively enables `core`, so a downstream user
 //! automatically has access to `hexeract::core::HandlerContext`.
@@ -119,3 +126,29 @@ pub use hexeract_middleware as middleware;
 #[cfg(feature = "macros")]
 #[cfg_attr(docsrs, doc(cfg(feature = "macros")))]
 pub use hexeract_macros as macros;
+
+/// Backend-agnostic scheduler traits and the validated `SchedulerBuilder`.
+///
+/// Re-export of [`hexeract_scheduler`].
+#[cfg(feature = "scheduler")]
+#[cfg_attr(docsrs, doc(cfg(feature = "scheduler")))]
+pub use hexeract_scheduler as scheduler;
+
+/// SQL schedule store backends for PostgreSQL, MySQL and SQLite via `sqlx`.
+///
+/// Re-export of [`hexeract_scheduler_sql`]. Enabled by any of the
+/// `scheduler-sql-postgres`, `scheduler-sql-mysql` or `scheduler-sql-sqlite` features.
+#[cfg(any(
+    feature = "scheduler-sql-postgres",
+    feature = "scheduler-sql-mysql",
+    feature = "scheduler-sql-sqlite"
+))]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(
+        feature = "scheduler-sql-postgres",
+        feature = "scheduler-sql-mysql",
+        feature = "scheduler-sql-sqlite"
+    )))
+)]
+pub use hexeract_scheduler_sql as scheduler_sql;

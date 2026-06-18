@@ -23,6 +23,14 @@ pub enum SchedulerError {
         reason: String,
     },
 
+    /// The worker configuration was rejected because a value is incoherent.
+    #[error("invalid scheduler configuration: {reason}")]
+    #[non_exhaustive]
+    InvalidConfiguration {
+        /// Human-readable explanation of why the configuration was rejected.
+        reason: String,
+    },
+
     /// The backend reported a storage-level failure.
     ///
     /// The original error is preserved as a boxed source so callers can
@@ -57,6 +65,14 @@ impl SchedulerError {
     #[must_use]
     pub fn invalid_trigger(reason: impl Into<String>) -> Self {
         Self::InvalidTrigger {
+            reason: reason.into(),
+        }
+    }
+
+    /// Build an [`SchedulerError::InvalidConfiguration`] from a reason.
+    #[must_use]
+    pub fn invalid_configuration(reason: impl Into<String>) -> Self {
+        Self::InvalidConfiguration {
             reason: reason.into(),
         }
     }
@@ -130,5 +146,12 @@ mod tests {
         let source = std::error::Error::source(&error).expect("source must be set");
         assert_eq!(source.to_string(), "sink unreachable");
         assert!(matches!(error, SchedulerError::Dispatch(_)));
+    }
+
+    #[test]
+    fn invalid_configuration_carries_reason_in_message() {
+        let error = SchedulerError::invalid_configuration("batch_size must be at least 1");
+        assert!(error.to_string().contains("batch_size must be at least 1"));
+        assert!(matches!(error, SchedulerError::InvalidConfiguration { .. }));
     }
 }
