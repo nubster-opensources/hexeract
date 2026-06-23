@@ -9,9 +9,9 @@ The audience for this document is anyone considering Hexeract for an audit-grade
 The dogfooding service required atomic publication of two effects per business operation:
 
 1. Persistence of the operational state (user registrations, password resets, login events, etc.) into an operational PostgreSQL database.
-2. Emission of an immutable audit event into a separate audit log stored on a different PostgreSQL database, isolated for defense-in-depth and compliance reasons (SOC 2 / ISO 27001 controls around audit storage).
+2. Emission of an immutable audit event into a separate audit log stored on a different PostgreSQL database, isolated for defense-in-depth: a compromise of the operational store must not be able to tamper with the audit trail.
 
-Cross-database transactions are not an option for this client. Two-phase commit was rejected as too operationally expensive, and an "audit best-effort" mode that could lose audit entries was rejected as non-compliant. The Outbox pattern was the only acceptable design.
+Cross-database transactions are not an option for this client. Two-phase commit was rejected as too operationally expensive, and an "audit best-effort" mode that could drop audit entries was rejected outright. The Outbox pattern was the only acceptable design.
 
 ## Use cases
 
