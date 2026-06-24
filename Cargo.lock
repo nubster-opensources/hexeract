@@ -1690,6 +1690,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-test",
  "trait-variant",
  "uuid",
 ]
