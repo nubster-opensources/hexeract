@@ -26,6 +26,16 @@ fn false_literal(dialect: Dialect) -> &'static str {
     }
 }
 
+/// The SQL literal for boolean true in this dialect.
+///
+/// PostgreSQL and MySQL accept `TRUE`; SQLite stores booleans as integers.
+fn true_literal(dialect: Dialect) -> &'static str {
+    match dialect {
+        Dialect::Sqlite => "1",
+        _ => "TRUE",
+    }
+}
+
 /// Prefix each comma-separated column in `columns` with the quoted table name.
 ///
 /// PostgreSQL's claim joins the target table against a `due` CTE that also
@@ -255,6 +265,53 @@ pub(crate) fn set_paused_sql(dialect: Dialect, table: &str) -> String {
     format!("UPDATE {qtable} SET paused = {paused} WHERE schedule_id = {id}")
 }
 
+/// Unpause a schedule AND realign it to a new occurrence (parameter 1),
+/// resetting the attempt counter, clearing the last recorded error and
+/// releasing any lease.
+///
+/// Only acts when the schedule is currently paused and non-terminal
+/// (delivered, cancelled and dead-lettered rows are excluded so a stale
+/// call cannot revive a finished schedule).
+///
+/// The store treats a zero-row result as: either "not found" (disambiguated
+/// via the `exists_sql` probe) or "not paused / already terminal" (silent
+/// no-op).
+pub(crate) fn resume_with_next_sql(dialect: Dialect, table: &str) -> String {
+    let qtable = dialect.quote_identifier(table);
+    let not_paused = false_literal(dialect);
+    let next = dialect.placeholder(1);
+    let id = dialect.placeholder(2);
+    format!(
+        "UPDATE {qtable} \
+         SET paused = {not_paused}, scheduled_for = {next}, attempts = 0, \
+             last_error = NULL, leased_until = NULL \
+         WHERE schedule_id = {id} \
+           AND paused = {not_paused_inv} \
+           AND delivered_at IS NULL AND cancelled_at IS NULL AND dead_lettered_at IS NULL",
+        not_paused_inv = true_literal(dialect),
+    )
+}
+
+/// Unpause a schedule without touching the stored occurrence.
+///
+/// Only acts when the schedule is currently paused and non-terminal.
+/// The store treats a zero-row result as "not found" (disambiguated via
+/// the `exists_sql` probe) or "not paused / already terminal" (silent
+/// no-op).
+pub(crate) fn resume_only_sql(dialect: Dialect, table: &str) -> String {
+    let qtable = dialect.quote_identifier(table);
+    let not_paused = false_literal(dialect);
+    let id = dialect.placeholder(1);
+    format!(
+        "UPDATE {qtable} \
+         SET paused = {not_paused}, leased_until = NULL \
+         WHERE schedule_id = {id} \
+           AND paused = {not_paused_inv} \
+           AND delivered_at IS NULL AND cancelled_at IS NULL AND dead_lettered_at IS NULL",
+        not_paused_inv = true_literal(dialect),
+    )
+}
+
 /// Read the columns needed to build a schedule snapshot.
 pub(crate) fn inspect_sql(dialect: Dialect, table: &str) -> String {
     let qtable = dialect.quote_identifier(table);
@@ -406,6 +463,60 @@ mod tests {
         assert!(sql.contains("leased_until = NULL"));
         assert!(sql.contains("scheduled_for = $1"));
         assert!(sql.contains("WHERE schedule_id = $2"));
+    }
+
+    #[test]
+    fn resume_statements_only_revive_a_paused_non_terminal_schedule() {
+        for dialect in [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite] {
+            let paused_true = true_literal(dialect);
+            let paused_false = false_literal(dialect);
+            for sql in [
+                resume_with_next_sql(dialect, "scheduled_messages"),
+                resume_only_sql(dialect, "scheduled_messages"),
+            ] {
+                assert!(
+                    sql.contains(&format!("paused = {paused_true}")),
+                    "{dialect:?} resume must only act on a paused schedule: {sql}"
+                );
+                assert!(
+                    sql.contains(&format!("SET paused = {paused_false}")),
+                    "{dialect:?} resume must clear the paused flag: {sql}"
+                );
+                assert!(
+                    sql.contains("delivered_at IS NULL")
+                        && sql.contains("cancelled_at IS NULL")
+                        && sql.contains("dead_lettered_at IS NULL"),
+                    "{dialect:?} resume must not revive a terminal schedule: {sql}"
+                );
+                assert!(
+                    sql.contains("leased_until = NULL"),
+                    "{dialect:?} resume must release any lease: {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resume_with_next_realigns_and_resets_attempts() {
+        let sql = resume_with_next_sql(Dialect::Postgres, "scheduled_messages");
+        assert!(sql.contains("scheduled_for = $1"), "must realign: {sql}");
+        assert!(sql.contains("attempts = 0"), "must reset attempts: {sql}");
+        assert!(sql.contains("last_error = NULL"), "must clear error: {sql}");
+        assert!(sql.contains("WHERE schedule_id = $2"), "must filter: {sql}");
+    }
+
+    #[test]
+    fn resume_only_leaves_the_occurrence_untouched() {
+        let sql = resume_only_sql(Dialect::Postgres, "scheduled_messages");
+        assert!(
+            !sql.contains("scheduled_for"),
+            "must not touch the occurrence: {sql}"
+        );
+        assert!(
+            !sql.contains("attempts"),
+            "must not touch the attempt counter: {sql}"
+        );
+        assert!(sql.contains("WHERE schedule_id = $1"), "must filter: {sql}");
     }
 
     #[test]

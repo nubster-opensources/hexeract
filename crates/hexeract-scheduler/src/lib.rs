@@ -36,6 +36,8 @@ pub mod builder;
 /// Sink that publishes a due occurrence on the message bus.
 #[cfg(feature = "bus")]
 pub mod bus_sink;
+/// Ergonomic lifecycle facade for a single schedule.
+pub mod control;
 /// The unified scheduler error type.
 pub mod error;
 /// A due occurrence claimed under a lease.
@@ -68,6 +70,7 @@ pub mod worker;
 pub use builder::SchedulerBuilder;
 #[cfg(feature = "bus")]
 pub use bus_sink::BusSink;
+pub use control::SchedulerControl;
 pub use error::SchedulerError;
 pub use lease::LeasedOccurrence;
 #[cfg(feature = "mediator")]

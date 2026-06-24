@@ -58,4 +58,5 @@ backend_scenarios!(
     dead_letter_excludes_and_records_error,
     mark_delivered_excludes,
     mark_failed_defers_reclaim_until_retry_at,
+    resume_realigns_paused_and_rejects_unknown,
 );
