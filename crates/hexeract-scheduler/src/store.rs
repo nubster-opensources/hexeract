@@ -168,4 +168,22 @@ pub trait ScheduleStore: Send + Sync + 'static {
     ///
     /// Returns [`SchedulerError::Database`] if the backend fails to read.
     async fn inspect(&self, schedule_id: Uuid) -> Result<Option<ScheduleSnapshot>, SchedulerError>;
+
+    /// Resume a paused schedule, optionally realigning its next occurrence.
+    ///
+    /// `Some(next)` unpauses AND sets `scheduled_for = next`, resetting the
+    /// attempt counter, clearing the last recorded error and releasing any
+    /// lease, atomically. `None` only unpauses, leaving the occurrence intact.
+    ///
+    /// Idempotent: a no-op returning `Ok(())` when the schedule is not Paused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchedulerError::ScheduleNotFound`] if no schedule matches
+    /// `schedule_id`, or [`SchedulerError::Database`] on a backend failure.
+    async fn resume(
+        &self,
+        schedule_id: Uuid,
+        next: Option<SystemTime>,
+    ) -> Result<(), SchedulerError>;
 }

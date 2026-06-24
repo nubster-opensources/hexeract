@@ -134,6 +134,8 @@ pub struct SqliteScheduleStore {
     mark_dead_lettered_sql: Arc<str>,
     cancel_sql: Arc<str>,
     set_paused_sql: Arc<str>,
+    resume_with_next_sql: Arc<str>,
+    resume_only_sql: Arc<str>,
     inspect_sql: Arc<str>,
     exists_sql: Arc<str>,
 }
@@ -161,6 +163,8 @@ impl SqliteScheduleStore {
             )),
             cancel_sql: Arc::from(statements::cancel_sql(DIALECT, &table_name)),
             set_paused_sql: Arc::from(statements::set_paused_sql(DIALECT, &table_name)),
+            resume_with_next_sql: Arc::from(statements::resume_with_next_sql(DIALECT, &table_name)),
+            resume_only_sql: Arc::from(statements::resume_only_sql(DIALECT, &table_name)),
             inspect_sql: Arc::from(statements::inspect_sql(DIALECT, &table_name)),
             exists_sql: Arc::from(statements::exists_sql(DIALECT, &table_name)),
             table_name: Arc::from(table_name),
@@ -321,6 +325,31 @@ impl ScheduleStore for SqliteScheduleStore {
             .await
             .map_err(database_error)?;
         row.as_ref().map(decode_snapshot).transpose()
+    }
+
+    async fn resume(
+        &self,
+        schedule_id: Uuid,
+        next: Option<SystemTime>,
+    ) -> Result<(), SchedulerError> {
+        let result = if let Some(next_time) = next {
+            sqlx::query(&self.resume_with_next_sql)
+                .bind(timestamp::format_sqlite_utc(next_time)?)
+                .bind(schedule_id)
+                .execute(&self.pool)
+                .await
+                .map_err(database_error)?
+        } else {
+            sqlx::query(&self.resume_only_sql)
+                .bind(schedule_id)
+                .execute(&self.pool)
+                .await
+                .map_err(database_error)?
+        };
+        if result.rows_affected() == 0 {
+            self.ensure_exists(schedule_id).await?;
+        }
+        Ok(())
     }
 }
 

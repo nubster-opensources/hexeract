@@ -194,6 +194,28 @@ impl ScheduleStore for InMemoryScheduleStore {
             )
         }))
     }
+
+    async fn resume(
+        &self,
+        schedule_id: Uuid,
+        next: Option<SystemTime>,
+    ) -> Result<(), SchedulerError> {
+        let mut schedules = self.lock()?;
+        let stored = schedules
+            .get_mut(&schedule_id)
+            .ok_or_else(|| SchedulerError::schedule_not_found(schedule_id))?;
+        if stored.status != ScheduleStatus::Paused {
+            return Ok(());
+        }
+        stored.status = ScheduleStatus::Pending;
+        if let Some(next_time) = next {
+            stored.message.scheduled_for = next_time;
+            stored.attempts = 0;
+            stored.last_error = None;
+            stored.leased_until = None;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -446,6 +468,70 @@ mod tests {
         store.set_paused(schedule_id, false).await.unwrap();
         let claimed = store.claim_due(base(), 10, LEASE).await.unwrap();
         assert_eq!(claimed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resume_with_next_realigns_occurrence_and_resets_attempts() {
+        let store = InMemoryScheduleStore::default();
+        let schedule_id = insert_delay(&store, base(), 5).await;
+        // Consume one attempt and record an error so we can verify they are reset.
+        store.claim_due(base(), 10, LEASE).await.unwrap();
+        store
+            .mark_failed(
+                schedule_id,
+                base() + Duration::from_secs(60),
+                "previous failure",
+            )
+            .await
+            .unwrap();
+        store.set_paused(schedule_id, true).await.unwrap();
+
+        let next = base() + Duration::from_secs(3_600);
+        store.resume(schedule_id, Some(next)).await.unwrap();
+
+        let snapshot = store.inspect(schedule_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.status, ScheduleStatus::Pending);
+        assert_eq!(snapshot.scheduled_for, next);
+        assert_eq!(snapshot.attempts, 0);
+        assert!(snapshot.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn resume_with_none_unpauses_without_touching_occurrence() {
+        let store = InMemoryScheduleStore::default();
+        let schedule_id = insert_delay(&store, base(), 5).await;
+        store.set_paused(schedule_id, true).await.unwrap();
+
+        store.resume(schedule_id, None).await.unwrap();
+
+        let snapshot = store.inspect(schedule_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.status, ScheduleStatus::Pending);
+        assert_eq!(
+            snapshot.scheduled_for,
+            base(),
+            "scheduled_for must be unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_of_non_paused_is_a_no_op() {
+        let store = InMemoryScheduleStore::default();
+        let schedule_id = insert_delay(&store, base(), 5).await;
+        // Status is Pending, not Paused: resume must be a no-op.
+        store.resume(schedule_id, None).await.unwrap();
+        let snapshot = store.inspect(schedule_id).await.unwrap().unwrap();
+        assert_eq!(
+            snapshot.status,
+            ScheduleStatus::Pending,
+            "status must remain Pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_of_unknown_schedule_errors() {
+        let store = InMemoryScheduleStore::default();
+        let error = store.resume(Uuid::from_u128(999), None).await.unwrap_err();
+        assert!(matches!(error, SchedulerError::ScheduleNotFound { .. }));
     }
 
     #[tokio::test]

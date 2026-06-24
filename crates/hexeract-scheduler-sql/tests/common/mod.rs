@@ -358,6 +358,61 @@ pub(crate) async fn mark_failed_defers_reclaim_until_retry_at<S: ScheduleStore>(
     assert_eq!(reclaimed[0].message.schedule_id, schedule_id);
 }
 
+/// Resuming a paused schedule with `next = Some(t)` sets the occurrence to `t`
+/// and makes it claimable; resuming with `None` only unpauses. Resuming an
+/// unknown id returns `ScheduleNotFound`.
+pub(crate) async fn resume_realigns_paused_and_rejects_unknown<S: ScheduleStore>(store: &S) {
+    // Resume with explicit next: occurrence is realigned and claimable.
+    let message = delay_message(past(60));
+    let schedule_id = message.schedule_id;
+    store.insert(&message, MAX_ATTEMPTS).await.expect("insert");
+    store.set_paused(schedule_id, true).await.expect("pause");
+
+    let next = future(3_600);
+    store
+        .resume(schedule_id, Some(next))
+        .await
+        .expect("resume with next");
+
+    let snapshot = store.inspect(schedule_id).await.unwrap().unwrap();
+    assert_eq!(snapshot.status, ScheduleStatus::Pending);
+    assert_eq!(snapshot.attempts, 0, "attempts must reset after resume");
+    // The occurrence is now in the future: not yet claimable.
+    assert!(
+        store
+            .claim_due(SystemTime::now(), 10, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_empty(),
+        "a future-aligned schedule must not be claimable yet"
+    );
+
+    // Resume with None: only unpauses, occurrence unchanged.
+    let message2 = delay_message(past(60));
+    let id2 = message2.schedule_id;
+    store
+        .insert(&message2, MAX_ATTEMPTS)
+        .await
+        .expect("insert2");
+    store.set_paused(id2, true).await.expect("pause2");
+    store.resume(id2, None).await.expect("resume with none");
+    let snap2 = store.inspect(id2).await.unwrap().unwrap();
+    assert_eq!(snap2.status, ScheduleStatus::Pending);
+    let claimed = store
+        .claim_due(SystemTime::now(), 10, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(
+        claimed.len(),
+        1,
+        "a past-due resumed schedule must be claimable"
+    );
+
+    // Unknown id returns ScheduleNotFound.
+    let error = store.resume(Uuid::now_v7(), None).await.unwrap_err();
+    assert!(matches!(error, SchedulerError::ScheduleNotFound { .. }));
+}
+
 /// Insert `count` due one-shot schedules and return their identifiers. Used by
 /// the competing-consumer contention test, which needs raw access to the ids.
 pub(crate) async fn insert_due_batch<S: ScheduleStore>(store: &S, count: usize) -> Vec<Uuid> {
