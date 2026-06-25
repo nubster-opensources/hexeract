@@ -157,6 +157,15 @@ impl Trigger {
     pub fn is_recurring(&self) -> bool {
         matches!(self, Self::Cron(_))
     }
+
+    /// A stable, lowercase tag identifying the trigger kind ("delay" or "cron").
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Delay(_) => "delay",
+            Self::Cron(_) => "cron",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +190,18 @@ mod tests {
             Ok(elapsed) => i64::try_from(elapsed.as_secs()).expect("fits"),
             Err(before) => -i64::try_from(before.duration().as_secs()).expect("fits"),
         }
+    }
+
+    #[test]
+    fn delay_kind_returns_delay() {
+        let t = Trigger::delay(UNIX_EPOCH + Duration::from_secs(60));
+        assert_eq!(t.kind(), "delay");
+    }
+
+    #[test]
+    fn cron_kind_returns_cron() {
+        let t = Trigger::cron("0 0 * * *").expect("valid cron");
+        assert_eq!(t.kind(), "cron");
     }
 
     #[test]

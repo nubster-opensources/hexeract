@@ -43,6 +43,7 @@ uuid = { workspace = true, features = ["v5", "v7"] }
 async-trait = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+tracing-test = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true

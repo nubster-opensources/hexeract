@@ -128,6 +128,7 @@ where
     }
 
     /// Claim and settle one batch, returning the number of occurrences claimed.
+    #[tracing::instrument(name = "scheduler.tick", skip_all, fields(claimed = tracing::field::Empty))]
     async fn poll_cycle(&self) -> Result<usize, SchedulerError> {
         let now = SystemTime::now();
         let claimed = self
@@ -135,6 +136,10 @@ where
             .claim_due(now, self.config.batch_size, self.config.lease)
             .await?;
         let count = claimed.len();
+        tracing::Span::current().record("claimed", count);
+        if count > 0 {
+            tracing::debug!(claimed = count, "scheduler claimed due occurrences");
+        }
         for occurrence in claimed {
             let schedule_id = occurrence.message.schedule_id;
             if let Err(error) = self.settle(occurrence).await {
@@ -149,11 +154,40 @@ where
     }
 
     /// Dispatch one occurrence and apply the success or failure outcome.
+    #[tracing::instrument(
+        name = "scheduler.dispatch",
+        skip_all,
+        fields(
+            schedule_id = %occurrence.message.schedule_id,
+            trigger = occurrence.message.trigger.kind(),
+            attempt = occurrence.attempts,
+            lag_ms = tracing::field::Empty
+        )
+    )]
     async fn settle(&self, occurrence: LeasedOccurrence) -> Result<(), SchedulerError> {
+        let now = SystemTime::now();
+        let lag = Self::dispatch_lag(occurrence.message.scheduled_for, now);
+        tracing::Span::current()
+            .record("lag_ms", u64::try_from(lag.as_millis()).unwrap_or(u64::MAX));
         match self.dispatch(&occurrence.message).await {
-            Ok(()) => self.on_success(&occurrence.message).await,
+            Ok(()) => {
+                tracing::debug!(
+                    schedule_id = %occurrence.message.schedule_id,
+                    trigger = occurrence.message.trigger.kind(),
+                    lag_ms = u64::try_from(lag.as_millis()).unwrap_or(u64::MAX),
+                    "scheduled occurrence dispatched"
+                );
+                self.on_success(&occurrence.message).await
+            }
             Err(error) => self.on_failure(&occurrence, &error).await,
         }
+    }
+
+    /// Duration from an occurrence's due time to `now`, clamped to zero when the
+    /// occurrence is not yet due (clock skew). The scheduler's primary health
+    /// signal: sustained growth means the worker is falling behind.
+    fn dispatch_lag(scheduled_for: SystemTime, now: SystemTime) -> Duration {
+        now.duration_since(scheduled_for).unwrap_or(Duration::ZERO)
     }
 
     /// Dispatch to the sink under the configured hard timeout.
@@ -174,7 +208,14 @@ where
             Trigger::Delay(_) => self.store.mark_delivered(message.schedule_id).await,
             Trigger::Cron(expression) => {
                 match expression.next_due(SystemTime::now(), message.scheduled_for)? {
-                    Some(next) => self.store.reschedule(message.schedule_id, next).await,
+                    Some(next) => {
+                        tracing::debug!(
+                            schedule_id = %message.schedule_id,
+                            trigger = message.trigger.kind(),
+                            "scheduled occurrence rescheduled"
+                        );
+                        self.store.reschedule(message.schedule_id, next).await
+                    }
                     None => self.store.mark_delivered(message.schedule_id).await,
                 }
             }
@@ -195,10 +236,16 @@ where
                 schedule_id = %schedule_id,
                 attempts = occurrence.attempts,
                 error = %reason,
-                "scheduled occurrence exhausted its attempt budget, dead-lettering"
+                "scheduled occurrence dead-lettered"
             );
             return self.store.mark_dead_lettered(schedule_id, &reason).await;
         }
+        tracing::warn!(
+            schedule_id = %schedule_id,
+            attempts = occurrence.attempts,
+            error = %reason,
+            "scheduled occurrence retried"
+        );
         let delay = self.next_retry_delay(occurrence.attempts);
         let retry_at = SystemTime::now()
             .checked_add(delay)
@@ -252,6 +299,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio_util::sync::CancellationToken;
+    use tracing_test::traced_test;
     use uuid::Uuid;
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -399,5 +447,59 @@ mod tests {
             .await
             .expect("task joins")
             .expect("graceful shutdown");
+    }
+
+    // --- dispatch_lag unit tests ---
+
+    #[test]
+    fn dispatch_lag_past_returns_positive_duration() {
+        let scheduled_for = UNIX_EPOCH + Duration::from_secs(1_000);
+        let now = scheduled_for + Duration::from_millis(250);
+        let lag =
+            SchedulerWorker::<InMemoryScheduleStore, SuccessSink>::dispatch_lag(scheduled_for, now);
+        assert_eq!(lag, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn dispatch_lag_future_clamps_to_zero() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let scheduled_for = now + Duration::from_secs(5);
+        let lag =
+            SchedulerWorker::<InMemoryScheduleStore, SuccessSink>::dispatch_lag(scheduled_for, now);
+        assert_eq!(lag, Duration::ZERO);
+    }
+
+    // --- tracing events tests ---
+
+    #[tokio::test]
+    #[traced_test]
+    async fn delay_dispatch_emits_dispatched_event() {
+        let store = InMemoryScheduleStore::new();
+        insert_delay(&store, 3).await;
+        let worker = SchedulerWorker::new(store, SuccessSink, test_config());
+        worker.poll_cycle().await.expect("cycle succeeds");
+        assert!(logs_contain("scheduled occurrence dispatched"));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn exhausted_dispatch_emits_dead_lettered_event() {
+        let store = InMemoryScheduleStore::new();
+        insert_delay(&store, 1).await;
+        let worker = SchedulerWorker::new(store, FailingSink, test_config());
+        worker.poll_cycle().await.expect("cycle succeeds");
+        assert!(logs_contain("scheduled occurrence dead-lettered"));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn cron_success_emits_rescheduled_event() {
+        let store = InMemoryScheduleStore::new();
+        let message =
+            ScheduledMessage::cron(Target::outbox(), "0 0 * * *", past(), &ReminderDue).unwrap();
+        store.insert(&message, 3).await.unwrap();
+        let worker = SchedulerWorker::new(store, SuccessSink, test_config());
+        worker.poll_cycle().await.expect("cycle succeeds");
+        assert!(logs_contain("scheduled occurrence rescheduled"));
     }
 }
