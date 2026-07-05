@@ -386,12 +386,10 @@ impl ScheduleAdmin for PgScheduleStore {
             .await
             .map_err(database_error)?;
         if result.rows_affected() == 0 {
-            self.ensure_exists(schedule_id).await?;
-            let snapshot = self
-                .inspect(schedule_id)
-                .await?
-                .ok_or_else(|| SchedulerError::schedule_not_found(schedule_id))?;
-            return Err(SchedulerError::not_replayable(schedule_id, snapshot.status));
+            return match self.inspect(schedule_id).await? {
+                None => Err(SchedulerError::schedule_not_found(schedule_id)),
+                Some(snapshot) => Err(SchedulerError::not_replayable(schedule_id, snapshot.status)),
+            };
         }
         Ok(())
     }
