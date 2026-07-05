@@ -25,11 +25,15 @@ hexeract-bus = { path = "../hexeract-bus", version = "0.5" }
 hexeract-bus-rabbitmq = { path = "../hexeract-bus-rabbitmq", version = "0.5" }
 hexeract-outbox = { path = "../hexeract-outbox", version = "0.5" }
 hexeract-outbox-sql = { path = "../hexeract-outbox-sql", version = "0.5", default-features = false, features = ["postgres"] }
+hexeract-scheduler = { path = "../hexeract-scheduler", version = "0.5" }
+hexeract-scheduler-sql = { path = "../hexeract-scheduler-sql", version = "0.5", default-features = false, features = ["postgres", "mysql", "sqlite"] }
 clap = { workspace = true }
 lapin = { workspace = true }
 native-tls = "0.2"
 postgres-native-tls = "0.5"
 serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true, features = ["postgres", "mysql", "sqlite", "uuid"] }
 tokio = { workspace = true }
 tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
 toml = "1.1"

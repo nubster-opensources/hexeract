@@ -48,6 +48,23 @@ fn patch_with_invalid_table_name_fails() {
 }
 
 #[test]
+fn scheduler_schema_prints_ddl_for_selected_dialect() {
+    Command::cargo_bin("hexeract")
+        .unwrap()
+        .args([
+            "scheduler",
+            "schema",
+            "--dialect",
+            "postgres",
+            "--table",
+            "scheduled_messages",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("CREATE TABLE IF NOT EXISTS scheduled_messages"));
+}
+
+#[test]
 fn apply_without_confirmation_flag_refuses_with_exit_code_2() {
     Command::cargo_bin("hexeract")
         .unwrap()
