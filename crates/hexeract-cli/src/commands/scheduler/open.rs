@@ -58,11 +58,11 @@ pub(crate) fn dialect_of(conn: &str) -> Result<DialectKind, CliError> {
 ///
 /// # Not yet wired
 ///
-/// No command calls `open`/`list_pending`/`list_dead_letter`/`inspect`/
-/// `replay` yet; the upcoming `scheduler list`/`inspect`/`replay` commands
-/// (B4/B5/B6) will. Kept `#[allow(dead_code)]` per associated item until then,
-/// mirroring `scheduler::view::render` in B2, so this task ships standalone
-/// under `-D warnings`.
+/// `scheduler list` (B4) wires `open`/`list_pending`. No command calls
+/// `list_dead_letter`/`inspect`/`replay` yet; the upcoming `scheduler
+/// inspect`/`replay` commands (B5/B6) will. Kept `#[allow(dead_code)]` per
+/// associated item until then, mirroring `scheduler::view::render` in B2, so
+/// this task ships standalone under `-D warnings`.
 pub(crate) enum AnyScheduleAdmin {
     Postgres(PgScheduleStore),
     MySql(MySqlScheduleStore),
@@ -77,7 +77,6 @@ impl AnyScheduleAdmin {
     /// Returns [`CliError::Fatal`] if the scheme is unsupported, the pool
     /// fails to connect, or the store rejects `table` as an invalid
     /// identifier.
-    #[allow(dead_code)] // Not called until B4/B5/B6 wire a `scheduler` subcommand that opens a store.
     pub(crate) async fn open(conn: &str, table: &str) -> Result<Self, CliError> {
         let fatal = |e: SchedulerError| CliError::Fatal(Box::new(e));
         let connect = |e: sqlx::Error| CliError::Fatal(Box::new(e));
@@ -104,7 +103,6 @@ impl AnyScheduleAdmin {
     }
 
     /// Forward to the active backend's [`ScheduleAdmin::list_pending`].
-    #[allow(dead_code)] // Not called until B4 wires `scheduler list --pending`.
     pub(crate) async fn list_pending(
         &self,
         limit: usize,
@@ -117,7 +115,7 @@ impl AnyScheduleAdmin {
     }
 
     /// Forward to the active backend's [`ScheduleAdmin::list_dead_letter`].
-    #[allow(dead_code)] // Not called until B4 wires `scheduler list --dead-letter`.
+    #[allow(dead_code)] // Not called until a future `scheduler list --dead-letter` variant wires it (B5/B6).
     pub(crate) async fn list_dead_letter(
         &self,
         limit: usize,

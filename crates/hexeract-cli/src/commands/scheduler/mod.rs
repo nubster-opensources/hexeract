@@ -1,3 +1,4 @@
+pub(crate) mod list;
 pub(crate) mod open;
 pub(crate) mod schema;
 pub(crate) mod view;
@@ -11,16 +12,15 @@ use crate::error::CliError;
 pub(crate) enum SchedulerAction {
     /// Print the scheduler schema DDL for the selected dialect.
     Schema(schema::SchemaArgs),
+    /// List non-terminal (pending and paused) schedules.
+    List(list::ListArgs),
 }
 
 impl SchedulerAction {
-    // `Schema` needs no database and has no `.await`, but upcoming actions
-    // (list, inspect, replay) do; keep the signature `async` so `Cli::run`
-    // dispatches uniformly across every namespace.
-    #[allow(clippy::unused_async)]
     pub(crate) async fn run(self) -> Result<(), CliError> {
         match self {
             Self::Schema(args) => args.run(),
+            Self::List(args) => args.run().await,
         }
     }
 }

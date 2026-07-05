@@ -85,14 +85,9 @@ fn format_time(time: std::time::SystemTime) -> String {
 
 /// Render a slice of views in the requested format.
 ///
-/// Not yet wired to a command: the upcoming `scheduler list`/`inspect`
-/// actions will call this. Kept `#[allow(dead_code)]` until that lands so
-/// this task can ship standalone under `-D warnings`.
-///
 /// # Errors
 ///
 /// Returns [`CliError::Fatal`] if JSON serialization fails.
-#[allow(dead_code)]
 pub(crate) fn render(views: &[ScheduleView], format: OutputFormat) -> Result<String, CliError> {
     match format {
         OutputFormat::Json => {
@@ -103,7 +98,6 @@ pub(crate) fn render(views: &[ScheduleView], format: OutputFormat) -> Result<Str
 }
 
 /// Render views as a hand-aligned, human-readable table.
-#[allow(dead_code)]
 fn render_text(views: &[ScheduleView]) -> String {
     use std::fmt::Write as _;
 

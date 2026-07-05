@@ -400,3 +400,55 @@ async fn outbox_check_ignores_same_named_table_in_other_schema() {
         .code(1)
         .stderr(contains("does not exist"));
 }
+
+/// Minimal event used to build a [`hexeract_scheduler::ScheduledMessage`] for
+/// the `scheduler list` integration test below.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TestReminder;
+
+impl hexeract_outbox::Event for TestReminder {
+    const EVENT_TYPE: &'static str = "test.reminder";
+}
+
+/// Verify that `scheduler list --format json` reports a seeded pending
+/// schedule (regression coverage for the B4 `scheduler list` subcommand).
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn scheduler_list_json_reports_pending() {
+    use hexeract_scheduler::{ScheduleStore, ScheduledMessage, Target};
+    use hexeract_scheduler_sql::{Dialect, PgScheduleStore, schema::schema_ddl};
+
+    let container = Postgres::default()
+        .start()
+        .await
+        .expect("docker daemon must be running");
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
+
+    let pool = sqlx::PgPool::connect(&url)
+        .await
+        .expect("must connect to test container");
+    sqlx::raw_sql(&schema_ddl(Dialect::Postgres, "scheduled_messages").unwrap())
+        .execute(&pool)
+        .await
+        .expect("schema DDL must apply");
+    let store = PgScheduleStore::new(pool, "scheduled_messages").expect("table name must be valid");
+    let message = ScheduledMessage::delay(
+        Target::mediator(),
+        std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+        &TestReminder,
+    )
+    .expect("message must build");
+    store
+        .insert(&message, 5)
+        .await
+        .expect("insert must succeed");
+
+    Command::cargo_bin("hexeract")
+        .unwrap()
+        .args(["scheduler", "list", "--conn", &url, "--format", "json"])
+        .assert()
+        .success()
+        .stdout(contains("\"status\": \"pending\""));
+}
