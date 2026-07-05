@@ -14,13 +14,27 @@ use crate::snapshot::ScheduleStatus;
 use crate::store::ScheduleStore;
 
 /// Stored row backing one schedule in the in-memory store.
-struct StoredSchedule {
-    message: ScheduledMessage,
-    max_attempts: u32,
-    attempts: u32,
-    leased_until: Option<SystemTime>,
-    status: ScheduleStatus,
-    last_error: Option<String>,
+pub(crate) struct StoredSchedule {
+    pub(crate) message: ScheduledMessage,
+    pub(crate) max_attempts: u32,
+    pub(crate) attempts: u32,
+    pub(crate) leased_until: Option<SystemTime>,
+    pub(crate) status: ScheduleStatus,
+    pub(crate) last_error: Option<String>,
+}
+
+impl StoredSchedule {
+    pub(crate) fn to_snapshot(&self) -> ScheduleSnapshot {
+        ScheduleSnapshot::new(
+            self.message.schedule_id,
+            self.status,
+            self.message.scheduled_for,
+            self.attempts,
+            self.max_attempts,
+            self.message.trigger.clone(),
+            self.last_error.clone(),
+        )
+    }
 }
 
 /// An in-memory [`ScheduleStore`] for tests and the worker test harness.
@@ -41,7 +55,9 @@ impl InMemoryScheduleStore {
         Self::default()
     }
 
-    fn lock(&self) -> Result<MutexGuard<'_, HashMap<Uuid, StoredSchedule>>, SchedulerError> {
+    pub(crate) fn lock(
+        &self,
+    ) -> Result<MutexGuard<'_, HashMap<Uuid, StoredSchedule>>, SchedulerError> {
         self.schedules
             .lock()
             .map_err(|_| SchedulerError::internal("schedule store mutex poisoned"))
@@ -182,17 +198,7 @@ impl ScheduleStore for InMemoryScheduleStore {
 
     async fn inspect(&self, schedule_id: Uuid) -> Result<Option<ScheduleSnapshot>, SchedulerError> {
         let schedules = self.lock()?;
-        Ok(schedules.get(&schedule_id).map(|stored| {
-            ScheduleSnapshot::new(
-                schedule_id,
-                stored.status,
-                stored.message.scheduled_for,
-                stored.attempts,
-                stored.max_attempts,
-                stored.message.trigger.clone(),
-                stored.last_error.clone(),
-            )
-        }))
+        Ok(schedules.get(&schedule_id).map(StoredSchedule::to_snapshot))
     }
 
     async fn resume(
