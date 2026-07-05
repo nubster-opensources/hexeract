@@ -1,3 +1,4 @@
+pub(crate) mod dead_letter;
 pub(crate) mod inspect;
 pub(crate) mod list;
 pub(crate) mod open;
@@ -17,6 +18,11 @@ pub(crate) enum SchedulerAction {
     List(list::ListArgs),
     /// Show the full state of one schedule by id.
     Inspect(inspect::InspectArgs),
+    /// Dead-letter queue operations.
+    DeadLetter {
+        #[command(subcommand)]
+        action: dead_letter::DeadLetterAction,
+    },
 }
 
 impl SchedulerAction {
@@ -25,6 +31,7 @@ impl SchedulerAction {
             Self::Schema(args) => args.run(),
             Self::List(args) => args.run().await,
             Self::Inspect(args) => args.run().await,
+            Self::DeadLetter { action } => action.run().await,
         }
     }
 }

@@ -542,3 +542,77 @@ async fn scheduler_inspect_unknown_id_fails_with_exit_code_1() {
         .failure()
         .code(1);
 }
+
+/// Verify that `scheduler dead-letter list` reports a seeded dead-lettered
+/// schedule, that `scheduler dead-letter replay <id>` moves it back to
+/// pending, and that replaying it a second time fails (regression coverage
+/// for the B6 `scheduler dead-letter` subcommands).
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn scheduler_dead_letter_list_and_replay_round_trip() {
+    use hexeract_scheduler::{ScheduleStore, ScheduledMessage, Target};
+    use hexeract_scheduler_sql::{Dialect, PgScheduleStore, schema::schema_ddl};
+
+    let container = Postgres::default()
+        .start()
+        .await
+        .expect("docker daemon must be running");
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
+
+    let pool = sqlx::PgPool::connect(&url)
+        .await
+        .expect("must connect to test container");
+    sqlx::raw_sql(&schema_ddl(Dialect::Postgres, "scheduled_messages").unwrap())
+        .execute(&pool)
+        .await
+        .expect("schema DDL must apply");
+    let store = PgScheduleStore::new(pool, "scheduled_messages").expect("table name must be valid");
+    let message = ScheduledMessage::delay(
+        Target::mediator(),
+        std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+        &TestReminder,
+    )
+    .expect("message must build");
+    store
+        .insert(&message, 5)
+        .await
+        .expect("insert must succeed");
+    store
+        .mark_dead_lettered(message.schedule_id, "boom")
+        .await
+        .expect("mark_dead_lettered must succeed");
+
+    let id = message.schedule_id.to_string();
+
+    Command::cargo_bin("hexeract")
+        .unwrap()
+        .args([
+            "scheduler",
+            "dead-letter",
+            "list",
+            "--conn",
+            &url,
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("dead-lettered"));
+
+    Command::cargo_bin("hexeract")
+        .unwrap()
+        .args(["scheduler", "dead-letter", "replay", &id, "--conn", &url])
+        .assert()
+        .success();
+
+    // Replaying the same id again fails: the first replay already moved it
+    // back to pending, so it is no longer dead-lettered (`NotReplayable`).
+    Command::cargo_bin("hexeract")
+        .unwrap()
+        .args(["scheduler", "dead-letter", "replay", &id, "--conn", &url])
+        .assert()
+        .failure()
+        .code(1);
+}

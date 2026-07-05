@@ -56,14 +56,10 @@ pub(crate) fn dialect_of(conn: &str) -> Result<DialectKind, CliError> {
 
 /// A [`ScheduleAdmin`] whose concrete backend is chosen at runtime.
 ///
-/// # Not yet wired
-///
 /// `scheduler list` (B4) wires `open`/`list_pending`; `scheduler inspect`
-/// (B5) wires `inspect`. No command calls `list_dead_letter`/`replay` yet;
-/// the upcoming `scheduler replay` command (B6) will. Kept
-/// `#[allow(dead_code)]` per associated item until then, mirroring
-/// `scheduler::view::render` in B2, so this task ships standalone under
-/// `-D warnings`.
+/// (B5) wires `inspect`; `scheduler dead-letter list`/`replay` (B6) wire
+/// `list_dead_letter`/`replay`. Every associated item is now consumed by a
+/// command.
 pub(crate) enum AnyScheduleAdmin {
     Postgres(PgScheduleStore),
     MySql(MySqlScheduleStore),
@@ -116,7 +112,6 @@ impl AnyScheduleAdmin {
     }
 
     /// Forward to the active backend's [`ScheduleAdmin::list_dead_letter`].
-    #[allow(dead_code)] // Not called until a future `scheduler list --dead-letter` variant wires it (B5/B6).
     pub(crate) async fn list_dead_letter(
         &self,
         limit: usize,
@@ -141,7 +136,6 @@ impl AnyScheduleAdmin {
     }
 
     /// Forward to the active backend's [`ScheduleAdmin::replay`].
-    #[allow(dead_code)] // Not called until B6 wires `scheduler replay`.
     pub(crate) async fn replay(&self, id: Uuid) -> Result<(), SchedulerError> {
         match self {
             Self::Postgres(s) => s.replay(id).await,
