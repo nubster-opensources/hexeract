@@ -329,9 +329,6 @@ pub(crate) fn inspect_sql(dialect: Dialect, table: &str) -> String {
 
 /// List pending (non-terminal) schedules, oldest occurrence first, bounded by
 /// a limit (parameter 1).
-// Not yet wired into a backend store; the admin CLI (#282 tasks A3-A5) is the
-// first caller.
-#[allow(dead_code)]
 pub(crate) fn list_pending_sql(dialect: Dialect, table: &str) -> String {
     let qtable = dialect.quote_identifier(table);
     let limit = dialect.placeholder(1);
@@ -344,9 +341,6 @@ pub(crate) fn list_pending_sql(dialect: Dialect, table: &str) -> String {
 
 /// List dead-lettered schedules, most recently dead-lettered first, bounded
 /// by a limit (parameter 1).
-// Not yet wired into a backend store; the admin CLI (#282 tasks A3-A5) is the
-// first caller.
-#[allow(dead_code)]
 pub(crate) fn list_dead_letter_sql(dialect: Dialect, table: &str) -> String {
     let qtable = dialect.quote_identifier(table);
     let limit = dialect.placeholder(1);
@@ -360,9 +354,6 @@ pub(crate) fn list_dead_letter_sql(dialect: Dialect, table: &str) -> String {
 /// Replay a dead-lettered schedule (parameter 1): realign it to the database
 /// clock, reset the attempt counter, clear the last error and unpause it,
 /// only if it is currently dead-lettered.
-// Not yet wired into a backend store; the admin CLI (#282 tasks A3-A5) is the
-// first caller.
-#[allow(dead_code)]
 pub(crate) fn replay_sql(dialect: Dialect, table: &str) -> String {
     let qtable = dialect.quote_identifier(table);
     let now = dialect.now_expr();

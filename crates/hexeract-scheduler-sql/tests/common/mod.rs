@@ -11,6 +11,7 @@ use std::time::Duration;
 use std::time::SystemTime;
 
 use hexeract_outbox::Event;
+use hexeract_scheduler::ScheduleAdmin;
 use hexeract_scheduler::ScheduleStatus;
 use hexeract_scheduler::ScheduleStore;
 use hexeract_scheduler::ScheduledMessage;
@@ -411,6 +412,63 @@ pub(crate) async fn resume_realigns_paused_and_rejects_unknown<S: ScheduleStore>
     // Unknown id returns ScheduleNotFound.
     let error = store.resume(Uuid::now_v7(), None).await.unwrap_err();
     assert!(matches!(error, SchedulerError::ScheduleNotFound { .. }));
+}
+
+/// Listing pending schedules orders by earliest occurrence first and honours
+/// the caller's limit.
+pub(crate) async fn list_pending_orders_and_limits<S: ScheduleAdmin>(store: &S) {
+    let sooner = delay_message(future(100));
+    let later = delay_message(future(200));
+    store.insert(&sooner, MAX_ATTEMPTS).await.expect("insert");
+    store.insert(&later, MAX_ATTEMPTS).await.expect("insert");
+    let listed = store.list_pending(10).await.expect("list");
+    assert_eq!(
+        listed.first().map(|s| s.schedule_id),
+        Some(sooner.schedule_id)
+    );
+    let capped = store.list_pending(1).await.expect("list");
+    assert_eq!(capped.len(), 1);
+    assert_eq!(capped[0].schedule_id, sooner.schedule_id);
+}
+
+/// Listing dead-lettered schedules reports the recorded error.
+pub(crate) async fn list_dead_letter_reports_errors<S: ScheduleAdmin>(store: &S) {
+    let message = delay_message(past(60));
+    store.insert(&message, MAX_ATTEMPTS).await.expect("insert");
+    store
+        .mark_dead_lettered(message.schedule_id, "boom")
+        .await
+        .expect("dead");
+    let listed = store.list_dead_letter(10).await.expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].schedule_id, message.schedule_id);
+    assert_eq!(listed[0].last_error.as_deref(), Some("boom"));
+}
+
+/// Replaying a dead-lettered schedule returns it to pending with its attempt
+/// counter and last error cleared, and it no longer appears in the dead
+/// letter listing.
+pub(crate) async fn replay_requeues_dead_letter<S: ScheduleAdmin>(store: &S) {
+    let message = delay_message(past(60));
+    store.insert(&message, MAX_ATTEMPTS).await.expect("insert");
+    store
+        .mark_dead_lettered(message.schedule_id, "boom")
+        .await
+        .expect("dead");
+    store.replay(message.schedule_id).await.expect("replay");
+    let snapshot = store.inspect(message.schedule_id).await.unwrap().unwrap();
+    assert_eq!(snapshot.status, ScheduleStatus::Pending);
+    assert_eq!(snapshot.attempts, 0);
+    assert_eq!(snapshot.last_error, None);
+    assert!(store.list_dead_letter(10).await.unwrap().is_empty());
+}
+
+/// Replaying a schedule that is not dead-lettered is rejected.
+pub(crate) async fn replay_rejects_non_dead_lettered<S: ScheduleAdmin>(store: &S) {
+    let message = delay_message(future(100));
+    store.insert(&message, MAX_ATTEMPTS).await.expect("insert");
+    let error = store.replay(message.schedule_id).await.expect_err("reject");
+    assert!(matches!(error, SchedulerError::NotReplayable { .. }));
 }
 
 /// Insert `count` due one-shot schedules and return their identifiers. Used by
