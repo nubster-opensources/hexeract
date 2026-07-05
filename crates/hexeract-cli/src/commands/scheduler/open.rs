@@ -43,8 +43,12 @@ pub(crate) enum DialectKind {
 /// Returns [`CliError::Fatal`] if the scheme is not one of `postgres`,
 /// `postgresql`, `mysql` or `sqlite`.
 pub(crate) fn dialect_of(conn: &str) -> Result<DialectKind, CliError> {
-    let scheme = conn.split(':').next().unwrap_or_default();
-    match scheme {
+    let scheme = conn
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match scheme.as_str() {
         "postgres" | "postgresql" => Ok(DialectKind::Postgres),
         "mysql" => Ok(DialectKind::MySql),
         "sqlite" => Ok(DialectKind::Sqlite),
@@ -165,6 +169,23 @@ mod tests {
         ));
         assert!(matches!(
             dialect_of("sqlite://x.db").unwrap(),
+            DialectKind::Sqlite
+        ));
+    }
+
+    #[test]
+    fn dialect_is_deduced_case_insensitively() {
+        // URL schemes are case-insensitive per RFC 3986.
+        assert!(matches!(
+            dialect_of("Postgres://x").unwrap(),
+            DialectKind::Postgres
+        ));
+        assert!(matches!(
+            dialect_of("MySQL://x").unwrap(),
+            DialectKind::MySql
+        ));
+        assert!(matches!(
+            dialect_of("SQLite://x.db").unwrap(),
             DialectKind::Sqlite
         ));
     }

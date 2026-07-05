@@ -1,5 +1,6 @@
 use clap::Args;
 use clap::ValueEnum;
+use hexeract_scheduler_sql::DEFAULT_TABLE_NAME;
 use hexeract_scheduler_sql::Dialect;
 use hexeract_scheduler_sql::schema::schema_ddl;
 
@@ -31,11 +32,7 @@ pub(crate) struct SchemaArgs {
     #[arg(long, value_enum, default_value_t = DialectArg::Postgres)]
     dialect: DialectArg,
     /// Scheduler table name. Must match `^[a-zA-Z_][a-zA-Z0-9_]*$`.
-    #[arg(
-        long,
-        default_value = "scheduled_messages",
-        env = "HEXERACT_SCHEDULER_TABLE"
-    )]
+    #[arg(long, default_value = DEFAULT_TABLE_NAME, env = "HEXERACT_SCHEDULER_TABLE")]
     table: String,
 }
 
