@@ -1,3 +1,4 @@
+pub(crate) mod open;
 pub(crate) mod schema;
 pub(crate) mod view;
 
