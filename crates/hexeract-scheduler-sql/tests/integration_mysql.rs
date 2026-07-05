@@ -68,6 +68,10 @@ backend_scenarios!(
     mark_delivered_excludes,
     mark_failed_defers_reclaim_until_retry_at,
     resume_realigns_paused_and_rejects_unknown,
+    list_pending_orders_and_limits,
+    list_dead_letter_reports_errors,
+    replay_requeues_dead_letter,
+    replay_rejects_non_dead_lettered,
 );
 
 /// Two workers claiming concurrently partition the due occurrences via the
