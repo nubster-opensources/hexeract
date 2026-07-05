@@ -61,6 +61,7 @@ backend_scenarios!(
     resume_realigns_paused_and_rejects_unknown,
     list_pending_orders_and_limits,
     list_dead_letter_reports_errors,
+    list_dead_letter_orders_most_recently_dead_lettered_first,
     replay_requeues_dead_letter,
     replay_rejects_non_dead_lettered,
 );

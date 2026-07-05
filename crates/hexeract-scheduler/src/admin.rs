@@ -50,14 +50,15 @@ impl ScheduleAdmin for InMemoryScheduleStore {
         limit: usize,
     ) -> Result<Vec<ScheduleSnapshot>, SchedulerError> {
         let schedules = self.lock()?;
-        let mut rows: Vec<ScheduleSnapshot> = schedules
+        let mut rows: Vec<&StoredSchedule> = schedules
             .values()
             .filter(|stored| stored.status == ScheduleStatus::DeadLettered)
-            .map(StoredSchedule::to_snapshot)
             .collect();
-        rows.sort_by(|a, b| b.scheduled_for.cmp(&a.scheduled_for));
+        // Most recently dead-lettered first, matching the SQL backends'
+        // `ORDER BY dead_lettered_at DESC`.
+        rows.sort_by(|a, b| b.dead_lettered_at.cmp(&a.dead_lettered_at));
         rows.truncate(limit);
-        Ok(rows)
+        Ok(rows.into_iter().map(StoredSchedule::to_snapshot).collect())
     }
 
     async fn replay(&self, schedule_id: Uuid) -> Result<(), SchedulerError> {
@@ -72,6 +73,7 @@ impl ScheduleAdmin for InMemoryScheduleStore {
         stored.attempts = 0;
         stored.last_error = None;
         stored.leased_until = None;
+        stored.dead_lettered_at = None;
         stored.message.scheduled_for = std::time::SystemTime::now();
         Ok(())
     }
@@ -96,6 +98,8 @@ mod tests {
     impl Event for ReminderDue {
         const EVENT_TYPE: &'static str = "reminders.due";
     }
+
+    const LEASE: Duration = Duration::from_secs(30);
 
     fn base() -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(1_000)
@@ -134,10 +138,20 @@ mod tests {
         store.set_paused(paused, true).await.expect("pause");
         let cancelled = insert_delay(&store, base(), 5).await;
         store.cancel(cancelled).await.expect("cancel");
+        let delivered = insert_delay(&store, base(), 5).await;
+        store
+            .claim_due(base(), 10, LEASE)
+            .await
+            .expect("claim delivered");
+        store.mark_delivered(delivered).await.expect("deliver");
         let listed = store.list_pending(10).await.expect("list");
         let ids: Vec<Uuid> = listed.iter().map(|s| s.schedule_id).collect();
         assert!(ids.contains(&paused));
         assert!(!ids.contains(&cancelled));
+        assert!(
+            !ids.contains(&delivered),
+            "a delivered schedule is terminal"
+        );
     }
 
     #[tokio::test]
@@ -154,15 +168,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_dead_letter_orders_most_recently_dead_lettered_first() {
+        let store = InMemoryScheduleStore::default();
+        let first = insert_delay(&store, base(), 5).await;
+        store
+            .mark_dead_lettered(first, "first")
+            .await
+            .expect("dead letter first");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let second = insert_delay(&store, base(), 5).await;
+        store
+            .mark_dead_lettered(second, "second")
+            .await
+            .expect("dead letter second");
+
+        let listed = store.list_dead_letter(10).await.expect("list");
+        assert_eq!(listed.len(), 2);
+        assert_eq!(
+            listed[0].schedule_id, second,
+            "the most recently dead-lettered schedule must come first"
+        );
+        assert_eq!(listed[1].schedule_id, first);
+    }
+
+    #[tokio::test]
     async fn replay_resets_dead_letter_to_pending() {
         let store = InMemoryScheduleStore::default();
         let dead = insert_delay(&store, base(), 5).await;
+        // Drive attempts above zero via a claim before dead-lettering, so the
+        // reset asserted below actually exercises the reset rather than a
+        // counter that was already zero.
+        let claimed = store.claim_due(base(), 10, LEASE).await.expect("claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].attempts, 1);
         store.mark_failed(dead, base(), "err").await.expect("fail");
         store.mark_dead_lettered(dead, "boom").await.expect("dead");
         store.replay(dead).await.expect("replay");
         let snapshot = store.inspect(dead).await.expect("inspect").expect("exists");
         assert_eq!(snapshot.status, ScheduleStatus::Pending);
-        assert_eq!(snapshot.attempts, 0);
+        assert_eq!(
+            snapshot.attempts, 0,
+            "replay must reset the attempt counter"
+        );
         assert_eq!(snapshot.last_error, None);
     }
 
@@ -172,6 +219,15 @@ mod tests {
         let pending = insert_delay(&store, base(), 5).await;
         let error = store.replay(pending).await.expect_err("must reject");
         assert!(matches!(error, SchedulerError::NotReplayable { .. }));
+    }
+
+    #[test]
+    fn not_replayable_display_includes_schedule_id_and_status() {
+        let schedule_id = Uuid::from_u128(7);
+        let error = SchedulerError::not_replayable(schedule_id, ScheduleStatus::Pending);
+        let message = error.to_string();
+        assert!(message.contains(&schedule_id.to_string()));
+        assert!(message.contains("Pending"));
     }
 
     use crate::SchedulerError;

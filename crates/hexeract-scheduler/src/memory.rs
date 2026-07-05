@@ -21,6 +21,13 @@ pub(crate) struct StoredSchedule {
     pub(crate) leased_until: Option<SystemTime>,
     pub(crate) status: ScheduleStatus,
     pub(crate) last_error: Option<String>,
+    /// Instant the schedule was moved to [`ScheduleStatus::DeadLettered`].
+    ///
+    /// Not exposed on [`ScheduleSnapshot`]; it exists solely so
+    /// `ScheduleAdmin::list_dead_letter` can order rows most-recent-first,
+    /// matching the `dead_lettered_at DESC` ordering used by the SQL
+    /// backends.
+    pub(crate) dead_lettered_at: Option<SystemTime>,
 }
 
 impl StoredSchedule {
@@ -80,6 +87,7 @@ impl ScheduleStore for InMemoryScheduleStore {
                 leased_until: None,
                 status: ScheduleStatus::Pending,
                 last_error: None,
+                dead_lettered_at: None,
             },
         );
         Ok(())
@@ -168,6 +176,7 @@ impl ScheduleStore for InMemoryScheduleStore {
                 stored.status = ScheduleStatus::DeadLettered;
                 stored.leased_until = None;
                 stored.last_error = Some(error.to_owned());
+                stored.dead_lettered_at = Some(SystemTime::now());
             }
         }
         Ok(())

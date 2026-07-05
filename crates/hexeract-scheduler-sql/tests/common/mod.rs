@@ -445,6 +445,45 @@ pub(crate) async fn list_dead_letter_reports_errors<S: ScheduleAdmin>(store: &S)
     assert_eq!(listed[0].last_error.as_deref(), Some("boom"));
 }
 
+/// Listing dead-lettered schedules orders the most recently dead-lettered
+/// schedule first, matching the `ORDER BY dead_lettered_at DESC` contract.
+pub(crate) async fn list_dead_letter_orders_most_recently_dead_lettered_first<S: ScheduleAdmin>(
+    store: &S,
+) {
+    let first = delay_message(past(60));
+    store
+        .insert(&first, MAX_ATTEMPTS)
+        .await
+        .expect("insert first");
+    store
+        .mark_dead_lettered(first.schedule_id, "first")
+        .await
+        .expect("dead letter first");
+
+    // Sleep past the coarsest timestamp precision among the backends (SQLite
+    // stores milliseconds) so the two dead-letter instants are unambiguously
+    // ordered.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let second = delay_message(past(60));
+    store
+        .insert(&second, MAX_ATTEMPTS)
+        .await
+        .expect("insert second");
+    store
+        .mark_dead_lettered(second.schedule_id, "second")
+        .await
+        .expect("dead letter second");
+
+    let listed = store.list_dead_letter(10).await.expect("list");
+    assert_eq!(listed.len(), 2);
+    assert_eq!(
+        listed[0].schedule_id, second.schedule_id,
+        "the most recently dead-lettered schedule must come first"
+    );
+    assert_eq!(listed[1].schedule_id, first.schedule_id);
+}
+
 /// Replaying a dead-lettered schedule returns it to pending with its attempt
 /// counter and last error cleared, and it no longer appears in the dead
 /// letter listing.
