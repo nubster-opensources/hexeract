@@ -1,3 +1,4 @@
+pub(crate) mod inspect;
 pub(crate) mod list;
 pub(crate) mod open;
 pub(crate) mod schema;
@@ -14,6 +15,8 @@ pub(crate) enum SchedulerAction {
     Schema(schema::SchemaArgs),
     /// List non-terminal (pending and paused) schedules.
     List(list::ListArgs),
+    /// Show the full state of one schedule by id.
+    Inspect(inspect::InspectArgs),
 }
 
 impl SchedulerAction {
@@ -21,6 +24,7 @@ impl SchedulerAction {
         match self {
             Self::Schema(args) => args.run(),
             Self::List(args) => args.run().await,
+            Self::Inspect(args) => args.run().await,
         }
     }
 }

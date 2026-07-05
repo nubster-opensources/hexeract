@@ -58,11 +58,12 @@ pub(crate) fn dialect_of(conn: &str) -> Result<DialectKind, CliError> {
 ///
 /// # Not yet wired
 ///
-/// `scheduler list` (B4) wires `open`/`list_pending`. No command calls
-/// `list_dead_letter`/`inspect`/`replay` yet; the upcoming `scheduler
-/// inspect`/`replay` commands (B5/B6) will. Kept `#[allow(dead_code)]` per
-/// associated item until then, mirroring `scheduler::view::render` in B2, so
-/// this task ships standalone under `-D warnings`.
+/// `scheduler list` (B4) wires `open`/`list_pending`; `scheduler inspect`
+/// (B5) wires `inspect`. No command calls `list_dead_letter`/`replay` yet;
+/// the upcoming `scheduler replay` command (B6) will. Kept
+/// `#[allow(dead_code)]` per associated item until then, mirroring
+/// `scheduler::view::render` in B2, so this task ships standalone under
+/// `-D warnings`.
 pub(crate) enum AnyScheduleAdmin {
     Postgres(PgScheduleStore),
     MySql(MySqlScheduleStore),
@@ -128,7 +129,6 @@ impl AnyScheduleAdmin {
     }
 
     /// Forward to the active backend's [`ScheduleStore::inspect`].
-    #[allow(dead_code)] // Not called until B5 wires `scheduler inspect`.
     pub(crate) async fn inspect(
         &self,
         id: Uuid,

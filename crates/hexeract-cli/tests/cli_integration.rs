@@ -452,3 +452,93 @@ async fn scheduler_list_json_reports_pending() {
         .success()
         .stdout(contains("\"status\": \"pending\""));
 }
+
+/// Verify that `scheduler inspect <id> --format json` reports the seeded
+/// schedule's own id (regression coverage for the B5 `scheduler inspect`
+/// subcommand).
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn scheduler_inspect_json_reports_seeded_schedule() {
+    use hexeract_scheduler::{ScheduleStore, ScheduledMessage, Target};
+    use hexeract_scheduler_sql::{Dialect, PgScheduleStore, schema::schema_ddl};
+
+    let container = Postgres::default()
+        .start()
+        .await
+        .expect("docker daemon must be running");
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
+
+    let pool = sqlx::PgPool::connect(&url)
+        .await
+        .expect("must connect to test container");
+    sqlx::raw_sql(&schema_ddl(Dialect::Postgres, "scheduled_messages").unwrap())
+        .execute(&pool)
+        .await
+        .expect("schema DDL must apply");
+    let store = PgScheduleStore::new(pool, "scheduled_messages").expect("table name must be valid");
+    let message = ScheduledMessage::delay(
+        Target::mediator(),
+        std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+        &TestReminder,
+    )
+    .expect("message must build");
+    store
+        .insert(&message, 5)
+        .await
+        .expect("insert must succeed");
+
+    let id = message.schedule_id.to_string();
+    Command::cargo_bin("hexeract")
+        .unwrap()
+        .args([
+            "scheduler",
+            "inspect",
+            &id,
+            "--conn",
+            &url,
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .stdout(contains(&id));
+}
+
+/// Verify that inspecting an id absent from the store fails with exit code 1.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn scheduler_inspect_unknown_id_fails_with_exit_code_1() {
+    use hexeract_scheduler_sql::Dialect;
+    use hexeract_scheduler_sql::schema::schema_ddl;
+
+    let container = Postgres::default()
+        .start()
+        .await
+        .expect("docker daemon must be running");
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
+
+    let pool = sqlx::PgPool::connect(&url)
+        .await
+        .expect("must connect to test container");
+    sqlx::raw_sql(&schema_ddl(Dialect::Postgres, "scheduled_messages").unwrap())
+        .execute(&pool)
+        .await
+        .expect("schema DDL must apply");
+
+    Command::cargo_bin("hexeract")
+        .unwrap()
+        .args([
+            "scheduler",
+            "inspect",
+            &uuid::Uuid::new_v4().to_string(),
+            "--conn",
+            &url,
+        ])
+        .assert()
+        .failure()
+        .code(1);
+}
