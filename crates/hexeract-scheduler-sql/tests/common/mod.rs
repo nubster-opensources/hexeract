@@ -220,6 +220,69 @@ pub(crate) async fn cancel_excludes_and_rejects_unknown<S: ScheduleStore>(store:
     assert!(matches!(error, SchedulerError::ScheduleNotFound { .. }));
 }
 
+/// Cancelling a schedule that already reached a terminal state (delivered or
+/// dead-lettered) is a no-op: the original terminal status is preserved, not
+/// overwritten to `Cancelled`. Cancelling an already-cancelled schedule stays
+/// idempotent.
+pub(crate) async fn cancel_does_not_clobber_a_terminal_status<S: ScheduleStore>(store: &S) {
+    let delivered_message = delay_message(past(60));
+    let delivered_id = delivered_message.schedule_id;
+    store
+        .insert(&delivered_message, MAX_ATTEMPTS)
+        .await
+        .expect("insert delivered");
+    store
+        .claim_due(SystemTime::now(), 10, Duration::from_secs(30))
+        .await
+        .expect("claim");
+    store
+        .mark_delivered(delivered_id)
+        .await
+        .expect("mark delivered");
+
+    store.cancel(delivered_id).await.expect("cancel delivered");
+    let snapshot = store.inspect(delivered_id).await.unwrap().unwrap();
+    assert_eq!(
+        snapshot.status,
+        ScheduleStatus::Delivered,
+        "cancel must not clobber a delivered schedule"
+    );
+
+    let dead_lettered_message = delay_message(past(60));
+    let dead_lettered_id = dead_lettered_message.schedule_id;
+    store
+        .insert(&dead_lettered_message, MAX_ATTEMPTS)
+        .await
+        .expect("insert dead-lettered");
+    store
+        .mark_dead_lettered(dead_lettered_id, "boom")
+        .await
+        .expect("dead letter");
+
+    store
+        .cancel(dead_lettered_id)
+        .await
+        .expect("cancel dead-lettered");
+    let snapshot = store.inspect(dead_lettered_id).await.unwrap().unwrap();
+    assert_eq!(
+        snapshot.status,
+        ScheduleStatus::DeadLettered,
+        "cancel must not clobber a dead-lettered schedule"
+    );
+
+    let cancelled_message = delay_message(past(60));
+    let cancelled_id = cancelled_message.schedule_id;
+    store
+        .insert(&cancelled_message, MAX_ATTEMPTS)
+        .await
+        .expect("insert cancelled");
+    store.cancel(cancelled_id).await.expect("first cancel");
+
+    store.cancel(cancelled_id).await.expect("second cancel");
+    let snapshot = store.inspect(cancelled_id).await.unwrap().unwrap();
+    assert_eq!(snapshot.status, ScheduleStatus::Cancelled);
+}
+
 /// Pausing excludes a schedule; resuming makes it claimable again; an unknown
 /// schedule is rejected.
 pub(crate) async fn pause_excludes_then_resume_reenables<S: ScheduleStore>(store: &S) {

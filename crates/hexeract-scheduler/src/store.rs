@@ -143,6 +143,10 @@ pub trait ScheduleStore: Send + Sync + 'static {
 
     /// Cancel a schedule, excluding it from future claims.
     ///
+    /// A no-op when the schedule is already in a terminal state (delivered,
+    /// dead-lettered, or already cancelled): the stored status is never
+    /// overwritten once it has reached a terminal outcome.
+    ///
     /// # Errors
     ///
     /// Returns [`SchedulerError::ScheduleNotFound`] if no schedule matches
