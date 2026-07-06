@@ -54,6 +54,7 @@ backend_scenarios!(
     excludes_not_yet_due,
     reschedule_advances_resets_and_reclaims,
     cancel_excludes_and_rejects_unknown,
+    cancel_does_not_clobber_a_terminal_status,
     pause_excludes_then_resume_reenables,
     dead_letter_excludes_and_records_error,
     mark_delivered_excludes,

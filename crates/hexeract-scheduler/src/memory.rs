@@ -162,8 +162,14 @@ impl ScheduleStore for InMemoryScheduleStore {
         let stored = schedules
             .get_mut(&schedule_id)
             .ok_or_else(|| SchedulerError::schedule_not_found(schedule_id))?;
-        stored.status = ScheduleStatus::Cancelled;
-        stored.leased_until = None;
+        let is_terminal = matches!(
+            stored.status,
+            ScheduleStatus::Delivered | ScheduleStatus::Cancelled | ScheduleStatus::DeadLettered
+        );
+        if !is_terminal {
+            stored.status = ScheduleStatus::Cancelled;
+            stored.leased_until = None;
+        }
         Ok(())
     }
 
@@ -447,6 +453,74 @@ mod tests {
         let store = InMemoryScheduleStore::default();
         let error = store.cancel(Uuid::from_u128(123)).await.unwrap_err();
         assert!(matches!(error, SchedulerError::ScheduleNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn cancel_does_not_clobber_a_delivered_schedule() {
+        let store = InMemoryScheduleStore::default();
+        let schedule_id = insert_delay(&store, base(), 5).await;
+        store.claim_due(base(), 10, LEASE).await.unwrap();
+        store.mark_delivered(schedule_id).await.unwrap();
+
+        store.cancel(schedule_id).await.unwrap();
+
+        let snapshot = store.inspect(schedule_id).await.unwrap().unwrap();
+        assert_eq!(
+            snapshot.status,
+            ScheduleStatus::Delivered,
+            "cancel must not overwrite a terminal Delivered status"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_does_not_clobber_a_dead_lettered_schedule() {
+        let store = InMemoryScheduleStore::default();
+        let schedule_id = insert_delay(&store, base(), 5).await;
+        store.mark_dead_lettered(schedule_id, "boom").await.unwrap();
+
+        store.cancel(schedule_id).await.unwrap();
+
+        let snapshot = store.inspect(schedule_id).await.unwrap().unwrap();
+        assert_eq!(
+            snapshot.status,
+            ScheduleStatus::DeadLettered,
+            "cancel must not overwrite a terminal DeadLettered status"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_is_idempotent_on_an_already_cancelled_schedule() {
+        let store = InMemoryScheduleStore::default();
+        let schedule_id = insert_delay(&store, base(), 5).await;
+        store.cancel(schedule_id).await.unwrap();
+
+        store.cancel(schedule_id).await.unwrap();
+
+        let snapshot = store.inspect(schedule_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.status, ScheduleStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn cancel_still_cancels_a_pending_schedule() {
+        let store = InMemoryScheduleStore::default();
+        let schedule_id = insert_delay(&store, base(), 5).await;
+
+        store.cancel(schedule_id).await.unwrap();
+
+        let snapshot = store.inspect(schedule_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.status, ScheduleStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn cancel_still_cancels_a_paused_schedule() {
+        let store = InMemoryScheduleStore::default();
+        let schedule_id = insert_delay(&store, base(), 5).await;
+        store.set_paused(schedule_id, true).await.unwrap();
+
+        store.cancel(schedule_id).await.unwrap();
+
+        let snapshot = store.inspect(schedule_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.status, ScheduleStatus::Cancelled);
     }
 
     #[tokio::test]

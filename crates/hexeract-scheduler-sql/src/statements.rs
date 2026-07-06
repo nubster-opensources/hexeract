@@ -246,13 +246,21 @@ pub(crate) fn mark_dead_lettered_sql(dialect: Dialect, table: &str) -> String {
     )
 }
 
-/// Cancel a schedule. The store treats a zero row count as "not found".
+/// Cancel a schedule, only if it is not already terminal or cancelled.
+///
+/// The store treats a zero row count as either "not found" or "already
+/// terminal" (disambiguated via the `exists_sql` probe), consistent with the
+/// idempotent contract used by [`reschedule_sql`] and the other
+/// acknowledgement statements: a schedule that already reached a terminal
+/// outcome keeps that outcome instead of being clobbered to `Cancelled`.
 pub(crate) fn cancel_sql(dialect: Dialect, table: &str) -> String {
     let qtable = dialect.quote_identifier(table);
     let now = dialect.now_expr();
     let id = dialect.placeholder(1);
     format!(
-        "UPDATE {qtable} SET cancelled_at = {now}, leased_until = NULL WHERE schedule_id = {id}"
+        "UPDATE {qtable} SET cancelled_at = {now}, leased_until = NULL \
+         WHERE schedule_id = {id} \
+           AND delivered_at IS NULL AND cancelled_at IS NULL AND dead_lettered_at IS NULL"
     )
 }
 
@@ -426,6 +434,7 @@ mod tests {
                 reschedule_sql(dialect, "scheduled_messages"),
                 mark_dead_lettered_sql(dialect, "scheduled_messages"),
                 mark_failed_sql(dialect, "scheduled_messages"),
+                cancel_sql(dialect, "scheduled_messages"),
             ] {
                 assert!(
                     sql.contains("delivered_at IS NULL")
