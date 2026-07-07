@@ -19,6 +19,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
 
 use hexeract::bus::Binding;
 use hexeract::bus::BusError;
@@ -35,8 +36,11 @@ use hexeract::bus_rabbitmq::ensure_topology;
 use hexeract::core::HandlerContext;
 use hexeract::outbox::Event;
 use hexeract::scheduler::BusSink;
+use hexeract::scheduler::ScheduleStore;
+use hexeract::scheduler::ScheduledMessage;
 use hexeract::scheduler::SchedulerBuilder;
 use hexeract::scheduler::SchedulerControl;
+use hexeract::scheduler::Target;
 use hexeract::scheduler_sql::Dialect;
 use hexeract::scheduler_sql::PgScheduleStore;
 use hexeract::scheduler_sql::schema::schema_ddl;
@@ -52,10 +56,8 @@ use uuid::Uuid;
 
 const TABLE: &str = "scheduled_messages";
 const ROUTING_KEY: &str = "reminders.due";
-#[allow(dead_code)]
 const MAX_ATTEMPTS: u32 = 5;
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
-#[allow(dead_code)]
 const ONE_SHOT_BUDGET: Duration = Duration::from_secs(10);
 #[allow(dead_code)]
 const CRON_BUDGET: Duration = Duration::from_secs(15);
@@ -100,7 +102,6 @@ impl Handler<ReminderDue> for CountingHandler {
 }
 
 /// Wait until `seen` reaches `target`, failing once `budget` is exhausted.
-#[allow(dead_code)]
 async fn wait_for_count(
     seen: &AtomicUsize,
     target: usize,
@@ -193,6 +194,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let control = SchedulerControl::new(Arc::new(store.clone()));
     tracing::info!("scheduler worker and bus consumer running");
 
+    tracing::info!("act 1: one-shot reminder due in two seconds");
+    let one_shot = ReminderDue {
+        reminder_id: Uuid::new_v4(),
+        note: "one-shot reminder".to_owned(),
+    };
+    let message = ScheduledMessage::delay(
+        Target::bus(ROUTING_KEY),
+        SystemTime::now() + Duration::from_secs(2),
+        &one_shot,
+    )?;
+    store.insert(&message, MAX_ATTEMPTS).await?;
+    tracing::info!(schedule_id = %message.schedule_id, "one-shot reminder scheduled");
+    wait_for_count(&seen, 1, ONE_SHOT_BUDGET, "act 1 one-shot reminder").await?;
     let _ = &control;
 
     cancel.cancel();
