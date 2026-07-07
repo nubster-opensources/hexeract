@@ -44,3 +44,4 @@ jobs:
           cargo run --example 03_bus_pubsub          -p hexeract-examples
           cargo run --example 04_bus_mediator        -p hexeract-examples
           cargo run --example 05_orders_to_payments  -p hexeract-examples
+          cargo run --example 06_scheduled_reminder  -p hexeract-examples
