@@ -19,6 +19,9 @@ hexeract = { path = "../hexeract", version = "0.5", features = [
   "outbox-sql-postgres",
   "bus",
   "bus-rabbitmq",
+  "scheduler",
+  "scheduler-bus",
+  "scheduler-sql-postgres",
 ] }
 serde = { workspace = true }
 serde_json = { workspace = true }
