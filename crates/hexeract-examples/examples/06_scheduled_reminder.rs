@@ -36,6 +36,7 @@ use hexeract::bus_rabbitmq::ensure_topology;
 use hexeract::core::HandlerContext;
 use hexeract::outbox::Event;
 use hexeract::scheduler::BusSink;
+use hexeract::scheduler::ScheduleStatus;
 use hexeract::scheduler::ScheduleStore;
 use hexeract::scheduler::ScheduledMessage;
 use hexeract::scheduler::SchedulerBuilder;
@@ -47,6 +48,7 @@ use hexeract::scheduler_sql::schema::schema_ddl;
 use serde::Deserialize;
 use serde::Serialize;
 use sqlx::PgPool;
+use testcontainers::ContainerAsync;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::rabbitmq::RabbitMq;
@@ -59,9 +61,7 @@ const ROUTING_KEY: &str = "reminders.due";
 const MAX_ATTEMPTS: u32 = 5;
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const ONE_SHOT_BUDGET: Duration = Duration::from_secs(10);
-#[allow(dead_code)]
 const CRON_BUDGET: Duration = Duration::from_secs(15);
-#[allow(dead_code)]
 const GRACE_WINDOW: Duration = Duration::from_secs(5);
 
 /// Reminder payload scheduled for future delivery on the bus.
@@ -122,32 +122,30 @@ async fn wait_for_count(
     Ok(())
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> Result<(), Box<dyn Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
-    tracing::info!("starting postgres container");
-    let postgres = Postgres::default().start().await?;
-    let postgres_host = postgres.get_host().await?;
-    let postgres_port = postgres.get_host_port_ipv4(5432).await?;
-    let postgres_url =
-        format!("postgres://postgres:postgres@{postgres_host}:{postgres_port}/postgres");
-    let pool = PgPool::connect(&postgres_url).await?;
+/// Start a Postgres container and prepare the schedule store table.
+async fn setup_postgres() -> Result<(ContainerAsync<Postgres>, PgScheduleStore), Box<dyn Error>> {
+    let container = Postgres::default().start().await?;
+    let host = container.get_host().await?;
+    let port = container.get_host_port_ipv4(5432).await?;
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    let pool = PgPool::connect(&url).await?;
     let ddl = schema_ddl(Dialect::Postgres, TABLE)?;
     sqlx::raw_sql(&ddl).execute(&pool).await?;
     let store = PgScheduleStore::new(pool, TABLE)?;
-    tracing::info!(table = TABLE, "schedule store ready");
+    Ok((container, store))
+}
 
-    tracing::info!("starting rabbitmq container");
-    let rabbitmq = RabbitMq::default().start().await?;
-    let rabbitmq_host = rabbitmq.get_host().await?;
-    let rabbitmq_port = rabbitmq.get_host_port_ipv4(5672).await?;
-    let rabbitmq_uri = format!("amqp://{rabbitmq_host}:{rabbitmq_port}");
+/// Start a RabbitMQ container and return its AMQP connection uri.
+async fn setup_rabbit() -> Result<(ContainerAsync<RabbitMq>, String), Box<dyn Error>> {
+    let container = RabbitMq::default().start().await?;
+    let host = container.get_host().await?;
+    let port = container.get_host_port_ipv4(5672).await?;
+    let uri = format!("amqp://{host}:{port}");
+    Ok((container, uri))
+}
 
+/// Declare the reminders exchange, queue and binding on the running broker.
+async fn declare_topology(rabbitmq_uri: &str) -> Result<(Exchange, Queue), Box<dyn Error>> {
     let exchange = Exchange::new("reminders.exchange", ExchangeKind::Topic)?
         .durable(false)
         .auto_delete(true);
@@ -157,7 +155,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let routing_key = RoutingKey::new(ROUTING_KEY)?;
     let binding = Binding::new(&queue.name, &exchange.name, routing_key.clone())?;
 
-    let admin = RabbitMqConnection::connect(&rabbitmq_uri).await?;
+    let admin = RabbitMqConnection::connect(rabbitmq_uri).await?;
     ensure_topology(
         &admin,
         std::slice::from_ref(&exchange),
@@ -171,6 +169,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         routing_key = %routing_key,
         "topology declared"
     );
+    Ok((exchange, queue))
+}
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+async fn main() -> Result<(), Box<dyn Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
+    let (_postgres, store) = setup_postgres().await?;
+    tracing::info!(table = TABLE, "schedule store ready");
+
+    let (_rabbitmq, rabbitmq_uri) = setup_rabbit().await?;
+    let (exchange, queue) = declare_topology(&rabbitmq_uri).await?;
 
     let seen = Arc::new(AtomicUsize::new(0));
     let consumer_conn = RabbitMqConnection::connect(&rabbitmq_uri).await?;
@@ -207,7 +221,66 @@ async fn main() -> Result<(), Box<dyn Error>> {
     store.insert(&message, MAX_ATTEMPTS).await?;
     tracing::info!(schedule_id = %message.schedule_id, "one-shot reminder scheduled");
     wait_for_count(&seen, 1, ONE_SHOT_BUDGET, "act 1 one-shot reminder").await?;
-    let _ = &control;
+
+    tracing::info!("act 2: recurring cron reminder every two seconds");
+    let recurring = ReminderDue {
+        reminder_id: Uuid::new_v4(),
+        note: "recurring reminder".to_owned(),
+    };
+    let message = ScheduledMessage::cron(
+        Target::bus(ROUTING_KEY),
+        "*/2 * * * * *",
+        SystemTime::now() + Duration::from_secs(2),
+        &recurring,
+    )?;
+    let schedule_id = message.schedule_id;
+    store.insert(&message, MAX_ATTEMPTS).await?;
+    tracing::info!(%schedule_id, "recurring reminder scheduled");
+
+    // Two occurrences prove the full recurring path: claim, dispatch and
+    // reschedule to the next cron instant.
+    wait_for_count(&seen, 3, CRON_BUDGET, "act 2 recurring reminder").await?;
+
+    let snapshot = control
+        .inspect(schedule_id)
+        .await?
+        .ok_or("recurring schedule not found on inspect")?;
+    tracing::info!(
+        status = ?snapshot.status,
+        scheduled_for = ?snapshot.scheduled_for,
+        attempts = snapshot.attempts,
+        "live schedule inspected"
+    );
+    if !matches!(snapshot.status, ScheduleStatus::Pending) {
+        return Err(format!("expected a pending schedule, got {:?}", snapshot.status).into());
+    }
+
+    control.cancel(schedule_id).await?;
+    let snapshot = control
+        .inspect(schedule_id)
+        .await?
+        .ok_or("recurring schedule not found after cancel")?;
+    if !matches!(snapshot.status, ScheduleStatus::Cancelled) {
+        return Err(format!("expected a cancelled schedule, got {:?}", snapshot.status).into());
+    }
+    tracing::info!("recurring reminder cancelled");
+
+    // Let any in-flight occurrence land before taking the baseline, then
+    // assert the cancelled schedule never fires again.
+    tokio::time::sleep(POLL_INTERVAL + Duration::from_secs(2)).await;
+    let baseline = seen.load(Ordering::SeqCst);
+    tokio::time::sleep(GRACE_WINDOW).await;
+    let after_grace = seen.load(Ordering::SeqCst);
+    if after_grace != baseline {
+        return Err(format!(
+            "cancelled schedule kept firing: {after_grace} reminders after a baseline of {baseline}"
+        )
+        .into());
+    }
+    tracing::info!(
+        total = after_grace,
+        "no reminder after cancel, grace window clean"
+    );
 
     cancel.cancel();
     scheduler_handle.await??;
