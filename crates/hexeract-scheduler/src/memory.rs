@@ -14,13 +14,34 @@ use crate::snapshot::ScheduleStatus;
 use crate::store::ScheduleStore;
 
 /// Stored row backing one schedule in the in-memory store.
-struct StoredSchedule {
-    message: ScheduledMessage,
-    max_attempts: u32,
-    attempts: u32,
-    leased_until: Option<SystemTime>,
-    status: ScheduleStatus,
-    last_error: Option<String>,
+pub(crate) struct StoredSchedule {
+    pub(crate) message: ScheduledMessage,
+    pub(crate) max_attempts: u32,
+    pub(crate) attempts: u32,
+    pub(crate) leased_until: Option<SystemTime>,
+    pub(crate) status: ScheduleStatus,
+    pub(crate) last_error: Option<String>,
+    /// Instant the schedule was moved to [`ScheduleStatus::DeadLettered`].
+    ///
+    /// Not exposed on [`ScheduleSnapshot`]; it exists solely so
+    /// `ScheduleAdmin::list_dead_letter` can order rows most-recent-first,
+    /// matching the `dead_lettered_at DESC` ordering used by the SQL
+    /// backends.
+    pub(crate) dead_lettered_at: Option<SystemTime>,
+}
+
+impl StoredSchedule {
+    pub(crate) fn to_snapshot(&self) -> ScheduleSnapshot {
+        ScheduleSnapshot::new(
+            self.message.schedule_id,
+            self.status,
+            self.message.scheduled_for,
+            self.attempts,
+            self.max_attempts,
+            self.message.trigger.clone(),
+            self.last_error.clone(),
+        )
+    }
 }
 
 /// An in-memory [`ScheduleStore`] for tests and the worker test harness.
@@ -41,7 +62,9 @@ impl InMemoryScheduleStore {
         Self::default()
     }
 
-    fn lock(&self) -> Result<MutexGuard<'_, HashMap<Uuid, StoredSchedule>>, SchedulerError> {
+    pub(crate) fn lock(
+        &self,
+    ) -> Result<MutexGuard<'_, HashMap<Uuid, StoredSchedule>>, SchedulerError> {
         self.schedules
             .lock()
             .map_err(|_| SchedulerError::internal("schedule store mutex poisoned"))
@@ -64,6 +87,7 @@ impl ScheduleStore for InMemoryScheduleStore {
                 leased_until: None,
                 status: ScheduleStatus::Pending,
                 last_error: None,
+                dead_lettered_at: None,
             },
         );
         Ok(())
@@ -152,6 +176,7 @@ impl ScheduleStore for InMemoryScheduleStore {
                 stored.status = ScheduleStatus::DeadLettered;
                 stored.leased_until = None;
                 stored.last_error = Some(error.to_owned());
+                stored.dead_lettered_at = Some(SystemTime::now());
             }
         }
         Ok(())
@@ -188,17 +213,7 @@ impl ScheduleStore for InMemoryScheduleStore {
 
     async fn inspect(&self, schedule_id: Uuid) -> Result<Option<ScheduleSnapshot>, SchedulerError> {
         let schedules = self.lock()?;
-        Ok(schedules.get(&schedule_id).map(|stored| {
-            ScheduleSnapshot::new(
-                schedule_id,
-                stored.status,
-                stored.message.scheduled_for,
-                stored.attempts,
-                stored.max_attempts,
-                stored.message.trigger.clone(),
-                stored.last_error.clone(),
-            )
-        }))
+        Ok(schedules.get(&schedule_id).map(StoredSchedule::to_snapshot))
     }
 
     async fn resume(

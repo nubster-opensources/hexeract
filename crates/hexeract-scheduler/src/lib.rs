@@ -31,6 +31,8 @@
 //! All instants are UTC. Per-schedule time zones are an explicit non-goal
 //! of this version.
 
+/// Operator surface over scheduled work: listing and replay.
+pub mod admin;
 /// Fluent assembly of a validated [`SchedulerWorker`].
 pub mod builder;
 /// Sink that publishes a due occurrence on the message bus.
@@ -67,6 +69,7 @@ pub mod trigger;
 /// The polling worker that drives schedules to their sink.
 pub mod worker;
 
+pub use admin::ScheduleAdmin;
 pub use builder::SchedulerBuilder;
 #[cfg(feature = "bus")]
 pub use bus_sink::BusSink;

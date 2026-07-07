@@ -18,6 +18,7 @@ use std::time::SystemTime;
 
 use hexeract_outbox_sql::Dialect;
 use hexeract_scheduler::LeasedOccurrence;
+use hexeract_scheduler::ScheduleAdmin;
 use hexeract_scheduler::ScheduleSnapshot;
 use hexeract_scheduler::ScheduleStore;
 use hexeract_scheduler::ScheduledMessage;
@@ -133,6 +134,9 @@ pub struct MySqlScheduleStore {
     resume_only_sql: Arc<str>,
     inspect_sql: Arc<str>,
     exists_sql: Arc<str>,
+    list_pending_sql: Arc<str>,
+    list_dead_letter_sql: Arc<str>,
+    replay_sql: Arc<str>,
 }
 
 impl MySqlScheduleStore {
@@ -162,6 +166,9 @@ impl MySqlScheduleStore {
             resume_only_sql: Arc::from(statements::resume_only_sql(DIALECT, &table_name)),
             inspect_sql: Arc::from(statements::inspect_sql(DIALECT, &table_name)),
             exists_sql: Arc::from(statements::exists_sql(DIALECT, &table_name)),
+            list_pending_sql: Arc::from(statements::list_pending_sql(DIALECT, &table_name)),
+            list_dead_letter_sql: Arc::from(statements::list_dead_letter_sql(DIALECT, &table_name)),
+            replay_sql: Arc::from(statements::replay_sql(DIALECT, &table_name)),
             table_name: Arc::from(table_name),
         })
     }
@@ -378,6 +385,44 @@ impl ScheduleStore for MySqlScheduleStore {
         };
         if result.rows_affected() == 0 {
             self.ensure_exists(schedule_id).await?;
+        }
+        Ok(())
+    }
+}
+
+impl ScheduleAdmin for MySqlScheduleStore {
+    async fn list_pending(&self, limit: usize) -> Result<Vec<ScheduleSnapshot>, SchedulerError> {
+        let rows = sqlx::query(&self.list_pending_sql)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(database_error)?;
+        rows.iter().map(decode_snapshot).collect()
+    }
+
+    async fn list_dead_letter(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ScheduleSnapshot>, SchedulerError> {
+        let rows = sqlx::query(&self.list_dead_letter_sql)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(database_error)?;
+        rows.iter().map(decode_snapshot).collect()
+    }
+
+    async fn replay(&self, schedule_id: Uuid) -> Result<(), SchedulerError> {
+        let result = sqlx::query(&self.replay_sql)
+            .bind(schedule_id)
+            .execute(&self.pool)
+            .await
+            .map_err(database_error)?;
+        if result.rows_affected() == 0 {
+            return match self.inspect(schedule_id).await? {
+                None => Err(SchedulerError::schedule_not_found(schedule_id)),
+                Some(snapshot) => Err(SchedulerError::not_replayable(schedule_id, snapshot.status)),
+            };
         }
         Ok(())
     }

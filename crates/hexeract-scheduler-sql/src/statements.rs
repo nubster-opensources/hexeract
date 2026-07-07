@@ -320,14 +320,58 @@ pub(crate) fn resume_only_sql(dialect: Dialect, table: &str) -> String {
     )
 }
 
+/// Columns returned for a schedule snapshot, in a fixed order.
+///
+/// The store maps a row in this column order onto a
+/// `hexeract_scheduler::ScheduleSnapshot`. Shared by [`inspect_sql`] and the
+/// admin listing statements so the snapshot shape has one source of truth.
+pub(crate) const SNAPSHOT_COLUMNS: &str = "schedule_id, trigger_kind, cron_expr, scheduled_for, attempts, max_attempts, \
+     paused, last_error, delivered_at, cancelled_at, dead_lettered_at";
+
 /// Read the columns needed to build a schedule snapshot.
 pub(crate) fn inspect_sql(dialect: Dialect, table: &str) -> String {
     let qtable = dialect.quote_identifier(table);
     let id = dialect.placeholder(1);
+    format!("SELECT {SNAPSHOT_COLUMNS} FROM {qtable} WHERE schedule_id = {id}")
+}
+
+/// List pending (non-terminal) schedules, oldest occurrence first, bounded by
+/// a limit (parameter 1).
+pub(crate) fn list_pending_sql(dialect: Dialect, table: &str) -> String {
+    let qtable = dialect.quote_identifier(table);
+    let limit = dialect.placeholder(1);
     format!(
-        "SELECT schedule_id, trigger_kind, cron_expr, scheduled_for, attempts, max_attempts, \
-                paused, last_error, delivered_at, cancelled_at, dead_lettered_at \
-         FROM {qtable} WHERE schedule_id = {id}"
+        "SELECT {SNAPSHOT_COLUMNS} FROM {qtable} \
+         WHERE delivered_at IS NULL AND cancelled_at IS NULL AND dead_lettered_at IS NULL \
+         ORDER BY scheduled_for LIMIT {limit}"
+    )
+}
+
+/// List dead-lettered schedules, most recently dead-lettered first, bounded
+/// by a limit (parameter 1).
+pub(crate) fn list_dead_letter_sql(dialect: Dialect, table: &str) -> String {
+    let qtable = dialect.quote_identifier(table);
+    let limit = dialect.placeholder(1);
+    format!(
+        "SELECT {SNAPSHOT_COLUMNS} FROM {qtable} \
+         WHERE dead_lettered_at IS NOT NULL \
+         ORDER BY dead_lettered_at DESC LIMIT {limit}"
+    )
+}
+
+/// Replay a dead-lettered schedule (parameter 1): realign it to the database
+/// clock, reset the attempt counter, clear the last error and unpause it,
+/// only if it is currently dead-lettered.
+pub(crate) fn replay_sql(dialect: Dialect, table: &str) -> String {
+    let qtable = dialect.quote_identifier(table);
+    let now = dialect.now_expr();
+    let not_paused = false_literal(dialect);
+    let id = dialect.placeholder(1);
+    format!(
+        "UPDATE {qtable} \
+         SET scheduled_for = {now}, attempts = 0, leased_until = NULL, last_error = NULL, \
+             paused = {not_paused}, dead_lettered_at = NULL \
+         WHERE schedule_id = {id} AND dead_lettered_at IS NOT NULL"
     )
 }
 
@@ -547,5 +591,39 @@ mod tests {
             assert!(mark_delivered_sql(dialect, "order").contains(&quoted));
             assert!(inspect_sql(dialect, "order").contains(&quoted));
         }
+    }
+}
+
+#[cfg(test)]
+mod admin_tests {
+    use super::*;
+    use hexeract_outbox_sql::Dialect;
+
+    #[test]
+    fn list_pending_selects_non_terminal_ordered_and_limited() {
+        let sql = list_pending_sql(Dialect::Postgres, "scheduled_messages");
+        assert!(sql.contains("delivered_at IS NULL"));
+        assert!(sql.contains("cancelled_at IS NULL"));
+        assert!(sql.contains("dead_lettered_at IS NULL"));
+        assert!(sql.contains("ORDER BY scheduled_for"));
+        assert!(sql.contains("LIMIT $1"));
+    }
+
+    #[test]
+    fn list_dead_letter_selects_dead_ordered_desc_and_limited() {
+        let sql = list_dead_letter_sql(Dialect::Postgres, "scheduled_messages");
+        assert!(sql.contains("dead_lettered_at IS NOT NULL"));
+        assert!(sql.contains("ORDER BY dead_lettered_at DESC"));
+        assert!(sql.contains("LIMIT $1"));
+    }
+
+    #[test]
+    fn replay_clears_dead_letter_and_resets_guarded() {
+        let sql = replay_sql(Dialect::Postgres, "scheduled_messages");
+        assert!(sql.contains("dead_lettered_at = NULL"));
+        assert!(sql.contains("attempts = 0"));
+        assert!(sql.contains("last_error = NULL"));
+        assert!(sql.contains("WHERE schedule_id = $1"));
+        assert!(sql.contains("dead_lettered_at IS NOT NULL"));
     }
 }

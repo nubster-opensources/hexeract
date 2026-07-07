@@ -25,6 +25,11 @@ enum Commands {
         #[command(subcommand)]
         action: commands::bus::BusAction,
     },
+    /// Operate on the scheduler storage.
+    Scheduler {
+        #[command(subcommand)]
+        action: commands::scheduler::SchedulerAction,
+    },
 }
 
 impl Cli {
@@ -32,6 +37,7 @@ impl Cli {
         match self.command {
             Commands::Outbox { action } => action.run().await,
             Commands::Bus { action } => action.run().await,
+            Commands::Scheduler { action } => action.run().await,
         }
     }
 }

@@ -46,6 +46,16 @@ pub enum SchedulerError {
         schedule_id: Uuid,
     },
 
+    /// A replay was requested on a schedule that is not dead-lettered.
+    #[error("schedule {schedule_id} is not replayable in status {status:?}")]
+    #[non_exhaustive]
+    NotReplayable {
+        /// Identifier of the schedule that could not be replayed.
+        schedule_id: Uuid,
+        /// The current status that made replay invalid.
+        status: crate::ScheduleStatus,
+    },
+
     /// A sink failed to dispatch a due occurrence.
     ///
     /// The original error is preserved as a boxed source. The worker treats
@@ -87,6 +97,15 @@ impl SchedulerError {
     #[must_use]
     pub fn schedule_not_found(schedule_id: Uuid) -> Self {
         Self::ScheduleNotFound { schedule_id }
+    }
+
+    /// Build a [`SchedulerError::NotReplayable`] for `schedule_id`.
+    #[must_use]
+    pub fn not_replayable(schedule_id: Uuid, status: crate::ScheduleStatus) -> Self {
+        Self::NotReplayable {
+            schedule_id,
+            status,
+        }
     }
 
     /// Build an [`SchedulerError::Dispatch`] from a sink error.

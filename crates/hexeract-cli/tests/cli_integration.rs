@@ -48,6 +48,23 @@ fn patch_with_invalid_table_name_fails() {
 }
 
 #[test]
+fn scheduler_schema_prints_ddl_for_selected_dialect() {
+    Command::cargo_bin("hexeract")
+        .unwrap()
+        .args([
+            "scheduler",
+            "schema",
+            "--dialect",
+            "postgres",
+            "--table",
+            "scheduled_messages",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("CREATE TABLE IF NOT EXISTS scheduled_messages"));
+}
+
+#[test]
 fn apply_without_confirmation_flag_refuses_with_exit_code_2() {
     Command::cargo_bin("hexeract")
         .unwrap()
@@ -382,4 +399,220 @@ async fn outbox_check_ignores_same_named_table_in_other_schema() {
         .failure()
         .code(1)
         .stderr(contains("does not exist"));
+}
+
+/// Minimal event used to build a [`hexeract_scheduler::ScheduledMessage`] for
+/// the `scheduler list` integration test below.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TestReminder;
+
+impl hexeract_outbox::Event for TestReminder {
+    const EVENT_TYPE: &'static str = "test.reminder";
+}
+
+/// Verify that `scheduler list --format json` reports a seeded pending
+/// schedule (regression coverage for the B4 `scheduler list` subcommand).
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn scheduler_list_json_reports_pending() {
+    use hexeract_scheduler::{ScheduleStore, ScheduledMessage, Target};
+    use hexeract_scheduler_sql::{Dialect, PgScheduleStore, schema::schema_ddl};
+
+    let container = Postgres::default()
+        .start()
+        .await
+        .expect("docker daemon must be running");
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
+
+    let pool = sqlx::PgPool::connect(&url)
+        .await
+        .expect("must connect to test container");
+    sqlx::raw_sql(&schema_ddl(Dialect::Postgres, "scheduled_messages").unwrap())
+        .execute(&pool)
+        .await
+        .expect("schema DDL must apply");
+    let store = PgScheduleStore::new(pool, "scheduled_messages").expect("table name must be valid");
+    let message = ScheduledMessage::delay(
+        Target::mediator(),
+        std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+        &TestReminder,
+    )
+    .expect("message must build");
+    store
+        .insert(&message, 5)
+        .await
+        .expect("insert must succeed");
+
+    Command::cargo_bin("hexeract")
+        .unwrap()
+        .args(["scheduler", "list", "--conn", &url, "--format", "json"])
+        .assert()
+        .success()
+        .stdout(contains("\"status\": \"pending\""));
+}
+
+/// Verify that `scheduler inspect <id> --format json` reports the seeded
+/// schedule's own id (regression coverage for the B5 `scheduler inspect`
+/// subcommand).
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn scheduler_inspect_json_reports_seeded_schedule() {
+    use hexeract_scheduler::{ScheduleStore, ScheduledMessage, Target};
+    use hexeract_scheduler_sql::{Dialect, PgScheduleStore, schema::schema_ddl};
+
+    let container = Postgres::default()
+        .start()
+        .await
+        .expect("docker daemon must be running");
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
+
+    let pool = sqlx::PgPool::connect(&url)
+        .await
+        .expect("must connect to test container");
+    sqlx::raw_sql(&schema_ddl(Dialect::Postgres, "scheduled_messages").unwrap())
+        .execute(&pool)
+        .await
+        .expect("schema DDL must apply");
+    let store = PgScheduleStore::new(pool, "scheduled_messages").expect("table name must be valid");
+    let message = ScheduledMessage::delay(
+        Target::mediator(),
+        std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+        &TestReminder,
+    )
+    .expect("message must build");
+    store
+        .insert(&message, 5)
+        .await
+        .expect("insert must succeed");
+
+    let id = message.schedule_id.to_string();
+    Command::cargo_bin("hexeract")
+        .unwrap()
+        .args([
+            "scheduler",
+            "inspect",
+            &id,
+            "--conn",
+            &url,
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .stdout(contains(&id));
+}
+
+/// Verify that inspecting an id absent from the store fails with exit code 1.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn scheduler_inspect_unknown_id_fails_with_exit_code_1() {
+    use hexeract_scheduler_sql::Dialect;
+    use hexeract_scheduler_sql::schema::schema_ddl;
+
+    let container = Postgres::default()
+        .start()
+        .await
+        .expect("docker daemon must be running");
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
+
+    let pool = sqlx::PgPool::connect(&url)
+        .await
+        .expect("must connect to test container");
+    sqlx::raw_sql(&schema_ddl(Dialect::Postgres, "scheduled_messages").unwrap())
+        .execute(&pool)
+        .await
+        .expect("schema DDL must apply");
+
+    Command::cargo_bin("hexeract")
+        .unwrap()
+        .args([
+            "scheduler",
+            "inspect",
+            &uuid::Uuid::new_v4().to_string(),
+            "--conn",
+            &url,
+        ])
+        .assert()
+        .failure()
+        .code(1);
+}
+
+/// Verify that `scheduler dead-letter list` reports a seeded dead-lettered
+/// schedule, that `scheduler dead-letter replay <id>` moves it back to
+/// pending, and that replaying it a second time fails (regression coverage
+/// for the B6 `scheduler dead-letter` subcommands).
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn scheduler_dead_letter_list_and_replay_round_trip() {
+    use hexeract_scheduler::{ScheduleStore, ScheduledMessage, Target};
+    use hexeract_scheduler_sql::{Dialect, PgScheduleStore, schema::schema_ddl};
+
+    let container = Postgres::default()
+        .start()
+        .await
+        .expect("docker daemon must be running");
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
+
+    let pool = sqlx::PgPool::connect(&url)
+        .await
+        .expect("must connect to test container");
+    sqlx::raw_sql(&schema_ddl(Dialect::Postgres, "scheduled_messages").unwrap())
+        .execute(&pool)
+        .await
+        .expect("schema DDL must apply");
+    let store = PgScheduleStore::new(pool, "scheduled_messages").expect("table name must be valid");
+    let message = ScheduledMessage::delay(
+        Target::mediator(),
+        std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+        &TestReminder,
+    )
+    .expect("message must build");
+    store
+        .insert(&message, 5)
+        .await
+        .expect("insert must succeed");
+    store
+        .mark_dead_lettered(message.schedule_id, "boom")
+        .await
+        .expect("mark_dead_lettered must succeed");
+
+    let id = message.schedule_id.to_string();
+
+    Command::cargo_bin("hexeract")
+        .unwrap()
+        .args([
+            "scheduler",
+            "dead-letter",
+            "list",
+            "--conn",
+            &url,
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("dead-lettered"));
+
+    Command::cargo_bin("hexeract")
+        .unwrap()
+        .args(["scheduler", "dead-letter", "replay", &id, "--conn", &url])
+        .assert()
+        .success();
+
+    // Replaying the same id again fails: the first replay already moved it
+    // back to pending, so it is no longer dead-lettered (`NotReplayable`).
+    Command::cargo_bin("hexeract")
+        .unwrap()
+        .args(["scheduler", "dead-letter", "replay", &id, "--conn", &url])
+        .assert()
+        .failure()
+        .code(1);
 }
