@@ -34,7 +34,7 @@ The three backends expose the same surface; the items below use the PostgreSQL n
 pub fn schema_ddl(dialect: Dialect, table: &str) -> Result<String, SchedulerError>;
 ```
 
-`schema_ddl` renders the canonical `scheduled_messages` table and its indexes for the given dialect, substituting `table` and validating it as an identifier matching `^[a-zA-Z_][a-zA-Z0-9_]*$`. It lives in the `schema` module. There is no separate schema reference page by design: the canonical DDL is obtained from `hexeract scheduler schema --dialect <postgres|mysql|sqlite>` (see [`cli.md`](cli.md)), which calls this same function, so the CLI output is always the single source of truth for the table shape.
+`schema_ddl` renders the canonical `scheduled_messages` table and its indexes for the given dialect, substituting `table` and validating it as an identifier matching `^[a-zA-Z_][a-zA-Z0-9_]*$`. It lives in the `schema` module. There is no separate schema reference page by design: the canonical DDL is obtained from `hexeract scheduler schema --dialect <postgres|my-sql|sqlite>` (see [`cli.md`](cli.md)), which calls this same function, so the CLI output is always the single source of truth for the table shape.
 
 | Item | Role |
 | --- | --- |
