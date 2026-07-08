@@ -52,6 +52,19 @@ A non-empty poll runs back-to-back without sleeping, so a backlog drains as fast
 - `max_attempts` (default `5`): retry budget per `message_id` before the delivery is parked or dropped (see [retry policy](retry-policy.md)).
 - `max_payload_bytes` (default `1 MiB`): cap on the size of a consumed payload, enforced before the payload is copied or deserialized. Broker bytes cross a trust boundary, so an oversize delivery follows the poison path: parked in the dead-letter queue when one is configured, dropped with a warning otherwise (see [retry policy](retry-policy.md)). The broker has already buffered the frame when the worker sees it, so the cap bounds the consumer's work, not the network: pair it with the broker-side `max_message_size` to bound ingress. Worst-case consumer buffering is roughly `prefetch x max_payload_bytes`.
 
+## Scheduler-specific timing
+
+`SchedulerWorker` is a poll loop over a `ScheduleStore`, similar in shape to `OutboxWorker` but with two extra knobs for claim safety and dispatch bounding. See [`hexeract-scheduler`](../reference/hexeract-scheduler.md) for the full `SchedulerBuilder` surface.
+
+- `poll_interval` (default `100 ms`): sleep duration after a cycle that claimed nothing, or that failed outright.
+- `batch_size` (default `10`): maximum number of due occurrences claimed per cycle.
+- `min_cycle_delay` (default `5 ms`): floor delay between consecutive non-empty cycles, so a backlog still drains quickly without spinning in a tight busy loop.
+- `dispatch_timeout` (default `30 s`): hard deadline for a single dispatch to the sink; a sink slower than this is treated as a failed attempt and follows the retry path.
+
+A non-empty cycle waits only `min_cycle_delay` before the next one, so a backlog drains close to as fast as the sink can absorb it. An empty or failed cycle waits the full `poll_interval` before retrying.
+
+Each cycle claims occurrences under a `lease` (default `30 s`): the window in which the claiming worker must dispatch and settle the occurrence before another worker is allowed to reclaim it. The builder only rejects a zero `lease` or a zero `dispatch_timeout`; it does not enforce a relationship between the two. Operationally, `lease` should be set with headroom above `dispatch_timeout` (enough margin to cover the settle step that follows a timed-out dispatch), so a slow sink hits its own timeout and gets retried by the same worker instead of the lease expiring first and letting a second worker claim and dispatch the same occurrence concurrently.
+
 ## ErasedHandler and TypedHandler
 
 The worker keeps handlers in a `HashMap<&'static str, Arc<dyn ErasedHandler>>` keyed by `MESSAGE_TYPE` / `EVENT_TYPE`. The user-facing trait is the typed `Handler<M>`; `TypedHandler<M, H>` is the adapter that translates from the dyn-safe `ErasedHandler::handle(&envelope, &ctx) -> BoxFuture<Result<(), BusError>>` to the typed `H::handle(message, &ctx) -> Result<(), H::Error>`.

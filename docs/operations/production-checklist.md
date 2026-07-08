@@ -21,6 +21,13 @@ Run through this list before letting a Hexeract-powered service answer a real wo
 - [ ] **Dead-letter routing key configured** when at-least-once must not drop on exhaustion. See [retry policy](../concepts/retry-policy.md).
 - [ ] **Broker reconnect tested.** `RabbitMqConnection::connect_with_retry` retries on startup, but the running connection does not auto-reconnect mid-session. Wrap your worker spawn in a supervisor that restarts on terminal broker errors.
 
+## Scheduler
+
+- [ ] **Schema applied via the CLI, never hand-edited.** Generate the DDL with `hexeract scheduler schema --dialect <postgres|my-sql|sqlite>` (note: the MySQL dialect token is `my-sql`, kebab-cased) and apply it through your versioned migration tool. The CLI is the source of truth for the table shape.
+- [ ] **Worker sized for your throughput.** Set `lease` with headroom above `dispatch_timeout` so a slow dispatch does not let another worker reclaim the occurrence (this is operational guidance, not an enforced rule: the builder only rejects a zero `lease` or a zero `dispatch_timeout`, and the defaults for both are 30s). Tune `poll_interval` (default 100ms) and `batch_size` (default 10) to the volume of occurrences you expect per cycle.
+- [ ] **Dispatch lag monitored.** Track the gap between an occurrence's due time and its actual dispatch time; a growing gap signals an under-provisioned worker pool or a stuck sink.
+- [ ] **Dead-letter alerted and operated.** Alert on dead-letter growth, inspect entries with `hexeract scheduler dead-letter list`, and replay a schedule with `hexeract scheduler dead-letter replay <schedule-id>` once the underlying cause is fixed.
+
 ## Service runtime
 
 - [ ] **Graceful shutdown propagates the `CancellationToken`.** SIGTERM, SIGINT and admin-triggered drains all call `cancel.cancel()` before awaiting the worker join handle.

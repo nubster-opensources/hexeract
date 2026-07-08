@@ -9,6 +9,7 @@ Hexeract is a six-dimension Rust messaging framework: **Mediator**, **Bus**, **O
 | Dispatch commands, queries and notifications in process | [Mediator quick start](getting-started/mediator-quick-start.md) |
 | Persist outgoing events transactionally with PostgreSQL, MySQL or SQLite | [Outbox quick start](getting-started/outbox-quick-start.md) |
 | Publish and consume messages on RabbitMQ | [Bus quick start](getting-started/bus-quick-start.md) |
+| Schedule delayed or recurring messages | [Scheduler quick start](getting-started/scheduler-quick-start.md) |
 | Migrate an existing project from v0.4.0 to v0.5.0 | [Migration v0.4 to v0.5](operations/migration-v0.4-v0.5.md) |
 | Migrate an existing project from v0.3.0 to v0.4.0 | [Migration v0.3 to v0.4](operations/migration-v0.3-v0.4.md) |
 | Migrate an existing project from v0.1.0 to v0.2.0 | [Migration v0.1 to v0.2](operations/migration-v0.1-v0.2.md) |
@@ -29,6 +30,7 @@ Visual overview of the building blocks and the flows they implement.
 - [Mediator flow](architecture/mediator-flow.md) (registry, dispatch sequence, fan-out fail-safe)
 - [Outbox flow](architecture/outbox-flow.md) (business transaction → envelope → worker → handler)
 - [Bus flow](architecture/bus-flow.md) (publish → AMQP → consume → ack)
+- [Scheduler flow](architecture/scheduler-flow.md) (schedule -> store -> worker -> sink, reschedule or dead-letter)
 
 ## Concepts
 
@@ -45,6 +47,8 @@ One file per cross-cutting concept the API exposes.
 - [SQLite outbox concurrency](concepts/sqlite-outbox-concurrency.md) (single-writer model, backend choice)
 - [Retry policy and dead-letter routing](concepts/retry-policy.md)
 - [Correlation ID propagation](concepts/correlation-id.md)
+- [Scheduler triggers](concepts/scheduler-triggers.md) (one-shot delay and cron-style recurrence)
+- [Scheduler delivery](concepts/scheduler-delivery.md) (lease, retry, jitter, dead-letter)
 
 ## Cookbook
 
@@ -68,6 +72,8 @@ Stable artefacts that operators reach for.
 - [`hexeract-outbox-postgres` migration](reference/hexeract-outbox-postgres.md) (removed in 0.5.0, redirect to `hexeract-outbox-sql`)
 - [`hexeract-bus` API](reference/hexeract-bus.md)
 - [`hexeract-bus-rabbitmq` API](reference/hexeract-bus-rabbitmq.md)
+- [`hexeract-scheduler` API](reference/hexeract-scheduler.md)
+- [`hexeract-scheduler-sql` API](reference/hexeract-scheduler-sql.md) (PostgreSQL, MySQL, SQLite on `sqlx`)
 - [Outbox PostgreSQL schema](reference/outbox-postgres-schema.md)
 - [`hexeract` CLI](reference/cli.md)
 

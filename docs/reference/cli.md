@@ -10,6 +10,7 @@ Top-level subcommands:
 
 - `outbox`: operate on the outbox storage
 - `bus`: operate on the bus broker (RabbitMQ)
+- `scheduler`: operate on the scheduler storage
 
 Each top-level subcommand has its own set of actions documented below.
 
@@ -107,6 +108,52 @@ Output: `purged <N> message(s) from <name>`.
 
 Without `--yes-i-know`, the command exits with a non-zero code and prints `refusing to purge without the explicit '--yes-i-know' safety flag` before opening any connection.
 
+## `hexeract scheduler`
+
+The `list`, `inspect`, `dead-letter list` and `dead-letter replay` subcommands share connection flags: `--conn` (env `DATABASE_URL`; the URL scheme selects the backend, `postgres://`/`postgresql://`, `mysql://` or `sqlite://`) and `--table` (env `HEXERACT_SCHEDULER_TABLE`, default `scheduled_messages`). Of these, only `list`, `inspect` and `dead-letter list` also accept `--format text|json` (default `text`): `dead-letter replay` has no `--format` flag. `scheduler schema` is offline DDL generation: it only accepts `--dialect` and `--table`, no `--conn` or `--format`.
+
+### `scheduler schema`
+
+Print the scheduler schema DDL for the selected dialect. No network access.
+
+```bash
+hexeract scheduler schema --dialect postgres --table scheduled_messages
+```
+
+`--dialect` accepts `postgres` (default), `my-sql` or `sqlite`. This is the CLI dialect token, not a connection URL scheme: `--conn` on the admin subcommands below uses `mysql://`, not `my-sql://`.
+
+### `scheduler list`
+
+List non-terminal (pending and paused) schedules. Accepts `--limit` (default 50).
+
+```bash
+hexeract scheduler list --conn "$DATABASE_URL" --format text
+```
+
+### `scheduler inspect`
+
+Show the full state of one schedule by id.
+
+```bash
+hexeract scheduler inspect <SCHEDULE_ID> --conn "$DATABASE_URL"
+```
+
+### `scheduler dead-letter list`
+
+List dead-lettered schedules. Accepts `--limit` (default 50).
+
+```bash
+hexeract scheduler dead-letter list --conn "$DATABASE_URL" --limit 50
+```
+
+### `scheduler dead-letter replay`
+
+Replay a dead-lettered schedule: reset attempts and reschedule now.
+
+```bash
+hexeract scheduler dead-letter replay <SCHEDULE_ID> --conn "$DATABASE_URL"
+```
+
 ## Exit codes
 
 | Code | Meaning |
@@ -120,6 +167,8 @@ Without `--yes-i-know`, the command exits with a non-zero code and prints `refus
 | Variable | Purpose |
 | --- | --- |
 | `HEXERACT_BUS_URL` | Default value for `--conn` on every `bus` subcommand |
+| `DATABASE_URL` | Default value for `--conn` on every `scheduler` admin subcommand (`list`, `inspect`, `dead-letter`) |
+| `HEXERACT_SCHEDULER_TABLE` | Default value for `--table` on every `scheduler` subcommand |
 | `RUST_LOG` | Standard `tracing_subscriber` filter; default is `info` |
 
 ## Integration tests
