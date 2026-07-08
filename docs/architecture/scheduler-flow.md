@@ -1,6 +1,6 @@
 # Scheduler flow
 
-This document explains how the Hexeract Scheduler is structured, what guarantees it provides and where the trade-offs live. Read [scheduler-quick-start.md](../getting-started/scheduler-quick-start.md) first if you have not yet wired the scheduler into a service.
+This document explains how the Hexeract Scheduler is structured and how a schedule flows from persistence to dispatch. Read [scheduler-quick-start.md](../getting-started/scheduler-quick-start.md) first if you have not yet wired the scheduler into a service.
 
 ## Concepts
 
