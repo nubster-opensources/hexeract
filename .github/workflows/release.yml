@@ -139,6 +139,27 @@ jobs:
         if: steps.mode.outputs.is_dry == 'false'
         run: sleep 30
 
+      # hexeract-scheduler and hexeract-scheduler-sql publish here, after the
+      # crates they depend on (core, outbox, bus, mediator, outbox-sql) and
+      # before hexeract-cli, which has a runtime dependency on both of them.
+      - name: Publish hexeract-scheduler
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: ./scripts/publish-or-skip.sh hexeract-scheduler ${{ steps.mode.outputs.args }}
+
+      - name: Wait for index propagation
+        if: steps.mode.outputs.is_dry == 'false'
+        run: sleep 30
+
+      - name: Publish hexeract-scheduler-sql
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: ./scripts/publish-or-skip.sh hexeract-scheduler-sql ${{ steps.mode.outputs.args }}
+
+      - name: Wait for index propagation
+        if: steps.mode.outputs.is_dry == 'false'
+        run: sleep 30
+
       - name: Publish hexeract-cli
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
