@@ -34,7 +34,7 @@ impl ScheduledMessage {
 }
 ```
 
-`delay` builds a message that fires once at `at`; `cron` builds one that fires repeatedly on `expression`, with its first occurrence at `first_occurrence`. Both mint the schedule identifier as a `UUIDv7` and encode `event` as JSON. `occurrence_id()` is derived from `schedule_id` and `scheduled_for`: it is the stable deduplication key consumers use under the at-least-once delivery contract.
+`delay` builds a message that fires once at `at`; `cron` builds one that fires repeatedly on `expression`, with its first occurrence at `first_occurrence`. Both mint the schedule identifier as a `UUIDv7` and encode `event` as JSON. `occurrence_id()` is derived from `schedule_id` and `scheduled_for`: it is the stable deduplication key consumers use under the at-least-once delivery contract. `ScheduledMessage` is `#[non_exhaustive]`: build instances through `delay` or `cron` rather than a struct literal.
 
 ### `Trigger` and `CronExpression`
 
@@ -59,7 +59,7 @@ impl CronExpression {
 }
 ```
 
-`Trigger::delay` fires once; `Trigger::cron` fires repeatedly and is rejected with `SchedulerError::InvalidTrigger` if `expression` is not structurally valid. `is_recurring()` distinguishes the two, `kind()` returns a stable lowercase tag (`"delay"` or `"cron"`). `CronExpression::parse` accepts a five field expression, a six field expression with a leading seconds field, or a supported macro such as `@daily`, all validated through the `isochron` cron engine. `next_occurrence` returns the next occurrence strictly after `after`, evaluated in UTC, or `None` when the engine's bounded search horizon finds nothing.
+`Trigger::delay` fires once; `Trigger::cron` fires repeatedly and is rejected with `SchedulerError::InvalidTrigger` if `expression` is not structurally valid. `is_recurring()` distinguishes the two, `kind()` returns a stable lowercase tag (`"delay"` or `"cron"`). `CronExpression::parse` accepts a five field expression, a six field expression with a leading seconds field, or a supported macro such as `@daily`, all validated through the `isochron` cron engine. `next_occurrence` returns the next occurrence strictly after `after`, evaluated in UTC, or `None` when the engine's bounded search horizon finds nothing. `Trigger` is `#[non_exhaustive]`: build instances through `Trigger::delay` or `Trigger::cron` and match it with a wildcard arm.
 
 ### `Target`
 
@@ -77,7 +77,7 @@ impl Target {
 }
 ```
 
-`Target` is the dispatch destination the worker routes a due occurrence to: in-process through the mediator, transactionally into the outbox, or onto the message bus under a routing key.
+`Target` is the dispatch destination the worker routes a due occurrence to: in-process through the mediator, transactionally into the outbox, or onto the message bus under a routing key. `Target` is `#[non_exhaustive]`: build instances through `Target::mediator`, `Target::outbox` or `Target::bus`, and match it with a wildcard arm.
 
 ### Store contract
 
