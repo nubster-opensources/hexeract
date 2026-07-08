@@ -110,7 +110,7 @@ Without `--yes-i-know`, the command exits with a non-zero code and prints `refus
 
 ## `hexeract scheduler`
 
-The `list`, `inspect` and `dead-letter` subcommands share connection flags: `--conn` (env `DATABASE_URL`; the URL scheme selects the backend, `postgres://`/`postgresql://`, `mysql://` or `sqlite://`), `--table` (env `HEXERACT_SCHEDULER_TABLE`, default `scheduled_messages`) and `--format text|json` (default `text`). `scheduler schema` is offline DDL generation: it only accepts `--dialect` and `--table`, no `--conn` or `--format`.
+The `list`, `inspect`, `dead-letter list` and `dead-letter replay` subcommands share connection flags: `--conn` (env `DATABASE_URL`; the URL scheme selects the backend, `postgres://`/`postgresql://`, `mysql://` or `sqlite://`) and `--table` (env `HEXERACT_SCHEDULER_TABLE`, default `scheduled_messages`). Of these, only `list`, `inspect` and `dead-letter list` also accept `--format text|json` (default `text`): `dead-letter replay` has no `--format` flag. `scheduler schema` is offline DDL generation: it only accepts `--dialect` and `--table`, no `--conn` or `--format`.
 
 ### `scheduler schema`
 
