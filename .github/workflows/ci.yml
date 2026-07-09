@@ -77,6 +77,7 @@ jobs:
         with:
           key: isolation-${{ matrix.backend }}
       - run: cargo check -p hexeract-outbox-sql --no-default-features --features ${{ matrix.backend }}
+      - run: cargo check -p hexeract-scheduler-sql --no-default-features --features ${{ matrix.backend }}
 
   supply-chain:
     name: Supply chain
