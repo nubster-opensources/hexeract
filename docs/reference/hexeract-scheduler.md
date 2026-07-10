@@ -106,6 +106,19 @@ pub trait ScheduleAdmin: ScheduleStore {
 
 `ScheduleStore` is the backend-agnostic persistence contract: `claim_due` atomically selects due, unleased, eligible occurrences, advancing their attempt counter and stamping a fresh lease, which is what makes at-least-once delivery crash-safe. `ScheduleAdmin` extends it with the operator surface (listing and dead-letter replay), kept separate so the worker hot path never depends on it. Both are backend-facing contracts; application code drives a schedule's lifecycle through `SchedulerControl` instead.
 
+Each entry `claim_due` returns is a `LeasedOccurrence`: the claimed message paired with the lease metadata the worker needs to dispatch it and decide what to do when delivery fails.
+
+```rust
+pub struct LeasedOccurrence {
+    pub message: ScheduledMessage,
+    pub attempts: u32,
+    pub max_attempts: u32,
+    pub leased_until: SystemTime,
+}
+```
+
+`attempts` counts the delivery tries consumed so far, including the one this claim represents; once it reaches `max_attempts` the worker promotes the occurrence to the dead-letter state instead of rescheduling. `leased_until` is the instant the claim holds the row until: another worker may re-claim the occurrence only after the lease expires, which is how a crashed worker's in-flight occurrences become eligible again without being lost.
+
 ### Worker construction
 
 ```rust
