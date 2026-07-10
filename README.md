@@ -60,7 +60,7 @@ Add the umbrella crate with the `outbox-sql-postgres` feature to your `Cargo.tom
 
 ```toml
 [dependencies]
-hexeract = { version = "0.5", features = ["outbox-sql-postgres"] }
+hexeract = { version = "0.6", features = ["outbox-sql-postgres"] }
 ```
 
 > Power users who prefer a strict SemVer per crate can keep depending on `hexeract-outbox`, `hexeract-outbox-sql`, `hexeract-bus`, `hexeract-bus-rabbitmq` etc. directly.
@@ -123,7 +123,7 @@ Add the umbrella crate with the `bus-rabbitmq` feature to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-hexeract = { version = "0.5", features = ["bus-rabbitmq"] }
+hexeract = { version = "0.6", features = ["bus-rabbitmq"] }
 ```
 
 Declare a domain message, a handler and wire a publisher plus a worker:
@@ -200,7 +200,7 @@ Add the umbrella crate with the `mediator` feature to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-hexeract = { version = "0.5", features = ["mediator"] }
+hexeract = { version = "0.6", features = ["mediator"] }
 ```
 
 Register a command handler and dispatch through the mediator:

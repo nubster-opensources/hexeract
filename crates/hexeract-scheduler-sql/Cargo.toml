@@ -23,8 +23,8 @@ mysql = ["hexeract-outbox-sql/mysql", "sqlx/mysql"]
 sqlite = ["hexeract-outbox-sql/sqlite", "sqlx/sqlite"]
 
 [dependencies]
-hexeract-scheduler = { path = "../hexeract-scheduler", version = "0.5" }
-hexeract-outbox-sql = { path = "../hexeract-outbox-sql", version = "0.5", default-features = false }
+hexeract-scheduler = { path = "../hexeract-scheduler", version = "0.6" }
+hexeract-outbox-sql = { path = "../hexeract-outbox-sql", version = "0.6", default-features = false }
 sqlx = { workspace = true, features = ["uuid", "json", "time"] }
 time = { workspace = true }
 serde_json = { workspace = true }
@@ -32,7 +32,7 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
-hexeract-outbox = { path = "../hexeract-outbox", version = "0.5" }
+hexeract-outbox = { path = "../hexeract-outbox", version = "0.6" }
 serde = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }

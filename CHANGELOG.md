@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-10
+
+Scheduler release. This cycle ships the durable message scheduler as two new crates: `hexeract-scheduler` (schedule store contract, delay and cron triggers, polling worker with lease-based claiming, bounded backoff with jitter and dead-lettering, mediator/bus/outbox sinks, fluent builder and lifecycle control) and `hexeract-scheduler-sql` (PostgreSQL, MySQL and SQLite backends). The `hexeract` umbrella crate gains a matching `scheduler` feature family and `hexeract-cli` gains a scheduler operator surface. All changes to previously published crates are additive; no breaking changes.
+
 ### Added
 - `hexeract-cli`: scheduler operator CLI: schema, list, inspect, dead-letter list/replay (#282).
 - `hexeract-scheduler`: tracing instrumentation for the scheduler worker. `poll_cycle` is wrapped in a `scheduler.tick` span (field: `claimed`); `settle` is wrapped in a `scheduler.dispatch` span (fields: `schedule_id`, `trigger`, `attempt`, `lag_ms`). Five structured events are emitted: `scheduler claimed due occurrences` (debug), `scheduled occurrence dispatched` (debug, with `lag_ms`), `scheduled occurrence rescheduled` (debug), `scheduled occurrence retried` (warn) and `scheduled occurrence dead-lettered` (error). The `lag_ms` field records the duration from the occurrence's scheduled time to worker pickup and is the primary health signal for detecting a worker falling behind. `Trigger::kind` is a new public helper returning a stable lowercase tag (`"delay"` or `"cron"`) used as a span field. (#281)
@@ -309,7 +313,8 @@ First public release. Ships the transactional outbox feature end to end against 
 
 This is the first published version, so no upgrade path applies.
 
-[Unreleased]: https://github.com/nubster-opensources/hexeract/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/nubster-opensources/hexeract/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/nubster-opensources/hexeract/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/nubster-opensources/hexeract/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/nubster-opensources/hexeract/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/nubster-opensources/hexeract/compare/v0.3.0...v0.3.1
