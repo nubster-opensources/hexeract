@@ -87,7 +87,7 @@ Released as v0.1.0 on crates.io. The seven shipped crates are `hexeract-core`, `
 - `dispatch_timeout` enforced as a hard per-handler deadline; deadline and cancellation-safe graceful shutdown.
 - Bus hardening: publisher confirms, bounded consumer buffer (`max_buffered`) and payload cap, plus a security sweep on the AMQP surface and the release CI.
 
-## v0.6.0: Scheduler
+## v0.6.0: Scheduler (DONE)
 
 **Goal.** Send a message in the future. Same primitives as the Outbox plus a time dimension.
 
