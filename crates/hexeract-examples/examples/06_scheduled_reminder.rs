@@ -13,10 +13,11 @@
 //! cargo run --example 06_scheduled_reminder -p hexeract-examples
 //! ```
 
+use std::collections::HashSet;
 use std::error::Error;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -34,6 +35,7 @@ use hexeract::bus_rabbitmq::RabbitMqTransport;
 use hexeract::bus_rabbitmq::RabbitMqWorkerBuilder;
 use hexeract::bus_rabbitmq::ensure_topology;
 use hexeract::core::HandlerContext;
+use hexeract::core::MessageId;
 use hexeract::outbox::Event;
 use hexeract::scheduler::BusSink;
 use hexeract::scheduler::ScheduleStatus;
@@ -79,41 +81,58 @@ impl Message for ReminderDue {
     const MESSAGE_TYPE: &'static str = "reminders.due";
 }
 
-/// Bus handler counting every reminder observed on the queue.
+/// Bus handler recording every distinct reminder occurrence seen on the queue.
+///
+/// Scheduler delivery is at-least-once: a due occurrence can reach the bus more
+/// than once, for example when a worker crashes after dispatch but before it
+/// records the delivery. [`BusSink`] stamps each occurrence id as the bus
+/// message id, so this handler deduplicates on `ctx.message_id` and counts
+/// distinct occurrences rather than raw deliveries. Consumers are expected to
+/// be idempotent for exactly this reason.
 #[derive(Debug)]
 struct CountingHandler {
-    seen: Arc<AtomicUsize>,
+    seen: Arc<Mutex<HashSet<MessageId>>>,
 }
 
 impl Handler<ReminderDue> for CountingHandler {
     type Error = BusError;
 
     async fn handle(&self, message: ReminderDue, ctx: &HandlerContext) -> Result<(), Self::Error> {
-        let total = self.seen.fetch_add(1, Ordering::SeqCst) + 1;
+        let distinct = {
+            let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+            seen.insert(ctx.message_id);
+            seen.len()
+        };
         tracing::info!(
             reminder_id = %message.reminder_id,
             note = %message.note,
             message_id = ?ctx.message_id,
-            total,
+            distinct,
             "reminder received"
         );
         Ok(())
     }
 }
 
-/// Wait until `seen` reaches `target`, failing once `budget` is exhausted.
+/// Count the distinct occurrences observed so far, keyed by occurrence id.
+fn distinct_count(seen: &Mutex<HashSet<MessageId>>) -> usize {
+    seen.lock().unwrap_or_else(PoisonError::into_inner).len()
+}
+
+/// Wait until the distinct occurrence count reaches `target`, failing once
+/// `budget` is exhausted.
 async fn wait_for_count(
-    seen: &AtomicUsize,
+    seen: &Mutex<HashSet<MessageId>>,
     target: usize,
     budget: Duration,
     what: &str,
 ) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
-    while seen.load(Ordering::SeqCst) < target {
+    while distinct_count(seen) < target {
         if started.elapsed() > budget {
             return Err(format!(
-                "{what}: only {}/{target} reminders received within {budget:?}",
-                seen.load(Ordering::SeqCst)
+                "{what}: only {}/{target} distinct reminders received within {budget:?}",
+                distinct_count(seen)
             )
             .into());
         }
@@ -186,7 +205,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (_rabbitmq, rabbitmq_uri) = setup_rabbit().await?;
     let (exchange, queue) = declare_topology(&rabbitmq_uri).await?;
 
-    let seen = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(Mutex::new(HashSet::new()));
     let consumer_conn = RabbitMqConnection::connect(&rabbitmq_uri).await?;
     let consumer = RabbitMqWorkerBuilder::new(consumer_conn)
         .queue(queue.name.as_str())
@@ -268,9 +287,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Let any in-flight occurrence land before taking the baseline, then
     // assert the cancelled schedule never fires again.
     tokio::time::sleep(POLL_INTERVAL + Duration::from_secs(2)).await;
-    let baseline = seen.load(Ordering::SeqCst);
+    let baseline = distinct_count(&seen);
     tokio::time::sleep(GRACE_WINDOW).await;
-    let after_grace = seen.load(Ordering::SeqCst);
+    let after_grace = distinct_count(&seen);
     if after_grace != baseline {
         return Err(format!(
             "cancelled schedule kept firing: {after_grace} reminders after a baseline of {baseline}"
@@ -278,7 +297,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .into());
     }
     tracing::info!(
-        total = after_grace,
+        distinct = after_grace,
         "no reminder after cancel, grace window clean"
     );
 
