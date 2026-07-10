@@ -305,6 +305,32 @@ mod tests {
     }
 
     #[test]
+    fn next_occurrence_evaluates_a_six_field_expression_to_the_second() {
+        let expr = CronExpression::parse("*/2 * * * * *").expect("valid cron");
+        let next = expr
+            .next_occurrence(at(datetime!(2026-06-15 00:00:01 UTC)))
+            .expect("conversion succeeds")
+            .expect("occurrence exists");
+        assert_eq!(
+            unix_secs(next),
+            datetime!(2026-06-15 00:00:02 UTC).unix_timestamp()
+        );
+    }
+
+    #[test]
+    fn next_occurrence_evaluates_the_daily_macro_to_the_next_midnight() {
+        let expr = CronExpression::parse("@daily").expect("valid cron");
+        let next = expr
+            .next_occurrence(at(datetime!(2026-06-15 12:00:00 UTC)))
+            .expect("conversion succeeds")
+            .expect("occurrence exists");
+        assert_eq!(
+            unix_secs(next),
+            datetime!(2026-06-16 00:00:00 UTC).unix_timestamp()
+        );
+    }
+
+    #[test]
     fn next_due_collapses_missed_occurrences() {
         let expr = CronExpression::parse("0 * * * *").expect("valid cron");
         let now = at(datetime!(2026-06-15 10:30:00 UTC));
