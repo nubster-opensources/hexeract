@@ -10,7 +10,7 @@ The scheduler is backend-agnostic core plus a `sqlx`-backed SQL store, one Cargo
 
 ```toml
 [dependencies]
-hexeract = { version = "0.5", features = [
+hexeract = { version = "0.6", features = [
   "scheduler",
   "scheduler-bus",
   "scheduler-sql-postgres",

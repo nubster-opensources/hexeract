@@ -30,25 +30,26 @@ Hexeract is sponsored by [Nubster](https://nubster.com).
 
 ## Status
 
-🛡️ **v0.5.0: reliability hardening shipped.** This release closes the delivery-reliability gaps in the outbox and the RabbitMQ bus: durable poison-message handling with opt-in dead-lettering, dispatch outside the database transaction, bounded exponential backoff with jitter, publisher confirms, bounded consumer buffers and a deadline/cancellation-safe shutdown. The legacy `hexeract-outbox-postgres` crate has been removed in 0.5.0; use `hexeract-outbox-sql` with the `postgres` feature instead. Mediator, middlewares, the `#[handler]` macro and Bus RabbitMQ stay stable from v0.3.0.
+⏰ **v0.6.0: durable message scheduler shipped.** This release adds the time dimension: `hexeract-scheduler` schedules a message for later (one-shot delay or recurring cron) and drives it through a polling worker with lease-based claiming, bounded backoff with jitter and dead-lettering, dispatching to the mediator, the bus or the outbox. `hexeract-scheduler-sql` persists schedules on PostgreSQL, MySQL or SQLite, and `hexeract scheduler` gives operators schema, list, inspect and dead-letter replay commands. All changes to previously published crates are additive. Mediator, middlewares, the `#[handler]` macro and Bus RabbitMQ stay stable from v0.3.0.
 
-| Feature | v0.1.0 | v0.2.0 | v0.3.0 | v0.4.0 | v0.5.0 |
-| --- | --- | --- | --- | --- | --- |
-| Transactional outbox (PostgreSQL) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Worker poll loop with `SKIP LOCKED` | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Fluent builder API | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `hexeract outbox` CLI | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Bus core (`Message`, `BusEnvelope`, `Transport`, `Handler<M>`) | ⏳ | ✅ | ✅ | ✅ | ✅ |
-| RabbitMQ backend (`lapin` connection pool, publish, consume, retry) | ⏳ | ✅ | ✅ | ✅ | ✅ |
-| Topology types (`Exchange`, `Queue`, `Binding`, `RoutingKey`) | ⏳ | ✅ | ✅ | ✅ | ✅ |
-| `hexeract bus declare / peek / purge` CLI | ⏳ | ✅ | ✅ | ✅ | ✅ |
-| In-process CQRS mediator (`send`, `query`, `publish`) | ⏳ | ⏳ | ✅ | ✅ | ✅ |
-| Built-in `TracingMiddleware` and `TimeoutMiddleware` | ⏳ | ⏳ | ✅ | ✅ | ✅ |
-| `#[handler]` attribute macro with `verify_handlers()` | ⏳ | ⏳ | ✅ | ✅ | ✅ |
-| Multi-database outbox (`hexeract-outbox-sql`: PostgreSQL, MySQL, SQLite) | ⏳ | ⏳ | ⏳ | ✅ | ✅ |
-| Delivery reliability (dead-letter, publisher confirms, bounded backoff, dispatch outside tx) | ⏳ | ⏳ | ⏳ | ⏳ | ✅ |
-| Polyglot bus (NATS, Kafka, SQS) | ⏳ v0.9.0 | ⏳ v0.9.0 | ⏳ v0.9.0 | ⏳ v0.9.0 | ⏳ v0.9.0 |
-| Sagas, Scheduler, Request and Reply | ⏳ later | ⏳ later | ⏳ later | ⏳ later | ⏳ later |
+| Feature | v0.1.0 | v0.2.0 | v0.3.0 | v0.4.0 | v0.5.0 | v0.6.0 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Transactional outbox (PostgreSQL) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Worker poll loop with `SKIP LOCKED` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Fluent builder API | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `hexeract outbox` CLI | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Bus core (`Message`, `BusEnvelope`, `Transport`, `Handler<M>`) | ⏳ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| RabbitMQ backend (`lapin` connection pool, publish, consume, retry) | ⏳ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Topology types (`Exchange`, `Queue`, `Binding`, `RoutingKey`) | ⏳ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `hexeract bus declare / peek / purge` CLI | ⏳ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| In-process CQRS mediator (`send`, `query`, `publish`) | ⏳ | ⏳ | ✅ | ✅ | ✅ | ✅ |
+| Built-in `TracingMiddleware` and `TimeoutMiddleware` | ⏳ | ⏳ | ✅ | ✅ | ✅ | ✅ |
+| `#[handler]` attribute macro with `verify_handlers()` | ⏳ | ⏳ | ✅ | ✅ | ✅ | ✅ |
+| Multi-database outbox (`hexeract-outbox-sql`: PostgreSQL, MySQL, SQLite) | ⏳ | ⏳ | ⏳ | ✅ | ✅ | ✅ |
+| Delivery reliability (dead-letter, publisher confirms, bounded backoff, dispatch outside tx) | ⏳ | ⏳ | ⏳ | ⏳ | ✅ | ✅ |
+| Durable scheduler (delay + cron triggers, SQL backends, sinks, operator CLI) | ⏳ | ⏳ | ⏳ | ⏳ | ⏳ | ✅ |
+| Polyglot bus (NATS, Kafka, SQS) | ⏳ v0.9.0 | ⏳ v0.9.0 | ⏳ v0.9.0 | ⏳ v0.9.0 | ⏳ v0.9.0 | ⏳ v0.9.0 |
+| Sagas, Request and Reply | ⏳ later | ⏳ later | ⏳ later | ⏳ later | ⏳ later | ⏳ later |
 
 See the [CHANGELOG](./CHANGELOG.md) for the detailed history.
 
@@ -60,7 +61,7 @@ Add the umbrella crate with the `outbox-sql-postgres` feature to your `Cargo.tom
 
 ```toml
 [dependencies]
-hexeract = { version = "0.5", features = ["outbox-sql-postgres"] }
+hexeract = { version = "0.6", features = ["outbox-sql-postgres"] }
 ```
 
 > Power users who prefer a strict SemVer per crate can keep depending on `hexeract-outbox`, `hexeract-outbox-sql`, `hexeract-bus`, `hexeract-bus-rabbitmq` etc. directly.
@@ -123,7 +124,7 @@ Add the umbrella crate with the `bus-rabbitmq` feature to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-hexeract = { version = "0.5", features = ["bus-rabbitmq"] }
+hexeract = { version = "0.6", features = ["bus-rabbitmq"] }
 ```
 
 Declare a domain message, a handler and wire a publisher plus a worker:
@@ -200,7 +201,7 @@ Add the umbrella crate with the `mediator` feature to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-hexeract = { version = "0.5", features = ["mediator"] }
+hexeract = { version = "0.6", features = ["mediator"] }
 ```
 
 Register a command handler and dispatch through the mediator:

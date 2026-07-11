@@ -11,9 +11,9 @@ This page walks you through publishing and consuming a typed message on a Rabbit
 
 ```toml
 [dependencies]
-hexeract-bus = "0.5"
-hexeract-bus-rabbitmq = "0.5"
-hexeract-core = "0.5"
+hexeract-bus = "0.6"
+hexeract-bus-rabbitmq = "0.6"
+hexeract-core = "0.6"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-util = "0.7"

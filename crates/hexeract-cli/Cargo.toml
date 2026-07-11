@@ -21,12 +21,12 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-hexeract-bus = { path = "../hexeract-bus", version = "0.5" }
-hexeract-bus-rabbitmq = { path = "../hexeract-bus-rabbitmq", version = "0.5" }
-hexeract-outbox = { path = "../hexeract-outbox", version = "0.5" }
-hexeract-outbox-sql = { path = "../hexeract-outbox-sql", version = "0.5", default-features = false, features = ["postgres"] }
-hexeract-scheduler = { path = "../hexeract-scheduler", version = "0.5" }
-hexeract-scheduler-sql = { path = "../hexeract-scheduler-sql", version = "0.5", default-features = false, features = ["postgres", "mysql", "sqlite"] }
+hexeract-bus = { path = "../hexeract-bus", version = "0.6" }
+hexeract-bus-rabbitmq = { path = "../hexeract-bus-rabbitmq", version = "0.6" }
+hexeract-outbox = { path = "../hexeract-outbox", version = "0.6" }
+hexeract-outbox-sql = { path = "../hexeract-outbox-sql", version = "0.6", default-features = false, features = ["postgres"] }
+hexeract-scheduler = { path = "../hexeract-scheduler", version = "0.6" }
+hexeract-scheduler-sql = { path = "../hexeract-scheduler-sql", version = "0.6", default-features = false, features = ["postgres", "mysql", "sqlite"] }
 clap = { workspace = true }
 lapin = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }

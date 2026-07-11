@@ -10,7 +10,7 @@ publish = false
 workspace = true
 
 [dependencies]
-hexeract = { path = "../hexeract", version = "0.5", features = ["macros", "mediator", "scheduler"] }
+hexeract = { path = "../hexeract", version = "0.6", features = ["macros", "mediator", "scheduler"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -24,10 +24,10 @@ outbox = []
 
 [dependencies]
 fastrand = { workspace = true }
-hexeract-bus = { path = "../hexeract-bus", version = "0.5", optional = true }
-hexeract-core = { path = "../hexeract-core", version = "0.5", optional = true }
-hexeract-mediator = { path = "../hexeract-mediator", version = "0.5", optional = true }
-hexeract-outbox = { path = "../hexeract-outbox", version = "0.5" }
+hexeract-bus = { path = "../hexeract-bus", version = "0.6", optional = true }
+hexeract-core = { path = "../hexeract-core", version = "0.6", optional = true }
+hexeract-mediator = { path = "../hexeract-mediator", version = "0.6", optional = true }
+hexeract-outbox = { path = "../hexeract-outbox", version = "0.6" }
 isochron = { workspace = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true }

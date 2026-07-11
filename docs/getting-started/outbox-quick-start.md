@@ -10,8 +10,8 @@ The outbox runs on PostgreSQL, MySQL or SQLite through the `sqlx`-backed `hexera
 
 ```toml
 [dependencies]
-hexeract-outbox = "0.5"
-hexeract-outbox-sql = { version = "0.5", features = ["postgres"] }
+hexeract-outbox = "0.6"
+hexeract-outbox-sql = { version = "0.6", features = ["postgres"] }
 
 # Already in most async Rust services:
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls-ring", "postgres", "uuid"] }
