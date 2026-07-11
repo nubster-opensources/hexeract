@@ -14,8 +14,8 @@
 //! - `sqlite`
 //!
 //! This module ships the schema DDL ([`schema`]) and a `sqlx`-backed
-//! [`hexeract_scheduler::ScheduleStore`] per backend: [`PgScheduleStore`],
-//! [`MySqlScheduleStore`] and [`SqliteScheduleStore`], each gated by its
+//! [`hexeract_scheduler::ScheduleStore`] per backend: `PgScheduleStore`,
+//! `MySqlScheduleStore` and `SqliteScheduleStore`, each gated by its
 //! Cargo feature.
 //!
 //! [`Dialect`]: hexeract_outbox_sql::Dialect

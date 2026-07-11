@@ -120,7 +120,7 @@ fn decode_snapshot(row: &sqlx::sqlite::SqliteRow) -> Result<ScheduleSnapshot, Sc
 
 /// SQLite implementation of [`ScheduleStore`] backed by `sqlx::SqlitePool`.
 ///
-/// See the [module documentation](self) for the single-worker concurrency
+/// See the module-level documentation for the single-worker concurrency
 /// model. Cheap to clone (the pool and the cached SQL strings are
 /// reference-counted).
 #[derive(Debug, Clone)]

@@ -8,7 +8,7 @@ use crate::target::Target;
 
 /// [`ScheduleSink`] that publishes a due occurrence on the message bus.
 ///
-/// When an occurrence targeting [`Target::Bus`](crate::Target::Bus) is due,
+/// When an occurrence targeting [`Target::Bus`] is due,
 /// the worker hands it to this sink, which publishes the stored `event_type`
 /// and `payload` under the target's routing key. The occurrence id
 /// ([`ScheduledMessage::occurrence_id`]) is propagated as the message id, so
