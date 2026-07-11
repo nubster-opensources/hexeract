@@ -102,6 +102,7 @@ Records of the structuring decisions taken along the way.
 Stable contracts that contributors and operators rely on.
 
 - [Governance](GOVERNANCE.md)
+- [Roadmap](explanation/roadmap.md)
 - [Release process](RELEASE_PROCESS.md)
 - [SemVer policy](SEMVER_POLICY.md)
 - [MSRV policy](MSRV_POLICY.md)

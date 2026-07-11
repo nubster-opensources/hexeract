@@ -48,7 +48,7 @@ sequenceDiagram
         Worker->>Store: dead_letter_exhausted()
         Store-->>Worker: swept count
         Worker->>Store: claim_due(now, batch_size, lease)
-        Store-->>Worker: Vec<LeasedOccurrence>
+        Store-->>Worker: leased occurrences
         loop For each occurrence
             Worker->>Sink: dispatch(&message)
             alt Ok
