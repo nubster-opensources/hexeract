@@ -8,10 +8,10 @@
 //!
 //! The example spins up a RabbitMQ container via `testcontainers`,
 //! declares an exchange, a queue and a binding through
-//! [`hexeract_bus_rabbitmq::ensure_topology`], spawns a
-//! [`RabbitMqWorker`](hexeract_bus_rabbitmq::RabbitMqWorker) with a
+//! `ensure_topology`, spawns a
+//! `RabbitMqWorker` with a
 //! counting handler, publishes five messages through a
-//! [`RabbitMqTransport`](hexeract_bus_rabbitmq::RabbitMqTransport),
+//! `RabbitMqTransport`,
 //! and asserts every delivery is acknowledged within the latency budget.
 
 use std::error::Error;

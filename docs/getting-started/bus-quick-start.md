@@ -37,7 +37,7 @@ impl Message for OrderPlaced {
 }
 ```
 
-The `MESSAGE_TYPE` is the stable routing key consumers dispatch on. Pick a kebab-cased identifier scoped by bounded context.
+The `MESSAGE_TYPE` is the stable routing key consumers dispatch on. Pick a dot-separated identifier scoped by bounded context, e.g. `orders.placed`.
 
 ## Step 3: declare the topology (optional but recommended)
 

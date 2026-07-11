@@ -10,7 +10,7 @@ Hexeract follows the Nubster general coding standards documented in [nubster-doc
 - **Conventional Commits**, all commit messages follow the `type(scope): description` format, enforced by `cog verify` in the commit-msg hook.
 - **Rust style**, workspace lints `clippy::all` and `clippy::pedantic` set to `deny`, MSRV pinned in `rust-toolchain.toml` and `Cargo.toml`.
 - **No competitor mentions**, the source code, commit messages, pull requests and documentation never name competing tools.
-- **English on the public API, French on internal artifacts**, rustdoc comments and public types are written in English; commit messages, issues and project documentation are written in French.
+- **English on the public API, French on internal artifacts**, rustdoc comments and public types are written in English; commit messages and issues are written in French; all documentation shipped in the repository is written in English.
 
 ## Local setup
 

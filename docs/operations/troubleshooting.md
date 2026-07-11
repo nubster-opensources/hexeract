@@ -70,6 +70,20 @@ loop {
 
 A first-class supervisor is planned for a future release.
 
+## Scheduler
+
+### Occurrence dead-lettered
+
+An occurrence exhausted its `max_attempts` budget, or was swept by `dead_letter_exhausted` after a worker crashed mid-attempt (logged as `swept schedules whose attempt budget was exhausted by a crashed worker` at `error` level, with a `count` field). Inspect the entry with `hexeract scheduler dead-letter list --conn "$DATABASE_URL"`, fix the underlying cause (a broken handler, an unreachable sink), then replay it with `hexeract scheduler dead-letter replay <SCHEDULE_ID> --conn "$DATABASE_URL"`.
+
+### Growing dispatch lag
+
+Track `lag_ms` on the `scheduled occurrence dispatched` event or the `scheduler.dispatch` span (see [observability](observability.md)). Sustained growth signals the worker pool is under-provisioned for the occurrence volume, or the sink (bus broker, outbox table, mediator handler) is slow or blocked. Scale workers horizontally, or investigate the sink's own latency first.
+
+### Repeated `lease lost; occurrence settled by another worker` warnings
+
+This `warn` fires when a worker tries to acknowledge an occurrence whose lease already moved to another worker. A few during normal operation are harmless (the fencing worked as intended). Repeated warnings point to either a zombie worker (paused on I/O or descheduled long enough that its lease expired before it could acknowledge) or a `lease` configured too close to `dispatch_timeout x batch_size`. Raise `lease` with more headroom, or investigate why a worker is stalling past its lease window.
+
 ## CLI
 
 ### `hexeract bus declare` fails with `InvalidTopology`
@@ -82,7 +96,7 @@ Add `--yes-i-know` to the command line. The flag is mandatory by design for dest
 
 ### `hexeract bus peek` prints `(queue ... is empty)` despite known traffic
 
-`peek` consumes through `basic_get` and immediately `basic_nack(requeue=true)`. If the queue has just been drained by a live consumer, `peek` will see it empty. Run `peek` before starting consumers, or against a paused consumer, when you want to inspect in-flight traffic.
+`peek` fetches through `basic_get`, accumulates the delivery tags as it prints each message, then releases the whole batch at once with a single `basic_nack(multiple=true, requeue=true)`. If the queue has just been drained by a live consumer, `peek` will see it empty. Run `peek` before starting consumers, or against a paused consumer, when you want to inspect in-flight traffic.
 
 ## Build, test and CI
 

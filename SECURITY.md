@@ -13,7 +13,7 @@ The supported window will be widened once Hexeract reaches 1.0.
 
 ## Reporting a vulnerability
 
-If you find a security vulnerability in Hexeract, please **do not** open a public GitHub issue. Disclosure rules:
+If you find a security vulnerability in Hexeract, please **do not** open a public issue on the repository. Disclosure rules:
 
 1. Email a detailed report to **security@nubster.com** with the subject prefix `[hexeract security]`.
 2. The report should include:
@@ -41,4 +41,4 @@ The following are explicitly **out of scope** for vulnerability reports:
 
 ## Public security advisories
 
-Confirmed and fixed vulnerabilities are published on the GitHub Security Advisories page of the repository. RustSec advisories are also coordinated for severe issues when applicable.
+Confirmed and fixed vulnerabilities are published on the security advisories page of the repository. RustSec advisories are also coordinated for severe issues when applicable.

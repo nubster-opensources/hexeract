@@ -18,6 +18,7 @@
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -88,7 +89,10 @@ impl PaymentBook {
             correlation_id = %ctx.correlation_id,
             "payment processed"
         );
-        self.recorded.lock().expect("poisoned").push(cmd.order_id);
+        self.recorded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(cmd.order_id);
         Ok(payment_id)
     }
 }
@@ -174,7 +178,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await?;
 
     let started = Instant::now();
-    while recorded.lock().expect("poisoned").is_empty() {
+    while recorded
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_empty()
+    {
         if started.elapsed() > PROCESSED_BUDGET {
             cancel.cancel();
             let _ = worker_handle.await;
@@ -185,7 +193,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     cancel.cancel();
     worker_handle.await??;
 
-    assert_eq!(recorded.lock().expect("poisoned").as_slice(), &[order_id]);
-    println!("processed payment for order {order_id}");
+    let processed = recorded.lock().unwrap_or_else(PoisonError::into_inner);
+    if processed.as_slice() != [order_id] {
+        return Err(format!(
+            "expected processed order {order_id}, got {:?}",
+            processed.as_slice()
+        )
+        .into());
+    }
+    tracing::info!(%order_id, "processed payment");
     Ok(())
 }

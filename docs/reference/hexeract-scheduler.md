@@ -196,7 +196,15 @@ impl MediatorSinkBuilder {
 }
 ```
 
-`ScheduleSink` is the contract a due occurrence is dispatched through, with at-least-once delivery semantics: implementations must tolerate redelivery and deduplicate on `occurrence_id()` when an effect must happen only once. `BusSink` publishes on the message bus under the target's routing key, stamping the occurrence id as message id. `OutboxSink` enqueues idempotently into the transactional outbox, keyed on the occurrence id, so a redelivery is a no-op rather than a second row. `MediatorSink` republishes in-process through the mediator; `MediatorSinkBuilder::register` binds a notification type to its `Event::EVENT_TYPE` before `build()` finishes the sink.
+`ScheduleSink` is the contract a due occurrence is dispatched through, with at-least-once delivery semantics: implementations must tolerate redelivery and deduplicate on `occurrence_id()` when an effect must happen only once. Each concrete sink sits behind its own Cargo feature, so a build only pulls in the dependencies of the sinks it actually uses:
+
+| Sink | Feature | Role |
+| --- | --- | --- |
+| `BusSink` | `bus` | Publishes on the message bus under the target's routing key, stamping the occurrence id as message id. |
+| `OutboxSink` | `outbox` | Enqueues idempotently into the transactional outbox, keyed on the occurrence id, so a redelivery is a no-op rather than a second row. |
+| `MediatorSink` | `mediator` | Republishes in-process through the mediator; `MediatorSinkBuilder::register` binds a notification type to its `Event::EVENT_TYPE` before `build()` finishes the sink. |
+
+Through the `hexeract` umbrella crate these map to `scheduler-bus`, `scheduler-outbox` and `scheduler-mediator`.
 
 ### `ScheduleSnapshot` and `ScheduleStatus`
 

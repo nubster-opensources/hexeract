@@ -14,6 +14,7 @@
 //!
 //! [`OutboxStore`]: hexeract_outbox::OutboxStore
 //! [`OutboxPublisher`]: hexeract_outbox::OutboxPublisher
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(not(any(feature = "postgres", feature = "mysql", feature = "sqlite")))]
 compile_error!(

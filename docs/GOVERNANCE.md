@@ -13,7 +13,7 @@ project is still pre-stable.
 The BDFL has the final say on:
 
 - The product vision and the scope boundaries declared in the
-  [roadmap](../ROADMAP.md).
+  [roadmap](explanation/roadmap.md).
 - Public API design decisions and semver classification of changes.
 - Acceptance, rejection or deferral of contributions.
 - Release cadence and the contents of each release.

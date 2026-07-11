@@ -1,12 +1,25 @@
 # Roadmap
 
+| Version | Theme | Status |
+| --- | --- | --- |
+| v0.1.0 | Outbox MVP | Shipped |
+| v0.2.0 | Bus RabbitMQ | Shipped |
+| v0.3.0 | Mediator Core | Shipped |
+| v0.4.0 | Outbox Multi-Database | Shipped |
+| v0.5.0 | Reliability | Shipped |
+| v0.6.0 | Scheduler | Shipped |
+| v0.7.0 | Request and Reply | Planned |
+| v0.8.0 | Sagas | Planned |
+| v0.9.0 | Polyglot Transports | Planned |
+| v0.10.0 | Polish and Stability | Planned |
+
 Hexeract is pre-stable. This document captures the intended trajectory of the project up to v1.0, ordered by release. **No dates are committed.** The project is sponsored on a best-effort basis by Nubster, and releases ship when they are ready, not when a calendar says so.
 
-The roadmap mirrors the [GitHub milestones](https://github.com/nubster-opensources/hexeract/milestones) one-for-one. Each section here is the public, prose form of a milestone; each milestone groups the issues that must close before the release ships. The full design notes for any given release live under `docs/design/`.
+The roadmap mirrors the [repository milestones](https://github.com/nubster-opensources/hexeract/milestones) one-for-one. Each section here is the public, prose form of a milestone; each milestone groups the issues that must close before the release ships. The full design notes for any given release live under `docs/design/`.
 
 ## Out of scope
 
-Hexeract is a Wolverine-style messaging framework for Rust, combining in-process dispatch, transactional outbox, broker transports, schedulers, request-reply and sagas. The following will never be in scope, regardless of demand:
+Hexeract is a messaging framework for Rust, combining in-process dispatch, transactional outbox, broker transports, schedulers, request-reply and sagas. The following will never be in scope, regardless of demand:
 
 - **Service mesh.** No sidecar proxies, no traffic shaping, no L7 routing.
 - **Brokered queue replacement.** Hexeract integrates with brokers; it does not aim to replace Kafka, NATS, RabbitMQ or their managed equivalents.
@@ -29,7 +42,7 @@ These boundaries are deliberate and non-negotiable. If a feature request crosses
 - Tracing instrumentation that never logs payload bytes.
 - End-to-end runnable example against two PostgreSQL containers (`02_outbox_two_databases`).
 - Criterion benchmark of `publish_in_tx` against a real PostgreSQL container.
-- Full release infrastructure: CHANGELOG, SEMVER and MSRV policies, SECURITY policy, Code of Conduct, GitHub templates, dependabot, release and docs workflows, integration tests workflow.
+- Full release infrastructure: CHANGELOG, SEMVER and MSRV policies, SECURITY policy, Code of Conduct, repository templates, dependabot, release and docs workflows, integration tests workflow.
 
 Released as v0.1.0 on crates.io. The seven shipped crates are `hexeract-core`, `hexeract-outbox`, `hexeract-outbox-postgres`, `hexeract-macros`, `hexeract-mediator`, `hexeract-cli` and the `hexeract` facade.
 
@@ -56,7 +69,7 @@ Released as v0.1.0 on crates.io. The seven shipped crates are `hexeract-core`, `
 
 ## v0.3.0: Mediator Core (DONE)
 
-**Goal.** Dispatch a typed `Command` to its `Handler` in-process, type-safe and reflection-free. The pattern Wolverine and MediatR popularised in .NET, but with compile-time guarantees instead of runtime registries.
+**Goal.** Dispatch a typed `Command` to its `Handler` in-process, type-safe and reflection-free. A pattern popularised in the .NET ecosystem, with compile-time guarantees instead of runtime registries.
 
 **Scope:**
 
@@ -128,7 +141,7 @@ Released as v0.1.0 on crates.io. The seven shipped crates are `hexeract-core`, `
 
 - `hexeract-bus-nats` via `async-nats`.
 - `hexeract-bus-kafka` via `rdkafka`.
-- `hexeract-bus-sqs` for AWS SQS.
+- `hexeract-bus-sqs` for SQS-compatible queues.
 - Per-message-route transport selection (a single application can publish to RabbitMQ for some events and Kafka for others).
 - Integration tests via `testcontainers` for each broker.
 
@@ -154,7 +167,7 @@ The items below have been discussed during the design phase but are not committe
 - **Inbox pattern.** Symmetric to the Outbox on the consumer side, deduplicating `message_id` at the database boundary.
 - **WASM hosts.** Run handlers compiled to WebAssembly in a sandbox for untrusted plugin scenarios.
 - **Visual saga inspector.** Web UI to observe saga state transitions in real time.
-- **Sustainability.** Open Core or hosted premium tier, GitHub Sponsors.
+- **Sustainability.** Open Core or hosted premium tier, the sponsoring page of the repository.
 
 ## How this roadmap is maintained
 
