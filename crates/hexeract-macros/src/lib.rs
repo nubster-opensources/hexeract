@@ -36,11 +36,9 @@ mod parse;
 /// The kind is mandatory and must be one of `command`, `query` or
 /// `notification`. The macro generates the matching trait
 /// implementation, plus a unit struct wrapper for the free function
-/// variant, and submits a [`HandlerRegistration`] entry via
-/// [`inventory::submit!`] for [`MediatorBuilder::verify_handlers`].
+/// variant, and submits a `HandlerRegistration` entry via
+/// [`inventory::submit!`] for `MediatorBuilder::verify_handlers`.
 ///
-/// [`HandlerRegistration`]: hexeract_core::HandlerRegistration
-/// [`MediatorBuilder::verify_handlers`]: hexeract_mediator::MediatorBuilder::verify_handlers
 /// [`inventory::submit!`]: https://docs.rs/inventory/latest/inventory/macro.submit.html
 #[proc_macro_attribute]
 pub fn handler(attr: TokenStream, item: TokenStream) -> TokenStream {

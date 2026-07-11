@@ -9,7 +9,7 @@ This document explains how the Hexeract Scheduler is structured and how a schedu
 | `ScheduledMessage` | `hexeract-scheduler` | Persisted unit of future work: a serialized event, its dispatch `Target`, its `Trigger` (delay or cron) and the UTC instant of the current occurrence (`scheduled_for`). Built with `::delay` or `::cron`. |
 | `Trigger` | `hexeract-scheduler` | `Delay(SystemTime)` fires once; `Cron(CronExpression)` recurs and exposes `next_due` to compute the following occurrence. |
 | `Target` | `hexeract-scheduler` | Dispatch destination: `mediator()`, `outbox()` or `bus(routing_key)`. |
-| `ScheduleStore` | `hexeract-scheduler` | Backend-agnostic contract for persisting and claiming schedules: `insert`, `claim_due`, `mark_delivered`, `reschedule`, `mark_failed`, `mark_dead_lettered`, `cancel`, `set_paused`, `inspect`, `resume`. |
+| `ScheduleStore` | `hexeract-scheduler` | Backend-agnostic contract for persisting and claiming schedules: `insert`, `claim_due`, `mark_delivered`, `reschedule`, `mark_failed`, `mark_dead_lettered`, `dead_letter_exhausted`, `cancel`, `set_paused`, `inspect`, `resume`. |
 | `LeasedOccurrence` | `hexeract-scheduler` | An occurrence returned by `claim_due`, carrying the `ScheduledMessage`, its attempt count and its lease deadline. |
 | `ScheduleSink` | `hexeract-scheduler` | Contract for dispatching a due occurrence to its destination. `BusSink`, `OutboxSink` and `MediatorSink` each implement it for one `Target`. |
 | `SchedulerWorker` | `hexeract-scheduler` | Polling worker that claims due occurrences from a `ScheduleStore`, dispatches them through a `ScheduleSink`, and settles each one (reschedule, deliver, retry or dead-letter). `run(cancel)` drives the loop until cancelled. |
@@ -67,7 +67,7 @@ sequenceDiagram
                     Worker->>Store: mark_dead_lettered(schedule_id, error)
                 else Attempts remaining
                     Worker->>Worker: next_retry_delay(attempts)
-                    Worker->>Store: mark_failed(schedule_id, retry_at, error)
+                    Worker->>Store: mark_failed(schedule_id, retry_in, error)
                 end
             end
         end

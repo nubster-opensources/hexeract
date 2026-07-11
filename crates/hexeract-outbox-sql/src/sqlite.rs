@@ -3,7 +3,7 @@
 //! # Concurrency
 //!
 //! SQLite has no `FOR UPDATE SKIP LOCKED`, so this backend assumes a
-//! **single [`OutboxWorker`] per database**. Running several workers against
+//! **single [`OutboxWorker`](hexeract_outbox::OutboxWorker) per database**. Running several workers against
 //! the same SQLite database can dispatch an envelope more than once, because
 //! concurrent pollers may read the same pending rows before either marks them
 //! delivered. For competing-consumers fan-out across many workers, use the

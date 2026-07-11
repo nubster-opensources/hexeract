@@ -1,6 +1,6 @@
 # Contributing to Hexeract
 
-Hexeract is currently in **alpha** (v0.3.x): Outbox, Bus and Mediator are shipped on crates.io, with Sagas, Scheduler and Request/Reply still ahead on the roadmap. The repository is public on [nubster-opensources/hexeract](https://github.com/nubster-opensources/hexeract) and contributions are welcome.
+Hexeract is currently in **alpha** (v0.6.0): Outbox, Bus, Mediator and the durable Scheduler are shipped on crates.io, with Sagas and Request/Reply still ahead on the roadmap. The repository is public on [nubster-opensources/hexeract](https://github.com/nubster-opensources/hexeract) and contributions are welcome.
 
 ## Conventions
 
@@ -27,7 +27,7 @@ cargo test --workspace --all-features
 
 ## Discussion before code
 
-Until v0.1.0, all design decisions go through a `discussion/` thread on the repository before any pull request is opened. This includes the public traits, the transport abstraction, the outbox schema and the saga state machine.
+Until v1.0, all design decisions go through a `discussion/` thread on the repository before any pull request is opened. This includes the public traits, the transport abstraction, the outbox schema and the saga state machine.
 
 ## Contributor License Agreement
 

@@ -382,8 +382,8 @@ impl Dialect {
     /// # Errors
     ///
     /// Returns [`OutboxError::Internal`] if `table` is not a valid
-    /// identifier matching `^[a-zA-Z_][a-zA-Z0-9_]*$` or exceeds
-    /// [`crate::validate::MAX_IDENTIFIER_LEN`] bytes.
+    /// identifier matching `^[a-zA-Z_][a-zA-Z0-9_]*$` or exceeds the
+    /// `MAX_IDENTIFIER_LEN` (63 bytes) limit.
     pub fn schema_ddl(self, table: &str) -> Result<String, OutboxError> {
         validate_table_name(table)?;
         let template = match self {
@@ -402,8 +402,8 @@ impl Dialect {
     /// # Errors
     ///
     /// Returns [`OutboxError::Internal`] if `table` is not a valid
-    /// identifier matching `^[a-zA-Z_][a-zA-Z0-9_]*$` or exceeds
-    /// [`crate::validate::MAX_IDENTIFIER_LEN`] bytes.
+    /// identifier matching `^[a-zA-Z_][a-zA-Z0-9_]*$` or exceeds the
+    /// `MAX_IDENTIFIER_LEN` (63 bytes) limit.
     pub fn dead_letter_schema_ddl(self, table: &str) -> Result<String, OutboxError> {
         validate_table_name(table)?;
         let template = match self {
