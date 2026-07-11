@@ -1,9 +1,6 @@
 # Hexeract
 
-**Rust messaging framework: Mediator, Bus, Outbox, Sagas, Scheduler, Request/Reply.**
-
-In-process mediator (CQRS), external message bus (RabbitMQ) and a transactional
-outbox/inbox, unified in a single coherent SDK with compile-time guarantees.
+> Rust messaging framework: Mediator, Bus, Outbox, Sagas, Scheduler, Request/Reply.
 
 [![crates.io](https://img.shields.io/crates/v/hexeract-outbox.svg?label=crates.io)](https://crates.io/crates/hexeract-outbox)
 [![docs.rs](https://img.shields.io/docsrs/hexeract-outbox?label=docs.rs)](https://docs.rs/hexeract-outbox)
@@ -13,20 +10,9 @@ outbox/inbox, unified in a single coherent SDK with compile-time guarantees.
 [![Status](https://img.shields.io/badge/status-alpha-yellow)](#status)
 [![Made with Rust](https://img.shields.io/badge/made%20with-Rust-orange?logo=rust)](https://www.rust-lang.org/)
 
-Hexeract is a server-side messaging framework written in Rust. It unifies in-process mediator handlers, external message bus transports, and a transactional outbox/inbox in a single coherent SDK. The framework relies on Rust's type system and procedural macros to provide compile-time guarantees in place of runtime reflection.
+Hexeract is a server-side messaging framework written in Rust. It unifies an in-process mediator (CQRS), an external message bus (RabbitMQ), a transactional outbox/inbox and a durable message scheduler in a single coherent SDK. The framework relies on Rust's type system and procedural macros to provide compile-time guarantees in place of runtime reflection.
 
 Hexeract is sponsored by [Nubster](https://nubster.com).
-
-## What do you need?
-
-| You need... | Reach for | Crate |
-|---|---|---|
-| Reliable event delivery tied to your DB transaction | Transactional outbox | `hexeract-outbox` |
-| A SQL outbox on Postgres, MySQL or SQLite | SQL backends | `hexeract-outbox-sql` |
-| In-process command/query dispatch (CQRS) | Mediator | `hexeract-mediator` |
-| Publish and consume over a broker | Message bus | `hexeract-bus` |
-| A RabbitMQ transport | AMQP backend | `hexeract-bus-rabbitmq` |
-| Everything wired together | Umbrella facade | `hexeract` |
 
 ## Status
 
@@ -52,6 +38,19 @@ Hexeract is sponsored by [Nubster](https://nubster.com).
 | Sagas, Request and Reply | ⏳ later | ⏳ later | ⏳ later | ⏳ later | ⏳ later | ⏳ later |
 
 See the [CHANGELOG](./CHANGELOG.md) for the detailed history.
+
+## What do you need?
+
+| You need... | Reach for | Crate |
+|---|---|---|
+| Reliable event delivery tied to your DB transaction | Transactional outbox | `hexeract-outbox` |
+| A SQL outbox on Postgres, MySQL or SQLite | SQL backends | `hexeract-outbox-sql` |
+| In-process command/query dispatch (CQRS) | Mediator | `hexeract-mediator` |
+| Publish and consume over a broker | Message bus | `hexeract-bus` |
+| A RabbitMQ transport | AMQP backend | `hexeract-bus-rabbitmq` |
+| Schedule delayed or recurring messages | Scheduler | `hexeract-scheduler` |
+| A SQL scheduler store on Postgres, MySQL or SQLite | SQL backends | `hexeract-scheduler-sql` |
+| Everything wired together | Umbrella facade | `hexeract` |
 
 ## Quick start
 
@@ -237,6 +236,47 @@ assert_eq!(greeting, "hello world");
 
 Queries (`Mediator::query`) and notifications (`Mediator::publish`) follow the same pattern. Notifications fan out to every handler registered for the type in registration order; failures are aggregated so siblings keep running. Wire your own [`Middleware`] implementations through `MediatorBuilder::with_middleware` to add tracing, timeouts or any cross-cutting behavior around every dispatch.
 
+### Scheduler (delayed and recurring messages)
+
+Add the umbrella crate with the `scheduler-sql-postgres` feature to your `Cargo.toml` (`scheduler-sql-mysql` and `scheduler-sql-sqlite` ship the same surface):
+
+```toml
+[dependencies]
+hexeract = { version = "0.6", features = ["scheduler", "scheduler-bus", "scheduler-sql-postgres", "outbox", "bus-rabbitmq"] }
+```
+
+Schedule a one-shot reminder and dispatch it onto the bus once it is due:
+
+```rust
+use hexeract::outbox::Event;
+use hexeract::scheduler::{ScheduledMessage, ScheduleStore, Target};
+use hexeract::scheduler_sql::PgScheduleStore;
+use serde::{Deserialize, Serialize};
+use std::time::{Duration, SystemTime};
+use uuid::Uuid;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ReminderDue { reminder_id: Uuid, note: String }
+
+impl Event for ReminderDue {
+    const EVENT_TYPE: &'static str = "reminders.due";
+}
+
+# async fn run(pool: sqlx::PgPool) -> Result<(), Box<dyn std::error::Error>> {
+let store = PgScheduleStore::new(pool, "scheduled_messages")?;
+
+let reminder = ReminderDue { reminder_id: Uuid::new_v4(), note: "renew your subscription".into() };
+let message = ScheduledMessage::delay(
+    Target::bus("reminders.due"),
+    SystemTime::now() + Duration::from_secs(60),
+    &reminder,
+)?;
+store.insert(&message, 5).await?;
+# Ok(()) }
+```
+
+A `SchedulerBuilder`-driven worker polls the store, claims due occurrences under a lease and dispatches them to the mediator, the bus or the outbox, with bounded backoff and dead-lettering on exhausted retries. See [`docs/getting-started/scheduler-quick-start.md`](./docs/getting-started/scheduler-quick-start.md) for the full walkthrough, including cron triggers and live schedule control.
+
 ## Why Hexeract
 
 Building event-driven services in Rust today means manually wiring a broker client, an outbox table, and an in-process dispatch layer together. Hexeract closes that gap with a single SDK that covers the full shipped surface while keeping each feature independently usable:
@@ -252,16 +292,16 @@ The bet behind Hexeract is that Rust's compile-time guarantees turn the outbox p
 Available today: Mediator, Bus, Outbox/Inbox, the durable Scheduler, and
 delivery reliability (dead-letter handling, publisher confirms, idempotency).
 
-Planned: Sagas, Request/Reply. See [`ROADMAP.md`](./ROADMAP.md).
+Planned: Sagas, Request/Reply. See [`docs/explanation/roadmap.md`](./docs/explanation/roadmap.md).
 
 ## What Hexeract is **not**
 
 To stay focused, the following are explicitly out of scope:
 
-- **Not a service mesh.** No automatic mTLS or network policies between services. Use Linkerd or Istio.
+- **Not a service mesh.** No automatic mTLS or network policies between services. Use a service mesh.
 - **Not a broker.** Hexeract is a client; you keep your existing RabbitMQ, NATS or Kafka.
-- **Not a standalone workflow engine.** Sagas live inside your services, not in a dedicated cluster. Use Temporal or Airflow when you need that shape.
-- **Not an event streaming engine.** No real-time stream processing. Use Kafka Streams or Apache Flink.
+- **Not a standalone workflow engine.** Sagas live inside your services, not in a dedicated cluster. Use a dedicated workflow engine when you need that shape.
+- **Not an event streaming engine.** No real-time stream processing. Use a stream-processing engine.
 
 ## Audience
 
@@ -276,7 +316,7 @@ To stay focused, the following are explicitly out of scope:
 
 ## Contributing
 
-Contributions are welcome. Please read [`CONTRIBUTING.md`](./CONTRIBUTING.md) first for the workflow and conventions, and [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md) for the community guidelines. For vulnerability reports, see [`SECURITY.md`](./SECURITY.md). For open-ended questions and design conversations, use [GitHub Discussions](https://github.com/nubster-opensources/hexeract/discussions).
+Contributions are welcome. Please read [`CONTRIBUTING.md`](./CONTRIBUTING.md) first for the workflow and conventions, and [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md) for the community guidelines. For vulnerability reports, see [`SECURITY.md`](./SECURITY.md). For open-ended questions and design conversations, open a thread on the [repository discussions](https://github.com/nubster-opensources/hexeract/discussions).
 
 Stability and versioning are documented in [`docs/SEMVER_POLICY.md`](./docs/SEMVER_POLICY.md) and [`docs/MSRV_POLICY.md`](./docs/MSRV_POLICY.md).
 

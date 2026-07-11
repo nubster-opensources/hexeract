@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -145,11 +146,17 @@ impl PaymentBook {
             %payment_id,
             "payment processed"
         );
-        self.recorded.lock().expect("poisoned").push(cmd.order_id);
+        self.recorded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(cmd.order_id);
         Ok(payment_id)
     }
 }
 
+// This manual handler registry is shown deliberately: it is the generic,
+// multi-backend outbox wiring path. For PostgreSQL specifically,
+// `PgOutboxWorkerBuilder` (see the quick start) is the ergonomic shortcut.
 fn outbox_registry(handler: BusForwarder) -> HashMap<&'static str, Arc<dyn ErasedHandler>> {
     let mut map = HashMap::new();
     let erased: Arc<dyn ErasedHandler> = Arc::new(TypedHandler::new(handler));
@@ -254,7 +261,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Await the full pipeline.
     let started = Instant::now();
-    while recorded.lock().expect("poisoned").is_empty() {
+    while recorded
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_empty()
+    {
         if started.elapsed() > PIPELINE_BUDGET {
             outbox_cancel.cancel();
             bus_cancel.cancel();
@@ -269,13 +280,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     outbox_handle.await??;
     bus_handle.await??;
 
-    assert_eq!(
-        recorded.lock().expect("poisoned").as_slice(),
-        &[order.order_id]
-    );
-    println!(
-        "order {} flowed through outbox -> bus -> mediator",
-        order.order_id
+    let processed = recorded.lock().unwrap_or_else(PoisonError::into_inner);
+    if processed.as_slice() != [order.order_id] {
+        return Err(format!(
+            "expected processed order {}, got {:?}",
+            order.order_id,
+            processed.as_slice()
+        )
+        .into());
+    }
+    tracing::info!(
+        order_id = %order.order_id,
+        "order flowed through outbox, bus and mediator"
     );
     Ok(())
 }

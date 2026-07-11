@@ -1,6 +1,6 @@
 # Hexeract Documentation
 
-Hexeract is a six-dimension Rust messaging framework: **Mediator**, **Bus**, **Outbox**, **Sagas**, **Scheduler**, **Request/Reply**. This index points at the documentation that is shipped today (v0.6.0).
+Hexeract is a six-dimension Rust messaging framework: **Mediator**, **Bus**, **Outbox**, **Sagas**, **Scheduler**, **Request/Reply** (Sagas and Request/Reply are on the roadmap). This index points at the documentation that is shipped today (v0.6.0).
 
 ## Start here
 
@@ -10,6 +10,7 @@ Hexeract is a six-dimension Rust messaging framework: **Mediator**, **Bus**, **O
 | Persist outgoing events transactionally with PostgreSQL, MySQL or SQLite | [Outbox quick start](getting-started/outbox-quick-start.md) |
 | Publish and consume messages on RabbitMQ | [Bus quick start](getting-started/bus-quick-start.md) |
 | Schedule delayed or recurring messages | [Scheduler quick start](getting-started/scheduler-quick-start.md) |
+| Migrate an existing project from v0.5.0 to v0.6.0 | [Migration v0.5 to v0.6](operations/migration-v0.5-v0.6.md) |
 | Migrate an existing project from v0.4.0 to v0.5.0 | [Migration v0.4 to v0.5](operations/migration-v0.4-v0.5.md) |
 | Migrate an existing project from v0.3.0 to v0.4.0 | [Migration v0.3 to v0.4](operations/migration-v0.3-v0.4.md) |
 | Migrate an existing project from v0.1.0 to v0.2.0 | [Migration v0.1 to v0.2](operations/migration-v0.1-v0.2.md) |
@@ -64,6 +65,7 @@ Recipes for the most common wirings.
 
 Stable artefacts that operators reach for.
 
+- [`hexeract-core` API](reference/hexeract-core.md)
 - [`hexeract-mediator` API](reference/hexeract-mediator.md)
 - [`hexeract-middleware` API](reference/hexeract-middleware.md)
 - [`hexeract-macros` API](reference/hexeract-macros.md)
@@ -84,6 +86,7 @@ How to run Hexeract services after the SDK leaves your hands.
 - [Production checklist](operations/production-checklist.md)
 - [Observability](operations/observability.md)
 - [Troubleshooting](operations/troubleshooting.md)
+- [Migration v0.5 to v0.6](operations/migration-v0.5-v0.6.md)
 - [Migration v0.4 to v0.5](operations/migration-v0.4-v0.5.md)
 - [Migration v0.3 to v0.4](operations/migration-v0.3-v0.4.md)
 - [Migration v0.1 to v0.2](operations/migration-v0.1-v0.2.md)

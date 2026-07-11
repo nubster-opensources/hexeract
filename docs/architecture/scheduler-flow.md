@@ -45,6 +45,8 @@ sequenceDiagram
     participant Sink as ScheduleSink
 
     loop Every poll_interval or min_cycle_delay
+        Worker->>Store: dead_letter_exhausted()
+        Store-->>Worker: swept count
         Worker->>Store: claim_due(now, batch_size, lease)
         Store-->>Worker: Vec<LeasedOccurrence>
         loop For each occurrence
@@ -52,22 +54,22 @@ sequenceDiagram
             alt Ok
                 Sink-->>Worker: Ok(())
                 alt Trigger::Delay
-                    Worker->>Store: mark_delivered(schedule_id)
+                    Worker->>Store: mark_delivered(schedule_id, lease)
                 else Trigger::Cron
                     Worker->>Worker: expression.next_due(now, scheduled_for)
                     alt Some(next)
-                        Worker->>Store: reschedule(schedule_id, next)
+                        Worker->>Store: reschedule(schedule_id, next, lease)
                     else None
-                        Worker->>Store: mark_delivered(schedule_id)
+                        Worker->>Store: mark_delivered(schedule_id, lease)
                     end
                 end
             else Err
                 Sink-->>Worker: Err(error)
                 alt Attempt budget exhausted
-                    Worker->>Store: mark_dead_lettered(schedule_id, error)
+                    Worker->>Store: mark_dead_lettered(schedule_id, error, lease)
                 else Attempts remaining
                     Worker->>Worker: next_retry_delay(attempts)
-                    Worker->>Store: mark_failed(schedule_id, retry_in, error)
+                    Worker->>Store: mark_failed(schedule_id, retry_in, error, lease)
                 end
             end
         end

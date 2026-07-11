@@ -29,7 +29,7 @@ impl NotificationHandler<UserRegistered> for AuditHandler {
     async fn handle(&self, n: Arc<UserRegistered>, _ctx: &HandlerContext) -> Result<(), HexeractError> {
         self.audit_log
             .lock()
-            .expect("audit log poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(n.id);
         Ok(())
     }
@@ -75,7 +75,10 @@ mediator
     })
     .await?;
 
-assert_eq!(*audit_log.lock().unwrap(), vec![1]);
+assert_eq!(
+    *audit_log.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+    vec![1]
+);
 # Ok(()) }
 ```
 

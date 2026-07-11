@@ -6,6 +6,7 @@ use hexeract::core::{
     Command, CommandHandler, CorrelationId, HandlerContext, HexeractError, MessageId,
 };
 use std::sync::Mutex;
+use std::sync::PoisonError;
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -41,7 +42,10 @@ impl InMemoryUserRepo {
     }
 
     fn count(&self) -> usize {
-        self.created.lock().expect("poisoned").len()
+        self.created
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 }
 
@@ -60,7 +64,10 @@ impl CommandHandler<CreateUser> for InMemoryUserRepo {
             email = %cmd.email,
             "user created"
         );
-        self.created.lock().expect("poisoned").push((id, cmd.email));
+        self.created
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((id, cmd.email));
         Ok(id)
     }
 }
@@ -80,20 +87,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &ctx,
         )
         .await?;
-    println!("created user with id {id}");
+    tracing::info!(%id, "created user");
 
     let ctx2 = HandlerContext::new(MessageId::new(), CorrelationId::new());
-    let err = repo
+    let result = repo
         .handle(
             CreateUser {
                 email: String::new(),
             },
             &ctx2,
         )
-        .await
-        .expect_err("empty email should be rejected");
-    println!("expected failure: {err}");
+        .await;
+    let Err(err) = result else {
+        return Err("empty email should have been rejected".into());
+    };
+    tracing::info!(%err, "expected failure");
 
-    println!("total users created: {}", repo.count());
+    tracing::info!(total = repo.count(), "total users created");
     Ok(())
 }

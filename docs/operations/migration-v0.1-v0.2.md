@@ -40,7 +40,7 @@ None on the outbox side. The bus side is entirely new.
 ## What is NOT yet covered by the bus
 
 - Native NATS, Kafka and SQS backends land in v0.9.0 (Polyglot Transports). Use the polyglot bus pattern when you need broker portability today: stay on RabbitMQ, switch when the v0.9.0 backends ship.
-- Saga orchestration (v0.8.0), Scheduler (v0.6.0), Request/Reply (v0.7.0), Mediator (v0.3.0) and Reliability extensions (v0.5.0) are roadmap items. See [ROADMAP.md](../../ROADMAP.md).
+- Saga orchestration (v0.8.0), Scheduler (v0.6.0), Request/Reply (v0.7.0), Mediator (v0.3.0) and Reliability extensions (v0.5.0) are roadmap items. See [docs/explanation/roadmap.md](../explanation/roadmap.md).
 
 ## CLI workflow that did not exist in v0.1.0
 

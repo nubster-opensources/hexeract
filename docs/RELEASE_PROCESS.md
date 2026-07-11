@@ -4,7 +4,7 @@ Hexeract uses a three-layer combo to ship new versions to crates.io. Whatever su
 
 ## Surfaces
 
-### Surface 1: GitHub UI (no CLI required)
+### Surface 1: the repository web UI (no CLI required)
 
 Use this when you want to bump from your browser, or when you do not have a local Rust toolchain handy.
 
@@ -65,15 +65,15 @@ git push origin v<TARGET>
 
 The tag push triggers [`.github/workflows/release.yml`](../.github/workflows/release.yml) which:
 
-1. Publishes the ten workspace crates to crates.io in dependency order (`hexeract-core` → `hexeract-outbox` → `hexeract-outbox-sql` → `hexeract-bus` → `hexeract-bus-rabbitmq` → `hexeract-mediator` → `hexeract-middleware` → `hexeract-macros` → `hexeract-cli` → `hexeract` facade), with 30 s sleeps between each to let the crates.io index propagate.
-2. Creates a GitHub Release whose notes are extracted from the `[<TARGET>]` section of `CHANGELOG.md`.
+1. Publishes the twelve workspace crates to crates.io in dependency order (`hexeract-core` -> `hexeract-outbox` -> `hexeract-outbox-sql` -> `hexeract-bus` -> `hexeract-bus-rabbitmq` -> `hexeract-mediator` -> `hexeract-middleware` -> `hexeract-macros` -> `hexeract-scheduler` -> `hexeract-scheduler-sql` -> `hexeract-cli` -> `hexeract` facade), with 30 s sleeps between each to let the crates.io index propagate.
+2. Creates a release entry on the repository whose notes are extracted from the `[<TARGET>]` section of `CHANGELOG.md`.
 
 Tagging is deliberately a manual step so the human reviewing the PR is also the one who triggers the publish, with full awareness of what is about to leave the workshop.
 
 ## What the bump script does NOT do
 
 - It does not publish to crates.io. The tag does, via `release.yml`.
-- It does not create the GitHub Release. The tag does.
+- It does not create the release entry. The tag does.
 - It does not edit your `[Unreleased]` items. Whatever you wrote there is preserved verbatim under the new `[<TARGET>]` section.
 - It does not skip pre-flight checks. If `cargo fmt` or `clippy` or the test suite fails, the bump aborts.
 

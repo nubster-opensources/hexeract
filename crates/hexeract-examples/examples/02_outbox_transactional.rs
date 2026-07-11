@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -61,11 +62,17 @@ impl OutboxHandler<OrderPlaced> for RecordingDrain {
 
     async fn handle(&self, event: OrderPlaced, ctx: &HandlerContext) -> Result<(), Self::Error> {
         tracing::info!(order_id = %event.order_id, message_id = %ctx.message_id, "relayed");
-        self.seen.lock().expect("poisoned").push(event.order_id);
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(event.order_id);
         Ok(())
     }
 }
 
+// This manual handler registry is shown deliberately: it is the generic,
+// multi-backend outbox wiring path. For PostgreSQL specifically,
+// `PgOutboxWorkerBuilder` (see the quick start) is the ergonomic shortcut.
 fn registry(handler: RecordingDrain) -> HashMap<&'static str, Arc<dyn ErasedHandler>> {
     let mut map = HashMap::new();
     let erased: Arc<dyn ErasedHandler> = Arc::new(TypedHandler::new(handler));
@@ -124,7 +131,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let handle = tokio::spawn(worker.run(cancel.clone()));
 
     let started = Instant::now();
-    while seen.lock().expect("poisoned").is_empty() {
+    while seen
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_empty()
+    {
         if started.elapsed() > RELAY_BUDGET {
             cancel.cancel();
             let _ = handle.await;
@@ -135,7 +146,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     cancel.cancel();
     handle.await??;
 
-    assert_eq!(seen.lock().expect("poisoned").as_slice(), &[order.order_id]);
-    println!("relayed order {}", order.order_id);
+    let relayed = seen.lock().unwrap_or_else(PoisonError::into_inner);
+    if relayed.as_slice() != [order.order_id] {
+        return Err(format!(
+            "expected relayed order {}, got {:?}",
+            order.order_id,
+            relayed.as_slice()
+        )
+        .into());
+    }
+    tracing::info!(order_id = %order.order_id, "relayed order");
     Ok(())
 }

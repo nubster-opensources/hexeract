@@ -25,3 +25,7 @@ tokio = { workspace = true, features = ["time"] }
 hexeract-mediator = { path = "../hexeract-mediator", version = "0.6" }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }
 tracing-test = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

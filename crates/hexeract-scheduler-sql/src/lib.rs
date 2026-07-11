@@ -19,6 +19,7 @@
 //! Cargo feature.
 //!
 //! [`Dialect`]: hexeract_outbox_sql::Dialect
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(not(any(feature = "postgres", feature = "mysql", feature = "sqlite")))]
 compile_error!(

@@ -81,7 +81,7 @@ Each entry is re-validated through the typed constructors (`Exchange::new`, `Que
 
 ### `bus peek`
 
-Dump the first `N` messages of a queue **without consuming them**. Each delivery is `basic_nack(requeue=true)`-ed after print, so the queue is left intact.
+Dump the first `N` messages of a queue **without consuming them**. Deliveries are fetched and printed one by one, then all released together in a single `basic_nack(multiple=true, requeue=true)` once fetching is done: nacking each message immediately would requeue it before the next `basic_get`, so the same head message would be read again instead of advancing through the queue. The queue is left intact once the batch nack completes.
 
 Payload output is capped at 1 KiB by default so a peek does not dump secrets or PII in full to a terminal, CI log or pipe. Pass `--max-bytes N` to raise the cap, or `--raw` to print the full, untruncated payload (only when every reader of the output is trusted with the whole message body). A truncated preview ends with the marker ` ...<truncated, use --raw or --max-bytes to see more>`.
 
@@ -171,11 +171,11 @@ hexeract scheduler dead-letter replay <SCHEDULE_ID> --conn "$DATABASE_URL"
 | `HEXERACT_BUS_URL` | Default value for `--conn` on every `bus` subcommand |
 | `DATABASE_URL` | Default value for `--conn` on every `scheduler` admin subcommand (`list`, `inspect`, `dead-letter`) |
 | `HEXERACT_SCHEDULER_TABLE` | Default value for `--table` on every `scheduler` subcommand |
-| `RUST_LOG` | Standard `tracing_subscriber` filter; default is `info` |
+| `RUST_LOG` | Standard `tracing_subscriber` filter; default is `warn,hexeract_cli=info` |
 
 ## Integration tests
 
-The `hexeract-cli` crate ships two `#[ignore]` integration tests against a RabbitMQ container spun up via `testcontainers`. Run them locally with:
+The `hexeract-cli` crate ships eight `#[ignore]` integration tests against RabbitMQ and PostgreSQL containers spun up via `testcontainers`. Run them locally with:
 
 ```bash
 cargo test -p hexeract-cli -- --ignored

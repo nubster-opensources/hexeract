@@ -24,7 +24,7 @@ Run through this list before letting a Hexeract-powered service answer a real wo
 ## Scheduler
 
 - [ ] **Schema applied via the CLI, never hand-edited.** Generate the DDL with `hexeract scheduler schema --dialect <postgres|my-sql|sqlite>` (note: the MySQL dialect token is `my-sql`, kebab-cased) and apply it through your versioned migration tool. The CLI is the source of truth for the table shape.
-- [ ] **Worker sized for your throughput.** Set `lease` with headroom above `dispatch_timeout` so a slow dispatch does not let another worker reclaim the occurrence (this is operational guidance, not an enforced rule: the builder only rejects a zero `lease` or a zero `dispatch_timeout`, and the defaults for both are 30s). Tune `poll_interval` (default 100ms) and `batch_size` (default 10) to the volume of occurrences you expect per cycle.
+- [ ] **Worker sized for your throughput.** `build()` enforces `lease >= batch_size x dispatch_timeout` (rejecting the configuration otherwise, including on overflow), because settling a claimed batch is sequential and a shorter lease could expire before the last occurrence in the batch is even dispatched. Defaults: `lease` 300s, `batch_size` 10, `dispatch_timeout` 30s, `poll_interval` 100ms. If you raise `batch_size` or `dispatch_timeout`, raise `lease` to match or `build()` will return `SchedulerError::InvalidConfiguration`.
 - [ ] **Dispatch lag monitored.** Track the gap between an occurrence's due time and its actual dispatch time; a growing gap signals an under-provisioned worker pool or a stuck sink.
 - [ ] **Dead-letter alerted and operated.** Alert on dead-letter growth, inspect entries with `hexeract scheduler dead-letter list`, and replay a schedule with `hexeract scheduler dead-letter replay <schedule-id>` once the underlying cause is fixed.
 
@@ -46,7 +46,7 @@ Run through this list before letting a Hexeract-powered service answer a real wo
 
 - [ ] **Connection string out of source control.** Use environment variables (`DATABASE_URL`, `HEXERACT_BUS_URL`) or a secret manager.
 - [ ] **TLS enabled on broker connections.** `amqps://` instead of `amqp://`; the lapin connection picks the right scheme automatically.
-- [ ] **PostgreSQL connections use TLS by default.** `outbox apply` and `outbox check` upgrade any `sslmode` other than an explicit `disable` to `require` and connect via `rustls` against the operating-system trust store; only `sslmode=disable` in the connection string opts into plaintext, and a warning is logged when it does.
+- [ ] **`outbox apply` and `outbox check` use TLS by default; scheduler admin commands do not.** `outbox apply`/`outbox check` upgrade any `sslmode` other than an explicit `disable` to `require` and connect via `rustls` against the operating-system trust store; only `sslmode=disable` in the connection string opts into plaintext, and a warning is logged when it does. `scheduler list`/`inspect`/`dead-letter` open their PostgreSQL pool through `sqlx` directly, which defaults to `sslmode=prefer` and silently falls back to cleartext if the server declines TLS. For those commands, set `sslmode=require` explicitly in `DATABASE_URL`.
 - [ ] **Credentials scoped per service.** A consumer service does not need publish permissions on every exchange; tighten the broker authorisation rules.
 - [ ] **Database role least-privileged.** The outbox publisher needs `INSERT` on the outbox table; the worker needs `SELECT FOR UPDATE` and `UPDATE`. No `DROP`, no `TRUNCATE`.
 

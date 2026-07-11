@@ -17,11 +17,14 @@ Hexeract emits `tracing` events on every poll cycle, dispatch, retry and ack. Th
 | `handler failed` | `hexeract-bus-rabbitmq` | `warn` | `message_type`, `attempt`, `max_attempts`, `error` | Handler returned `Err` in `AckMode::Manual`, before the nack/DLR decision |
 | `delivery dropped after exhausting retry budget` | `hexeract-bus-rabbitmq` | `warn` | `message_type`, `attempts` | `max_attempts` reached with no DLR configured |
 | `rabbitmq worker cancelled` | `hexeract-bus-rabbitmq` | `info` | `queue` | The `CancellationToken` fired and the consume loop is exiting |
+| `swept schedules whose attempt budget was exhausted by a crashed worker` | `hexeract-scheduler` | `error` | `count` | `dead_letter_exhausted` found at least one row left `Pending` with its attempt budget exhausted and no active lease, at the start of a poll cycle |
 | `scheduler claimed due occurrences` | `hexeract-scheduler` | `debug` | `claimed` | A poll cycle claimed at least one due occurrence |
+| `lease already expired before dispatch, skipping` | `hexeract-scheduler` | `warn` | `schedule_id` | The claimed occurrence's lease had already elapsed by the time the worker was about to dispatch it; the worker skips it and lets it expire back to claimable |
 | `scheduled occurrence dispatched` | `hexeract-scheduler` | `debug` | `schedule_id`, `trigger`, `lag_ms` | The sink returned `Ok` for an occurrence |
 | `scheduled occurrence rescheduled` | `hexeract-scheduler` | `debug` | `schedule_id`, `trigger` | A cron schedule was advanced to its next occurrence after a successful dispatch |
 | `scheduled occurrence retried` | `hexeract-scheduler` | `warn` | `schedule_id`, `attempts`, `error` | A dispatch failed and the attempt budget is not yet exhausted |
 | `scheduled occurrence dead-lettered` | `hexeract-scheduler` | `error` | `schedule_id`, `attempts`, `error` | A dispatch failed and the attempt budget is exhausted |
+| `lease lost; occurrence settled by another worker` | `hexeract-scheduler` | `warn` | `schedule_id` | An acknowledgement (`mark_delivered`, `reschedule`, `mark_failed` or `mark_dead_lettered`) found the occurrence's lease no longer matched, meaning another worker already reclaimed and settled it |
 
 The scheduler also emits two spans: `scheduler.tick` (one per poll cycle, carries the `claimed` field) and `scheduler.dispatch` (one per settled occurrence, carries `schedule_id`, `trigger`, `attempt` and `lag_ms`). The `lag_ms` field measures the duration between the occurrence's `scheduled_for` time and the moment the worker picks it up. Sustained growth of `lag_ms` is the primary signal that the worker is falling behind the dispatch rate.
 
