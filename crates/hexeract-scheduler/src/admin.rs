@@ -139,11 +139,16 @@ mod tests {
         let cancelled = insert_delay(&store, base(), 5).await;
         store.cancel(cancelled).await.expect("cancel");
         let delivered = insert_delay(&store, base(), 5).await;
-        store
+        let claimed = store
             .claim_due(base(), 10, LEASE)
             .await
             .expect("claim delivered");
-        store.mark_delivered(delivered).await.expect("deliver");
+        assert_eq!(claimed.len(), 1);
+        let applied = store
+            .mark_delivered(delivered, claimed[0].leased_until)
+            .await
+            .expect("deliver");
+        assert!(applied, "the freshly claimed lease must still be valid");
         let listed = store.list_pending(10).await.expect("list");
         let ids: Vec<Uuid> = listed.iter().map(|s| s.schedule_id).collect();
         assert!(ids.contains(&paused));
@@ -158,7 +163,13 @@ mod tests {
     async fn list_dead_letter_returns_only_dead_lettered() {
         let store = InMemoryScheduleStore::default();
         let dead = insert_delay(&store, base(), 5).await;
-        store.mark_dead_lettered(dead, "boom").await.expect("dead");
+        let claimed = store.claim_due(base(), 10, LEASE).await.expect("claim");
+        assert_eq!(claimed.len(), 1);
+        let applied = store
+            .mark_dead_lettered(dead, "boom", claimed[0].leased_until)
+            .await
+            .expect("dead");
+        assert!(applied, "the freshly claimed lease must still be valid");
         let alive = insert_delay(&store, base(), 5).await;
         let listed = store.list_dead_letter(10).await.expect("list");
         assert_eq!(listed.len(), 1);
@@ -171,14 +182,22 @@ mod tests {
     async fn list_dead_letter_orders_most_recently_dead_lettered_first() {
         let store = InMemoryScheduleStore::default();
         let first = insert_delay(&store, base(), 5).await;
+        let claimed_first = store
+            .claim_due(base(), 10, LEASE)
+            .await
+            .expect("claim first");
         store
-            .mark_dead_lettered(first, "first")
+            .mark_dead_lettered(first, "first", claimed_first[0].leased_until)
             .await
             .expect("dead letter first");
         tokio::time::sleep(Duration::from_millis(5)).await;
         let second = insert_delay(&store, base(), 5).await;
+        let claimed_second = store
+            .claim_due(base(), 10, LEASE)
+            .await
+            .expect("claim second");
         store
-            .mark_dead_lettered(second, "second")
+            .mark_dead_lettered(second, "second", claimed_second[0].leased_until)
             .await
             .expect("dead letter second");
 
@@ -201,8 +220,11 @@ mod tests {
         let claimed = store.claim_due(base(), 10, LEASE).await.expect("claim");
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].attempts, 1);
-        store.mark_failed(dead, base(), "err").await.expect("fail");
-        store.mark_dead_lettered(dead, "boom").await.expect("dead");
+        let applied = store
+            .mark_dead_lettered(dead, "boom", claimed[0].leased_until)
+            .await
+            .expect("dead");
+        assert!(applied, "the freshly claimed lease must still be valid");
         store.replay(dead).await.expect("replay");
         let snapshot = store.inspect(dead).await.expect("inspect").expect("exists");
         assert_eq!(snapshot.status, ScheduleStatus::Pending);

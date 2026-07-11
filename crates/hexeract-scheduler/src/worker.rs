@@ -24,7 +24,14 @@ pub struct SchedulerWorkerConfig {
     /// Maximum number of occurrences claimed per cycle.
     pub batch_size: usize,
     /// Lease granted to each claimed occurrence: the window in which this
-    /// worker must dispatch and acknowledge before another worker may reclaim.
+    /// worker must dispatch and acknowledge before another worker may
+    /// reclaim.
+    ///
+    /// Must be at least `batch_size × dispatch_timeout`: settling a batch is
+    /// sequential, so a shorter lease can expire before the last occurrence
+    /// in the batch is even dispatched, letting a second worker reclaim and
+    /// race the first. [`crate::builder::SchedulerBuilder::build`] validates
+    /// this invariant.
     pub lease: Duration,
     /// Base delay of the exponential retry backoff.
     pub retry_base_delay: Duration,
@@ -45,7 +52,7 @@ impl Default for SchedulerWorkerConfig {
         Self {
             poll_interval: Duration::from_millis(100),
             batch_size: 10,
-            lease: Duration::from_secs(30),
+            lease: Duration::from_secs(300),
             retry_base_delay: Duration::from_secs(1),
             retry_max_delay: Duration::from_secs(300),
             jitter: true,
@@ -78,8 +85,13 @@ where
     K: ScheduleSink,
 {
     /// Build a worker over `store` and `sink` with the given configuration.
+    ///
+    /// Crate-private: [`SchedulerBuilder::build`](crate::builder::SchedulerBuilder::build)
+    /// is the only public path to a `SchedulerWorker`, so the lease invariant
+    /// it validates (`lease >= batch_size × dispatch_timeout`) cannot be
+    /// bypassed by constructing a `SchedulerWorkerConfig` by hand.
     #[must_use]
-    pub fn new(store: S, sink: K, config: SchedulerWorkerConfig) -> Self {
+    pub(crate) fn new(store: S, sink: K, config: SchedulerWorkerConfig) -> Self {
         Self {
             store,
             sink,
@@ -130,6 +142,13 @@ where
     /// Claim and settle one batch, returning the number of occurrences claimed.
     #[tracing::instrument(name = "scheduler.tick", skip_all, fields(claimed = tracing::field::Empty))]
     async fn poll_cycle(&self) -> Result<usize, SchedulerError> {
+        let swept = self.store.dead_letter_exhausted().await?;
+        if swept > 0 {
+            tracing::error!(
+                count = swept,
+                "swept schedules whose attempt budget was exhausted by a crashed worker"
+            );
+        }
         let now = SystemTime::now();
         let claimed = self
             .store
@@ -165,6 +184,18 @@ where
         )
     )]
     async fn settle(&self, occurrence: LeasedOccurrence) -> Result<(), SchedulerError> {
+        // Cheap pre-dispatch guard: a lease that has already elapsed will lose
+        // the fencing check on every acknowledgement below anyway, so skip the
+        // dispatch entirely and let the occurrence expire back to claimable.
+        // Correctness never depends on this guard (the fencing on the
+        // acknowledgement is the real guarantee); it only avoids wasted work.
+        if occurrence.leased_until <= SystemTime::now() {
+            tracing::warn!(
+                schedule_id = %occurrence.message.schedule_id,
+                "lease already expired before dispatch, skipping"
+            );
+            return Ok(());
+        }
         let now = SystemTime::now();
         let lag = Self::dispatch_lag(occurrence.message.scheduled_for, now);
         tracing::Span::current()
@@ -177,7 +208,7 @@ where
                     lag_ms = u64::try_from(lag.as_millis()).unwrap_or(u64::MAX),
                     "scheduled occurrence dispatched"
                 );
-                self.on_success(&occurrence.message).await
+                self.on_success(&occurrence).await
             }
             Err(error) => self.on_failure(&occurrence, &error).await,
         }
@@ -203,9 +234,20 @@ where
 
     /// Acknowledge a successful dispatch: deliver a one-shot schedule, or
     /// advance a recurring one to its next occurrence.
-    async fn on_success(&self, message: &ScheduledMessage) -> Result<(), SchedulerError> {
-        match &message.trigger {
-            Trigger::Delay(_) => self.store.mark_delivered(message.schedule_id).await,
+    ///
+    /// Both acknowledgements are fenced on `occurrence.leased_until`: if the
+    /// lease was reclaimed by another worker in the meantime, the store
+    /// reports `Ok(false)` and this occurrence is left alone rather than
+    /// clobbering whatever the new owner has since written.
+    async fn on_success(&self, occurrence: &LeasedOccurrence) -> Result<(), SchedulerError> {
+        let message = &occurrence.message;
+        let lease = occurrence.leased_until;
+        let applied = match &message.trigger {
+            Trigger::Delay(_) => {
+                self.store
+                    .mark_delivered(message.schedule_id, lease)
+                    .await?
+            }
             Trigger::Cron(expression) => {
                 match expression.next_due(SystemTime::now(), message.scheduled_for)? {
                     Some(next) => {
@@ -214,16 +256,32 @@ where
                             trigger = message.trigger.kind(),
                             "scheduled occurrence rescheduled"
                         );
-                        self.store.reschedule(message.schedule_id, next).await
+                        self.store
+                            .reschedule(message.schedule_id, next, lease)
+                            .await?
                     }
-                    None => self.store.mark_delivered(message.schedule_id).await,
+                    None => {
+                        self.store
+                            .mark_delivered(message.schedule_id, lease)
+                            .await?
+                    }
                 }
             }
+        };
+        if !applied {
+            tracing::warn!(
+                schedule_id = %message.schedule_id,
+                "lease lost; occurrence settled by another worker"
+            );
         }
+        Ok(())
     }
 
     /// Apply a failed dispatch: retry with backoff, or dead-letter once the
     /// attempt budget is exhausted.
+    ///
+    /// Both outcomes are fenced on `occurrence.leased_until`, see
+    /// [`Self::on_success`].
     async fn on_failure(
         &self,
         occurrence: &LeasedOccurrence,
@@ -231,26 +289,36 @@ where
     ) -> Result<(), SchedulerError> {
         let schedule_id = occurrence.message.schedule_id;
         let reason = error.to_string();
-        if occurrence.is_exhausted() {
+        let lease = occurrence.leased_until;
+        let applied = if occurrence.is_exhausted() {
             tracing::error!(
                 schedule_id = %schedule_id,
                 attempts = occurrence.attempts,
                 error = %reason,
                 "scheduled occurrence dead-lettered"
             );
-            return self.store.mark_dead_lettered(schedule_id, &reason).await;
+            self.store
+                .mark_dead_lettered(schedule_id, &reason, lease)
+                .await?
+        } else {
+            tracing::warn!(
+                schedule_id = %schedule_id,
+                attempts = occurrence.attempts,
+                error = %reason,
+                "scheduled occurrence retried"
+            );
+            let delay = self.next_retry_delay(occurrence.attempts);
+            self.store
+                .mark_failed(schedule_id, delay, &reason, lease)
+                .await?
+        };
+        if !applied {
+            tracing::warn!(
+                schedule_id = %schedule_id,
+                "lease lost; occurrence settled by another worker"
+            );
         }
-        tracing::warn!(
-            schedule_id = %schedule_id,
-            attempts = occurrence.attempts,
-            error = %reason,
-            "scheduled occurrence retried"
-        );
-        let delay = self.next_retry_delay(occurrence.attempts);
-        let retry_at = SystemTime::now()
-            .checked_add(delay)
-            .ok_or_else(|| SchedulerError::internal("retry deadline overflow"))?;
-        self.store.mark_failed(schedule_id, retry_at, &reason).await
+        Ok(())
     }
 
     /// Compute the next retry delay: bounded exponential backoff with optional
@@ -501,5 +569,150 @@ mod tests {
         let worker = SchedulerWorker::new(store, SuccessSink, test_config());
         worker.poll_cycle().await.expect("cycle succeeds");
         assert!(logs_contain("scheduled occurrence rescheduled"));
+    }
+
+    // --- crash-recovery sweep and fencing ---
+
+    /// A worker that crashed while handling its last attempt leaves a row
+    /// `Pending`, exhausted and unleased. `poll_cycle` sweeps it to the
+    /// dead-letter state at the start of the next cycle, and the swept
+    /// schedule is replayable afterward.
+    #[tokio::test]
+    async fn poll_cycle_sweeps_crash_exhausted_schedules_to_dead_letter() {
+        use crate::admin::ScheduleAdmin;
+
+        let store = InMemoryScheduleStore::new();
+        let schedule_id = insert_delay(&store, 1).await;
+        // Simulate a worker that claimed the last attempt and crashed before
+        // acknowledging: the lease is granted, then left to expire.
+        let short_lease = Duration::from_millis(20);
+        let claimed = store
+            .claim_due(SystemTime::now(), 10, short_lease)
+            .await
+            .expect("claim succeeds");
+        assert_eq!(claimed.len(), 1);
+        assert!(claimed[0].is_exhausted());
+        tokio::time::sleep(short_lease + Duration::from_millis(100)).await;
+
+        let worker = SchedulerWorker::new(store, SuccessSink, test_config());
+        worker.poll_cycle().await.expect("cycle succeeds");
+
+        let snapshot = worker.store.inspect(schedule_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.status, ScheduleStatus::DeadLettered);
+        assert_eq!(
+            snapshot.last_error.as_deref(),
+            Some(crate::store::DEAD_LETTER_EXHAUSTED_MESSAGE)
+        );
+
+        worker
+            .store
+            .replay(schedule_id)
+            .await
+            .expect("a swept schedule must be replayable");
+        let replayed = worker.store.inspect(schedule_id).await.unwrap().unwrap();
+        assert_eq!(replayed.status, ScheduleStatus::Pending);
+        assert_eq!(replayed.attempts, 0);
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn poll_cycle_logs_when_sweeping_crash_exhausted_schedules() {
+        let store = InMemoryScheduleStore::new();
+        insert_delay(&store, 1).await;
+        let short_lease = Duration::from_millis(20);
+        store
+            .claim_due(SystemTime::now(), 10, short_lease)
+            .await
+            .expect("claim succeeds");
+        tokio::time::sleep(short_lease + Duration::from_millis(100)).await;
+
+        let worker = SchedulerWorker::new(store, SuccessSink, test_config());
+        worker.poll_cycle().await.expect("cycle succeeds");
+
+        assert!(logs_contain(
+            "swept schedules whose attempt budget was exhausted by a crashed worker"
+        ));
+    }
+
+    /// The pre-dispatch guard in `settle` skips a batch entry whose lease has
+    /// already elapsed by the time it is processed, without dispatching or
+    /// touching the store. This only avoids wasted dispatch work; correctness
+    /// is guaranteed by the acknowledgement fencing regardless.
+    #[tokio::test]
+    #[traced_test]
+    async fn settle_skips_dispatch_when_the_lease_has_already_expired() {
+        let store = InMemoryScheduleStore::new();
+        let schedule_id = insert_delay(&store, 3).await;
+        let short_lease = Duration::from_millis(20);
+        let claimed = store
+            .claim_due(SystemTime::now(), 10, short_lease)
+            .await
+            .expect("claim succeeds");
+        tokio::time::sleep(short_lease + Duration::from_millis(100)).await;
+
+        let worker = SchedulerWorker::new(store, SuccessSink, test_config());
+        worker
+            .settle(claimed.into_iter().next().unwrap())
+            .await
+            .expect("settle succeeds even when skipping");
+
+        assert!(logs_contain(
+            "lease already expired before dispatch, skipping"
+        ));
+        let snapshot = worker.store.inspect(schedule_id).await.unwrap().unwrap();
+        assert_eq!(
+            snapshot.status,
+            ScheduleStatus::Pending,
+            "an expired-lease occurrence must be left for reclaim, not delivered"
+        );
+    }
+
+    /// If another worker reclaims an occurrence between this worker's claim
+    /// and its acknowledgement (a zombie: paused on I/O, descheduled, or
+    /// simply slower than the lease window), `on_success` must not clobber
+    /// the state the new owner has since written.
+    #[tokio::test]
+    #[traced_test]
+    async fn on_success_does_not_apply_when_the_lease_was_reclaimed() {
+        let store = InMemoryScheduleStore::new();
+        let schedule_id = insert_delay(&store, 3).await;
+        let short_lease = Duration::from_millis(20);
+        let stale = store
+            .claim_due(SystemTime::now(), 10, short_lease)
+            .await
+            .expect("first claim succeeds")
+            .into_iter()
+            .next()
+            .expect("occurrence claimed");
+        tokio::time::sleep(short_lease + Duration::from_millis(100)).await;
+
+        // A second worker reclaims the same occurrence and delivers it first.
+        let reclaimed = store
+            .claim_due(SystemTime::now(), 10, Duration::from_secs(30))
+            .await
+            .expect("reclaim succeeds");
+        assert_eq!(reclaimed.len(), 1);
+        let applied = store
+            .mark_delivered(schedule_id, reclaimed[0].leased_until)
+            .await
+            .expect("delivery succeeds");
+        assert!(applied);
+
+        // The first (stale) worker now tries to acknowledge with its old lease.
+        let worker = SchedulerWorker::new(store, SuccessSink, test_config());
+        worker
+            .on_success(&stale)
+            .await
+            .expect("on_success does not error on a lost lease");
+
+        assert!(logs_contain(
+            "lease lost; occurrence settled by another worker"
+        ));
+        let snapshot = worker.store.inspect(schedule_id).await.unwrap().unwrap();
+        assert_eq!(
+            snapshot.status,
+            ScheduleStatus::Delivered,
+            "the reclaiming worker's delivery must stand"
+        );
     }
 }

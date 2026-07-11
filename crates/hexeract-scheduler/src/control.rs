@@ -265,11 +265,13 @@ mod tests {
         let msg = delay_message(past(60));
         let id = insert(&store, &msg).await;
         // Deliver the schedule directly via the store.
-        store
+        let claimed = store
             .claim_due(SystemTime::now(), 10, Duration::from_secs(30))
             .await
             .unwrap();
-        store.mark_delivered(id).await.unwrap();
+        let lease = claimed[0].leased_until;
+        let applied = store.mark_delivered(id, lease).await.unwrap();
+        assert!(applied, "the freshly claimed lease must still be valid");
 
         // Cancel must be a no-op (no ScheduleNotFound, no status change).
         control.cancel(id).await.unwrap();
