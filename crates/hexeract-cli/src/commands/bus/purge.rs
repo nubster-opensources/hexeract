@@ -1,8 +1,10 @@
 use clap::Args;
+use hexeract_bus::Queue;
 use hexeract_bus_rabbitmq::RabbitMqConnection;
 use lapin::options::QueuePurgeOptions;
 use lapin::types::ShortString;
 
+use crate::conn_string::ConnString;
 use crate::error::CliError;
 
 /// CLI arguments for `hexeract bus purge`.
@@ -12,8 +14,13 @@ use crate::error::CliError;
 #[derive(Args, Debug)]
 pub(crate) struct PurgeArgs {
     /// AMQP connection string.
-    #[arg(long, env = "HEXERACT_BUS_URL")]
-    conn: String,
+    ///
+    /// Carries broker credentials in its userinfo component. Prefer
+    /// setting `HEXERACT_BUS_URL` in the environment over passing this on
+    /// the command line: argv is readable by every local user via
+    /// `/proc/<pid>/cmdline` or `ps aux`, and shells persist it in history.
+    #[arg(long, env = "HEXERACT_BUS_URL", hide_env_values = true)]
+    conn: ConnString,
     /// Queue name to purge.
     #[arg(long)]
     queue: String,
@@ -37,7 +44,13 @@ impl PurgeArgs {
             ));
         }
 
-        let connection = RabbitMqConnection::connect(&self.conn)
+        // Validate the queue name before touching the network: it is
+        // cheap, local input validation, and it must reject an oversize
+        // or control-character-bearing name with an ordinary error
+        // rather than a panic (#366).
+        let queue = Queue::new(self.queue.as_str()).map_err(|e| CliError::Fatal(Box::new(e)))?;
+
+        let connection = RabbitMqConnection::connect(self.conn.as_str())
             .await
             .map_err(|e| CliError::Fatal(Box::new(e)))?;
         let channel = connection
@@ -46,12 +59,12 @@ impl PurgeArgs {
             .map_err(|e| CliError::Fatal(Box::new(e)))?;
         let purged = channel
             .queue_purge(
-                ShortString::from(self.queue.as_str()),
+                ShortString::from(queue.name.as_str()),
                 QueuePurgeOptions::default(),
             )
             .await
             .map_err(|e| CliError::Fatal(Box::new(e)))?;
-        println!("purged {purged} message(s) from `{}`", self.queue);
+        println!("purged {purged} message(s) from `{}`", queue.name);
         Ok(())
     }
 }
@@ -129,5 +142,27 @@ mod tests {
             panic!("expected purge subcommand");
         };
         assert!(args.yes_i_know);
+    }
+
+    #[tokio::test]
+    async fn purge_with_overlong_queue_name_fails_instead_of_panicking() {
+        // Regression for #366: `ShortString::from` panics past 255 bytes,
+        // but `Queue::new` (127-byte limit) must reject this first with a
+        // normal error, never a panic.
+        let cli = TestCli::try_parse_from([
+            "hexeract",
+            "purge",
+            "--conn",
+            "amqp://127.0.0.1:1",
+            "--queue",
+            &"q".repeat(300),
+            "--yes-i-know",
+        ])
+        .expect("must parse");
+        let BusAction::Purge(args) = cli.action else {
+            panic!("expected purge subcommand");
+        };
+        let result = args.run().await;
+        assert!(result.is_err(), "an oversize queue name must be rejected");
     }
 }
