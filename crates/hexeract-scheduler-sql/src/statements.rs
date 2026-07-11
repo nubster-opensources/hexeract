@@ -180,69 +180,111 @@ pub(crate) fn mysql_claim_reselect_sql(table: &str, n: usize) -> String {
     format!("SELECT {CLAIM_COLUMNS} FROM {qtable} WHERE schedule_id IN ({ids})")
 }
 
-/// Mark a one-shot schedule delivered and release its lease, only if it is not
-/// already terminal or cancelled.
+/// Mark a one-shot schedule delivered and release its lease, only if it is
+/// not already terminal or cancelled and the row still carries exactly the
+/// lease (parameter 2) the caller's claim stamped on it.
+///
+/// The `leased_until = {lease}` fencing predicate is the store-side half of
+/// the crash-safety contract: a worker whose lease has since been reclaimed
+/// by another worker (see [`crate::postgres::PgScheduleStore::mark_delivered`]
+/// and its siblings) updates zero rows instead of clobbering the new owner's
+/// state.
 pub(crate) fn mark_delivered_sql(dialect: Dialect, table: &str) -> String {
     let qtable = dialect.quote_identifier(table);
     let now = dialect.now_expr();
     let id = dialect.placeholder(1);
+    let lease = dialect.placeholder(2);
     format!(
         "UPDATE {qtable} SET delivered_at = {now}, leased_until = NULL \
-         WHERE schedule_id = {id} \
+         WHERE schedule_id = {id} AND leased_until = {lease} \
            AND delivered_at IS NULL AND cancelled_at IS NULL AND dead_lettered_at IS NULL"
     )
 }
 
 /// Advance a recurring schedule to its next occurrence (parameter 1), reset
 /// the attempt counter and release the lease, only if it is not terminal or
-/// cancelled.
+/// cancelled and the row still carries exactly the lease (parameter 3) the
+/// caller's claim stamped on it. See [`mark_delivered_sql`] for the fencing
+/// rationale.
 pub(crate) fn reschedule_sql(dialect: Dialect, table: &str) -> String {
     let qtable = dialect.quote_identifier(table);
     let next = dialect.placeholder(1);
     let id = dialect.placeholder(2);
+    let lease = dialect.placeholder(3);
     format!(
         "UPDATE {qtable} \
          SET scheduled_for = {next}, attempts = 0, leased_until = NULL, last_error = NULL \
-         WHERE schedule_id = {id} \
+         WHERE schedule_id = {id} AND leased_until = {lease} \
            AND delivered_at IS NULL AND cancelled_at IS NULL AND dead_lettered_at IS NULL"
     )
 }
 
 /// Defer the next claim of a failed occurrence by pushing `leased_until`
-/// forward to `retry_at` (parameter 1) and recording the last error
-/// (parameter 2).
+/// forward to the database clock plus a bound retry interval (parameter 1),
+/// recording the last error (parameter 2), only if the row still carries
+/// exactly the lease (parameter 4) the caller's claim stamped on it.
 ///
 /// Semantics:
-/// - Sets `leased_until = retry_at` so `claim_due` skips the row until that
-///   instant passes.
+/// - Sets `leased_until` to the **database** clock plus the bound interval,
+///   never a caller-supplied absolute instant, so the retry deadline is
+///   immune to skew between the worker host and the database host (mirroring
+///   the claim's own lease anchoring, #230).
 /// - Sets `last_error = error` for observability.
 /// - Does NOT touch `attempts`, `scheduled_for`, or `status`: the attempt was
 ///   already counted at claim time, and the schedule stays pending.
+/// - Fenced on `leased_until = {lease}`; see [`mark_delivered_sql`].
 /// - Idempotent: a zero-row UPDATE when no pending schedule matches is fine.
 pub(crate) fn mark_failed_sql(dialect: Dialect, table: &str) -> String {
     let qtable = dialect.quote_identifier(table);
-    let retry_at = dialect.placeholder(1);
+    let retry_in = dialect.now_plus_interval_expr(1);
     let error = dialect.placeholder(2);
     let id = dialect.placeholder(3);
+    let lease = dialect.placeholder(4);
     format!(
         "UPDATE {qtable} \
-         SET leased_until = {retry_at}, last_error = {error} \
-         WHERE schedule_id = {id} \
+         SET leased_until = {retry_in}, last_error = {error} \
+         WHERE schedule_id = {id} AND leased_until = {lease} \
            AND delivered_at IS NULL AND cancelled_at IS NULL AND dead_lettered_at IS NULL"
     )
 }
 
 /// Move a schedule to the dead-letter state with the last error (parameter 1),
-/// only if it is not already terminal or cancelled.
+/// only if it is not already terminal or cancelled and the row still carries
+/// exactly the lease (parameter 3) the caller's claim stamped on it. See
+/// [`mark_delivered_sql`] for the fencing rationale.
 pub(crate) fn mark_dead_lettered_sql(dialect: Dialect, table: &str) -> String {
     let qtable = dialect.quote_identifier(table);
     let now = dialect.now_expr();
     let error = dialect.placeholder(1);
     let id = dialect.placeholder(2);
+    let lease = dialect.placeholder(3);
     format!(
         "UPDATE {qtable} SET dead_lettered_at = {now}, last_error = {error}, leased_until = NULL \
-         WHERE schedule_id = {id} \
+         WHERE schedule_id = {id} AND leased_until = {lease} \
            AND delivered_at IS NULL AND cancelled_at IS NULL AND dead_lettered_at IS NULL"
+    )
+}
+
+/// Dead-letter, in one statement, every non-terminal, non-paused schedule
+/// whose attempt budget is exhausted and whose lease has expired or was
+/// never taken, recording the last error (parameter 1).
+///
+/// Unlike the four acknowledgements above, this statement carries no lease
+/// parameter: it does not fence on a caller-held token, it sweeps whichever
+/// rows the eligibility predicate matches. Affected-row count is the sweep
+/// count; every backend can read it directly from the `UPDATE` result, no
+/// `RETURNING` needed.
+pub(crate) fn dead_letter_exhausted_sql(dialect: Dialect, table: &str) -> String {
+    let qtable = dialect.quote_identifier(table);
+    let now = dialect.now_expr();
+    let not_paused = false_literal(dialect);
+    let error = dialect.placeholder(1);
+    format!(
+        "UPDATE {qtable} SET dead_lettered_at = {now}, last_error = {error}, leased_until = NULL \
+         WHERE delivered_at IS NULL AND cancelled_at IS NULL AND dead_lettered_at IS NULL \
+           AND paused = {not_paused} \
+           AND attempts >= max_attempts \
+           AND (leased_until IS NULL OR leased_until <= {now})"
     )
 }
 
@@ -491,22 +533,60 @@ mod tests {
     }
 
     #[test]
-    fn mark_failed_sets_lease_and_error_without_touching_attempts() {
-        let sql = mark_failed_sql(Dialect::Postgres, "scheduled_messages");
+    fn the_four_acknowledgements_fence_on_the_caller_held_lease() {
+        // #352: an ack must only apply while the row still carries exactly
+        // the lease the caller's claim stamped on it, so a zombie worker
+        // whose lease was reclaimed cannot clobber the new owner's state.
+        for dialect in [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite] {
+            let ph = |i| dialect.placeholder(i);
+            assert!(
+                mark_delivered_sql(dialect, "scheduled_messages")
+                    .contains(&format!("leased_until = {}", ph(2))),
+                "{dialect:?} mark_delivered must fence on leased_until"
+            );
+            assert!(
+                reschedule_sql(dialect, "scheduled_messages")
+                    .contains(&format!("leased_until = {}", ph(3))),
+                "{dialect:?} reschedule must fence on leased_until"
+            );
+            assert!(
+                mark_failed_sql(dialect, "scheduled_messages")
+                    .contains(&format!("leased_until = {}", ph(4))),
+                "{dialect:?} mark_failed must fence on leased_until"
+            );
+            assert!(
+                mark_dead_lettered_sql(dialect, "scheduled_messages")
+                    .contains(&format!("leased_until = {}", ph(3))),
+                "{dialect:?} mark_dead_lettered must fence on leased_until"
+            );
+        }
+    }
+
+    #[test]
+    fn mark_failed_anchors_the_new_lease_on_the_database_clock_plus_a_bound_interval() {
+        // #355: retry scheduling must never bind a caller-supplied absolute
+        // instant; the backend derives it from its own clock.
+        let pg = mark_failed_sql(Dialect::Postgres, "scheduled_messages");
         assert!(
-            sql.contains("leased_until = $1"),
-            "must defer via leased_until: {sql}"
+            pg.contains("leased_until = (NOW() +"),
+            "must defer via the DB-clock interval expression: {pg}"
         );
-        assert!(sql.contains("last_error = $2"), "must record error: {sql}");
-        assert!(!sql.contains("attempts"), "must not modify attempts: {sql}");
+        assert!(pg.contains("last_error = $2"), "must record error: {pg}");
+        assert!(!pg.contains("attempts ="), "must not modify attempts: {pg}");
         assert!(
-            !sql.contains("scheduled_for"),
-            "must not modify scheduled_for: {sql}"
+            !pg.contains("scheduled_for"),
+            "must not modify scheduled_for: {pg}"
         );
         assert!(
-            sql.contains("WHERE schedule_id = $3"),
-            "must filter by schedule_id: {sql}"
+            pg.contains("WHERE schedule_id = $3"),
+            "must filter by schedule_id: {pg}"
         );
+        assert!(pg.contains("leased_until = $4"), "must fence: {pg}");
+
+        let mysql = mark_failed_sql(Dialect::MySql, "scheduled_messages");
+        assert!(mysql.contains("UTC_TIMESTAMP(6) + INTERVAL"));
+        let sqlite = mark_failed_sql(Dialect::Sqlite, "scheduled_messages");
+        assert!(sqlite.contains("strftime("));
     }
 
     #[test]
@@ -516,6 +596,7 @@ mod tests {
         assert!(sql.contains("leased_until = NULL"));
         assert!(sql.contains("scheduled_for = $1"));
         assert!(sql.contains("WHERE schedule_id = $2"));
+        assert!(sql.contains("leased_until = $3"));
     }
 
     #[test]
@@ -591,6 +672,65 @@ mod tests {
             assert!(mark_delivered_sql(dialect, "order").contains(&quoted));
             assert!(inspect_sql(dialect, "order").contains(&quoted));
         }
+    }
+
+    #[test]
+    fn dead_letter_exhausted_sweeps_by_column_comparison_with_no_lease_parameter() {
+        // #331: the sweeper matches crash-exhausted rows purely on their own
+        // attempts/max_attempts columns; unlike the four acknowledgements, it
+        // carries no caller-supplied lease to fence on.
+        for dialect in [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite] {
+            let sql = dead_letter_exhausted_sql(dialect, "scheduled_messages");
+            assert!(
+                sql.contains("attempts >= max_attempts"),
+                "{dialect:?} must compare the row's own attempts to its own budget: {sql}"
+            );
+            assert!(
+                sql.contains("leased_until IS NULL OR leased_until <="),
+                "{dialect:?} must only sweep an expired or never-taken lease: {sql}"
+            );
+            assert!(
+                sql.contains("delivered_at IS NULL")
+                    && sql.contains("cancelled_at IS NULL")
+                    && sql.contains("dead_lettered_at IS NULL"),
+                "{dialect:?} must exclude terminal rows: {sql}"
+            );
+            assert!(
+                sql.contains(&format!("paused = {}", false_literal(dialect))),
+                "{dialect:?} must exclude paused rows: {sql}"
+            );
+            assert!(
+                sql.contains("dead_lettered_at ="),
+                "{dialect:?} must move the row to the dead-letter state: {sql}"
+            );
+            assert!(
+                sql.contains("leased_until = NULL"),
+                "{dialect:?} must release the lease: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn dead_letter_exhausted_binds_only_the_error_message() {
+        // Exactly one bind parameter (the error text); everything else in the
+        // predicate is a bare column comparison or a dialect literal.
+        let pg = dead_letter_exhausted_sql(Dialect::Postgres, "scheduled_messages");
+        assert!(pg.contains("last_error = $1"), "{pg}");
+        assert!(!pg.contains("$2"), "must bind no parameter beyond $1: {pg}");
+
+        let mysql = dead_letter_exhausted_sql(Dialect::MySql, "scheduled_messages");
+        assert_eq!(
+            mysql.matches('?').count(),
+            1,
+            "MySQL must bind exactly one ?: {mysql}"
+        );
+
+        let sqlite = dead_letter_exhausted_sql(Dialect::Sqlite, "scheduled_messages");
+        assert_eq!(
+            sqlite.matches('?').count(),
+            1,
+            "SQLite must bind exactly one ?: {sqlite}"
+        );
     }
 }
 

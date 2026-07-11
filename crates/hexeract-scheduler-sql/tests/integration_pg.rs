@@ -67,13 +67,16 @@ backend_scenarios!(
     pause_excludes_then_resume_reenables,
     dead_letter_excludes_and_records_error,
     mark_delivered_excludes,
-    mark_failed_defers_reclaim_until_retry_at,
+    mark_failed_defers_reclaim_until_retry_in_elapses,
     resume_realigns_paused_and_rejects_unknown,
     list_pending_orders_and_limits,
     list_dead_letter_reports_errors,
     list_dead_letter_orders_most_recently_dead_lettered_first,
     replay_requeues_dead_letter,
     replay_rejects_non_dead_lettered,
+    ack_round_trips_the_claimed_lease,
+    ack_with_a_stale_lease_is_rejected_after_reclaim,
+    dead_letter_exhausted_sweeps_crash_exhausted_schedules,
 );
 
 /// Two workers claiming concurrently partition the due occurrences via

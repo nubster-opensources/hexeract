@@ -571,7 +571,7 @@ async fn scheduler_dead_letter_list_and_replay_round_trip() {
     let store = PgScheduleStore::new(pool, "scheduled_messages").expect("table name must be valid");
     let message = ScheduledMessage::delay(
         Target::mediator(),
-        std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+        std::time::SystemTime::now() - std::time::Duration::from_secs(60),
         &TestReminder,
     )
     .expect("message must build");
@@ -579,10 +579,25 @@ async fn scheduler_dead_letter_list_and_replay_round_trip() {
         .insert(&message, 5)
         .await
         .expect("insert must succeed");
-    store
-        .mark_dead_lettered(message.schedule_id, "boom")
+    // Dead-lettering is fenced on the lease a claim stamps, so the occurrence
+    // is claimed first to obtain that token.
+    let claimed = store
+        .claim_due(
+            std::time::SystemTime::now(),
+            10,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("claim must succeed");
+    let lease = claimed
+        .first()
+        .expect("the seeded occurrence must be claimable")
+        .leased_until;
+    let applied = store
+        .mark_dead_lettered(message.schedule_id, "boom", lease)
         .await
         .expect("mark_dead_lettered must succeed");
+    assert!(applied, "the freshly claimed lease must still be valid");
 
     let id = message.schedule_id.to_string();
 

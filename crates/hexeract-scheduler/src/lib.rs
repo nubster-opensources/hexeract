@@ -85,6 +85,7 @@ pub use outbox_sink::OutboxSink;
 pub use schedule::ScheduledMessage;
 pub use sink::ScheduleSink;
 pub use snapshot::{ScheduleSnapshot, ScheduleStatus};
+pub use store::DEAD_LETTER_EXHAUSTED_MESSAGE;
 pub use store::ScheduleStore;
 pub use target::Target;
 pub use trigger::{CronExpression, Trigger};

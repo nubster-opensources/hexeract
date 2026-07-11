@@ -44,6 +44,27 @@ impl StoredSchedule {
     }
 }
 
+/// Look up a schedule and return a mutable borrow only when it is still
+/// `Pending` and its stored `leased_until` equals `lease` exactly.
+///
+/// This is the in-memory mirror of the `WHERE ... AND leased_until = ?`
+/// fencing every SQL backend applies to the acknowledgement statements: a
+/// caller holding a stale lease (its occurrence was reclaimed by another
+/// worker in the meantime) gets `None` rather than a mutable handle onto a
+/// row it no longer owns.
+fn fenced_pending_mut(
+    schedules: &mut HashMap<Uuid, StoredSchedule>,
+    schedule_id: Uuid,
+    lease: SystemTime,
+) -> Option<&mut StoredSchedule> {
+    let stored = schedules.get_mut(&schedule_id)?;
+    if stored.status == ScheduleStatus::Pending && stored.leased_until == Some(lease) {
+        Some(stored)
+    } else {
+        None
+    }
+}
+
 /// An in-memory [`ScheduleStore`] for tests and the worker test harness.
 ///
 /// It implements the full claim and lease contract in process, with no
@@ -125,61 +146,89 @@ impl ScheduleStore for InMemoryScheduleStore {
         Ok(claimed)
     }
 
-    async fn mark_delivered(&self, schedule_id: Uuid) -> Result<(), SchedulerError> {
+    async fn mark_delivered(
+        &self,
+        schedule_id: Uuid,
+        lease: SystemTime,
+    ) -> Result<bool, SchedulerError> {
         let mut schedules = self.lock()?;
-        if let Some(stored) = schedules.get_mut(&schedule_id) {
-            if stored.status == ScheduleStatus::Pending {
-                stored.status = ScheduleStatus::Delivered;
-                stored.leased_until = None;
-            }
-        }
-        Ok(())
+        let Some(stored) = fenced_pending_mut(&mut schedules, schedule_id, lease) else {
+            return Ok(false);
+        };
+        stored.status = ScheduleStatus::Delivered;
+        stored.leased_until = None;
+        Ok(true)
     }
 
-    async fn reschedule(&self, schedule_id: Uuid, next: SystemTime) -> Result<(), SchedulerError> {
+    async fn reschedule(
+        &self,
+        schedule_id: Uuid,
+        next: SystemTime,
+        lease: SystemTime,
+    ) -> Result<bool, SchedulerError> {
         let mut schedules = self.lock()?;
-        if let Some(stored) = schedules.get_mut(&schedule_id) {
-            if stored.status == ScheduleStatus::Pending {
-                stored.message.scheduled_for = next;
-                stored.attempts = 0;
-                stored.leased_until = None;
-                stored.last_error = None;
-            }
-        }
-        Ok(())
+        let Some(stored) = fenced_pending_mut(&mut schedules, schedule_id, lease) else {
+            return Ok(false);
+        };
+        stored.message.scheduled_for = next;
+        stored.attempts = 0;
+        stored.leased_until = None;
+        stored.last_error = None;
+        Ok(true)
     }
 
     async fn mark_failed(
         &self,
         schedule_id: Uuid,
-        retry_at: SystemTime,
+        retry_in: Duration,
         error: &str,
-    ) -> Result<(), SchedulerError> {
+        lease: SystemTime,
+    ) -> Result<bool, SchedulerError> {
         let mut schedules = self.lock()?;
-        if let Some(stored) = schedules.get_mut(&schedule_id) {
-            if stored.status == ScheduleStatus::Pending {
-                stored.leased_until = Some(retry_at);
-                stored.last_error = Some(error.to_owned());
-            }
-        }
-        Ok(())
+        let Some(stored) = fenced_pending_mut(&mut schedules, schedule_id, lease) else {
+            return Ok(false);
+        };
+        let retry_at = SystemTime::now()
+            .checked_add(retry_in)
+            .ok_or_else(|| SchedulerError::internal("retry deadline overflow"))?;
+        stored.leased_until = Some(retry_at);
+        stored.last_error = Some(error.to_owned());
+        Ok(true)
     }
 
     async fn mark_dead_lettered(
         &self,
         schedule_id: Uuid,
         error: &str,
-    ) -> Result<(), SchedulerError> {
+        lease: SystemTime,
+    ) -> Result<bool, SchedulerError> {
         let mut schedules = self.lock()?;
-        if let Some(stored) = schedules.get_mut(&schedule_id) {
-            if stored.status == ScheduleStatus::Pending {
+        let Some(stored) = fenced_pending_mut(&mut schedules, schedule_id, lease) else {
+            return Ok(false);
+        };
+        stored.status = ScheduleStatus::DeadLettered;
+        stored.leased_until = None;
+        stored.last_error = Some(error.to_owned());
+        stored.dead_lettered_at = Some(SystemTime::now());
+        Ok(true)
+    }
+
+    async fn dead_letter_exhausted(&self) -> Result<u64, SchedulerError> {
+        let mut schedules = self.lock()?;
+        let now = SystemTime::now();
+        let mut swept = 0u64;
+        for stored in schedules.values_mut() {
+            let is_exhausted = stored.attempts >= stored.max_attempts;
+            let lease_free = stored.leased_until.is_none_or(|until| until <= now);
+            if stored.status == ScheduleStatus::Pending && is_exhausted && lease_free {
                 stored.status = ScheduleStatus::DeadLettered;
                 stored.leased_until = None;
-                stored.last_error = Some(error.to_owned());
-                stored.dead_lettered_at = Some(SystemTime::now());
+                stored.last_error = Some(crate::store::DEAD_LETTER_EXHAUSTED_MESSAGE.to_owned());
+                stored.dead_lettered_at = Some(now);
+                swept += 1;
             }
         }
-        Ok(())
+        Ok(swept)
     }
 
     async fn cancel(&self, schedule_id: Uuid) -> Result<(), SchedulerError> {
@@ -377,8 +426,12 @@ mod tests {
     async fn claim_due_excludes_delivered_schedules() {
         let store = InMemoryScheduleStore::default();
         let schedule_id = insert_delay(&store, base(), 5).await;
-        store.claim_due(base(), 10, LEASE).await.unwrap();
-        store.mark_delivered(schedule_id).await.unwrap();
+        let first = store.claim_due(base(), 10, LEASE).await.unwrap();
+        let applied = store
+            .mark_delivered(schedule_id, first[0].leased_until)
+            .await
+            .unwrap();
+        assert!(applied);
         let claimed = store
             .claim_due(base() + Duration::from_secs(60), 10, LEASE)
             .await
@@ -405,10 +458,14 @@ mod tests {
             ScheduledMessage::cron(Target::outbox(), "0 0 * * *", base(), &ReminderDue).unwrap();
         let schedule_id = message.schedule_id;
         store.insert(&message, 5).await.unwrap();
-        store.claim_due(base(), 10, LEASE).await.unwrap();
+        let claimed = store.claim_due(base(), 10, LEASE).await.unwrap();
 
         let next = base() + Duration::from_secs(86_400);
-        store.reschedule(schedule_id, next).await.unwrap();
+        let applied = store
+            .reschedule(schedule_id, next, claimed[0].leased_until)
+            .await
+            .unwrap();
+        assert!(applied);
         let snapshot = store.inspect(schedule_id).await.unwrap().unwrap();
         assert_eq!(snapshot.status, ScheduleStatus::Pending);
         assert_eq!(snapshot.scheduled_for, next);
@@ -421,27 +478,36 @@ mod tests {
         assert_eq!(claimed[0].attempts, 1);
     }
 
+    /// `mark_failed` anchors the new lease on the store's own clock plus the
+    /// relative `retry_in`, not on a caller-supplied absolute instant: the
+    /// occurrence is unreclaimable before `retry_in` elapses and reclaimable
+    /// once it has, observed against the real clock (`SystemTime::now`), not
+    /// the synthetic `base()` used elsewhere in this file for `claim_due`.
     #[tokio::test]
-    async fn mark_failed_defers_reclaim_until_retry_at() {
+    async fn mark_failed_defers_reclaim_until_retry_in_elapses() {
         let store = InMemoryScheduleStore::default();
-        let schedule_id = insert_delay(&store, base(), 5).await;
-        let first = store.claim_due(base(), 10, LEASE).await.unwrap();
+        let due = SystemTime::now() - Duration::from_secs(60);
+        let schedule_id = insert_delay(&store, due, 5).await;
+        let first = store.claim_due(SystemTime::now(), 10, LEASE).await.unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].attempts, 1);
 
-        let retry_at = base() + Duration::from_secs(120);
-        store
-            .mark_failed(schedule_id, retry_at, "boom")
+        let retry_in = Duration::from_millis(300);
+        let applied = store
+            .mark_failed(schedule_id, retry_in, "boom", first[0].leased_until)
             .await
             .unwrap();
+        assert!(applied);
 
-        let early = store
-            .claim_due(base() + Duration::from_secs(60), 10, LEASE)
-            .await
-            .unwrap();
-        assert!(early.is_empty());
+        let early = store.claim_due(SystemTime::now(), 10, LEASE).await.unwrap();
+        assert!(
+            early.is_empty(),
+            "must not be reclaimable before retry_in elapses"
+        );
 
-        let reclaimed = store.claim_due(retry_at, 10, LEASE).await.unwrap();
+        tokio::time::sleep(retry_in + Duration::from_millis(150)).await;
+
+        let reclaimed = store.claim_due(SystemTime::now(), 10, LEASE).await.unwrap();
         assert_eq!(reclaimed.len(), 1);
         assert_eq!(reclaimed[0].attempts, 2);
         assert_eq!(reclaimed[0].occurrence_id(), first[0].occurrence_id());
@@ -455,9 +521,14 @@ mod tests {
     async fn mark_dead_lettered_excludes_and_reports() {
         let store = InMemoryScheduleStore::default();
         let schedule_id = insert_delay(&store, base(), 5).await;
-        store.mark_dead_lettered(schedule_id, "boom").await.unwrap();
         let claimed = store.claim_due(base(), 10, LEASE).await.unwrap();
-        assert!(claimed.is_empty());
+        let applied = store
+            .mark_dead_lettered(schedule_id, "boom", claimed[0].leased_until)
+            .await
+            .unwrap();
+        assert!(applied);
+        let after = store.claim_due(base(), 10, LEASE).await.unwrap();
+        assert!(after.is_empty());
         let snapshot = store.inspect(schedule_id).await.unwrap().unwrap();
         assert_eq!(snapshot.status, ScheduleStatus::DeadLettered);
         assert_eq!(snapshot.last_error.as_deref(), Some("boom"));
@@ -474,8 +545,11 @@ mod tests {
     async fn cancel_does_not_clobber_a_delivered_schedule() {
         let store = InMemoryScheduleStore::default();
         let schedule_id = insert_delay(&store, base(), 5).await;
-        store.claim_due(base(), 10, LEASE).await.unwrap();
-        store.mark_delivered(schedule_id).await.unwrap();
+        let claimed = store.claim_due(base(), 10, LEASE).await.unwrap();
+        store
+            .mark_delivered(schedule_id, claimed[0].leased_until)
+            .await
+            .unwrap();
 
         store.cancel(schedule_id).await.unwrap();
 
@@ -491,7 +565,11 @@ mod tests {
     async fn cancel_does_not_clobber_a_dead_lettered_schedule() {
         let store = InMemoryScheduleStore::default();
         let schedule_id = insert_delay(&store, base(), 5).await;
-        store.mark_dead_lettered(schedule_id, "boom").await.unwrap();
+        let claimed = store.claim_due(base(), 10, LEASE).await.unwrap();
+        store
+            .mark_dead_lettered(schedule_id, "boom", claimed[0].leased_until)
+            .await
+            .unwrap();
 
         store.cancel(schedule_id).await.unwrap();
 
@@ -564,12 +642,13 @@ mod tests {
         let store = InMemoryScheduleStore::default();
         let schedule_id = insert_delay(&store, base(), 5).await;
         // Consume one attempt and record an error so we can verify they are reset.
-        store.claim_due(base(), 10, LEASE).await.unwrap();
+        let claimed = store.claim_due(base(), 10, LEASE).await.unwrap();
         store
             .mark_failed(
                 schedule_id,
-                base() + Duration::from_secs(60),
+                Duration::from_secs(60),
                 "previous failure",
+                claimed[0].leased_until,
             )
             .await
             .unwrap();
@@ -642,5 +721,229 @@ mod tests {
             .await
             .unwrap();
         assert!(after_expiry.is_empty());
+    }
+
+    // --- Fencing: a stale lease token must not apply an acknowledgement ---
+
+    #[tokio::test]
+    async fn mark_delivered_with_a_stale_lease_is_a_no_op() {
+        let store = InMemoryScheduleStore::default();
+        let schedule_id = insert_delay(&store, base(), 5).await;
+        let claimed = store.claim_due(base(), 10, LEASE).await.unwrap();
+        let stale = claimed[0].leased_until + Duration::from_secs(1);
+
+        let applied = store.mark_delivered(schedule_id, stale).await.unwrap();
+
+        assert!(!applied, "a stale token must not apply");
+        let snapshot = store.inspect(schedule_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.status, ScheduleStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn reschedule_with_a_stale_lease_is_a_no_op() {
+        let store = InMemoryScheduleStore::default();
+        let message =
+            ScheduledMessage::cron(Target::outbox(), "0 0 * * *", base(), &ReminderDue).unwrap();
+        let schedule_id = message.schedule_id;
+        store.insert(&message, 5).await.unwrap();
+        let claimed = store.claim_due(base(), 10, LEASE).await.unwrap();
+        let stale = claimed[0].leased_until + Duration::from_secs(1);
+
+        let applied = store
+            .reschedule(schedule_id, base() + Duration::from_secs(86_400), stale)
+            .await
+            .unwrap();
+
+        assert!(!applied, "a stale token must not apply");
+        let snapshot = store.inspect(schedule_id).await.unwrap().unwrap();
+        assert_eq!(
+            snapshot.scheduled_for,
+            base(),
+            "the occurrence must be untouched by a stale reschedule"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_failed_with_a_stale_lease_is_a_no_op() {
+        let store = InMemoryScheduleStore::default();
+        let schedule_id = insert_delay(&store, base(), 5).await;
+        let claimed = store.claim_due(base(), 10, LEASE).await.unwrap();
+        let stale = claimed[0].leased_until + Duration::from_secs(1);
+
+        let applied = store
+            .mark_failed(schedule_id, Duration::from_secs(60), "stale", stale)
+            .await
+            .unwrap();
+
+        assert!(!applied, "a stale token must not apply");
+        let snapshot = store.inspect(schedule_id).await.unwrap().unwrap();
+        assert!(snapshot.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn mark_dead_lettered_with_a_stale_lease_is_a_no_op() {
+        let store = InMemoryScheduleStore::default();
+        let schedule_id = insert_delay(&store, base(), 5).await;
+        let claimed = store.claim_due(base(), 10, LEASE).await.unwrap();
+        let stale = claimed[0].leased_until + Duration::from_secs(1);
+
+        let applied = store
+            .mark_dead_lettered(schedule_id, "stale", stale)
+            .await
+            .unwrap();
+
+        assert!(!applied, "a stale token must not apply");
+        let snapshot = store.inspect(schedule_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.status, ScheduleStatus::Pending);
+    }
+
+    /// Zombie scenario: worker A claims with a short lease and stalls past
+    /// its expiry; worker B reclaims the same occurrence and delivers
+    /// successfully (a cron schedule advances to T+1). A's late
+    /// acknowledgements, carrying its now-stale token, must not touch the row
+    /// B already settled: T+1 stays intact and the schedule never reaches the
+    /// dead-letter state through A's mistake.
+    #[tokio::test]
+    async fn a_stale_lease_cannot_corrupt_state_written_by_the_worker_that_reclaimed_it() {
+        let store = InMemoryScheduleStore::default();
+        let message =
+            ScheduledMessage::cron(Target::outbox(), "0 0 * * *", base(), &ReminderDue).unwrap();
+        let schedule_id = message.schedule_id;
+        store.insert(&message, 5).await.unwrap();
+
+        let short_lease = Duration::from_secs(1);
+        let claimed_by_a = store.claim_due(base(), 10, short_lease).await.unwrap();
+        assert_eq!(claimed_by_a.len(), 1);
+        let a_token = claimed_by_a[0].leased_until;
+
+        // A's lease has since expired; B reclaims the same occurrence with a
+        // fresh token.
+        let reclaim_at = base() + Duration::from_secs(2);
+        let claimed_by_b = store.claim_due(reclaim_at, 10, LEASE).await.unwrap();
+        assert_eq!(claimed_by_b.len(), 1);
+        let b_token = claimed_by_b[0].leased_until;
+        assert_ne!(a_token, b_token, "B must hold a token distinct from A's");
+
+        // B delivers successfully: the cron schedule advances to T+1.
+        let next = reclaim_at + Duration::from_secs(86_400);
+        let b_applied = store.reschedule(schedule_id, next, b_token).await.unwrap();
+        assert!(b_applied, "B's fresh token must apply");
+
+        // A, unaware it was reclaimed, now tries to settle with its stale token.
+        let a_marked_failed = store
+            .mark_failed(
+                schedule_id,
+                Duration::from_secs(60),
+                "A's late failure",
+                a_token,
+            )
+            .await
+            .unwrap();
+        assert!(!a_marked_failed, "A's stale token must not apply");
+        let a_marked_dead = store
+            .mark_dead_lettered(schedule_id, "A's late crash", a_token)
+            .await
+            .unwrap();
+        assert!(
+            !a_marked_dead,
+            "A's stale token must not dead-letter B's occurrence"
+        );
+
+        let snapshot = store.inspect(schedule_id).await.unwrap().unwrap();
+        assert_eq!(
+            snapshot.status,
+            ScheduleStatus::Pending,
+            "B's successful reschedule must stand"
+        );
+        assert_eq!(
+            snapshot.scheduled_for, next,
+            "T+1 must be intact, untouched by A's stale acknowledgements"
+        );
+        assert!(
+            snapshot.last_error.is_none(),
+            "A's late failure must not be recorded"
+        );
+    }
+
+    // --- dead_letter_exhausted: the crash-recovery sweeper ---
+
+    #[tokio::test]
+    async fn dead_letter_exhausted_sweeps_only_pending_exhausted_rows_with_an_expired_lease() {
+        let store = InMemoryScheduleStore::default();
+        let due = SystemTime::now() - Duration::from_secs(60);
+
+        // Exhausted, lease expired (simulating a crashed worker): must be swept.
+        let exhausted_id = insert_delay(&store, due, 1).await;
+        store
+            .claim_due(SystemTime::now(), 10, Duration::from_millis(10))
+            .await
+            .unwrap();
+
+        // Exhausted, but still actively leased: must NOT be swept.
+        let still_leased_id = insert_delay(&store, due, 1).await;
+        store
+            .claim_due(SystemTime::now(), 10, Duration::from_secs(3_600))
+            .await
+            .unwrap();
+
+        // Within its attempt budget: must NOT be swept.
+        let not_exhausted_id = insert_delay(&store, due, 5).await;
+        store
+            .claim_due(SystemTime::now(), 10, Duration::from_millis(10))
+            .await
+            .unwrap();
+
+        // Exhausted and lease-expired, but paused: must NOT be swept.
+        let paused_id = insert_delay(&store, due, 1).await;
+        store
+            .claim_due(SystemTime::now(), 10, Duration::from_millis(10))
+            .await
+            .unwrap();
+        store.set_paused(paused_id, true).await.unwrap();
+
+        // Let the short leases above actually expire against the real clock.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let swept = store.dead_letter_exhausted().await.unwrap();
+        assert_eq!(
+            swept, 1,
+            "only the exhausted, unleased, non-paused row is swept"
+        );
+
+        let exhausted_snapshot = store.inspect(exhausted_id).await.unwrap().unwrap();
+        assert_eq!(exhausted_snapshot.status, ScheduleStatus::DeadLettered);
+        assert_eq!(
+            exhausted_snapshot.last_error.as_deref(),
+            Some(crate::store::DEAD_LETTER_EXHAUSTED_MESSAGE)
+        );
+
+        assert_eq!(
+            store
+                .inspect(still_leased_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ScheduleStatus::Pending,
+            "a still-leased exhausted row must not be swept"
+        );
+        assert_eq!(
+            store
+                .inspect(not_exhausted_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ScheduleStatus::Pending,
+            "a row within its attempt budget must not be swept"
+        );
+        assert_eq!(
+            store.inspect(paused_id).await.unwrap().unwrap().status,
+            ScheduleStatus::Paused,
+            "a paused row must not be swept even if exhausted"
+        );
+
+        let swept_again = store.dead_letter_exhausted().await.unwrap();
+        assert_eq!(swept_again, 0, "sweeping must be idempotent");
     }
 }
