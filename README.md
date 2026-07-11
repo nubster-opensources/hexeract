@@ -1,6 +1,6 @@
 # Hexeract
 
-**Hexeract: the batteries-included messaging framework for Rust.**
+**Rust messaging framework: Mediator, Bus, Outbox, Sagas, Scheduler, Request/Reply.**
 
 In-process mediator (CQRS), external message bus (RabbitMQ) and a transactional
 outbox/inbox, unified in a single coherent SDK with compile-time guarantees.
@@ -267,6 +267,11 @@ To stay focused, the following are explicitly out of scope:
 - **Rust backend teams** building microservices who want a cohesive messaging toolkit instead of stacking incompatible crates.
 - **Developers migrating to Rust** looking for a cohesive messaging SDK.
 - **Polyglot teams** with part of their stack moving to Rust and the need to stay interoperable on a shared bus alongside their Node, Python or Go services.
+
+## Documentation
+
+- API reference: [docs.rs](https://docs.rs/hexeract) for the published crates, and the full workspace rustdoc built on every push to `main`, published at <https://nubster-opensources.github.io/hexeract/>.
+- Guides: the [`docs/` index](docs/index.md) maps quick starts, architecture, concepts, migration and operations guides to their source files.
 
 ## Contributing
 
