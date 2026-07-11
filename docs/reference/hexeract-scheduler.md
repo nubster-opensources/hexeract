@@ -86,10 +86,11 @@ impl Target {
 pub trait ScheduleStore: Send + Sync + 'static {
     async fn insert(&self, message: &ScheduledMessage, max_attempts: u32) -> Result<(), SchedulerError>;
     async fn claim_due(&self, now: SystemTime, batch_size: usize, lease: Duration) -> Result<Vec<LeasedOccurrence>, SchedulerError>;
-    async fn mark_delivered(&self, schedule_id: Uuid) -> Result<(), SchedulerError>;
-    async fn reschedule(&self, schedule_id: Uuid, next: SystemTime) -> Result<(), SchedulerError>;
-    async fn mark_failed(&self, schedule_id: Uuid, retry_at: SystemTime, error: &str) -> Result<(), SchedulerError>;
-    async fn mark_dead_lettered(&self, schedule_id: Uuid, error: &str) -> Result<(), SchedulerError>;
+    async fn mark_delivered(&self, schedule_id: Uuid, lease: SystemTime) -> Result<bool, SchedulerError>;
+    async fn reschedule(&self, schedule_id: Uuid, next: SystemTime, lease: SystemTime) -> Result<bool, SchedulerError>;
+    async fn mark_failed(&self, schedule_id: Uuid, retry_in: Duration, error: &str, lease: SystemTime) -> Result<bool, SchedulerError>;
+    async fn mark_dead_lettered(&self, schedule_id: Uuid, error: &str, lease: SystemTime) -> Result<bool, SchedulerError>;
+    async fn dead_letter_exhausted(&self) -> Result<u64, SchedulerError>;
     async fn cancel(&self, schedule_id: Uuid) -> Result<(), SchedulerError>;
     async fn set_paused(&self, schedule_id: Uuid, paused: bool) -> Result<(), SchedulerError>;
     async fn inspect(&self, schedule_id: Uuid) -> Result<Option<ScheduleSnapshot>, SchedulerError>;
@@ -105,6 +106,14 @@ pub trait ScheduleAdmin: ScheduleStore {
 ```
 
 `ScheduleStore` is the backend-agnostic persistence contract: `claim_due` atomically selects due, unleased, eligible occurrences, advancing their attempt counter and stamping a fresh lease, which is what makes at-least-once delivery crash-safe. `ScheduleAdmin` extends it with the operator surface (listing and dead-letter replay), kept separate so the worker hot path never depends on it. Both are backend-facing contracts; application code drives a schedule's lifecycle through `SchedulerControl` instead.
+
+#### Fencing
+
+`mark_delivered`, `reschedule`, `mark_failed` and `mark_dead_lettered` all take the `lease` a prior `claim_due` stamped on the occurrence (`LeasedOccurrence::leased_until`) and only apply the acknowledgement when the row still carries exactly that lease. A worker whose lease has expired before it gets around to acknowledging (a zombie: paused on I/O, descheduled by the OS, or simply slower than the lease window) can no longer corrupt the state written by whichever worker reclaimed the occurrence in the meantime. `Ok(true)` means the acknowledgement was applied; `Ok(false)` is not an error, it is the signal that another worker now owns this occurrence, and the caller should move on without retrying locally.
+
+`mark_failed` takes `retry_in`, a delay from now, rather than an absolute instant: the backend adds it to its own database clock when computing the new `leased_until`, so the retry deadline stays immune to skew between the worker host and the database host, mirroring how `claim_due` anchors its own lease.
+
+`dead_letter_exhausted` closes a crash-safety gap the four fenced acknowledgements cannot: a worker that crashes while handling its last attempt leaves a row `Pending`, with `attempts >= max_attempts` and no active lease, which `claim_due` will never select again since its attempt budget is exhausted. `dead_letter_exhausted` dead-letters every such row in one statement (excluding paused and still-leased rows) and returns the count swept; `SchedulerWorker::run` calls it at the start of every poll cycle and logs a non-zero count as an operational signal of crashed workers. It carries no lease parameter of its own: it matches purely on each row's own `attempts`, `max_attempts`, `leased_until` and `paused` columns, and is idempotent.
 
 Each entry `claim_due` returns is a `LeasedOccurrence`: the claimed message paired with the lease metadata the worker needs to dispatch it and decide what to do when delivery fails.
 
@@ -140,7 +149,9 @@ impl<S: ScheduleStore, K: ScheduleSink> SchedulerWorker<S, K> {
 }
 ```
 
-`SchedulerBuilder::new` starts from `SchedulerWorkerConfig::default`; the eight setters override individual tuning fields, and `build()` validates the combination (batch size at least 1, non-zero durations, `retry_max_delay >= retry_base_delay`) before returning the worker, rejecting an incoherent configuration with `SchedulerError::InvalidConfiguration`. `SchedulerWorker::run` drives the polling loop until `cancel` is triggered: each cycle claims and settles one batch, dispatches under `dispatch_timeout`, then retries with bounded exponential backoff or dead-letters once the attempt budget is exhausted.
+`SchedulerBuilder::new` starts from `SchedulerWorkerConfig::default`; the eight setters override individual tuning fields, and `build()` validates the combination (batch size at least 1, non-zero durations, `retry_max_delay >= retry_base_delay`) before returning the worker, rejecting an incoherent configuration with `SchedulerError::InvalidConfiguration`. `SchedulerWorker::run` drives the polling loop until `cancel` is triggered: each cycle first sweeps crash-exhausted schedules via `dead_letter_exhausted`, then claims and settles one batch, dispatches under `dispatch_timeout`, then retries with bounded exponential backoff or dead-letters once the attempt budget is exhausted.
+
+`build()` also validates that `lease >= batch_size × dispatch_timeout` (or rejects an overflowing product), since settling a claimed batch is sequential: a shorter lease could expire before the last occurrence in the batch is even dispatched, letting a second worker reclaim and race the first. The default `lease` is 300 seconds, matching the default `batch_size` (10) times the default `dispatch_timeout` (30 seconds).
 
 ### `SchedulerControl`
 
