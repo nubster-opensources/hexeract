@@ -200,19 +200,22 @@ impl Dialect {
     /// PostgreSQL and SQLite use the SQL-standard double quote; MySQL uses
     /// backticks because it does not enable `ANSI_QUOTES` by default, so a
     /// double-quoted identifier is parsed as a string literal and rejected.
-    /// The name is assumed to have passed [`validate_table_name`], so it cannot
-    /// contain a quote character and quoting only restores reserved-word and
-    /// case handling.
+    /// Every embedded occurrence of the delimiter is doubled (the
+    /// SQL-standard escape), so the quoting is safe on its own rather than
+    /// relying solely on the caller having run [`validate_table_name`]
+    /// first. Callers are still expected to validate the name up front
+    /// (defense in depth, not a replacement for validation): this crate's
+    /// own DDL helpers do, and sibling SQL backend crates (such as the
+    /// scheduler) are expected to follow the same convention.
     ///
-    /// Exposed for sibling SQL backend crates (such as the scheduler) so the
-    /// injection-safe quoting rule has a single source of truth. Not part of
-    /// the stable public API.
+    /// Exposed for sibling SQL backend crates so the injection-safe quoting
+    /// rule has a single source of truth. Not part of the stable public API.
     #[doc(hidden)]
     #[must_use]
     pub fn quote_identifier(self, name: &str) -> String {
         match self {
-            Self::Postgres | Self::Sqlite => format!("\"{name}\""),
-            Self::MySql => format!("`{name}`"),
+            Self::Postgres | Self::Sqlite => format!("\"{}\"", name.replace('"', "\"\"")),
+            Self::MySql => format!("`{}`", name.replace('`', "``")),
         }
     }
 
@@ -638,6 +641,41 @@ mod tests {
         assert_eq!(Dialect::Postgres.quote_identifier("t"), "\"t\"");
         assert_eq!(Dialect::Sqlite.quote_identifier("t"), "\"t\"");
         assert_eq!(Dialect::MySql.quote_identifier("t"), "`t`");
+    }
+
+    #[test]
+    fn quote_identifier_doubles_an_embedded_double_quote_for_postgres_and_sqlite() {
+        // Defense in depth (#359): quote_identifier must be safe on its own,
+        // independent of the validate_table_name convention observed by
+        // in-crate and sibling-crate callers. Doubling the delimiter is the
+        // SQL-standard escape for an embedded quote character.
+        assert_eq!(Dialect::Postgres.quote_identifier("a\"b"), "\"a\"\"b\"");
+        assert_eq!(Dialect::Sqlite.quote_identifier("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn quote_identifier_doubles_an_embedded_backtick_for_mysql() {
+        // Same defense-in-depth rule for MySQL's backtick delimiter.
+        assert_eq!(Dialect::MySql.quote_identifier("a`b"), "`a``b`");
+    }
+
+    #[test]
+    fn quote_identifier_is_unchanged_for_names_without_a_delimiter() {
+        // The escape must be transparent for the common case (a name that
+        // already passed validate_table_name and contains no delimiter),
+        // so every existing caller across the workspace keeps working.
+        assert_eq!(
+            Dialect::Postgres.quote_identifier("audit_outbox"),
+            "\"audit_outbox\""
+        );
+        assert_eq!(
+            Dialect::Sqlite.quote_identifier("audit_outbox"),
+            "\"audit_outbox\""
+        );
+        assert_eq!(
+            Dialect::MySql.quote_identifier("audit_outbox"),
+            "`audit_outbox`"
+        );
     }
 
     #[test]
