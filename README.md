@@ -234,7 +234,7 @@ assert_eq!(greeting, "hello world");
 # Ok(()) }
 ```
 
-Queries (`Mediator::query`) and notifications (`Mediator::publish`) follow the same pattern. Notifications fan out to every handler registered for the type in registration order; failures are aggregated so siblings keep running. Wire your own [`Middleware`] implementations through `MediatorBuilder::with_middleware` to add tracing, timeouts or any cross-cutting behavior around every dispatch.
+Queries (`Mediator::query`) and notifications (`Mediator::publish`) follow the same pattern. Notifications fan out to every handler registered for the type in registration order; failures are aggregated so siblings keep running. Wire your own `Middleware` implementations through `MediatorBuilder::with_middleware` to add tracing, timeouts or any cross-cutting behavior around every dispatch.
 
 ### Scheduler (delayed and recurring messages)
 
@@ -284,6 +284,7 @@ Building event-driven services in Rust today means manually wiring a broker clie
 - **Mediator**, dispatch commands to handlers in-process, type-safe and reflection-free.
 - **Bus**, publish and consume over a message broker through a unified transport abstraction.
 - **Outbox**, save business state and outgoing messages atomically in a single database transaction.
+- **Scheduler**, schedule a message for later (one-shot delay or recurring cron) and deliver it durably to the mediator, the bus or the outbox.
 
 The bet behind Hexeract is that Rust's compile-time guarantees turn the outbox pattern from a vigilance discipline into something the type system enforces.
 
