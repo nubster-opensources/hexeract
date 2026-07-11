@@ -135,10 +135,22 @@ async fn declare_queue_on(channel: &Channel, queue: &Queue) -> Result<(), BusErr
         auto_delete: queue.auto_delete,
         ..QueueDeclareOptions::default()
     };
+    let name = queue_short_name(queue)?;
     channel
-        .queue_declare(
-            ShortString::from(queue.name.as_str()),
-            options,
+        .queue_declare(name, options, FieldTable::default())
+        .await
+        .map_err(|err| BusError::Transport(Box::new(err)))?;
+    Ok(())
+}
+
+async fn bind_queue_on(channel: &Channel, binding: &Binding) -> Result<(), BusError> {
+    let (queue, exchange, routing_key) = binding_short_names(binding)?;
+    channel
+        .queue_bind(
+            queue,
+            exchange,
+            routing_key,
+            QueueBindOptions::default(),
             FieldTable::default(),
         )
         .await
@@ -146,18 +158,39 @@ async fn declare_queue_on(channel: &Channel, queue: &Queue) -> Result<(), BusErr
     Ok(())
 }
 
-async fn bind_queue_on(channel: &Channel, binding: &Binding) -> Result<(), BusError> {
-    channel
-        .queue_bind(
-            ShortString::from(binding.queue.as_str()),
-            ShortString::from(binding.exchange.as_str()),
-            ShortString::from(binding.routing_key.as_str()),
-            QueueBindOptions::default(),
-            FieldTable::default(),
-        )
-        .await
-        .map_err(|err| BusError::Transport(Box::new(err)))?;
-    Ok(())
+/// Convert `queue.name` into a [`ShortString`] without panicking.
+///
+/// `Queue::name` is a `pub` field, so a caller can mutate it past the
+/// AMQP short-string limit after [`Queue::new`] already validated it.
+/// This helper is the last line of defense before that name reaches
+/// lapin's panicking `ShortString::from`.
+///
+/// # Errors
+///
+/// Returns [`BusError::InvalidTopology`] when `queue.name` exceeds
+/// the AMQP `ShortString` limit of 255 bytes.
+fn queue_short_name(queue: &Queue) -> Result<ShortString, BusError> {
+    to_short_string(queue.name.as_str(), "queue name")
+}
+
+/// Convert `binding.queue`, `binding.exchange` and `binding.routing_key`
+/// into [`ShortString`]s without panicking.
+///
+/// `Binding::queue` and `Binding::exchange` are `pub` fields, so a
+/// caller can mutate them past the AMQP short-string limit after
+/// [`Binding::new`] already validated them.
+///
+/// # Errors
+///
+/// Returns [`BusError::InvalidTopology`] when any of the three values
+/// exceeds the AMQP `ShortString` limit of 255 bytes.
+fn binding_short_names(
+    binding: &Binding,
+) -> Result<(ShortString, ShortString, ShortString), BusError> {
+    let queue = to_short_string(binding.queue.as_str(), "queue name")?;
+    let exchange = to_short_string(binding.exchange.as_str(), "exchange name")?;
+    let routing_key = to_short_string(binding.routing_key.as_str(), "routing key")?;
+    Ok((queue, exchange, routing_key))
 }
 
 #[cfg(test)]
@@ -188,5 +221,62 @@ mod tests {
         let _exchange = Exchange::new("orders", ExchangeKind::Topic).unwrap();
         let _queue = Queue::new("orders.received").unwrap();
         let _key = RoutingKey::new("orders.*").unwrap();
+    }
+
+    /// `Queue::name` is validated by `Queue::new`, but the field is
+    /// `pub`, so a caller can mutate it past the AMQP short-string
+    /// limit afterward. `queue_short_name` must return an error
+    /// instead of panicking through `ShortString::from`.
+    #[test]
+    fn queue_short_name_rejects_name_mutated_past_the_limit_after_construction() {
+        let mut queue = Queue::new("orders.received").expect("valid queue name");
+        queue.name = "a".repeat(256);
+
+        let err = queue_short_name(&queue).expect_err("oversize name must error, not panic");
+
+        match err {
+            BusError::InvalidTopology { reason } => assert!(reason.contains("queue name")),
+            other => panic!("expected InvalidTopology, got {other:?}"),
+        }
+    }
+
+    /// Same attack surface as above, but on `Binding::queue`: mutating
+    /// the `pub` field past construction must surface as an error.
+    #[test]
+    fn binding_short_names_rejects_queue_mutated_past_the_limit_after_construction() {
+        let mut binding = Binding::new(
+            "orders.received",
+            "orders",
+            RoutingKey::new("orders.*").expect("valid routing key"),
+        )
+        .expect("valid binding");
+        binding.queue = "a".repeat(256);
+
+        let err = binding_short_names(&binding).expect_err("oversize queue must error, not panic");
+
+        match err {
+            BusError::InvalidTopology { reason } => assert!(reason.contains("queue name")),
+            other => panic!("expected InvalidTopology, got {other:?}"),
+        }
+    }
+
+    /// Same attack surface as above, but on `Binding::exchange`.
+    #[test]
+    fn binding_short_names_rejects_exchange_mutated_past_the_limit_after_construction() {
+        let mut binding = Binding::new(
+            "orders.received",
+            "orders",
+            RoutingKey::new("orders.*").expect("valid routing key"),
+        )
+        .expect("valid binding");
+        binding.exchange = "a".repeat(256);
+
+        let err =
+            binding_short_names(&binding).expect_err("oversize exchange must error, not panic");
+
+        match err {
+            BusError::InvalidTopology { reason } => assert!(reason.contains("exchange name")),
+            other => panic!("expected InvalidTopology, got {other:?}"),
+        }
     }
 }
