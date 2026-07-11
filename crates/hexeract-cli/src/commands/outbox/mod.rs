@@ -2,6 +2,7 @@ use clap::Subcommand;
 
 pub(crate) mod apply;
 pub(crate) mod check;
+mod connect;
 pub(crate) mod patch;
 
 use crate::error::CliError;
