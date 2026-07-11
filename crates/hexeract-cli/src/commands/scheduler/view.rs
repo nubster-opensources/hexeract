@@ -62,7 +62,7 @@ fn status_label(status: ScheduleStatus) -> &'static str {
     }
 }
 
-/// Map a trigger to its CLI label ("delay" or "cron:<expression>").
+/// Map a trigger to its CLI label (`"delay"` or `"cron:<expression>"`).
 ///
 /// `Trigger` is `#[non_exhaustive]`, so a catch-all arm is required even
 /// though every current variant is handled explicitly.

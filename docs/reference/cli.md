@@ -37,7 +37,7 @@ hexeract outbox apply \
 
 ### `outbox check`
 
-Validate that the target table exists with the expected columns and indexes.
+Validate that the target table exists with the expected columns.
 
 ```bash
 hexeract outbox check --conn "$DATABASE_URL" --table audit_outbox
@@ -45,7 +45,7 @@ hexeract outbox check --conn "$DATABASE_URL" --table audit_outbox
 
 ## `hexeract bus`
 
-The bus subcommands accept `--conn AMQP_URL` or the `HEXERACT_BUS_URL` environment variable.
+The bus subcommands accept `--conn AMQP_URL` or the `HEXERACT_BUS_URL` environment variable. Connection strings passed via `--conn` are never echoed back: parsed arguments and connection errors always render `<redacted>` or a host-only form, never the raw credential-bearing string.
 
 ### `bus declare`
 
@@ -83,6 +83,8 @@ Each entry is re-validated through the typed constructors (`Exchange::new`, `Que
 
 Dump the first `N` messages of a queue **without consuming them**. Each delivery is `basic_nack(requeue=true)`-ed after print, so the queue is left intact.
 
+Payload output is capped at 1 KiB by default so a peek does not dump secrets or PII in full to a terminal, CI log or pipe. Pass `--max-bytes N` to raise the cap, or `--raw` to print the full, untruncated payload (only when every reader of the output is trusted with the whole message body). A truncated preview ends with the marker ` ...<truncated, use --raw or --max-bytes to see more>`.
+
 ```bash
 hexeract bus peek --queue orders.received --count 5
 ```
@@ -106,7 +108,7 @@ hexeract bus purge --queue orders.received --yes-i-know
 
 Output: `purged <N> message(s) from <name>`.
 
-Without `--yes-i-know`, the command exits with a non-zero code and prints `refusing to purge without the explicit '--yes-i-know' safety flag` before opening any connection.
+Without `--yes-i-know`, the command refuses to purge with a non-zero exit, printing `Refusing to purge without --yes-i-know.` and a reminder that purging is irreversible, before opening any connection.
 
 ## `hexeract scheduler`
 

@@ -1,6 +1,6 @@
 //! Built-in middlewares for the Hexeract messaging framework.
 //!
-//! - [`TracingMiddleware`] opens a [`tracing::Span`] around every dispatch
+//! - [`TracingMiddleware`] opens a [`::tracing::Span`] around every dispatch
 //!   and emits a structured event on entry and on completion or failure.
 //! - [`TimeoutMiddleware`] aborts the dispatch with
 //!   [`hexeract_core::HexeractError::Timeout`] when the inner pipeline takes

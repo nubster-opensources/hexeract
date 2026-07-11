@@ -116,7 +116,7 @@ join.await??;
 # Ok(()) }
 ```
 
-See [`docs/tutorial/getting-started.md`](./docs/tutorial/getting-started.md) for the full integration walkthrough.
+See [`docs/getting-started/outbox-quick-start.md`](./docs/getting-started/outbox-quick-start.md) for the full integration walkthrough.
 
 ### Bus (RabbitMQ)
 
@@ -249,10 +249,10 @@ The bet behind Hexeract is that Rust's compile-time guarantees turn the outbox p
 
 ## Roadmap
 
-Available today: Mediator, Bus, Outbox/Inbox, and delivery reliability
-(dead-letter handling, publisher confirms, idempotency).
+Available today: Mediator, Bus, Outbox/Inbox, the durable Scheduler, and
+delivery reliability (dead-letter handling, publisher confirms, idempotency).
 
-Planned: Sagas, Scheduler, Request/Reply. See [`ROADMAP.md`](./ROADMAP.md).
+Planned: Sagas, Request/Reply. See [`ROADMAP.md`](./ROADMAP.md).
 
 ## What Hexeract is **not**
 

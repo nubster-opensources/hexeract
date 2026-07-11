@@ -312,8 +312,8 @@ impl OutboxWorkerConfig {
 ///
 /// Generic over any [`OutboxStore`] backend. The worker takes ownership
 /// of the store and a registry mapping `event_type` to its
-/// [`ErasedHandler`], then [`Self::start`] spawns the polling task and
-/// returns a [`JoinHandle`].
+/// [`ErasedHandler`], then [`Self::run`] returns a boxed future that
+/// polls until cancelled.
 pub struct OutboxWorker<S>
 where
     S: OutboxStore,
