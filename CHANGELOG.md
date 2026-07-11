@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 
 ## [Unreleased]
 
-## [0.6.0] - 2026-07-10
+## [0.6.0] - 2026-07-11
 
 Scheduler release. This cycle ships the durable message scheduler as two new crates: `hexeract-scheduler` (schedule store contract, delay and cron triggers, polling worker with lease-based claiming, bounded backoff with jitter and dead-lettering, mediator/bus/outbox sinks, fluent builder and lifecycle control) and `hexeract-scheduler-sql` (PostgreSQL, MySQL and SQLite backends). The `hexeract` umbrella crate gains a matching `scheduler` feature family and `hexeract-cli` gains a scheduler operator surface. All changes to previously published crates are additive; no breaking changes.
 
@@ -25,6 +25,23 @@ Scheduler release. This cycle ships the durable message scheduler as two new cra
 - `hexeract-scheduler`: `SchedulerBuilder`, a fluent, type-safe assembly surface for `SchedulerWorker`. Construction takes both the `ScheduleStore` and `ScheduleSink` up front via `new(store, sink)`, each field of `SchedulerWorkerConfig` is overridable through a move-self setter, and the terminal `build()` validates the configuration before constructing the worker: a zero `batch_size`, a zero duration for `poll_interval`, `lease`, `dispatch_timeout` or `retry_base_delay`, or a `retry_max_delay` smaller than `retry_base_delay` are each rejected with a typed `SchedulerError::InvalidConfiguration` instead of silently producing an incoherent worker. A `config()` accessor on `SchedulerWorker` exposes the active configuration for introspection and assertion. The `hexeract` umbrella crate gains a matching `scheduler` feature family (`scheduler`, `scheduler-mediator`, `scheduler-bus`, `scheduler-outbox`, `scheduler-sql-postgres`, `scheduler-sql-mysql`, `scheduler-sql-sqlite`) re-exporting the full public surface of `hexeract-scheduler` and `hexeract-scheduler-sql`. The default `lease` is 300 seconds (previously 30), matching the default `batch_size` (10) times the default `dispatch_timeout` (30s); `build()` now also rejects any `lease` shorter than `batch_size × dispatch_timeout`, or a configuration whose product overflows, with `SchedulerError::InvalidConfiguration`, since settling a batch is sequential and a shorter lease could expire before the last occurrence in the batch is even dispatched. (#277, #352)
 - `hexeract-scheduler`: `SchedulerControl`, an ergonomic lifecycle facade wrapping a shared `ScheduleStore` and exposing four operations: `inspect`, `pause`, `cancel` and `resume`. `cancel` is a silent no-op on terminal schedules (Delivered, Cancelled, DeadLettered) so callers do not need to guard the status first. `resume` realigns a past-due paused cron schedule to the next strictly future occurrence via `CronExpression::next_occurrence`, with no catch-up fire for missed ticks; a paused delay schedule is simply unpaused with the stored occurrence intact. (#276)
 - `hexeract-scheduler`: `ScheduleStore::resume`, an atomic primitive that unpauses a schedule. When called with `Some(next)`, it sets `scheduled_for = next`, resets the attempt counter, clears the last recorded error and releases any active lease in one step. When called with `None`, it only unpauses, leaving the existing occurrence intact. Idempotent: a no-op on non-Paused schedules. All SQL backends (PostgreSQL, MySQL, SQLite) implement it with the same terminal-guard predicate used by the other acknowledgement methods. (#276)
+
+### Changed
+
+- `hexeract-cli`: the PostgreSQL operator connection now uses `rustls` with the operating-system trust store (via `rustls-native-certs`) instead of `native-tls`/OpenSSL, aligning the CLI with the workspace TLS stack and removing the OpenSSL C build and its CVE surface from the binary. The `ring` crypto provider is pinned explicitly so a multi-provider dependency graph cannot cause a runtime panic. (#370)
+
+### Security
+
+- `hexeract-cli`: connection strings passed through `--conn` are no longer exposed via `argv`, `derive(Debug)` or connect-error messages. A redacting `ConnString` newtype masks credentials in every rendering path, so a leaked process listing or log line no longer discloses the database password. (#362)
+- `hexeract-cli`: the outbox TLS opt-out no longer relies on a naive substring match that could silently downgrade a connection to plaintext. Only an explicitly parsed disable maps to a no-TLS connection (with a warning); every other mode, including the default, requires TLS. (#365)
+- `hexeract-cli`: `bus peek` no longer prints message payloads unredacted and uncapped. Output is capped (default 1 KiB, overridable with `--max-bytes`/`--raw`) and redacted, so credentials embedded in a peeked payload do not leak to the terminal. (#368)
+
+### Fixed
+
+- `hexeract-bus-rabbitmq`: topology declaration no longer uses the panicking `ShortString::from` on queue and binding names; an over-long name surfaces a typed `BusError` instead of aborting the process. (#342)
+- `hexeract-cli`: `bus peek` and `bus purge` validate the `--queue` argument through `Queue::new` before constructing the AMQP short string, so an over-long or malformed name is a clean error rather than a panic. (#366)
+- `hexeract-mediator`: the dispatch terminals use a non-poisoning lock, so a panic in one handler no longer poisons the shared terminal and cascades into unrelated dispatches. (#363)
+- `hexeract-outbox-sql`: `Dialect::quote_identifier` now escapes an embedded delimiter (doubling `"` for PostgreSQL and SQLite, `` ` `` for MySQL) as defense in depth against a malformed table or column identifier. (#359)
 
 ## [0.5.0] - 2026-06-12
 
