@@ -7,14 +7,20 @@ use lapin::Channel;
 use lapin::Connection;
 use lapin::ConnectionProperties;
 
-/// Redact the credentials of an AMQP URI for safe logging.
+/// Redact the credentials of a connection URI for safe logging.
 ///
 /// Returns `scheme://***@host[:port][/vhost]` when a userinfo component
 /// is present, dropping the user and password entirely. When the URI is
 /// malformed enough that the host cannot be isolated, returns the static
 /// `"<redacted AMQP URI>"` so a raw, password-bearing string is never
 /// surfaced. The function never echoes the password under any input.
-pub(crate) fn redact_uri(uri: &str) -> String {
+///
+/// The parsing is scheme-agnostic (it only looks for `scheme://` and a
+/// trailing `user:pass@` userinfo component), so it is reused by the
+/// `hexeract-cli` crate to redact PostgreSQL connection strings as well
+/// as AMQP ones.
+#[must_use]
+pub fn redact_uri(uri: &str) -> String {
     // Split off the scheme (everything up to and including "://" or ":").
     let (scheme, rest) = match uri.split_once("://") {
         Some((scheme, rest)) => (scheme, rest),

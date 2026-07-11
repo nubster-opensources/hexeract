@@ -17,6 +17,7 @@ use std::time::Duration;
 use std::time::SystemTime;
 
 use hexeract_outbox_sql::Dialect;
+use hexeract_scheduler::DEAD_LETTER_EXHAUSTED_MESSAGE;
 use hexeract_scheduler::LeasedOccurrence;
 use hexeract_scheduler::ScheduleAdmin;
 use hexeract_scheduler::ScheduleSnapshot;
@@ -128,6 +129,7 @@ pub struct MySqlScheduleStore {
     reschedule_sql: Arc<str>,
     mark_failed_sql: Arc<str>,
     mark_dead_lettered_sql: Arc<str>,
+    dead_letter_exhausted_sql: Arc<str>,
     cancel_sql: Arc<str>,
     set_paused_sql: Arc<str>,
     resume_with_next_sql: Arc<str>,
@@ -157,6 +159,10 @@ impl MySqlScheduleStore {
             reschedule_sql: Arc::from(statements::reschedule_sql(DIALECT, &table_name)),
             mark_failed_sql: Arc::from(statements::mark_failed_sql(DIALECT, &table_name)),
             mark_dead_lettered_sql: Arc::from(statements::mark_dead_lettered_sql(
+                DIALECT,
+                &table_name,
+            )),
+            dead_letter_exhausted_sql: Arc::from(statements::dead_letter_exhausted_sql(
                 DIALECT,
                 &table_name,
             )),
@@ -281,53 +287,77 @@ impl ScheduleStore for MySqlScheduleStore {
         Ok(claimed)
     }
 
-    async fn mark_delivered(&self, schedule_id: Uuid) -> Result<(), SchedulerError> {
-        sqlx::query(&self.mark_delivered_sql)
+    async fn mark_delivered(
+        &self,
+        schedule_id: Uuid,
+        lease: SystemTime,
+    ) -> Result<bool, SchedulerError> {
+        let result = sqlx::query(&self.mark_delivered_sql)
             .bind(schedule_id)
+            .bind(timestamp::to_primitive_utc(lease))
             .execute(&self.pool)
             .await
             .map_err(database_error)?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
-    async fn reschedule(&self, schedule_id: Uuid, next: SystemTime) -> Result<(), SchedulerError> {
-        sqlx::query(&self.reschedule_sql)
+    async fn reschedule(
+        &self,
+        schedule_id: Uuid,
+        next: SystemTime,
+        lease: SystemTime,
+    ) -> Result<bool, SchedulerError> {
+        let result = sqlx::query(&self.reschedule_sql)
             .bind(timestamp::to_primitive_utc(next))
             .bind(schedule_id)
+            .bind(timestamp::to_primitive_utc(lease))
             .execute(&self.pool)
             .await
             .map_err(database_error)?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     async fn mark_failed(
         &self,
         schedule_id: Uuid,
-        retry_at: SystemTime,
+        retry_in: Duration,
         error: &str,
-    ) -> Result<(), SchedulerError> {
-        sqlx::query(&self.mark_failed_sql)
-            .bind(timestamp::to_primitive_utc(retry_at))
+        lease: SystemTime,
+    ) -> Result<bool, SchedulerError> {
+        let result = sqlx::query(&self.mark_failed_sql)
+            .bind(duration_to_micros(retry_in))
             .bind(error)
             .bind(schedule_id)
+            .bind(timestamp::to_primitive_utc(lease))
             .execute(&self.pool)
             .await
             .map_err(database_error)?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     async fn mark_dead_lettered(
         &self,
         schedule_id: Uuid,
         error: &str,
-    ) -> Result<(), SchedulerError> {
-        sqlx::query(&self.mark_dead_lettered_sql)
+        lease: SystemTime,
+    ) -> Result<bool, SchedulerError> {
+        let result = sqlx::query(&self.mark_dead_lettered_sql)
             .bind(error)
             .bind(schedule_id)
+            .bind(timestamp::to_primitive_utc(lease))
             .execute(&self.pool)
             .await
             .map_err(database_error)?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn dead_letter_exhausted(&self) -> Result<u64, SchedulerError> {
+        let result = sqlx::query(&self.dead_letter_exhausted_sql)
+            .bind(DEAD_LETTER_EXHAUSTED_MESSAGE)
+            .execute(&self.pool)
+            .await
+            .map_err(database_error)?;
+        Ok(result.rows_affected())
     }
 
     async fn cancel(&self, schedule_id: Uuid) -> Result<(), SchedulerError> {
@@ -458,6 +488,19 @@ mod tests {
             store
                 .exists_sql
                 .contains("SELECT 1 FROM `scheduled_messages`")
+        );
+        assert!(store.mark_delivered_sql.contains("leased_until = ?"));
+        assert!(store.reschedule_sql.contains("leased_until = ?"));
+        assert!(
+            store
+                .mark_failed_sql
+                .contains("UTC_TIMESTAMP(6) + INTERVAL")
+        );
+        assert!(store.mark_dead_lettered_sql.contains("leased_until = ?"));
+        assert!(
+            store
+                .dead_letter_exhausted_sql
+                .contains("attempts >= max_attempts")
         );
     }
 

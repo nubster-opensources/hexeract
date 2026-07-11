@@ -11,14 +11,20 @@ use hexeract_bus_rabbitmq::RabbitMqConnection;
 use hexeract_bus_rabbitmq::ensure_topology;
 use serde::Deserialize;
 
+use crate::conn_string::ConnString;
 use crate::error::CliError;
 
 /// CLI arguments for `hexeract bus declare`.
 #[derive(Args, Debug)]
 pub(crate) struct DeclareArgs {
     /// AMQP connection string (e.g. `amqp://guest:guest@localhost:5672`).
-    #[arg(long, env = "HEXERACT_BUS_URL")]
-    conn: String,
+    ///
+    /// Carries broker credentials in its userinfo component. Prefer
+    /// setting `HEXERACT_BUS_URL` in the environment over passing this on
+    /// the command line: argv is readable by every local user via
+    /// `/proc/<pid>/cmdline` or `ps aux`, and shells persist it in history.
+    #[arg(long, env = "HEXERACT_BUS_URL", hide_env_values = true)]
+    conn: ConnString,
     /// Path to the TOML topology file.
     #[arg(long)]
     topology: PathBuf,
@@ -34,7 +40,7 @@ impl DeclareArgs {
             .into_bus_values()
             .map_err(|e| CliError::Fatal(Box::new(e)))?;
 
-        let connection = RabbitMqConnection::connect(&self.conn)
+        let connection = RabbitMqConnection::connect(self.conn.as_str())
             .await
             .map_err(|e| CliError::Fatal(Box::new(e)))?;
         ensure_topology(&connection, &exchanges, &queues, &bindings)

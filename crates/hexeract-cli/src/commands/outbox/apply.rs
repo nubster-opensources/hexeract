@@ -1,9 +1,8 @@
 use clap::Args;
 use hexeract_outbox_sql::Dialect;
-use postgres_native_tls::MakeTlsConnector;
-use tokio_postgres::NoTls;
 
-use super::check::is_ssl_disabled;
+use super::connect::connect;
+use crate::conn_string::ConnString;
 use crate::error::CliError;
 
 /// Apply the canonical outbox schema to a target PostgreSQL database.
@@ -14,8 +13,14 @@ use crate::error::CliError;
 #[derive(Args, Debug)]
 pub(crate) struct ApplyArgs {
     /// PostgreSQL connection URL (e.g. `postgres://user:pass@host:5432/db`).
-    #[arg(long, env = "DATABASE_URL")]
-    conn: String,
+    ///
+    /// Carries database credentials in its userinfo component. Prefer
+    /// setting `DATABASE_URL` in the environment, or a `.pgpass` file,
+    /// over passing this on the command line: argv is readable by every
+    /// local user via `/proc/<pid>/cmdline` or `ps aux`, and shells
+    /// persist it in history.
+    #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
+    conn: ConnString,
     /// Outbox table name. Must match `^[a-zA-Z_][a-zA-Z0-9_]*$`.
     #[arg(long, default_value = "audit_outbox", env = "HEXERACT_OUTBOX_TABLE")]
     table: String,
@@ -57,35 +62,5 @@ impl ApplyArgs {
 
         println!("Schema applied to table `{}`.", self.table);
         Ok(())
-    }
-}
-
-/// Connect to PostgreSQL, using TLS unless `sslmode=disable` is present in the URL.
-async fn connect(url: &str) -> Result<tokio_postgres::Client, CliError> {
-    if is_ssl_disabled(url) {
-        tracing::warn!("TLS disabled via sslmode=disable; credentials will be sent in cleartext");
-        let (client, connection) = tokio_postgres::connect(url, NoTls)
-            .await
-            .map_err(|e| CliError::Fatal(Box::new(e)))?;
-        tokio::spawn(async move {
-            if let Err(err) = connection.await {
-                tracing::error!(error = %err, "PostgreSQL connection task error");
-            }
-        });
-        Ok(client)
-    } else {
-        let builder = native_tls::TlsConnector::builder()
-            .build()
-            .map_err(|e| CliError::Fatal(Box::new(e)))?;
-        let connector = MakeTlsConnector::new(builder);
-        let (client, connection) = tokio_postgres::connect(url, connector)
-            .await
-            .map_err(|e| CliError::Fatal(Box::new(e)))?;
-        tokio::spawn(async move {
-            if let Err(err) = connection.await {
-                tracing::error!(error = %err, "PostgreSQL connection task error");
-            }
-        });
-        Ok(client)
     }
 }

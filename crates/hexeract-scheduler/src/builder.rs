@@ -16,6 +16,7 @@
 //!
 //! let worker = SchedulerBuilder::new(InMemoryScheduleStore::default(), NoopSink)
 //!     .batch_size(50)
+//!     .dispatch_timeout(Duration::from_secs(1))
 //!     .lease(Duration::from_secs(60))
 //!     .build()?;
 //! assert_eq!(worker.config().batch_size, 50);
@@ -134,6 +135,11 @@ where
     /// - `poll_interval`, `lease`, `dispatch_timeout` and `retry_base_delay`
     ///   must be non-zero.
     /// - `retry_max_delay` must be >= `retry_base_delay`.
+    /// - `lease` must be at least `batch_size × dispatch_timeout`: settling a
+    ///   batch is sequential, so a shorter lease can expire before the last
+    ///   occurrence in the batch is dispatched, letting a second worker
+    ///   reclaim it and race the first. An overflowing product is rejected
+    ///   the same way, since no finite lease could satisfy it.
     pub fn build(self) -> Result<SchedulerWorker<S, K>, SchedulerError> {
         if self.config.batch_size == 0 {
             return Err(SchedulerError::invalid_configuration(
@@ -164,6 +170,21 @@ where
             return Err(SchedulerError::invalid_configuration(
                 "retry_max_delay must be >= retry_base_delay",
             ));
+        }
+        let batch_size = u32::try_from(self.config.batch_size).unwrap_or(u32::MAX);
+        match self.config.dispatch_timeout.checked_mul(batch_size) {
+            Some(minimum_lease) if self.config.lease >= minimum_lease => {}
+            Some(minimum_lease) => {
+                return Err(SchedulerError::invalid_configuration(format!(
+                    "lease ({:?}) must be at least batch_size × dispatch_timeout ({:?})",
+                    self.config.lease, minimum_lease
+                )));
+            }
+            None => {
+                return Err(SchedulerError::invalid_configuration(
+                    "batch_size × dispatch_timeout overflows; lease cannot satisfy the invariant",
+                ));
+            }
         }
         Ok(SchedulerWorker::new(self.store, self.sink, self.config))
     }
@@ -213,14 +234,22 @@ mod tests {
 
     #[test]
     fn batch_size_setter_is_applied() {
-        let worker = builder().batch_size(50).build().expect("valid config");
+        let worker = builder()
+            .batch_size(50)
+            .dispatch_timeout(Duration::from_secs(1))
+            .build()
+            .expect("valid config");
         assert_eq!(worker.config().batch_size, 50);
     }
 
     #[test]
     fn lease_setter_is_applied() {
         let lease = Duration::from_secs(120);
-        let worker = builder().lease(lease).build().expect("valid config");
+        let worker = builder()
+            .lease(lease)
+            .dispatch_timeout(Duration::from_secs(5))
+            .build()
+            .expect("valid config");
         assert_eq!(worker.config().lease, lease);
     }
 
@@ -282,6 +311,46 @@ mod tests {
             .expect("build must fail");
         assert!(matches!(err, SchedulerError::InvalidConfiguration { .. }));
         assert!(err.to_string().contains("dispatch_timeout"));
+    }
+
+    #[test]
+    fn lease_below_batch_size_times_dispatch_timeout_is_rejected() {
+        // batch_size × dispatch_timeout = 10 × 30s = 300s; a 60s lease is
+        // too short for the worst-case sequential settle of a full batch.
+        let err = builder()
+            .batch_size(10)
+            .dispatch_timeout(Duration::from_secs(30))
+            .lease(Duration::from_secs(60))
+            .build()
+            .err()
+            .expect("build must fail");
+        assert!(matches!(err, SchedulerError::InvalidConfiguration { .. }));
+        assert!(err.to_string().contains("lease"));
+        assert!(err.to_string().contains("batch_size"));
+    }
+
+    #[test]
+    fn lease_equal_to_batch_size_times_dispatch_timeout_is_accepted() {
+        // The invariant is inclusive: lease == batch_size × dispatch_timeout
+        // must pass, matching the crate defaults (10 × 30s = 300s lease).
+        let result = builder()
+            .batch_size(10)
+            .dispatch_timeout(Duration::from_secs(30))
+            .lease(Duration::from_secs(300))
+            .build();
+        assert!(result.is_ok(), "an exactly sufficient lease must be valid");
+    }
+
+    #[test]
+    fn lease_invariant_overflowing_product_is_rejected() {
+        let err = builder()
+            .batch_size(usize::MAX)
+            .dispatch_timeout(Duration::MAX)
+            .build()
+            .err()
+            .expect("build must fail");
+        assert!(matches!(err, SchedulerError::InvalidConfiguration { .. }));
+        assert!(err.to_string().contains("overflow"));
     }
 
     #[test]

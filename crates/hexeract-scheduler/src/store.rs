@@ -8,6 +8,11 @@ use crate::lease::LeasedOccurrence;
 use crate::schedule::ScheduledMessage;
 use crate::snapshot::ScheduleSnapshot;
 
+/// Error message recorded by [`ScheduleStore::dead_letter_exhausted`] on every
+/// schedule it sweeps.
+pub const DEAD_LETTER_EXHAUSTED_MESSAGE: &str =
+    "attempts exhausted by a crashed worker; dead-lettered by the sweeper";
+
 /// Backend-agnostic contract for persisting and claiming scheduled messages.
 ///
 /// A store keeps each schedule with the instant of its current occurrence
@@ -55,6 +60,20 @@ use crate::snapshot::ScheduleSnapshot;
 /// the contract needs no cross-method transaction. The acknowledgement
 /// methods are idempotent: applying them to an unknown schedule is a no-op,
 /// which keeps redelivery safe.
+///
+/// # Fencing
+///
+/// Every acknowledgement ([`Self::mark_delivered`], [`Self::reschedule`],
+/// [`Self::mark_failed`] and [`Self::mark_dead_lettered`]) takes the `lease`
+/// a prior [`Self::claim_due`] stamped on the occurrence (carried on
+/// [`LeasedOccurrence::leased_until`]) and only applies when the row still
+/// carries exactly that lease. A worker whose lease has expired before it
+/// gets around to acknowledging (a zombie: paused on I/O, descheduled by the
+/// OS, or simply slower than the lease window) can no longer corrupt the
+/// state written by whichever worker reclaimed the occurrence in the
+/// meantime. `Ok(true)` means the acknowledgement was applied; `Ok(false)`
+/// is not an error, it is the signal that another worker now owns this
+/// occurrence, and the caller should move on without retrying locally.
 #[trait_variant::make(Send)]
 pub trait ScheduleStore: Send + Sync + 'static {
     /// Persist a new schedule with the given attempt budget.
@@ -89,33 +108,56 @@ pub trait ScheduleStore: Send + Sync + 'static {
 
     /// Mark a one-shot schedule as delivered and release its lease.
     ///
-    /// Idempotent: a no-op when no schedule matches `schedule_id`.
+    /// Applies only when the schedule is still `Pending` and `leased_until`
+    /// still equals `lease`; see the trait-level fencing documentation.
+    /// Idempotent: a no-op (returning `Ok(false)`) when no schedule matches
+    /// `schedule_id`.
     ///
     /// # Errors
     ///
     /// Returns [`SchedulerError::Database`] if the backend fails to update.
-    async fn mark_delivered(&self, schedule_id: Uuid) -> Result<(), SchedulerError>;
+    async fn mark_delivered(
+        &self,
+        schedule_id: Uuid,
+        lease: SystemTime,
+    ) -> Result<bool, SchedulerError>;
 
     /// Advance a recurring schedule to its `next` occurrence, resetting the
     /// attempt counter and releasing the lease.
     ///
-    /// Idempotent: a no-op when no schedule matches `schedule_id`.
+    /// Applies only when the schedule is still `Pending` and `leased_until`
+    /// still equals `lease`; see the trait-level fencing documentation.
+    /// Idempotent: a no-op (returning `Ok(false)`) when no schedule matches
+    /// `schedule_id`.
     ///
     /// # Errors
     ///
     /// Returns [`SchedulerError::Database`] if the backend fails to update.
-    async fn reschedule(&self, schedule_id: Uuid, next: SystemTime) -> Result<(), SchedulerError>;
+    async fn reschedule(
+        &self,
+        schedule_id: Uuid,
+        next: SystemTime,
+        lease: SystemTime,
+    ) -> Result<bool, SchedulerError>;
 
-    /// Record a failed delivery attempt and defer the next claim until
-    /// `retry_at`, keeping the occurrence pending and its attempt counter
+    /// Record a failed delivery attempt and defer the next claim by
+    /// `retry_in`, keeping the occurrence pending and its attempt counter
     /// untouched.
     ///
-    /// The attempt is advanced at claim time, not here, so a failed
-    /// occurrence keeps the attempt already consumed; this method only pushes
-    /// the lease out to `retry_at` (the worker's backoff deadline) and records
-    /// the error. The occurrence is reclaimed once `retry_at` has passed, as
-    /// long as it still has attempt budget. Idempotent: a no-op when no
-    /// schedule matches `schedule_id`.
+    /// `retry_in` is a delay from now, not an absolute instant: the backend
+    /// adds it to its own database clock when computing the new
+    /// `leased_until`, so the retry deadline stays immune to skew between the
+    /// worker host and the database host (mirroring
+    /// [`Self::claim_due`]'s lease anchoring). The attempt is advanced at
+    /// claim time, not here, so a failed occurrence keeps the attempt already
+    /// consumed; this method only pushes the lease out and records the error.
+    /// The occurrence is reclaimed once the new `leased_until` has passed, as
+    /// long as it still has attempt budget.
+    ///
+    /// Applies only when the schedule is still `Pending` and `leased_until`
+    /// still equals `lease`; see the trait-level fencing documentation.
+    /// Idempotent: a no-op (returning `Ok(false)`) when no schedule matches
+    /// `schedule_id`.
     ///
     /// # Errors
     ///
@@ -123,14 +165,18 @@ pub trait ScheduleStore: Send + Sync + 'static {
     async fn mark_failed(
         &self,
         schedule_id: Uuid,
-        retry_at: SystemTime,
+        retry_in: Duration,
         error: &str,
-    ) -> Result<(), SchedulerError>;
+        lease: SystemTime,
+    ) -> Result<bool, SchedulerError>;
 
     /// Move a schedule to the dead-letter state, recording the last error
     /// and releasing the lease.
     ///
-    /// Idempotent: a no-op when no schedule matches `schedule_id`.
+    /// Applies only when the schedule is still `Pending` and `leased_until`
+    /// still equals `lease`; see the trait-level fencing documentation.
+    /// Idempotent: a no-op (returning `Ok(false)`) when no schedule matches
+    /// `schedule_id`.
     ///
     /// # Errors
     ///
@@ -139,7 +185,28 @@ pub trait ScheduleStore: Send + Sync + 'static {
         &self,
         schedule_id: Uuid,
         error: &str,
-    ) -> Result<(), SchedulerError>;
+        lease: SystemTime,
+    ) -> Result<bool, SchedulerError>;
+
+    /// Dead-letter every non-terminal, non-paused schedule whose attempt
+    /// budget is exhausted and whose lease has expired or was never taken.
+    ///
+    /// A worker that crashes while handling its last attempt leaves a row
+    /// with `attempts >= max_attempts`, still `Pending`, and no active lease:
+    /// [`Self::claim_due`] excludes it because its budget is exhausted, so
+    /// without this sweep it would sit forever, neither claimable nor
+    /// dead-lettered. [`crate::worker::SchedulerWorker`] calls this once at
+    /// the start of every poll cycle to close that gap; a non-zero count is
+    /// worth logging as an operational signal of crashed workers. The last
+    /// error recorded on each swept row is [`DEAD_LETTER_EXHAUSTED_MESSAGE`].
+    ///
+    /// Idempotent: a schedule already dead-lettered by a previous sweep is no
+    /// longer non-terminal, so it is not matched again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchedulerError::Database`] if the backend fails to update.
+    async fn dead_letter_exhausted(&self) -> Result<u64, SchedulerError>;
 
     /// Cancel a schedule, excluding it from future claims.
     ///

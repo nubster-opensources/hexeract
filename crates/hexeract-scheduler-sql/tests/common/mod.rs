@@ -181,10 +181,11 @@ pub(crate) async fn reschedule_advances_resets_and_reclaims<S: ScheduleStore>(st
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].attempts, 1);
 
-    store
-        .reschedule(schedule_id, past(30))
+    let applied = store
+        .reschedule(schedule_id, past(30), claimed[0].leased_until)
         .await
         .expect("reschedule");
+    assert!(applied, "the freshly claimed lease must still be valid");
     let snapshot = store.inspect(schedule_id).await.unwrap().unwrap();
     assert_eq!(snapshot.status, ScheduleStatus::Pending);
     assert_eq!(snapshot.attempts, 0);
@@ -231,12 +232,12 @@ pub(crate) async fn cancel_does_not_clobber_a_terminal_status<S: ScheduleStore>(
         .insert(&delivered_message, MAX_ATTEMPTS)
         .await
         .expect("insert delivered");
-    store
+    let claimed = store
         .claim_due(SystemTime::now(), 10, Duration::from_secs(30))
         .await
         .expect("claim");
     store
-        .mark_delivered(delivered_id)
+        .mark_delivered(delivered_id, claimed[0].leased_until)
         .await
         .expect("mark delivered");
 
@@ -254,8 +255,12 @@ pub(crate) async fn cancel_does_not_clobber_a_terminal_status<S: ScheduleStore>(
         .insert(&dead_lettered_message, MAX_ATTEMPTS)
         .await
         .expect("insert dead-lettered");
+    let claimed = store
+        .claim_due(SystemTime::now(), 10, Duration::from_secs(30))
+        .await
+        .expect("claim");
     store
-        .mark_dead_lettered(dead_lettered_id, "boom")
+        .mark_dead_lettered(dead_lettered_id, "boom", claimed[0].leased_until)
         .await
         .expect("dead letter");
 
@@ -319,8 +324,12 @@ pub(crate) async fn dead_letter_excludes_and_records_error<S: ScheduleStore>(sto
     let schedule_id = message.schedule_id;
     store.insert(&message, MAX_ATTEMPTS).await.expect("insert");
 
+    let claimed = store
+        .claim_due(SystemTime::now(), 10, Duration::from_secs(30))
+        .await
+        .expect("claim");
     store
-        .mark_dead_lettered(schedule_id, "boom")
+        .mark_dead_lettered(schedule_id, "boom", claimed[0].leased_until)
         .await
         .expect("dead letter");
     assert!(
@@ -343,11 +352,14 @@ pub(crate) async fn mark_delivered_excludes<S: ScheduleStore>(store: &S) {
     let schedule_id = message.schedule_id;
     store.insert(&message, MAX_ATTEMPTS).await.expect("insert");
 
-    store
+    let claimed = store
         .claim_due(SystemTime::now(), 10, Duration::from_secs(30))
         .await
         .expect("claim");
-    store.mark_delivered(schedule_id).await.expect("deliver");
+    store
+        .mark_delivered(schedule_id, claimed[0].leased_until)
+        .await
+        .expect("deliver");
     assert!(
         store
             .claim_due(SystemTime::now(), 10, Duration::from_secs(30))
@@ -360,11 +372,13 @@ pub(crate) async fn mark_delivered_excludes<S: ScheduleStore>(store: &S) {
     assert_eq!(snapshot.status, ScheduleStatus::Delivered);
 }
 
-/// A failed occurrence is deferred until `retry_at`: it is not reclaimable
-/// before that instant, becomes reclaimable at or after it, and the snapshot
-/// retains the error string. `attempts` is not incremented by `mark_failed`
-/// itself (it was already counted at claim time).
-pub(crate) async fn mark_failed_defers_reclaim_until_retry_at<S: ScheduleStore>(store: &S) {
+/// A failed occurrence is deferred by a relative `retry_in`, anchored on the
+/// database clock rather than a caller-supplied absolute instant (#355): it
+/// is not reclaimable before `retry_in` elapses, becomes reclaimable once it
+/// has, and the snapshot retains the error string. `attempts` is not
+/// incremented by `mark_failed` itself (it was already counted at claim
+/// time).
+pub(crate) async fn mark_failed_defers_reclaim_until_retry_in_elapses<S: ScheduleStore>(store: &S) {
     let message = delay_message(past(60));
     let schedule_id = message.schedule_id;
     store.insert(&message, MAX_ATTEMPTS).await.expect("insert");
@@ -377,21 +391,27 @@ pub(crate) async fn mark_failed_defers_reclaim_until_retry_at<S: ScheduleStore>(
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].attempts, 1);
 
-    // Defer retry to 2 seconds in the future.
-    let retry_at = SystemTime::now() + Duration::from_secs(2);
-    store
-        .mark_failed(schedule_id, retry_at, "connection refused")
+    // Defer retry by 2 seconds, fenced on the lease this claim stamped.
+    let retry_in = Duration::from_secs(2);
+    let applied = store
+        .mark_failed(
+            schedule_id,
+            retry_in,
+            "connection refused",
+            first[0].leased_until,
+        )
         .await
         .expect("mark_failed");
+    assert!(applied, "the freshly claimed lease must still be valid");
 
-    // Before retry_at: the occurrence must not be reclaimable.
+    // Before retry_in elapses: the occurrence must not be reclaimable.
     let too_early = store
         .claim_due(SystemTime::now(), 10, Duration::from_secs(30))
         .await
-        .expect("claim before retry_at");
+        .expect("claim before retry_in elapses");
     assert!(
         too_early.is_empty(),
-        "a failed schedule must not be reclaimable before retry_at"
+        "a failed schedule must not be reclaimable before retry_in elapses"
     );
 
     // The snapshot must reflect the error but remain Pending.
@@ -405,18 +425,18 @@ pub(crate) async fn mark_failed_defers_reclaim_until_retry_at<S: ScheduleStore>(
     // attempts must NOT have changed (still 1 from the claim, not 2).
     assert_eq!(snapshot.attempts, 1);
 
-    // Wait past retry_at.
+    // Wait past retry_in.
     tokio::time::sleep(Duration::from_millis(2_500)).await;
 
-    // At or after retry_at: the occurrence is reclaimable and attempts advance.
+    // Once retry_in has elapsed: the occurrence is reclaimable and attempts advance.
     let reclaimed = store
         .claim_due(SystemTime::now(), 10, Duration::from_secs(30))
         .await
-        .expect("claim after retry_at");
+        .expect("claim after retry_in elapses");
     assert_eq!(
         reclaimed.len(),
         1,
-        "must be reclaimable once retry_at has passed"
+        "must be reclaimable once retry_in has elapsed"
     );
     assert_eq!(reclaimed[0].attempts, 2, "attempts must advance on reclaim");
     assert_eq!(reclaimed[0].message.schedule_id, schedule_id);
@@ -498,8 +518,12 @@ pub(crate) async fn list_pending_orders_and_limits<S: ScheduleAdmin>(store: &S) 
 pub(crate) async fn list_dead_letter_reports_errors<S: ScheduleAdmin>(store: &S) {
     let message = delay_message(past(60));
     store.insert(&message, MAX_ATTEMPTS).await.expect("insert");
+    let claimed = store
+        .claim_due(SystemTime::now(), 10, Duration::from_secs(30))
+        .await
+        .expect("claim");
     store
-        .mark_dead_lettered(message.schedule_id, "boom")
+        .mark_dead_lettered(message.schedule_id, "boom", claimed[0].leased_until)
         .await
         .expect("dead");
     let listed = store.list_dead_letter(10).await.expect("list");
@@ -518,8 +542,12 @@ pub(crate) async fn list_dead_letter_orders_most_recently_dead_lettered_first<S:
         .insert(&first, MAX_ATTEMPTS)
         .await
         .expect("insert first");
+    let claimed_first = store
+        .claim_due(SystemTime::now(), 10, Duration::from_secs(30))
+        .await
+        .expect("claim first");
     store
-        .mark_dead_lettered(first.schedule_id, "first")
+        .mark_dead_lettered(first.schedule_id, "first", claimed_first[0].leased_until)
         .await
         .expect("dead letter first");
 
@@ -533,8 +561,12 @@ pub(crate) async fn list_dead_letter_orders_most_recently_dead_lettered_first<S:
         .insert(&second, MAX_ATTEMPTS)
         .await
         .expect("insert second");
+    let claimed_second = store
+        .claim_due(SystemTime::now(), 10, Duration::from_secs(30))
+        .await
+        .expect("claim second");
     store
-        .mark_dead_lettered(second.schedule_id, "second")
+        .mark_dead_lettered(second.schedule_id, "second", claimed_second[0].leased_until)
         .await
         .expect("dead letter second");
 
@@ -553,8 +585,12 @@ pub(crate) async fn list_dead_letter_orders_most_recently_dead_lettered_first<S:
 pub(crate) async fn replay_requeues_dead_letter<S: ScheduleAdmin>(store: &S) {
     let message = delay_message(past(60));
     store.insert(&message, MAX_ATTEMPTS).await.expect("insert");
+    let claimed = store
+        .claim_due(SystemTime::now(), 10, Duration::from_secs(30))
+        .await
+        .expect("claim");
     store
-        .mark_dead_lettered(message.schedule_id, "boom")
+        .mark_dead_lettered(message.schedule_id, "boom", claimed[0].leased_until)
         .await
         .expect("dead");
     store.replay(message.schedule_id).await.expect("replay");
@@ -583,4 +619,115 @@ pub(crate) async fn insert_due_batch<S: ScheduleStore>(store: &S, count: usize) 
         store.insert(&message, MAX_ATTEMPTS).await.expect("insert");
     }
     ids
+}
+
+/// Round-trip fencing (#352): the lease token `claim_due` returns applies the
+/// acknowledgement it is bound to. This exercises the real backend's
+/// timestamp round-trip end to end (PostgreSQL `TIMESTAMPTZ` microsecond
+/// precision, MySQL `DATETIME(6)`, SQLite millisecond text), not just the
+/// SQL generated for the statement.
+pub(crate) async fn ack_round_trips_the_claimed_lease<S: ScheduleStore>(store: &S) {
+    let message = delay_message(past(60));
+    let schedule_id = message.schedule_id;
+    store.insert(&message, MAX_ATTEMPTS).await.expect("insert");
+
+    let claimed = store
+        .claim_due(SystemTime::now(), 10, Duration::from_secs(30))
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1);
+
+    let applied = store
+        .mark_delivered(schedule_id, claimed[0].leased_until)
+        .await
+        .expect("mark_delivered with the freshly claimed token");
+    assert!(
+        applied,
+        "the token claim_due returned must round-trip back into the ack"
+    );
+
+    let snapshot = store.inspect(schedule_id).await.unwrap().unwrap();
+    assert_eq!(snapshot.status, ScheduleStatus::Delivered);
+}
+
+/// Round-trip fencing (#352): a lease token taken before another worker
+/// reclaimed the same occurrence is rejected, and the reclaiming worker's
+/// state is left untouched.
+pub(crate) async fn ack_with_a_stale_lease_is_rejected_after_reclaim<S: ScheduleStore>(store: &S) {
+    let message = delay_message(past(60));
+    let schedule_id = message.schedule_id;
+    store.insert(&message, MAX_ATTEMPTS).await.expect("insert");
+
+    let short_lease = Duration::from_millis(500);
+    let first = store
+        .claim_due(SystemTime::now(), 10, short_lease)
+        .await
+        .expect("first claim");
+    assert_eq!(first.len(), 1);
+    let stale_token = first[0].leased_until;
+
+    tokio::time::sleep(short_lease + Duration::from_millis(500)).await;
+
+    let reclaimed = store
+        .claim_due(SystemTime::now(), 10, Duration::from_secs(30))
+        .await
+        .expect("reclaim after expiry");
+    assert_eq!(reclaimed.len(), 1);
+    assert_ne!(
+        reclaimed[0].leased_until, stale_token,
+        "the reclaim must stamp a fresh, distinct token"
+    );
+
+    let applied = store
+        .mark_delivered(schedule_id, stale_token)
+        .await
+        .expect("mark_delivered with a stale token");
+    assert!(!applied, "a stale token must not apply");
+
+    let snapshot = store.inspect(schedule_id).await.unwrap().unwrap();
+    assert_eq!(
+        snapshot.status,
+        ScheduleStatus::Pending,
+        "the reclaimed occurrence must be untouched by the stale ack"
+    );
+}
+
+/// A schedule left `Pending`, exhausted and unleased by a crashed worker is
+/// swept to the dead-letter state by `dead_letter_exhausted`, and the sweep
+/// is idempotent.
+pub(crate) async fn dead_letter_exhausted_sweeps_crash_exhausted_schedules<S: ScheduleStore>(
+    store: &S,
+) {
+    let message = delay_message(past(60));
+    let schedule_id = message.schedule_id;
+    store.insert(&message, 1).await.expect("insert");
+
+    let short_lease = Duration::from_millis(500);
+    let claimed = store
+        .claim_due(SystemTime::now(), 10, short_lease)
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1);
+    assert!(claimed[0].is_exhausted());
+
+    tokio::time::sleep(short_lease + Duration::from_millis(500)).await;
+
+    let swept = store
+        .dead_letter_exhausted()
+        .await
+        .expect("sweep crash-exhausted schedules");
+    assert_eq!(swept, 1);
+
+    let snapshot = store.inspect(schedule_id).await.unwrap().unwrap();
+    assert_eq!(snapshot.status, ScheduleStatus::DeadLettered);
+    assert_eq!(
+        snapshot.last_error.as_deref(),
+        Some(hexeract_scheduler::DEAD_LETTER_EXHAUSTED_MESSAGE)
+    );
+
+    let swept_again = store
+        .dead_letter_exhausted()
+        .await
+        .expect("sweep again is idempotent");
+    assert_eq!(swept_again, 0, "sweeping must be idempotent");
 }

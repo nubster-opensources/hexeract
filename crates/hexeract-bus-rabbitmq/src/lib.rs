@@ -38,6 +38,7 @@ pub mod transport;
 pub mod worker;
 
 pub use connection::RabbitMqConnection;
+pub use connection::redact_uri;
 pub use pool::ChannelPool;
 pub use pool::PooledChannel;
 pub use topology::bind_queue;
