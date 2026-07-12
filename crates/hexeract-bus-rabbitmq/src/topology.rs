@@ -211,7 +211,7 @@ mod tests {
         // The connect itself already fails: no usable connection to
         // call ensure_topology on.
         let err = connection_result.expect_err("must fail to connect");
-        assert!(matches!(err, BusError::Connection(_)));
+        assert!(matches!(err, BusError::Connection { .. }));
     }
 
     #[test]

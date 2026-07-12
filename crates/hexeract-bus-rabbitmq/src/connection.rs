@@ -41,19 +41,47 @@ pub fn redact_uri(uri: &str) -> String {
     format!("{scheme}://***@{host_and_path}")
 }
 
+/// Connection properties shared by every connect path.
+///
+/// Auto-recovery is enabled so the lapin IO loop transparently reconnects
+/// on a network drop and replays the topology (exchanges, queues, bindings,
+/// consumers) on the new connection. A long-lived publisher therefore stays
+/// usable across a broker blip instead of failing forever, and a consumer's
+/// subscription is replayed without tearing down the worker (#334).
+///
+/// The recovery backoff is deliberately tightened. lapin applies this same
+/// backoff to the initial connection attempt, and its default retries for
+/// minutes: that would defeat [`RabbitMqConnection::connect_with_retry`],
+/// which owns the retry policy, and would delay the permanent-failure
+/// early-break (#340) by hammering a refused handshake before the real
+/// error surfaces. A short, bounded backoff keeps a refused or unreachable
+/// connect fast so our own loop and classifier stay in control, while still
+/// giving a live session a few quick reconnection attempts across a blip.
+fn connection_properties() -> ConnectionProperties {
+    ConnectionProperties::default()
+        .enable_auto_recover()
+        .configure_backoff(|builder| {
+            builder
+                .with_max_times(3)
+                .with_min_delay(Duration::from_millis(50))
+                .with_max_delay(Duration::from_millis(500))
+        })
+}
+
 /// Build a credential-safe [`BusError::Connection`] for a failed connect.
 ///
-/// The underlying `lapin` error is deliberately not chained as the
-/// source: for a malformed URI the `amq-protocol-uri` error embeds the
-/// raw URI (password included), and any error-chain formatter would
-/// expose it. The message carries only the redacted form.
-fn connection_error(uri: &str) -> BusError {
-    BusError::Connection(
+/// The underlying `lapin` error is deliberately not chained as the source:
+/// for a malformed URI the `amq-protocol-uri` error embeds the raw URI
+/// (password included), and any error-chain formatter would expose it. The
+/// message carries only the redacted form. `retryable` is the classification
+/// from [`is_transient`].
+fn connection_error(uri: &str, retryable: bool) -> BusError {
+    BusError::connection(
         format!(
             "failed to connect to rabbitmq broker at {}",
             redact_uri(uri)
-        )
-        .into(),
+        ),
+        retryable,
     )
 }
 
@@ -160,9 +188,9 @@ impl RabbitMqConnection {
     /// credentials: the raw `lapin` error (which can echo a malformed
     /// URI back) is dropped in favour of a credential-redacted message.
     pub async fn connect(uri: &str) -> Result<Self, BusError> {
-        let inner = Connection::connect(uri, ConnectionProperties::default())
+        let inner = Connection::connect(uri, connection_properties())
             .await
-            .map_err(|_err| connection_error(uri))?;
+            .map_err(|err| connection_error(uri, is_transient(&err)))?;
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -200,19 +228,29 @@ impl RabbitMqConnection {
         base_delay: Duration,
     ) -> Result<Self, BusError> {
         let attempts = attempts.max(1);
+        let mut retryable = true;
         for attempt in 1..=attempts {
-            match Connection::connect(uri, ConnectionProperties::default()).await {
+            match Connection::connect(uri, connection_properties()).await {
                 Ok(conn) => {
                     return Ok(Self {
                         inner: Arc::new(conn),
                     });
                 }
-                Err(_err) => {
+                Err(err) => {
+                    retryable = is_transient(&err);
                     tracing::warn!(
                         attempt,
+                        retryable,
                         uri = %redact_uri(uri),
                         "rabbitmq connect failed"
                     );
+                    // A permanent failure (bad credentials -> ACCESS_REFUSED,
+                    // unsupported protocol version) fails identically on every
+                    // retry: stop early instead of burning the whole budget
+                    // hammering a broker that refuses the handshake (#340).
+                    if !retryable {
+                        break;
+                    }
                     if attempt < attempts {
                         let shift = attempt.saturating_sub(1).min(8);
                         let delay = base_delay.checked_mul(1u32 << shift).unwrap_or(base_delay);
@@ -221,7 +259,7 @@ impl RabbitMqConnection {
                 }
             }
         }
-        Err(connection_error(uri))
+        Err(connection_error(uri, retryable))
     }
 
     /// Open a fresh AMQP channel on the underlying connection.
@@ -230,10 +268,10 @@ impl RabbitMqConnection {
     ///
     /// Returns [`BusError::Connection`] if the channel cannot be opened.
     pub async fn create_channel(&self) -> Result<Channel, BusError> {
-        self.inner
-            .create_channel()
-            .await
-            .map_err(|err| BusError::Connection(Box::new(err)))
+        self.inner.create_channel().await.map_err(|err| {
+            let retryable = is_transient(&err);
+            BusError::connection(err, retryable)
+        })
     }
 
     /// Open a short-lived channel, hand it to `f` and drop it when the
@@ -278,15 +316,26 @@ mod tests {
         )
         .await;
         let err = result.expect_err("must fail to connect");
-        assert!(matches!(err, BusError::Connection(_)));
+        assert!(matches!(err, BusError::Connection { .. }));
     }
 
     #[tokio::test]
     async fn connect_returns_connection_error_on_unreachable_broker() {
+        let started = std::time::Instant::now();
         let err = RabbitMqConnection::connect("amqp://127.0.0.1:1")
             .await
             .expect_err("must fail to connect");
-        assert!(matches!(err, BusError::Connection(_)));
+        assert!(matches!(err, BusError::Connection { .. }));
+        // Regression guard for the bounded backoff. A refused connect to a
+        // closed local port returns instantly at the TCP layer; without the
+        // tightened backoff in `connection_properties`, lapin's default
+        // auto-recover loop turns that instant refusal into a minutes-long
+        // retry. Ten seconds is far below that yet tolerant of CI noise.
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "a refused connect must fail fast, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -355,7 +404,20 @@ mod tests {
             Duration::from_millis(1),
         )
         .await;
-        assert!(matches!(result, Err(BusError::Connection(_))));
+        assert!(matches!(result, Err(BusError::Connection { .. })));
+    }
+
+    #[test]
+    fn connection_properties_enable_auto_recover() {
+        // Locks the #334 fix at the source without a broker: the shared
+        // properties must carry auto-recovery, otherwise a dropped publisher
+        // connection would never heal. ConnectionProperties has no getter, so
+        // assert through its Debug rendering.
+        let rendered = format!("{:?}", connection_properties());
+        assert!(
+            rendered.contains("auto_recover: true"),
+            "connect paths must enable auto-recovery, got {rendered}"
+        );
     }
 
     #[test]

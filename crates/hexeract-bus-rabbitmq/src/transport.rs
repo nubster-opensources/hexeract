@@ -497,7 +497,7 @@ mod tests {
         let err = RabbitMqTransport::new("amqp://127.0.0.1:1")
             .await
             .expect_err("must fail to connect");
-        assert!(matches!(err, BusError::Connection(_)));
+        assert!(matches!(err, BusError::Connection { .. }));
     }
 
     #[tokio::test]
@@ -506,7 +506,7 @@ mod tests {
         let err = RabbitMqTransport::with_exchange("amqp://127.0.0.1:1", exchange)
             .await
             .expect_err("must fail to connect");
-        assert!(matches!(err, BusError::Connection(_)));
+        assert!(matches!(err, BusError::Connection { .. }));
     }
 
     #[test]

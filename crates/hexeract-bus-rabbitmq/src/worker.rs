@@ -612,9 +612,9 @@ impl RabbitMqWorker {
                         if cancel.is_cancelled() {
                             break;
                         }
-                        return Err(BusError::Connection(
-                            "rabbitmq consumer stream ended unexpectedly: connection or channel lost"
-                                .into(),
+                        return Err(BusError::connection(
+                            "rabbitmq consumer stream ended unexpectedly: connection or channel lost",
+                            true,
                         ));
                     };
                     match item {

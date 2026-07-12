@@ -985,7 +985,7 @@ async fn worker_run_returns_connection_error_when_broker_stops() {
         .expect("worker must exit after the broker stops")
         .expect("worker task must not panic");
     assert!(
-        matches!(result, Err(BusError::Connection(_))),
+        matches!(result, Err(BusError::Connection { .. })),
         "a dead broker must surface as a connection error so a supervisor restarts the worker, got {result:?}"
     );
 }
