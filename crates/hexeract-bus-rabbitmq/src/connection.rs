@@ -6,6 +6,7 @@ use hexeract_bus::BusError;
 use lapin::Channel;
 use lapin::Connection;
 use lapin::ConnectionProperties;
+use lapin::ErrorKind;
 
 /// Redact the credentials of a connection URI for safe logging.
 ///
@@ -53,6 +54,36 @@ fn connection_error(uri: &str) -> BusError {
             redact_uri(uri)
         )
         .into(),
+    )
+}
+
+/// Classify a lapin failure as transient (worth retrying) or permanent.
+///
+/// Reads only the error *shape* through [`lapin::Error::kind`], never its
+/// formatted content, so it is safe on the credential-bearing connect path
+/// where the content can echo the URI. Transient failures are transport
+/// level (TCP refused, reset, timed out); a permanent failure is an AMQP
+/// handshake rejection (bad credentials surface as `ACCESS_REFUSED`, an
+/// unsupported protocol version, or an authentication provider error) that
+/// would fail identically on every retry and must not be hammered (#340).
+///
+/// lapin's own `Error::can_be_recovered` is deliberately not used: it
+/// classifies every `ProtocolError` as recoverable, so it would retry an
+/// `ACCESS_REFUSED`, which is exactly the bug this classifier prevents.
+pub(crate) fn is_transient(error: &lapin::Error) -> bool {
+    // Permanent kinds are enumerated; everything else (transport-level
+    // IOError, and any future `#[non_exhaustive]` variant such as a
+    // channel/connection state during a recovery gap or a missing
+    // heartbeat) is transient, so a retry or auto-recovery is given a
+    // chance to heal it, bounded by the caller's attempt budget. Expressed
+    // as a negated match so the shared `true` outcomes do not trip
+    // clippy::match_same_arms (pedantic, denied at the workspace level).
+    !matches!(
+        error.kind(),
+        ErrorKind::InvalidProtocolVersion(_)
+            | ErrorKind::AuthProviderError(_)
+            | ErrorKind::RuntimeShutdownError(_)
+            | ErrorKind::ProtocolError(_)
     )
 }
 
@@ -325,5 +356,18 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(BusError::Connection(_))));
+    }
+
+    #[test]
+    fn is_transient_true_for_io_error() {
+        // A TCP-level failure (refused, reset, timed out) is transient and
+        // worth retrying. lapin exposes `From<std::io::Error>`, so this
+        // branch is unit-testable without a broker; the permanent branches
+        // (ACCESS_REFUSED etc.) are covered by the integration suite.
+        let err: lapin::Error = std::io::Error::other("connection reset").into();
+        assert!(
+            is_transient(&err),
+            "an IO failure must classify as transient"
+        );
     }
 }
