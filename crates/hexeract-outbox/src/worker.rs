@@ -88,7 +88,7 @@ pub trait OutboxStore: Send + Sync + 'static {
     /// Called by the worker after [`Self::mark_failed`] when
     /// `attempts + 1 >= max_attempts`. The default implementation is a no-op so
     /// backends that do not persist dead-lettered envelopes need not override it.
-    /// Called within the same transaction as `mark_failed` — both succeed or both
+    /// Called within the same transaction as `mark_failed`: both succeed or both
     /// roll back.
     async fn mark_dead_lettered<'a>(
         &self,
@@ -398,7 +398,7 @@ where
     }
 
     async fn poll_cycle(&self, cancel: &CancellationToken) -> Result<usize, OutboxError> {
-        // Phase 1 — claim (short transaction: SQL only, no handler I/O)
+        // Phase 1: claim (short transaction: SQL only, no handler I/O)
         // The FOR UPDATE SKIP LOCKED locks are held only for the SELECT +
         // the claim UPDATE, then released at commit. Competing workers can
         // immediately pick up other rows.
@@ -420,7 +420,7 @@ where
         };
         let count = envelopes.len();
 
-        // Phase 2 — dispatch + ack (one transaction per envelope, outside the poll lock)
+        // Phase 2: dispatch + ack (one transaction per envelope, outside the poll lock)
         for envelope in &envelopes {
             // Isolate per-envelope settle failures: a transient DB error while
             // acking one envelope must not abandon the rest of the claimed

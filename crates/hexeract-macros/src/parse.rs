@@ -694,7 +694,7 @@ mod tests {
         let item = quote! {
             impl H {
                 async fn handle(&self, cmd: C, ctx: &HandlerContext) -> {
-                    // missing return type — malformed
+                    // missing return type: malformed
                 }
             }
         };
