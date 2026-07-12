@@ -1,0 +1,32 @@
+# Changelog
+
+All notable changes to this crate are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Changed
+
+- Breaking: `BusError::Connection` is now a struct variant `{ source, retryable }`.
+  Build it with `BusError::connection(source, retryable)` and read the transience
+  classification with `BusError::is_retryable_connection()`.
+
+### Fixed
+
+- The publisher self-heals after a broker outage: the connection enables lapin
+  auto-recovery, so a long-lived publisher transparently reconnects and replays
+  its topology instead of failing forever (#334).
+- A publish issued during the reconnect window is retried once across the
+  recovered channel, so a transient blip does not surface as a publish failure
+  (#334).
+- Connect fails fast on a permanent authentication failure (`ACCESS_REFUSED`)
+  instead of hammering the broker through the whole retry budget. The shared
+  recovery backoff is bounded so a refused or unreachable connect returns
+  promptly rather than looping for minutes (#340).
+- Transient requeue nacks are paced, ending the redelivery hot loop that spun
+  the CPU when a retry or dead-letter publish kept failing (#336).
+- In-flight `no_ack` handlers are drained at shutdown, so a cancelled
+  unacknowledged consumer no longer silently loses messages that the broker had
+  already removed from the queue (#338).
