@@ -1494,3 +1494,44 @@ async fn channel_pool_bounds_live_channels_and_returns_them_under_contention() {
         "all live channels must be returned to the pool; cache holds {idle} of {max_size}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn connect_with_retry_fails_fast_on_access_refused() {
+    let (container, _uri) = start_rabbit().await;
+    // Same host and port as the running container, deliberately wrong
+    // credentials. The default image accepts guest/guest, so guest with a
+    // bad password triggers an ACCESS_REFUSED handshake rejection.
+    let host = container
+        .get_host()
+        .await
+        .expect("rabbitmq container must expose a host");
+    let port = container
+        .get_host_port_ipv4(5672)
+        .await
+        .expect("rabbitmq container must expose AMQP port");
+    let bad_uri = format!("amqp://guest:wrong-password@{host}:{port}/%2f");
+
+    let started = std::time::Instant::now();
+    // A generous per-attempt delay: if the loop wrongly retried all five
+    // attempts it would sleep for seconds. A permanent failure must return
+    // after the first classified attempt without draining the budget.
+    let result = RabbitMqConnection::connect_with_retry(&bad_uri, 5, Duration::from_secs(2)).await;
+    let elapsed = started.elapsed();
+
+    let err = result.expect_err("bad credentials must fail");
+    assert_eq!(
+        err.is_retryable_connection(),
+        Some(false),
+        "ACCESS_REFUSED must be classified permanent"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "a permanent failure must not sleep through the retry budget, took {elapsed:?}"
+    );
+    let rendered = format!("{err:?} {err}");
+    assert!(
+        !rendered.contains("wrong-password"),
+        "the credential must never leak into the error"
+    );
+}
