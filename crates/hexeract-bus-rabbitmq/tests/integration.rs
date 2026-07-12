@@ -1589,3 +1589,80 @@ async fn publish_recovers_after_a_broker_blip() {
         "publisher must self-heal after a broker blip (#334)"
     );
 }
+
+#[derive(Debug)]
+struct SlowCountingHandler {
+    done: Arc<AtomicUsize>,
+}
+
+impl Handler<OrderPlaced> for SlowCountingHandler {
+    type Error = hexeract_bus::BusError;
+
+    async fn handle(
+        &self,
+        _message: OrderPlaced,
+        _ctx: &HandlerContext,
+    ) -> Result<(), Self::Error> {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        self.done.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker"]
+async fn no_ack_shutdown_drains_in_flight_handlers() {
+    let (_container, uri) = start_rabbit().await;
+    let queue_name = "noack.drain";
+    declare_temporary_queue(&uri, queue_name).await;
+
+    let done = Arc::new(AtomicUsize::new(0));
+    let transport = RabbitMqTransport::new(&uri)
+        .await
+        .expect("transport connects");
+    let batch = 4usize;
+    for _ in 0..batch {
+        transport
+            .publish(
+                queue_name,
+                &OrderPlaced {
+                    order_id: Uuid::now_v7(),
+                },
+            )
+            .await
+            .expect("publish succeeds");
+    }
+
+    let consumer_conn = RabbitMqConnection::connect(&uri)
+        .await
+        .expect("consumer connects");
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .ack_mode(AckMode::Unacknowledged)
+        .max_buffered(batch)
+        .register_handler::<OrderPlaced, _>(SlowCountingHandler {
+            done: Arc::clone(&done),
+        })
+        .build()
+        .expect("worker builds");
+
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
+
+    // Let all deliveries enter their (slow) handlers, then cancel mid-flight.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cancel.cancel();
+
+    tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("worker drains and exits")
+        .expect("worker task joins")
+        .expect("worker run returns Ok");
+
+    assert_eq!(
+        done.load(Ordering::SeqCst),
+        batch,
+        "every in-flight no_ack handler must finish before shutdown (#338)"
+    );
+}
