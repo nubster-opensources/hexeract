@@ -4,7 +4,7 @@
 //! the macro is expanded in a compilation unit that belongs to `hexeract-core`
 //! (integration tests, examples, doctests). Before the fix, the `Itself` arm
 //! emitted the bare `crate` keyword as the root path, which refers to the
-//! integration-test binary rather than the library — causing every generated
+//! integration-test binary rather than the library, causing every generated
 //! path (`crate::CommandHandler`, `crate::HandlerContext`, etc.) to fail to
 //! resolve. After the fix the absolute path `::hexeract_core` is emitted,
 //! which resolves correctly in all compilation contexts.

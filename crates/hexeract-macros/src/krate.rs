@@ -24,7 +24,7 @@ use syn::Ident;
 /// # `Itself` handling
 ///
 /// `proc_macro_crate` returns [`FoundCrate::Itself`] when the macro expansion
-/// point is inside `hexeract-core` or `hexeract` itself — including integration
+/// point is inside `hexeract-core` or `hexeract` itself, including integration
 /// tests, examples, doctests and benchmarks of those crates, where `crate`
 /// refers to the test/example compilation unit rather than the library. Using
 /// the bare `crate` keyword would generate unresolvable paths in all of those
