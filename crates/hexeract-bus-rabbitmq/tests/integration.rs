@@ -1535,3 +1535,57 @@ async fn connect_with_retry_fails_fast_on_access_refused() {
         "the credential must never leak into the error"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker"]
+async fn publish_recovers_after_a_broker_blip() {
+    let (container, uri) = start_rabbit().await;
+    let queue_name = "publish.recovery";
+    declare_temporary_queue(&uri, queue_name).await;
+
+    let transport = RabbitMqTransport::new(&uri)
+        .await
+        .expect("transport connects");
+
+    // Publish once while healthy.
+    transport
+        .publish(
+            queue_name,
+            &OrderPlaced {
+                order_id: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("first publish succeeds");
+
+    // Freeze then resume the broker to force a reconnect.
+    container.pause().await.expect("broker pauses");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    container.unpause().await.expect("broker resumes");
+
+    // A publish issued after the blip must eventually succeed on its own,
+    // without rebuilding the transport. Retry the call a few times to absorb
+    // the reconnection window; the point is that it recovers rather than
+    // failing forever.
+    let mut published = false;
+    for _ in 0..20 {
+        if transport
+            .publish(
+                queue_name,
+                &OrderPlaced {
+                    order_id: Uuid::now_v7(),
+                },
+            )
+            .await
+            .is_ok()
+        {
+            published = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        published,
+        "publisher must self-heal after a broker blip (#334)"
+    );
+}
