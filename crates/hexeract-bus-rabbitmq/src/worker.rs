@@ -61,6 +61,11 @@ pub const DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(5);
 /// Default cap on the size of a consumed payload, in bytes (1 MiB).
 pub const DEFAULT_MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 
+/// Pause inserted before requeue-nacking a delivery whose transient
+/// retry/dead-letter publish failed, so a persistently failing publish paces
+/// the redelivery loop instead of spinning the CPU (#336).
+const REQUEUE_PACE: Duration = Duration::from_millis(500);
+
 /// Decision taken after an attempt to settle a delivery with the broker.
 ///
 /// A single transient broker error on `basic_ack` / `basic_nack` /
@@ -846,6 +851,11 @@ impl RabbitMqWorker {
         requeue: bool,
         context: &str,
     ) -> Result<(), BusError> {
+        if let Some(pace) = Self::requeue_pace(requeue) {
+            // Cadence the transient redelivery so a persistently failing
+            // publish does not spin the broker in a hot loop (#336).
+            tokio::time::sleep(pace).await;
+        }
         let nacked = channel
             .basic_nack(
                 delivery.delivery_tag,
@@ -884,6 +894,15 @@ impl RabbitMqWorker {
     ///   recoverable, so requeue (`requeue: true`) for another attempt.
     const fn requeue_on_publish_failure(err: &BusError) -> bool {
         !matches!(err, BusError::Unroutable { .. })
+    }
+
+    /// How long to pace a requeue nack, if at all.
+    ///
+    /// A transient publish failure (`requeue == true`) is paced by
+    /// [`REQUEUE_PACE`]; an unroutable drop (`requeue == false`) is never
+    /// paced because the delivery leaves the queue instead of coming back.
+    const fn requeue_pace(requeue: bool) -> Option<Duration> {
+        if requeue { Some(REQUEUE_PACE) } else { None }
     }
 
     /// Publish-then-settle core of the retry path, generic over the
@@ -1582,6 +1601,15 @@ mod tests {
             RabbitMqWorker::requeue_on_publish_failure(&transient),
             "a transient transport error must requeue for another attempt"
         );
+    }
+
+    #[test]
+    fn requeue_pace_paces_only_transient_requeue() {
+        // A transient publish failure (requeue: true) is paced so the broker
+        // does not redeliver instantly in a hot CPU loop; an unroutable drop
+        // (requeue: false) leaves the queue and is never paced (#336).
+        assert_eq!(RabbitMqWorker::requeue_pace(true), Some(REQUEUE_PACE));
+        assert_eq!(RabbitMqWorker::requeue_pace(false), None);
     }
 
     #[test]
