@@ -19,8 +19,19 @@ pub enum BusError {
     Transport(#[source] Box<dyn std::error::Error + Send + Sync>),
 
     /// The transport could not establish or maintain a connection to the broker.
+    ///
+    /// `retryable` records whether the failure is transient (a retry or an
+    /// automatic reconnection may succeed) or permanent (bad credentials,
+    /// an unsupported protocol version): a permanent failure must not be
+    /// hammered by a reconnect loop.
     #[error("connection error")]
-    Connection(#[source] Box<dyn std::error::Error + Send + Sync>),
+    Connection {
+        /// The underlying driver error, preserved as a boxed source.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+        /// Whether the failure is transient and worth retrying.
+        retryable: bool,
+    },
 
     /// A mandatory publish was returned by the broker as unroutable.
     ///
@@ -90,6 +101,36 @@ pub enum BusError {
     Internal(String),
 }
 
+impl BusError {
+    /// Build a [`BusError::Connection`] from a boxed source and a
+    /// transience hint.
+    ///
+    /// `retryable` is `true` when the failure is transient (a retry or an
+    /// automatic reconnection may succeed) and `false` when it is permanent
+    /// (bad credentials, an unsupported protocol version).
+    pub fn connection(
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+        retryable: bool,
+    ) -> Self {
+        Self::Connection {
+            source: source.into(),
+            retryable,
+        }
+    }
+
+    /// Whether a [`BusError::Connection`] was classified as transient.
+    ///
+    /// Returns `None` for every other variant, so a caller can distinguish
+    /// "not a connection error" from "a connection error that is permanent".
+    #[must_use]
+    pub fn is_retryable_connection(&self) -> Option<bool> {
+        match self {
+            Self::Connection { retryable, .. } => Some(*retryable),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,9 +155,21 @@ mod tests {
     #[test]
     fn connection_error_preserves_source_chain() {
         let inner = std::io::Error::other("amqp handshake failed");
-        let error = BusError::Connection(Box::new(inner));
+        let error = BusError::connection(inner, true);
         let source = std::error::Error::source(&error).expect("source must be set");
         assert_eq!(source.to_string(), "amqp handshake failed");
+    }
+
+    #[test]
+    fn connection_carries_retryable_flag() {
+        let permanent = BusError::connection(std::io::Error::other("access refused"), false);
+        assert_eq!(permanent.is_retryable_connection(), Some(false));
+        let transient = BusError::connection(std::io::Error::other("reset"), true);
+        assert_eq!(transient.is_retryable_connection(), Some(true));
+        assert_eq!(
+            BusError::Internal("x".to_owned()).is_retryable_connection(),
+            None
+        );
     }
 
     #[test]

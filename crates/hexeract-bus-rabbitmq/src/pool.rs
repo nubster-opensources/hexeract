@@ -113,7 +113,7 @@ impl ChannelPool {
         let permit = Arc::clone(&self.live)
             .acquire_owned()
             .await
-            .map_err(|err| BusError::Connection(Box::new(err)))?;
+            .map_err(|err| BusError::connection(err, false))?;
 
         let cached = {
             let mut idle = self.lock_idle();
@@ -134,7 +134,10 @@ impl ChannelPool {
                 channel
                     .confirm_select(ConfirmSelectOptions::default())
                     .await
-                    .map_err(|err| BusError::Connection(Box::new(err)))?;
+                    .map_err(|err| {
+                        let retryable = crate::connection::is_transient(&err);
+                        BusError::connection(err, retryable)
+                    })?;
             }
             channel
         };

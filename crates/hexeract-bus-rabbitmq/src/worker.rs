@@ -40,6 +40,7 @@ use lapin::types::ShortString;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
 use crate::connection::RabbitMqConnection;
@@ -60,6 +61,16 @@ pub const DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// Default cap on the size of a consumed payload, in bytes (1 MiB).
 pub const DEFAULT_MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+/// Pause inserted before requeue-nacking a delivery whose transient
+/// retry/dead-letter publish failed, so a persistently failing publish paces
+/// the redelivery loop instead of spinning the CPU (#336).
+const REQUEUE_PACE: Duration = Duration::from_millis(500);
+
+/// Upper bound on how long shutdown waits for in-flight `no_ack` handlers to
+/// finish before giving up, so a wedged handler cannot block shutdown forever
+/// (#338).
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Decision taken after an attempt to settle a delivery with the broker.
 ///
@@ -601,6 +612,11 @@ impl RabbitMqWorker {
             .await
             .map_err(|err| BusError::Transport(Box::new(err)))?;
 
+        // Tracks in-flight no_ack dispatches so shutdown can drain them
+        // instead of dropping them (#338). Empty on the acked paths, where
+        // the draining wait resolves immediately.
+        let tracker = TaskTracker::new();
+
         loop {
             tokio::select! {
                 () = cancel.cancelled() => {
@@ -612,9 +628,9 @@ impl RabbitMqWorker {
                         if cancel.is_cancelled() {
                             break;
                         }
-                        return Err(BusError::Connection(
-                            "rabbitmq consumer stream ended unexpectedly: connection or channel lost"
-                                .into(),
+                        return Err(BusError::connection(
+                            "rabbitmq consumer stream ended unexpectedly: connection or channel lost",
+                            true,
                         ));
                     };
                     match item {
@@ -630,7 +646,7 @@ impl RabbitMqWorker {
                                 let permit = flow_control.acquire().await?;
                                 let worker = Arc::clone(&this);
                                 let channel = channel.clone();
-                                tokio::spawn(async move {
+                                tracker.spawn(async move {
                                     let _permit = permit;
                                     let _ = worker.dispatch(&channel, delivery).await;
                                 });
@@ -648,6 +664,7 @@ impl RabbitMqWorker {
                 }
             }
         }
+        drain_in_flight(&tracker, SHUTDOWN_DRAIN_TIMEOUT).await;
         Ok(())
     }
 
@@ -846,6 +863,11 @@ impl RabbitMqWorker {
         requeue: bool,
         context: &str,
     ) -> Result<(), BusError> {
+        if let Some(pace) = Self::requeue_pace(requeue) {
+            // Cadence the transient redelivery so a persistently failing
+            // publish does not spin the broker in a hot loop (#336).
+            tokio::time::sleep(pace).await;
+        }
         let nacked = channel
             .basic_nack(
                 delivery.delivery_tag,
@@ -884,6 +906,15 @@ impl RabbitMqWorker {
     ///   recoverable, so requeue (`requeue: true`) for another attempt.
     const fn requeue_on_publish_failure(err: &BusError) -> bool {
         !matches!(err, BusError::Unroutable { .. })
+    }
+
+    /// How long to pace a requeue nack, if at all.
+    ///
+    /// A transient publish failure (`requeue == true`) is paced by
+    /// [`REQUEUE_PACE`]; an unroutable drop (`requeue == false`) is never
+    /// paced because the delivery leaves the queue instead of coming back.
+    const fn requeue_pace(requeue: bool) -> Option<Duration> {
+        if requeue { Some(REQUEUE_PACE) } else { None }
     }
 
     /// Publish-then-settle core of the retry path, generic over the
@@ -1260,6 +1291,21 @@ pub(crate) fn wait_queue_name(queue: &str) -> String {
     format!("{queue}{RETRY_QUEUE_SUFFIX}")
 }
 
+/// Close `tracker` and wait for every in-flight task to finish, bounded by
+/// `timeout`. Logs a warning if the drain does not complete in time.
+///
+/// Used at shutdown of a `no_ack` consumer: those deliveries are already
+/// removed from the broker, so a dropped in-flight task would silently lose a
+/// message. Draining lets each handler run to completion instead (#338).
+async fn drain_in_flight(tracker: &TaskTracker, timeout: Duration) {
+    tracker.close();
+    if tokio::time::timeout(timeout, tracker.wait()).await.is_err() {
+        tracing::warn!(
+            "rabbitmq worker shutdown drain timed out; some no_ack handlers were still in flight"
+        );
+    }
+}
+
 /// Read the broker-maintained retry count from the `x-death` header.
 ///
 /// Each time the broker dead-letters a message it appends or updates
@@ -1581,6 +1627,37 @@ mod tests {
         assert!(
             RabbitMqWorker::requeue_on_publish_failure(&transient),
             "a transient transport error must requeue for another attempt"
+        );
+    }
+
+    #[test]
+    fn requeue_pace_paces_only_transient_requeue() {
+        // A transient publish failure (requeue: true) is paced so the broker
+        // does not redeliver instantly in a hot CPU loop; an unroutable drop
+        // (requeue: false) leaves the queue and is never paced (#336).
+        assert_eq!(RabbitMqWorker::requeue_pace(true), Some(REQUEUE_PACE));
+        assert_eq!(RabbitMqWorker::requeue_pace(false), None);
+    }
+
+    #[tokio::test]
+    async fn drain_in_flight_waits_for_spawned_tasks() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio_util::task::TaskTracker;
+
+        let done = Arc::new(AtomicUsize::new(0));
+        let tracker = TaskTracker::new();
+        for _ in 0..8 {
+            let done = Arc::clone(&done);
+            tracker.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                done.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        drain_in_flight(&tracker, Duration::from_secs(5)).await;
+        assert_eq!(
+            done.load(Ordering::SeqCst),
+            8,
+            "drain must wait for every in-flight no_ack handler to finish (#338)"
         );
     }
 

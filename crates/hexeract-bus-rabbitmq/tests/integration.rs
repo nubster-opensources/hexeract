@@ -985,7 +985,7 @@ async fn worker_run_returns_connection_error_when_broker_stops() {
         .expect("worker must exit after the broker stops")
         .expect("worker task must not panic");
     assert!(
-        matches!(result, Err(BusError::Connection(_))),
+        matches!(result, Err(BusError::Connection { .. })),
         "a dead broker must surface as a connection error so a supervisor restarts the worker, got {result:?}"
     );
 }
@@ -1492,5 +1492,184 @@ async fn channel_pool_bounds_live_channels_and_returns_them_under_contention() {
     assert_eq!(
         idle, max_size,
         "all live channels must be returned to the pool; cache holds {idle} of {max_size}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn connect_with_retry_fails_fast_on_access_refused() {
+    let (container, _uri) = start_rabbit().await;
+    // Same host and port as the running container, deliberately wrong
+    // credentials. The default image accepts guest/guest, so guest with a
+    // bad password triggers an ACCESS_REFUSED handshake rejection.
+    let host = container
+        .get_host()
+        .await
+        .expect("rabbitmq container must expose a host");
+    let port = container
+        .get_host_port_ipv4(5672)
+        .await
+        .expect("rabbitmq container must expose AMQP port");
+    let bad_uri = format!("amqp://guest:wrong-password@{host}:{port}/%2f");
+
+    let started = std::time::Instant::now();
+    // A generous per-attempt delay: if the loop wrongly retried all five
+    // attempts it would sleep ~30s (2 + 4 + 8 + 16). A permanent failure must
+    // break the loop early instead of draining that budget.
+    let result = RabbitMqConnection::connect_with_retry(&bad_uri, 5, Duration::from_secs(2)).await;
+    let elapsed = started.elapsed();
+
+    let err = result.expect_err("bad credentials must fail");
+    assert_eq!(
+        err.is_retryable_connection(),
+        Some(false),
+        "ACCESS_REFUSED must be classified permanent"
+    );
+    // A freshly started broker consistently rejects the very first handshake
+    // with a transient error before it is ready to return a clean
+    // ACCESS_REFUSED, so the loop sleeps exactly one base delay (2s) and then
+    // classifies the second attempt as permanent: ~2s total. The next
+    // transient retry would only be reached at ~6s (2 + 4), so a 3s ceiling
+    // proves the early break with a clean margin without weakening the
+    // fail-fast against the ~30s full-budget drain (#340).
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "a permanent failure must not sleep through the retry budget, took {elapsed:?}"
+    );
+    let rendered = format!("{err:?} {err}");
+    assert!(
+        !rendered.contains("wrong-password"),
+        "the credential must never leak into the error"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker"]
+async fn publish_recovers_after_a_broker_blip() {
+    let (container, uri) = start_rabbit().await;
+    let queue_name = "publish.recovery";
+    declare_temporary_queue(&uri, queue_name).await;
+
+    let transport = RabbitMqTransport::new(&uri)
+        .await
+        .expect("transport connects");
+
+    // Publish once while healthy.
+    transport
+        .publish(
+            queue_name,
+            &OrderPlaced {
+                order_id: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("first publish succeeds");
+
+    // Freeze then resume the broker to force a reconnect.
+    container.pause().await.expect("broker pauses");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    container.unpause().await.expect("broker resumes");
+
+    // A publish issued after the blip must eventually succeed on its own,
+    // without rebuilding the transport. Retry the call a few times to absorb
+    // the reconnection window; the point is that it recovers rather than
+    // failing forever.
+    let mut published = false;
+    for _ in 0..20 {
+        if transport
+            .publish(
+                queue_name,
+                &OrderPlaced {
+                    order_id: Uuid::now_v7(),
+                },
+            )
+            .await
+            .is_ok()
+        {
+            published = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        published,
+        "publisher must self-heal after a broker blip (#334)"
+    );
+}
+
+#[derive(Debug)]
+struct SlowCountingHandler {
+    done: Arc<AtomicUsize>,
+}
+
+impl Handler<OrderPlaced> for SlowCountingHandler {
+    type Error = hexeract_bus::BusError;
+
+    async fn handle(
+        &self,
+        _message: OrderPlaced,
+        _ctx: &HandlerContext,
+    ) -> Result<(), Self::Error> {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        self.done.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker"]
+async fn no_ack_shutdown_drains_in_flight_handlers() {
+    let (_container, uri) = start_rabbit().await;
+    let queue_name = "noack.drain";
+    declare_temporary_queue(&uri, queue_name).await;
+
+    let done = Arc::new(AtomicUsize::new(0));
+    let transport = RabbitMqTransport::new(&uri)
+        .await
+        .expect("transport connects");
+    let batch = 4usize;
+    for _ in 0..batch {
+        transport
+            .publish(
+                queue_name,
+                &OrderPlaced {
+                    order_id: Uuid::now_v7(),
+                },
+            )
+            .await
+            .expect("publish succeeds");
+    }
+
+    let consumer_conn = RabbitMqConnection::connect(&uri)
+        .await
+        .expect("consumer connects");
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .ack_mode(AckMode::Unacknowledged)
+        .max_buffered(batch)
+        .register_handler::<OrderPlaced, _>(SlowCountingHandler {
+            done: Arc::clone(&done),
+        })
+        .build()
+        .expect("worker builds");
+
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
+
+    // Let all deliveries enter their (slow) handlers, then cancel mid-flight.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cancel.cancel();
+
+    tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("worker drains and exits")
+        .expect("worker task joins")
+        .expect("worker run returns Ok");
+
+    assert_eq!(
+        done.load(Ordering::SeqCst),
+        batch,
+        "every in-flight no_ack handler must finish before shutdown (#338)"
     );
 }

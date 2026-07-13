@@ -83,14 +83,18 @@ impl RabbitMqTransport {
     ///
     /// Uses the bounded reconnect loop from
     /// [`RabbitMqConnection::connect_with_retry`] with the crate-wide
-    /// [`DEFAULT_RETRY_ATTEMPTS`] and [`DEFAULT_RETRY_BASE_DELAY`].
+    /// [`DEFAULT_RETRY_ATTEMPTS`] and [`DEFAULT_RETRY_BASE_DELAY`]. The
+    /// resulting publisher connection has lapin auto-recovery enabled, so it
+    /// heals itself across a broker blip instead of failing forever (#334): a
+    /// publisher is long lived and has no supervisor to rebuild it, unlike a
+    /// [`crate::RabbitMqWorker`], whose supervisor owns its recovery.
     ///
     /// # Errors
     ///
     /// Returns [`BusError::Connection`] if the broker remains
     /// unreachable after the retry loop exits.
     pub async fn new(connection_string: &str) -> Result<Self, BusError> {
-        let connection = RabbitMqConnection::connect_with_retry(
+        let connection = RabbitMqConnection::connect_with_retry_recovering(
             connection_string,
             DEFAULT_RETRY_ATTEMPTS,
             DEFAULT_RETRY_BASE_DELAY,
@@ -119,7 +123,7 @@ impl RabbitMqTransport {
         connection_string: &str,
         exchange: Exchange,
     ) -> Result<Self, BusError> {
-        let connection = RabbitMqConnection::connect_with_retry(
+        let connection = RabbitMqConnection::connect_with_retry_recovering(
             connection_string,
             DEFAULT_RETRY_ATTEMPTS,
             DEFAULT_RETRY_BASE_DELAY,
@@ -204,27 +208,52 @@ impl RabbitMqTransport {
         routing_key: &str,
         envelope: &BusEnvelope,
     ) -> Result<Uuid, BusError> {
-        let pooled = self.pool.acquire().await?;
         let properties = envelope_to_properties(envelope)?;
         let exchange = to_short_string(self.exchange.as_str(), "exchange name")?;
         let routing_key_short = to_short_string(routing_key, "routing key")?;
         let confirms = self.pool.confirms();
-        let confirmation = pooled
-            .channel()
-            .basic_publish(
-                exchange,
-                routing_key_short,
-                BasicPublishOptions {
-                    mandatory: confirms,
-                    ..BasicPublishOptions::default()
-                },
-                &envelope.payload,
-                properties,
-            )
-            .await
-            .map_err(|err| BusError::Transport(Box::new(err)))?
-            .await
-            .map_err(|err| BusError::Transport(Box::new(err)))?;
+
+        // One recovery-aware attempt. When the connection is mid auto-recovery
+        // the first publish can fail with a recoverable lapin error; await the
+        // channel recovery and retry once on a fresh channel, so a transient
+        // broker blip does not surface as a publish failure. This matters for a
+        // synchronous request/reply waiting on the reply (#334).
+        let mut recovered = false;
+        let confirmation = loop {
+            let pooled = self.pool.acquire().await?;
+            let outcome = async {
+                pooled
+                    .channel()
+                    .basic_publish(
+                        exchange.clone(),
+                        routing_key_short.clone(),
+                        BasicPublishOptions {
+                            mandatory: confirms,
+                            ..BasicPublishOptions::default()
+                        },
+                        &envelope.payload,
+                        properties.clone(),
+                    )
+                    .await?
+                    .await
+            }
+            .await;
+            match outcome {
+                Ok(confirmation) => break confirmation,
+                Err(err) => {
+                    if recovered {
+                        return Err(BusError::Transport(Box::new(err)));
+                    }
+                    match pooled.channel().wait_for_recovery(err).await {
+                        // Recovered: loop once more on a freshly acquired
+                        // channel. Falling through to the end of the loop body
+                        // re-enters the attempt, so no explicit continue.
+                        Ok(()) => recovered = true,
+                        Err(err) => return Err(BusError::Transport(Box::new(err))),
+                    }
+                }
+            }
+        };
         if confirms {
             crate::confirm::confirmation_to_result(confirmation, "publish", routing_key)?;
         }
@@ -497,7 +526,7 @@ mod tests {
         let err = RabbitMqTransport::new("amqp://127.0.0.1:1")
             .await
             .expect_err("must fail to connect");
-        assert!(matches!(err, BusError::Connection(_)));
+        assert!(matches!(err, BusError::Connection { .. }));
     }
 
     #[tokio::test]
@@ -506,7 +535,7 @@ mod tests {
         let err = RabbitMqTransport::with_exchange("amqp://127.0.0.1:1", exchange)
             .await
             .expect_err("must fail to connect");
-        assert!(matches!(err, BusError::Connection(_)));
+        assert!(matches!(err, BusError::Connection { .. }));
     }
 
     #[test]
