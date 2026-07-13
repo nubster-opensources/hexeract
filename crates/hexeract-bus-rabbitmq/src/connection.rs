@@ -41,13 +41,35 @@ pub fn redact_uri(uri: &str) -> String {
     format!("{scheme}://***@{host_and_path}")
 }
 
-/// Connection properties shared by every connect path.
+/// Connection properties for the supervised consumer/worker path.
+///
+/// Auto-recovery is deliberately left off. A [`RabbitMqWorker`] does not
+/// reconnect on its own: recovery belongs to its supervisor, which rebuilds
+/// every piece of broker state (queues, bindings, consumer) from scratch on
+/// each iteration. That contract requires a lost connection to end the
+/// consumer stream so [`RabbitMqWorker::run`] returns
+/// [`BusError::Connection`] and the supervisor can restart it. lapin's
+/// auto-recovery exists to keep that stream alive across a drop, which is
+/// exactly what would defeat the supervisor: the stream would never end, the
+/// worker would never surface a dead broker, and its run loop would block
+/// forever. The consumer path therefore stays on plain, single-attempt
+/// connection properties.
+///
+/// [`RabbitMqWorker`]: crate::RabbitMqWorker
+/// [`RabbitMqWorker::run`]: crate::RabbitMqWorker::run
+fn supervised_properties() -> ConnectionProperties {
+    ConnectionProperties::default()
+}
+
+/// Connection properties for the auto-recovering publisher path.
 ///
 /// Auto-recovery is enabled so the lapin IO loop transparently reconnects
-/// on a network drop and replays the topology (exchanges, queues, bindings,
-/// consumers) on the new connection. A long-lived publisher therefore stays
-/// usable across a broker blip instead of failing forever, and a consumer's
-/// subscription is replayed without tearing down the worker (#334).
+/// on a network drop and replays the topology (exchanges, queues, bindings)
+/// on the new connection. A long-lived publisher therefore stays usable
+/// across a broker blip instead of failing forever (#334). This is reserved
+/// for the publisher: a publisher has no supervisor to rebuild it, so it
+/// must heal itself, whereas a consumer is rebuilt by its supervisor (see
+/// [`supervised_properties`]).
 ///
 /// The recovery backoff is deliberately tightened. lapin applies this same
 /// backoff to the initial connection attempt, and its default retries for
@@ -57,7 +79,7 @@ pub fn redact_uri(uri: &str) -> String {
 /// error surfaces. A short, bounded backoff keeps a refused or unreachable
 /// connect fast so our own loop and classifier stay in control, while still
 /// giving a live session a few quick reconnection attempts across a blip.
-fn connection_properties() -> ConnectionProperties {
+fn recovering_properties() -> ConnectionProperties {
     ConnectionProperties::default()
         .enable_auto_recover()
         .configure_backoff(|builder| {
@@ -188,7 +210,7 @@ impl RabbitMqConnection {
     /// credentials: the raw `lapin` error (which can echo a malformed
     /// URI back) is dropped in favour of a credential-redacted message.
     pub async fn connect(uri: &str) -> Result<Self, BusError> {
-        let inner = Connection::connect(uri, connection_properties())
+        let inner = Connection::connect(uri, supervised_properties())
             .await
             .map_err(|err| connection_error(uri, is_transient(&err)))?;
         Ok(Self {
@@ -227,10 +249,49 @@ impl RabbitMqConnection {
         attempts: u32,
         base_delay: Duration,
     ) -> Result<Self, BusError> {
+        Self::connect_with_retry_inner(uri, attempts, base_delay, false).await
+    }
+
+    /// Like [`Self::connect_with_retry`] but enables lapin auto-recovery on
+    /// the resulting connection, for the long-lived publisher path that must
+    /// heal itself across a broker blip (#334).
+    ///
+    /// Reserved for [`crate::RabbitMqTransport`]: a publisher has no
+    /// supervisor to rebuild it. The consumer/worker path must not use this,
+    /// because auto-recovery keeps the consumer stream alive across a drop
+    /// and would stop [`crate::RabbitMqWorker::run`] from ever detecting a
+    /// dead broker (the run loop would block forever instead of returning a
+    /// connection error for the supervisor to act on).
+    pub(crate) async fn connect_with_retry_recovering(
+        uri: &str,
+        attempts: u32,
+        base_delay: Duration,
+    ) -> Result<Self, BusError> {
+        Self::connect_with_retry_inner(uri, attempts, base_delay, true).await
+    }
+
+    /// Shared retry loop backing both connect-with-retry variants.
+    ///
+    /// `recovering` selects the connection properties rebuilt on each
+    /// attempt: [`recovering_properties`] enables auto-recovery for the
+    /// publisher, [`supervised_properties`] leaves it off for the worker.
+    /// The properties are rebuilt per attempt because lapin consumes them
+    /// by value.
+    async fn connect_with_retry_inner(
+        uri: &str,
+        attempts: u32,
+        base_delay: Duration,
+        recovering: bool,
+    ) -> Result<Self, BusError> {
         let attempts = attempts.max(1);
         let mut retryable = true;
         for attempt in 1..=attempts {
-            match Connection::connect(uri, connection_properties()).await {
+            let properties = if recovering {
+                recovering_properties()
+            } else {
+                supervised_properties()
+            };
+            match Connection::connect(uri, properties).await {
                 Ok(conn) => {
                     return Ok(Self {
                         inner: Arc::new(conn),
@@ -326,10 +387,10 @@ mod tests {
             .await
             .expect_err("must fail to connect");
         assert!(matches!(err, BusError::Connection { .. }));
-        // Regression guard for the bounded backoff. A refused connect to a
-        // closed local port returns instantly at the TCP layer; without the
-        // tightened backoff in `connection_properties`, lapin's default
-        // auto-recover loop turns that instant refusal into a minutes-long
+        // Regression guard on the supervised connect path. A refused connect
+        // to a closed local port returns instantly at the TCP layer because
+        // `supervised_properties` leaves auto-recovery off: there is no lapin
+        // reconnection loop to turn that instant refusal into a minutes-long
         // retry. Ten seconds is far below that yet tolerant of CI noise.
         assert!(
             started.elapsed() < Duration::from_secs(10),
@@ -408,15 +469,23 @@ mod tests {
     }
 
     #[test]
-    fn connection_properties_enable_auto_recover() {
-        // Locks the #334 fix at the source without a broker: the shared
-        // properties must carry auto-recovery, otherwise a dropped publisher
-        // connection would never heal. ConnectionProperties has no getter, so
-        // assert through its Debug rendering.
-        let rendered = format!("{:?}", connection_properties());
+    fn properties_split_auto_recovery_by_role() {
+        // Locks the role split at the source without a broker. The publisher
+        // path must carry auto-recovery, otherwise a dropped publisher
+        // connection would never heal (#334). The consumer/worker path must
+        // NOT, otherwise auto-recovery keeps the consumer stream alive across
+        // a drop and the worker never detects a dead broker, blocking its run
+        // loop forever. ConnectionProperties has no getter, so assert through
+        // its Debug rendering.
+        let recovering = format!("{:?}", recovering_properties());
         assert!(
-            rendered.contains("auto_recover: true"),
-            "connect paths must enable auto-recovery, got {rendered}"
+            recovering.contains("auto_recover: true"),
+            "the publisher path must enable auto-recovery, got {recovering}"
+        );
+        let supervised = format!("{:?}", supervised_properties());
+        assert!(
+            supervised.contains("auto_recover: false"),
+            "the consumer/worker path must leave auto-recovery off, got {supervised}"
         );
     }
 

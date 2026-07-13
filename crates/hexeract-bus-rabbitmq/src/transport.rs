@@ -83,14 +83,18 @@ impl RabbitMqTransport {
     ///
     /// Uses the bounded reconnect loop from
     /// [`RabbitMqConnection::connect_with_retry`] with the crate-wide
-    /// [`DEFAULT_RETRY_ATTEMPTS`] and [`DEFAULT_RETRY_BASE_DELAY`].
+    /// [`DEFAULT_RETRY_ATTEMPTS`] and [`DEFAULT_RETRY_BASE_DELAY`]. The
+    /// resulting publisher connection has lapin auto-recovery enabled, so it
+    /// heals itself across a broker blip instead of failing forever (#334): a
+    /// publisher is long lived and has no supervisor to rebuild it, unlike a
+    /// [`crate::RabbitMqWorker`], whose supervisor owns its recovery.
     ///
     /// # Errors
     ///
     /// Returns [`BusError::Connection`] if the broker remains
     /// unreachable after the retry loop exits.
     pub async fn new(connection_string: &str) -> Result<Self, BusError> {
-        let connection = RabbitMqConnection::connect_with_retry(
+        let connection = RabbitMqConnection::connect_with_retry_recovering(
             connection_string,
             DEFAULT_RETRY_ATTEMPTS,
             DEFAULT_RETRY_BASE_DELAY,
@@ -119,7 +123,7 @@ impl RabbitMqTransport {
         connection_string: &str,
         exchange: Exchange,
     ) -> Result<Self, BusError> {
-        let connection = RabbitMqConnection::connect_with_retry(
+        let connection = RabbitMqConnection::connect_with_retry_recovering(
             connection_string,
             DEFAULT_RETRY_ATTEMPTS,
             DEFAULT_RETRY_BASE_DELAY,

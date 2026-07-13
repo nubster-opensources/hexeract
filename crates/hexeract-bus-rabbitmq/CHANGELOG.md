@@ -22,9 +22,14 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   recovered channel, so a transient blip does not surface as a publish failure
   (#334).
 - Connect fails fast on a permanent authentication failure (`ACCESS_REFUSED`)
-  instead of hammering the broker through the whole retry budget. The shared
-  recovery backoff is bounded so a refused or unreachable connect returns
-  promptly rather than looping for minutes (#340).
+  instead of hammering the broker through the whole retry budget. The
+  publisher's recovery backoff is bounded so a refused or unreachable connect
+  returns promptly rather than looping for minutes (#340).
+- The consumer worker deliberately does not enable lapin auto-recovery: a dead
+  broker ends its consumer stream so `RabbitMqWorker::run` returns a connection
+  error for its supervisor to rebuild and restart, instead of blocking forever
+  while lapin keeps the subscription in recovery. Auto-recovery is reserved for
+  the long-lived publisher, which has no supervisor to rebuild it (#334).
 - Transient requeue nacks are paced, ending the redelivery hot loop that spun
   the CPU when a retry or dead-letter publish kept failing (#336).
 - In-flight `no_ack` handlers are drained at shutdown, so a cancelled

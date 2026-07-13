@@ -1514,8 +1514,8 @@ async fn connect_with_retry_fails_fast_on_access_refused() {
 
     let started = std::time::Instant::now();
     // A generous per-attempt delay: if the loop wrongly retried all five
-    // attempts it would sleep for seconds. A permanent failure must return
-    // after the first classified attempt without draining the budget.
+    // attempts it would sleep ~30s (2 + 4 + 8 + 16). A permanent failure must
+    // break the loop early instead of draining that budget.
     let result = RabbitMqConnection::connect_with_retry(&bad_uri, 5, Duration::from_secs(2)).await;
     let elapsed = started.elapsed();
 
@@ -1525,8 +1525,15 @@ async fn connect_with_retry_fails_fast_on_access_refused() {
         Some(false),
         "ACCESS_REFUSED must be classified permanent"
     );
+    // A freshly started broker consistently rejects the very first handshake
+    // with a transient error before it is ready to return a clean
+    // ACCESS_REFUSED, so the loop sleeps exactly one base delay (2s) and then
+    // classifies the second attempt as permanent: ~2s total. The next
+    // transient retry would only be reached at ~6s (2 + 4), so a 3s ceiling
+    // proves the early break with a clean margin without weakening the
+    // fail-fast against the ~30s full-budget drain (#340).
     assert!(
-        elapsed < Duration::from_secs(2),
+        elapsed < Duration::from_secs(3),
         "a permanent failure must not sleep through the retry budget, took {elapsed:?}"
     );
     let rendered = format!("{err:?} {err}");
