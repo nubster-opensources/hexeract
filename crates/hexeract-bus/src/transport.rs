@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use uuid::Uuid;
 
+use crate::BusEnvelope;
 use crate::BusError;
 use crate::Message;
 
@@ -48,6 +49,22 @@ use crate::Message;
 /// ```
 #[async_trait]
 pub trait Transport: Send + Sync + 'static {
+    /// Publish a pre-built [`crate::BusEnvelope`] under `routing_key`.
+    ///
+    /// This is the single primitive every backend implements; the other
+    /// publish methods are default helpers that mint an envelope and
+    /// delegate here. Returns the envelope `message_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BusError::Connection`] if the broker is unreachable or
+    /// [`BusError::Transport`] if the broker rejected the publish.
+    async fn publish_envelope(
+        &self,
+        routing_key: &str,
+        envelope: &BusEnvelope,
+    ) -> Result<Uuid, BusError>;
+
     /// Publish `message` to the broker under the given `routing_key`.
     ///
     /// Mints a fresh [`crate::BusEnvelope`] and returns its
@@ -62,7 +79,10 @@ pub trait Transport: Send + Sync + 'static {
     /// encoded as JSON, [`BusError::Connection`] if the broker is
     /// unreachable, or [`BusError::Transport`] if the broker
     /// rejected the publish.
-    async fn publish<M: Message>(&self, routing_key: &str, message: &M) -> Result<Uuid, BusError>;
+    async fn publish<M: Message>(&self, routing_key: &str, message: &M) -> Result<Uuid, BusError> {
+        let envelope = BusEnvelope::new(Uuid::now_v7(), message)?;
+        self.publish_envelope(routing_key, &envelope).await
+    }
 
     /// Publish `message` with extra `headers` attached to the envelope.
     ///
@@ -81,7 +101,10 @@ pub trait Transport: Send + Sync + 'static {
         routing_key: &str,
         headers: HashMap<String, String>,
         message: &M,
-    ) -> Result<Uuid, BusError>;
+    ) -> Result<Uuid, BusError> {
+        let envelope = BusEnvelope::with_headers(Uuid::now_v7(), headers, message)?;
+        self.publish_envelope(routing_key, &envelope).await
+    }
 
     /// Publish `message` and propagate a caller-supplied `correlation_id`.
     ///
@@ -105,7 +128,10 @@ pub trait Transport: Send + Sync + 'static {
         routing_key: &str,
         correlation_id: Uuid,
         message: &M,
-    ) -> Result<Uuid, BusError>;
+    ) -> Result<Uuid, BusError> {
+        let envelope = BusEnvelope::new(correlation_id, message)?;
+        self.publish_envelope(routing_key, &envelope).await
+    }
 }
 
 #[cfg(test)]
@@ -117,7 +143,6 @@ mod tests {
     use serde::Serialize;
 
     use super::*;
-    use crate::BusEnvelope;
 
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct OrderPlaced {
@@ -155,47 +180,16 @@ mod tests {
 
     #[async_trait]
     impl Transport for MockTransport {
-        async fn publish<M: Message>(
+        async fn publish_envelope(
             &self,
             routing_key: &str,
-            message: &M,
+            envelope: &BusEnvelope,
         ) -> Result<Uuid, BusError> {
-            let envelope = BusEnvelope::new(Uuid::now_v7(), message)?;
             let message_id = envelope.message_id;
             self.recorded
                 .lock()
                 .unwrap()
-                .push((routing_key.to_owned(), envelope));
-            Ok(message_id)
-        }
-
-        async fn publish_with_headers<M: Message>(
-            &self,
-            routing_key: &str,
-            headers: HashMap<String, String>,
-            message: &M,
-        ) -> Result<Uuid, BusError> {
-            let envelope = BusEnvelope::with_headers(Uuid::now_v7(), headers, message)?;
-            let message_id = envelope.message_id;
-            self.recorded
-                .lock()
-                .unwrap()
-                .push((routing_key.to_owned(), envelope));
-            Ok(message_id)
-        }
-
-        async fn publish_with_correlation_id<M: Message>(
-            &self,
-            routing_key: &str,
-            correlation_id: Uuid,
-            message: &M,
-        ) -> Result<Uuid, BusError> {
-            let envelope = BusEnvelope::new(correlation_id, message)?;
-            let message_id = envelope.message_id;
-            self.recorded
-                .lock()
-                .unwrap()
-                .push((routing_key.to_owned(), envelope));
+                .push((routing_key.to_owned(), envelope.clone()));
             Ok(message_id)
         }
     }
@@ -207,6 +201,20 @@ mod tests {
     }
 
     fn assert_send<T: Send>(_: &T) {}
+
+    #[tokio::test]
+    async fn default_publish_delegates_to_publish_envelope() {
+        let transport = MockTransport::new();
+        let id = transport
+            .publish("orders.placed", &sample_order())
+            .await
+            .expect("publish must succeed");
+        let recorded = transport.snapshot();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, "orders.placed");
+        assert_eq!(recorded[0].1.message_id, id);
+        assert_eq!(recorded[0].1.message_type, "orders.placed");
+    }
 
     #[tokio::test]
     async fn publish_records_envelope_under_routing_key() {
