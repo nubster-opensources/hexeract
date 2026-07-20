@@ -7,7 +7,6 @@ use hexeract_bus::BusEnvelope;
 use hexeract_bus::BusError;
 use hexeract_bus::Exchange;
 use hexeract_bus::ExchangeKind;
-use hexeract_bus::Message;
 use hexeract_bus::RawBusPublish;
 use hexeract_bus::Transport;
 use lapin::BasicProperties;
@@ -202,7 +201,10 @@ impl RabbitMqTransport {
     pub fn exchange(&self) -> &str {
         &self.exchange
     }
+}
 
+#[async_trait]
+impl Transport for RabbitMqTransport {
     async fn publish_envelope(
         &self,
         routing_key: &str,
@@ -258,34 +260,6 @@ impl RabbitMqTransport {
             crate::confirm::confirmation_to_result(confirmation, "publish", routing_key)?;
         }
         Ok(envelope.message_id)
-    }
-}
-
-#[async_trait]
-impl Transport for RabbitMqTransport {
-    async fn publish<M: Message>(&self, routing_key: &str, message: &M) -> Result<Uuid, BusError> {
-        let envelope = BusEnvelope::new(Uuid::now_v7(), message)?;
-        self.publish_envelope(routing_key, &envelope).await
-    }
-
-    async fn publish_with_headers<M: Message>(
-        &self,
-        routing_key: &str,
-        headers: HashMap<String, String>,
-        message: &M,
-    ) -> Result<Uuid, BusError> {
-        let envelope = BusEnvelope::with_headers(Uuid::now_v7(), headers, message)?;
-        self.publish_envelope(routing_key, &envelope).await
-    }
-
-    async fn publish_with_correlation_id<M: Message>(
-        &self,
-        routing_key: &str,
-        correlation_id: Uuid,
-        message: &M,
-    ) -> Result<Uuid, BusError> {
-        let envelope = BusEnvelope::new(correlation_id, message)?;
-        self.publish_envelope(routing_key, &envelope).await
     }
 }
 
@@ -363,6 +337,7 @@ fn envelope_to_properties(envelope: &BusEnvelope) -> Result<BasicProperties, Bus
 mod tests {
     use std::time::Duration;
 
+    use hexeract_bus::Message;
     use serde::Deserialize;
     use serde::Serialize;
 
