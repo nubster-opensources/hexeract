@@ -43,9 +43,14 @@ use testcontainers_modules::rabbitmq::RabbitMq;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
-const PING_QUEUE: &str = "examples.request_reply.ping";
-const DIVIDE_QUEUE: &str = "examples.request_reply.divide";
-const SILENCE_QUEUE: &str = "examples.request_reply.silence";
+// `RabbitMqTransport` publishes on the default exchange, which only ever
+// routes a message to the queue whose name equals the routing key. The
+// request client uses `Request::MESSAGE_TYPE` as that routing key (see
+// `RequestClient::request`), so each queue below must be named exactly
+// after the matching request's `MESSAGE_TYPE`, not after the queue's role.
+const PING_QUEUE: &str = "examples.ping";
+const DIVIDE_QUEUE: &str = "examples.divide";
+const SILENCE_QUEUE: &str = "examples.silence";
 const RETRY_ATTEMPTS: u32 = 5;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
 
