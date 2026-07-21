@@ -116,7 +116,7 @@ Released as v0.1.0 on crates.io. The seven shipped crates are `hexeract-core`, `
 **Goal.** Synchronous RPC pattern over the asynchronous bus, via correlation IDs.
 
 Implemented in code on the request-reply feature branch: see the CHANGELOG's
-`[Unreleased]` section for the shipped symbols. The crate versions stay at
+`[Unreleased]` section for the added symbols. The crate versions stay at
 0.6.0 and the release is a separate decision once every v0.7.0 issue is
 closed.
 
