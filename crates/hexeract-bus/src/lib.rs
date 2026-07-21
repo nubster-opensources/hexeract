@@ -32,6 +32,8 @@ pub mod request;
 pub mod request_client;
 /// Errors observed by the caller of a request-reply round trip.
 pub mod request_error;
+/// Responder-side handler that produces a typed reply for a [`Request`].
+pub mod request_handler;
 /// Strongly-typed topology declarations shared by transports.
 pub mod topology;
 /// Backend-agnostic publish contract implemented by bus backends.
@@ -55,6 +57,7 @@ pub use reply_status::RemoteErrorPayload;
 pub use request::Request;
 pub use request_client::RequestClient;
 pub use request_error::RequestError;
+pub use request_handler::RequestHandler;
 pub use topology::Binding;
 pub use topology::Exchange;
 pub use topology::ExchangeKind;
