@@ -40,7 +40,15 @@ Requester and responder agree on the reply shape purely through envelope convent
 - On success, the reply payload decodes as `R::Reply` like any other message.
 - On failure, the reply's `message_type` is stamped with the sentinel `hexeract.reply.error` and the payload decodes as `RemoteErrorPayload`, a protocol type deliberately not a `Message`: a remote fault is not a domain message. `RemoteErrorPayload` carries `error_type` (a stable-ish category, the name of the `BusError` variant the responder's error converted into) and `message` (the human-readable failure text).
 
-A request published without a `reply_to` (bypassing `RequestClient`, for example a hand-crafted envelope) is handled fire-and-forget: `RepliedHandler` still runs the handler for its side effect but publishes no reply, logging a warning rather than failing the delivery.
+A request published without a `reply_to` (bypassing `RequestClient`, for example a hand-crafted envelope) is handled fire-and-forget: `RepliedHandler` still runs the handler for its side effect, logging a warning instead of publishing a reply. The handler's `Result` still drives the delivery, though: on `Ok`, `handle` returns `Ok(())` and the delivery is acked normally, exactly as if a reply had been sent; on `Err`, the handler's error is propagated out of `RepliedHandler::handle` unchanged, exactly as it would from a plain `Handler<M>`, so the worker's usual nack, retry and dead-letter policy applies (see [Retry policy](retry-policy.md) and [Ack modes](ack-modes.md)). A real `RequestClient` always stamps `reply_to`, so this path only matters for a `Request` type deliberately used fire-and-forget, bypassing `RequestClient`.
+
+## Declaring the responder queue
+
+`RabbitMqTransport::publish_envelope` publishes every request `mandatory` and awaits the publisher confirm, so a request published to a routing key with no bound queue is returned by the broker as NO_ROUTE and surfaces immediately as `RequestError::Transport(BusError::Unroutable)`, never as a hang: a misconfigured responder fails the caller's very first request outright instead of leaving it to wait out its timeout.
+
+For that fast failure to be useful, the responder side must declare and bind, out-of-band, a queue named exactly the request's `MESSAGE_TYPE`: `RequestClient` publishes to that routing key, and the default exchange routes a message to the queue of the same name. `RabbitMqWorkerBuilder` does not auto-declare the queue it consumes from, no more than it does for a plain `Handler<M>`: at startup the worker declares only its own retry (`<queue>.retry`) and dead-letter queues, never the queue passed to `.queue(...)`. The request queue's topology, like any other queue the worker consumes from, is declared out-of-band before the worker starts (see [Worker](worker.md)).
+
+This is a deliberate asymmetry with the reply inbox described below: the inbox is exclusive to one connection, so only the client that owns that connection can declare it, and it does so on every reconnect. The request queue, by contrast, is shared: any number of client processes publish to it and any number of worker instances may consume from it, so it is owned by whoever operates the responder, not minted by the framework.
 
 ## Failure modes
 
