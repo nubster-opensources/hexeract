@@ -12,6 +12,8 @@
 //! Backend implementations live in companion crates such as
 //! `hexeract-bus-rabbitmq`.
 
+/// Rendez-vous point correlating replies with their in-flight request.
+pub mod correlation;
 /// In-flight representation of a message crossing the bus.
 pub mod envelope;
 /// Errors raised by the bus primitives, transports and workers.
@@ -33,6 +35,8 @@ pub mod topology;
 /// Backend-agnostic publish contract implemented by bus backends.
 pub mod transport;
 
+pub use correlation::CorrelationRegistry;
+pub use correlation::PendingReply;
 pub use envelope::BusEnvelope;
 pub use error::BusError;
 pub use handler::BoxFuture;
