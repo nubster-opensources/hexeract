@@ -4,23 +4,24 @@
 //! publisher transport ([`RabbitMqTransport::new`]) with a reply inbox
 //! consumed on a distinct, supervised connection
 //! ([`RabbitMqConnection::connect_with_retry`]). The two connections
-//! must stay separate: see the [`crate::reply_inbox`] module docs for
-//! why lapin's native auto-recovery on the publisher side would mask a
+//! must stay separate: see the `reply_inbox` module docs for why
+//! lapin's native auto-recovery on the publisher side would mask a
 //! broker outage from the inbox supervisor.
 //!
 //! # Supervisor contract
 //!
-//! A background task drives [`run_reply_inbox`] in a loop:
+//! A background task drives `run_reply_inbox` in a loop:
 //!
 //! - On cancellation, or a plain `Ok(())` return, the task stops.
 //! - On `Err` (the broker connection was lost), the task
-//!   [`CorrelationRegistry::drain`]s every in-flight slot so a caller
-//!   waiting on a reply observes [`hexeract_bus::RequestError::Transport`]
-//!   immediately instead of waiting out its timeout, reconnects over a
-//!   fresh supervised connection, declares a fresh exclusive inbox (the
-//!   previous one died with its connection), publishes the new name
-//!   into the `Arc<Mutex<String>>` the [`RequestClient`] reads on every
-//!   request, and resumes consuming.
+//!   [`hexeract_bus::CorrelationRegistry::drain`]s every in-flight slot
+//!   so a caller waiting on a reply observes
+//!   [`hexeract_bus::RequestError::Transport`] immediately instead of
+//!   waiting out its timeout, reconnects over a fresh supervised
+//!   connection, declares a fresh exclusive inbox (the previous one
+//!   died with its connection), publishes the new name into the
+//!   `Arc<Mutex<String>>` the [`hexeract_bus::RequestClient`] reads on
+//!   every request, and resumes consuming.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
