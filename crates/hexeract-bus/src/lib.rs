@@ -28,6 +28,8 @@ pub mod raw_publish;
 pub mod reply_status;
 /// Trait for messages that expect a single typed reply.
 pub mod request;
+/// Generic request-reply client built on top of a [`Transport`].
+pub mod request_client;
 /// Errors observed by the caller of a request-reply round trip.
 pub mod request_error;
 /// Strongly-typed topology declarations shared by transports.
@@ -51,6 +53,7 @@ pub use reply_status::REPLY_STATUS_HEADER;
 pub use reply_status::REPLY_STATUS_OK;
 pub use reply_status::RemoteErrorPayload;
 pub use request::Request;
+pub use request_client::RequestClient;
 pub use request_error::RequestError;
 pub use topology::Binding;
 pub use topology::Exchange;
