@@ -27,6 +27,8 @@ pub enum RequestError {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+
     use super::*;
 
     #[test]
@@ -43,5 +45,30 @@ mod tests {
         };
         assert!(err.to_string().contains("Internal"));
         assert!(err.to_string().contains("boom"));
+    }
+
+    #[test]
+    fn transport_preserves_source_chain() {
+        let inner = std::io::Error::other("broker exploded");
+        let bus_error = BusError::Transport(Box::new(inner));
+        let err = RequestError::Transport(bus_error);
+        let source = err.source().expect("source must be set");
+        assert_eq!(source.to_string(), "transport error");
+        let inner_source = source.source().expect("inner source must be set");
+        assert_eq!(inner_source.to_string(), "broker exploded");
+    }
+
+    #[test]
+    fn decode_preserves_source_chain() {
+        let invalid_json = b"not json";
+        let serde_error: serde_json::Error =
+            serde_json::from_slice::<serde_json::Value>(invalid_json).unwrap_err();
+        let bus_error: BusError = serde_error.into();
+        let err = RequestError::Decode(bus_error);
+        let source = err.source().expect("source must be set");
+        assert_eq!(
+            source.to_string(),
+            "failed to (de)serialize message payload as JSON"
+        );
     }
 }
