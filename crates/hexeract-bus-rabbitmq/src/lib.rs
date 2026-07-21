@@ -30,6 +30,9 @@ pub(crate) mod confirm;
 pub mod connection;
 /// Per-publisher pool of `lapin` channels.
 pub mod pool;
+/// Consumer for the exclusive, auto-delete reply inbox of the
+/// request-reply client path.
+pub(crate) mod reply_inbox;
 /// Topology declaration helpers backed by lapin.
 pub mod topology;
 /// [`hexeract_bus::Transport`] implementation backed by RabbitMQ.
@@ -50,3 +53,17 @@ pub use worker::AckMode;
 pub use worker::RabbitMqWorker;
 pub use worker::RabbitMqWorkerBuilder;
 pub use worker::RabbitMqWorkerConfig;
+
+/// Test-only entry point for [`reply_inbox::declare_reply_inbox`].
+///
+/// Reexported so the crate's own `tests/` integration suite, which lives
+/// outside the crate for privacy purposes, can drive the reply inbox
+/// consumer end to end. Not part of the crate's public contract: it may
+/// change or disappear without a semver bump.
+#[doc(hidden)]
+pub use reply_inbox::declare_reply_inbox as declare_reply_inbox_for_test;
+/// Test-only entry point for [`reply_inbox::run_reply_inbox`].
+///
+/// See [`declare_reply_inbox_for_test`] for why this is reexported.
+#[doc(hidden)]
+pub use reply_inbox::run_reply_inbox as run_reply_inbox_for_test;
