@@ -24,6 +24,8 @@ pub mod handler;
 pub mod message;
 /// Contract for publishing a raw message with a caller-supplied id.
 pub mod raw_publish;
+/// Adapter that erases a [`RequestHandler`] into an [`ErasedHandler`].
+pub mod replied_handler;
 /// Wire contract for the request-reply error path.
 pub mod reply_status;
 /// Trait for messages that expect a single typed reply.
@@ -49,6 +51,7 @@ pub use handler::Handler;
 pub use handler::TypedHandler;
 pub use message::Message;
 pub use raw_publish::RawBusPublish;
+pub use replied_handler::RepliedHandler;
 pub use reply_status::REPLY_ERROR_MESSAGE_TYPE;
 pub use reply_status::REPLY_STATUS_ERROR;
 pub use reply_status::REPLY_STATUS_HEADER;
