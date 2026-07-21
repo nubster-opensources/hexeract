@@ -162,4 +162,60 @@ mod tests {
         let pong: Pong = env.decode().unwrap();
         assert_eq!(pong.seq, 1);
     }
+
+    #[tokio::test]
+    async fn dropping_pending_removes_slot() {
+        let registry = Arc::new(CorrelationRegistry::new());
+        {
+            let _pending = registry.register();
+            assert_eq!(registry.len(), 1);
+        }
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn timeout_path_leaves_no_slot() {
+        let registry = Arc::new(CorrelationRegistry::new());
+        {
+            let mut pending = registry.register();
+            let timed_out =
+                tokio::time::timeout(std::time::Duration::from_millis(10), pending.wait()).await;
+            assert!(timed_out.is_err());
+        }
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_closes_all_in_flight_channels() {
+        let registry = Arc::new(CorrelationRegistry::new());
+        let mut a = registry.register();
+        let mut b = registry.register();
+        assert_eq!(registry.len(), 2);
+        registry.drain();
+        assert_eq!(registry.len(), 0);
+        assert!(a.wait().await.is_err());
+        assert!(b.wait().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn thousand_concurrent_slots_never_cross() {
+        let registry = Arc::new(CorrelationRegistry::new());
+        let mut pendings = Vec::new();
+        let mut ids = Vec::new();
+        for _ in 0..1000 {
+            let pending = registry.register();
+            ids.push(pending.correlation_id());
+            pendings.push(pending);
+        }
+        // resolve each with its own sequence number
+        for (seq, cid) in ids.iter().enumerate() {
+            registry.resolve(reply_for(*cid, seq as u64));
+        }
+        for (seq, mut pending) in pendings.into_iter().enumerate() {
+            let env = pending.wait().await.expect("each slot resolves");
+            let pong: Pong = env.decode().unwrap();
+            assert_eq!(pong.seq, seq as u64);
+        }
+        assert_eq!(registry.len(), 0);
+    }
 }
