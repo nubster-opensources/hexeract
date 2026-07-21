@@ -7,6 +7,12 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+### Added
+
+- Exclusive, auto-delete, server-named reply inbox (`declare_reply_inbox` / `run_reply_inbox`) consumed on a connection distinct from the auto-recovering publisher, routing every delivery to a `hexeract_bus::CorrelationRegistry` by correlation id. (#400)
+- `connect_request_client`, assembling a ready-to-use `RequestClient<RabbitMqTransport>`: an auto-recovering publisher transport plus a supervised reply inbox whose background task drains in-flight requests, reconnects and re-declares a fresh inbox on broker loss. (#400)
+- `RabbitMqWorkerBuilder::register_request_handler`, registering a `RequestHandler` on the worker so an incoming request is dispatched and its reply, or an encoded error, published back automatically via `RepliedHandler`. (#401)
+
 ### Changed
 
 - Breaking: `BusError::Connection` is now a struct variant `{ source, retryable }`.

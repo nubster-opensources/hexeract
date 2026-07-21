@@ -18,6 +18,8 @@ Hexeract is sponsored by [Nubster](https://nubster.com).
 
 ⏰ **v0.6.0: durable message scheduler shipped.** This release adds the time dimension: `hexeract-scheduler` schedules a message for later (one-shot delay or recurring cron) and drives it through a polling worker with lease-based claiming, bounded backoff with jitter and dead-lettering, dispatching to the mediator, the bus or the outbox. `hexeract-scheduler-sql` persists schedules on PostgreSQL, MySQL or SQLite, and `hexeract scheduler` gives operators schema, list, inspect and dead-letter replay commands. All changes to previously published crates are additive. Mediator, middlewares, the `#[handler]` macro and Bus RabbitMQ stay stable from v0.3.0.
 
+🚧 **v0.7.0: Request/Reply in progress, not yet released.** `hexeract-bus` gains a synchronous-over-async RPC surface: the `Request` trait, `RequestClient`, the `RequestError` taxonomy and the `CorrelationRegistry`/`PendingReply` rendezvous, plus `RequestHandler` and `RepliedHandler` on the responder side. `hexeract-bus-rabbitmq` gains the matching exclusive reply inbox, `connect_request_client` and `register_request_handler`. The code is complete on the feature branch; the crate versions stay at 0.6.0 and the release ships once every v0.7.0 issue is closed. See the CHANGELOG's `[Unreleased]` section and [`docs/explanation/roadmap.md`](./docs/explanation/roadmap.md).
+
 | Feature | v0.1.0 | v0.2.0 | v0.3.0 | v0.4.0 | v0.5.0 | v0.6.0 |
 | --- | --- | --- | --- | --- | --- | --- |
 | Transactional outbox (PostgreSQL) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -35,7 +37,10 @@ Hexeract is sponsored by [Nubster](https://nubster.com).
 | Delivery reliability (dead-letter, publisher confirms, bounded backoff, dispatch outside tx) | ⏳ | ⏳ | ⏳ | ⏳ | ✅ | ✅ |
 | Durable scheduler (delay + cron triggers, SQL backends, sinks, operator CLI) | ⏳ | ⏳ | ⏳ | ⏳ | ⏳ | ✅ |
 | Polyglot bus (NATS, Kafka, SQS) | ⏳ v0.9.0 | ⏳ v0.9.0 | ⏳ v0.9.0 | ⏳ v0.9.0 | ⏳ v0.9.0 | ⏳ v0.9.0 |
-| Sagas, Request and Reply | ⏳ later | ⏳ later | ⏳ later | ⏳ later | ⏳ later | ⏳ later |
+| Request and Reply (`Request`, `RequestClient`, `RequestHandler`) | ⏳ later | ⏳ later | ⏳ later | ⏳ later | ⏳ later | 🚧 unreleased¹ |
+| Sagas | ⏳ later | ⏳ later | ⏳ later | ⏳ later | ⏳ later | ⏳ later |
+
+¹ Implemented in code on the request-reply feature branch, pending release; not part of any tagged v0.6.0 artifact.
 
 See the [CHANGELOG](./CHANGELOG.md) for the detailed history.
 
@@ -293,7 +298,9 @@ The bet behind Hexeract is that Rust's compile-time guarantees turn the outbox p
 Available today: Mediator, Bus, Outbox/Inbox, the durable Scheduler, and
 delivery reliability (dead-letter handling, publisher confirms, idempotency).
 
-Planned: Sagas, Request/Reply. See [`docs/explanation/roadmap.md`](./docs/explanation/roadmap.md).
+Request/Reply is implemented in code (unreleased), see the CHANGELOG's
+`[Unreleased]` section. Planned: Sagas. See
+[`docs/explanation/roadmap.md`](./docs/explanation/roadmap.md).
 
 ## What Hexeract is **not**
 

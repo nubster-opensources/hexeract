@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 
 ## [Unreleased]
 
+### Added
+
+- `hexeract-bus`: `Transport::publish_envelope`, the single primitive every backend implements. `publish`, `publish_with_headers` and `publish_with_correlation_id` are now default methods built on top of it, with no change of behavior. (#430)
+- `hexeract-bus`: `Request` trait, layering the request-reply pattern on top of `Message` by naming the reply type the responder sends back. (#399)
+- `hexeract-bus`: `RequestError`, the taxonomy of request-reply round trip failures observed by the caller: `Timeout`, `Remote` (decoded from the reply), `Transport` and `Decode`, the two latter preserving the underlying `BusError` in the error chain. (#399)
+- `hexeract-bus`: `CorrelationRegistry` and `PendingReply`, the rendezvous point between a waiting caller and its reply delivery. Registration mints a fresh correlation id and a drop-safe `PendingReply`, dropping it without waiting always releases its slot, so a cancelled or timed-out request never leaks. (#399)
+- `hexeract-bus`: `RequestClient`, a synchronous-over-async RPC client over `Transport`. `request` and `request_with_timeout` publish a `Request` and await its typed reply through the shared `CorrelationRegistry`, mapping a missing reply channel, a lost connection, an expired deadline or a remote error onto `RequestError`. (#399)
+- `hexeract-bus`: `RequestHandler`, the responder-side counterpart of `Handler` that returns a typed reply instead of performing a side effect. (#401)
+- `hexeract-bus`: `RepliedHandler`, adapting a `RequestHandler` into an `ErasedHandler` that publishes the reply, or an encoded error, back to the request's `reply_to`, preserving the inbound correlation id. (#401)
+
+Request-reply is available in code on this branch but not yet released; see [`docs/explanation/roadmap.md`](docs/explanation/roadmap.md) for v0.7.0 status.
+
 ## [0.6.0] - 2026-07-11
 
 Scheduler release. This cycle ships the durable message scheduler as two new crates: `hexeract-scheduler` (schedule store contract, delay and cron triggers, polling worker with lease-based claiming, bounded backoff with jitter and dead-lettering, mediator/bus/outbox sinks, fluent builder and lifecycle control) and `hexeract-scheduler-sql` (PostgreSQL, MySQL and SQLite backends). The `hexeract` umbrella crate gains a matching `scheduler` feature family and `hexeract-cli` gains a scheduler operator surface. All changes to previously published crates are additive; no breaking changes.
