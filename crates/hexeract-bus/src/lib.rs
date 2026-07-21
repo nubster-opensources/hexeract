@@ -9,6 +9,16 @@
 //! consumer-side dispatch primitives ([`Handler`], [`ErasedHandler`],
 //! [`TypedHandler`]).
 //!
+//! It also ships the backend-agnostic request-reply primitives: the
+//! [`Request`] trait naming a typed reply, [`RequestClient`] and
+//! [`RequestError`] on the caller side, [`RequestHandler`] and
+//! [`RepliedHandler`] on the responder side, and the [`CorrelationRegistry`]
+//! (with its RAII [`PendingReply`] guard) correlating a reply back to its
+//! in-flight request. The wire contract between the two sides
+//! ([`REPLY_STATUS_HEADER`], [`REPLY_STATUS_OK`], [`REPLY_STATUS_ERROR`],
+//! [`REPLY_ERROR_MESSAGE_TYPE`], [`RemoteErrorPayload`]) is documented in
+//! full in `docs/concepts/request-reply.md` in the workspace.
+//!
 //! Backend implementations live in companion crates such as
 //! `hexeract-bus-rabbitmq`.
 
