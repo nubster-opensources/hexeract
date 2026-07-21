@@ -110,6 +110,12 @@ async fn reply_published_to_inbox_is_resolved() {
 async fn connection_drop_fails_in_flight_fast() {
     let broker = harness::start_rabbitmq().await;
     let cancel = CancellationToken::new();
+
+    // Bind a queue for the request routing key so the request is routable and
+    // genuinely pends awaiting a reply. Without it the publish fails fast as
+    // Unroutable (NO_ROUTE) and never reaches the connection-drop path.
+    declare_ping_queue(broker.uri(), "tests.ping").await;
+
     let client = hexeract_bus_rabbitmq::connect_request_client(
         broker.uri(),
         Duration::from_secs(30),
@@ -118,7 +124,7 @@ async fn connection_drop_fails_in_flight_fast() {
     .await
     .unwrap();
 
-    // no responder is running; kill the broker while a request is in flight
+    // no responder consumes it; kill the broker while a request is in flight
     let request = client.request(&Ping { seq: 1 });
     tokio::pin!(request);
     tokio::select! {
