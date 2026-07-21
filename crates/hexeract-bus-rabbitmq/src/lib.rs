@@ -33,6 +33,8 @@ pub mod pool;
 /// Consumer for the exclusive, auto-delete reply inbox of the
 /// request-reply client path.
 pub(crate) mod reply_inbox;
+/// Facade assembling a supervised request-reply client.
+pub mod request_client;
 /// Topology declaration helpers backed by lapin.
 pub mod topology;
 /// [`hexeract_bus::Transport`] implementation backed by RabbitMQ.
@@ -44,6 +46,7 @@ pub use connection::RabbitMqConnection;
 pub use connection::redact_uri;
 pub use pool::ChannelPool;
 pub use pool::PooledChannel;
+pub use request_client::connect_request_client;
 pub use topology::bind_queue;
 pub use topology::declare_exchange;
 pub use topology::declare_queue;

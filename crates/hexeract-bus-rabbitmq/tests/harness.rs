@@ -26,7 +26,7 @@ use testcontainers_modules::rabbitmq::RabbitMq;
 /// A running RabbitMQ test container, kept alive for the container's
 /// AMQP URI to stay reachable.
 pub(crate) struct RunningBroker {
-    _container: ContainerAsync<RabbitMq>,
+    container: ContainerAsync<RabbitMq>,
     uri: String,
 }
 
@@ -34,6 +34,16 @@ impl RunningBroker {
     /// The AMQP URI of the running broker.
     pub(crate) fn uri(&self) -> &str {
         &self.uri
+    }
+
+    /// Stop the underlying container immediately, simulating a broker
+    /// crash so a test can assert on how a client reacts to a dropped
+    /// connection.
+    pub(crate) async fn stop(&self) {
+        self.container
+            .stop_with_timeout(Some(0))
+            .await
+            .expect("rabbitmq container must stop");
     }
 }
 
@@ -52,10 +62,7 @@ pub(crate) async fn start_rabbitmq() -> RunningBroker {
         .await
         .expect("rabbitmq container must expose AMQP port");
     let uri = format!("amqp://{host}:{port}");
-    RunningBroker {
-        _container: container,
-        uri,
-    }
+    RunningBroker { container, uri }
 }
 
 /// Publish `envelope` to `routing_key` on the default exchange.

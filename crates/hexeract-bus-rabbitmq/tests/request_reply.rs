@@ -18,6 +18,7 @@ use std::time::Duration;
 use hexeract_bus::BusEnvelope;
 use hexeract_bus::CorrelationRegistry;
 use hexeract_bus::Message;
+use hexeract_bus::Request;
 use hexeract_bus_rabbitmq::RabbitMqConnection;
 use hexeract_bus_rabbitmq::declare_reply_inbox_for_test;
 use hexeract_bus_rabbitmq::run_reply_inbox_for_test;
@@ -26,6 +27,17 @@ use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
 mod harness; // reuse the crate's testcontainers helper
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Ping {
+    seq: u64,
+}
+impl Message for Ping {
+    const MESSAGE_TYPE: &'static str = "tests.ping";
+}
+impl Request for Ping {
+    type Reply = Pong;
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Pong {
@@ -79,4 +91,35 @@ async fn reply_published_to_inbox_is_resolved() {
 
     cancel.cancel();
     let _ = handle.await;
+}
+
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn connection_drop_fails_in_flight_fast() {
+    let broker = harness::start_rabbitmq().await;
+    let cancel = CancellationToken::new();
+    let client = hexeract_bus_rabbitmq::connect_request_client(
+        broker.uri(),
+        Duration::from_secs(30),
+        cancel.clone(),
+    )
+    .await
+    .unwrap();
+
+    // no responder is running; kill the broker while a request is in flight
+    let request = client.request(&Ping { seq: 1 });
+    tokio::pin!(request);
+    tokio::select! {
+        _ = &mut request => panic!("should still be pending before the drop"),
+        () = tokio::time::sleep(Duration::from_millis(200)) => {}
+    }
+    broker.stop().await; // testcontainers stop
+    let outcome = tokio::time::timeout(Duration::from_secs(10), &mut request)
+        .await
+        .expect("must resolve well under the 30s timeout");
+    assert!(matches!(
+        outcome,
+        Err(hexeract_bus::RequestError::Transport(_))
+    ));
+    cancel.cancel();
 }
