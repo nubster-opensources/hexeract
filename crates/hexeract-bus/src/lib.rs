@@ -22,6 +22,8 @@ pub mod handler;
 pub mod message;
 /// Contract for publishing a raw message with a caller-supplied id.
 pub mod raw_publish;
+/// Trait for messages that expect a single typed reply.
+pub mod request;
 /// Strongly-typed topology declarations shared by transports.
 pub mod topology;
 /// Backend-agnostic publish contract implemented by bus backends.
@@ -35,6 +37,7 @@ pub use handler::Handler;
 pub use handler::TypedHandler;
 pub use message::Message;
 pub use raw_publish::RawBusPublish;
+pub use request::Request;
 pub use topology::Binding;
 pub use topology::Exchange;
 pub use topology::ExchangeKind;
