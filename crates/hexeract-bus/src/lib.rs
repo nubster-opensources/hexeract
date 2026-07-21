@@ -12,7 +12,7 @@
 //! Backend implementations live in companion crates such as
 //! `hexeract-bus-rabbitmq`.
 
-/// Rendez-vous point correlating replies with their in-flight request.
+/// Rendezvous point correlating replies with their in-flight request.
 pub mod correlation;
 /// In-flight representation of a message crossing the bus.
 pub mod envelope;

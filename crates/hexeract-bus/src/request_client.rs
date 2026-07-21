@@ -224,7 +224,7 @@ mod tests {
             error_type: "Internal".to_owned(),
             message: "downstream down".to_owned(),
         };
-        let mut err_env = BusEnvelope::restore(
+        let err_env = BusEnvelope::restore(
             Uuid::now_v7(),
             REPLY_ERROR_MESSAGE_TYPE.to_owned(),
             serde_json::to_vec(&payload).unwrap(),
@@ -236,7 +236,6 @@ mod tests {
             )]),
             std::time::SystemTime::UNIX_EPOCH,
         );
-        let _ = &mut err_env;
         registry.resolve(err_env);
         let err = request_fut.await.expect_err("remote error");
         match err {

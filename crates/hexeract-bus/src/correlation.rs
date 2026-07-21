@@ -8,7 +8,7 @@ use crate::BusEnvelope;
 
 type Slots = HashMap<CorrelationId, oneshot::Sender<BusEnvelope>>;
 
-/// Rendez-vous point between request callers and reply deliveries.
+/// Rendezvous point between request callers and reply deliveries.
 ///
 /// A caller registers a slot keyed by a freshly minted [`CorrelationId`] and
 /// awaits its [`PendingReply`]. The transport-side inbox consumer calls
@@ -102,6 +102,12 @@ impl PendingReply {
 
     /// Await the reply envelope. Borrows `self` so the RAII guard stays live
     /// and cleans the slot when the caller drops the [`PendingReply`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`tokio::sync::oneshot::error::RecvError`] if the reply channel
+    /// was closed before a reply arrived (for example after `drain()` on
+    /// connection loss).
     pub async fn wait(&mut self) -> Result<BusEnvelope, oneshot::error::RecvError> {
         (&mut self.receiver).await
     }
