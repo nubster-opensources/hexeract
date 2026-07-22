@@ -7,6 +7,7 @@ use crate::reply_status::{
     REPLY_ERROR_MESSAGE_TYPE, REPLY_STATUS_ERROR, REPLY_STATUS_HEADER, REPLY_STATUS_OK,
     RemoteErrorPayload,
 };
+use crate::rpc_protocol::{PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, REQUEST_ID_HEADER};
 use crate::{BoxFuture, BusEnvelope, BusError, ErasedHandler, Request, RequestHandler, Transport};
 
 /// Adapts a [`RequestHandler<R>`] into an [`ErasedHandler`] that decodes the
@@ -65,11 +66,20 @@ where
                 return Ok(());
             };
             let correlation_id = envelope.correlation_id;
+            let request_id = envelope.headers.get(REQUEST_ID_HEADER).cloned();
             let reply_envelope = match self.handler.handle(request, ctx).await {
                 Ok(reply) => {
                     let mut env = BusEnvelope::new(correlation_id, &reply)?;
                     env.headers
                         .insert(REPLY_STATUS_HEADER.to_owned(), REPLY_STATUS_OK.to_owned());
+                    if let Some(request_id) = request_id.as_ref() {
+                        env.headers
+                            .insert(REQUEST_ID_HEADER.to_owned(), request_id.clone());
+                    }
+                    env.headers.insert(
+                        PROTOCOL_VERSION_HEADER.to_owned(),
+                        PROTOCOL_VERSION.to_string(),
+                    );
                     env
                 }
                 Err(error) => {
@@ -78,16 +88,26 @@ where
                         error_type: error_variant_name(&error).to_owned(),
                         message: error.to_string(),
                     };
+                    let mut headers = std::collections::HashMap::from([
+                        (
+                            REPLY_STATUS_HEADER.to_owned(),
+                            REPLY_STATUS_ERROR.to_owned(),
+                        ),
+                        (
+                            PROTOCOL_VERSION_HEADER.to_owned(),
+                            PROTOCOL_VERSION.to_string(),
+                        ),
+                    ]);
+                    if let Some(request_id) = request_id.as_ref() {
+                        headers.insert(REQUEST_ID_HEADER.to_owned(), request_id.clone());
+                    }
                     BusEnvelope::restore(
                         uuid::Uuid::now_v7(),
                         REPLY_ERROR_MESSAGE_TYPE.to_owned(),
                         serde_json::to_vec(&payload)?,
                         correlation_id,
                         None,
-                        std::collections::HashMap::from([(
-                            REPLY_STATUS_HEADER.to_owned(),
-                            REPLY_STATUS_ERROR.to_owned(),
-                        )]),
+                        headers,
                         std::time::SystemTime::now(),
                     )
                 }

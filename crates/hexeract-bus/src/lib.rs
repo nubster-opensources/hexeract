@@ -12,9 +12,9 @@
 //! It also ships the backend-agnostic request-reply primitives: the
 //! [`Request`] trait naming a typed reply, [`RequestClient`] and
 //! [`RequestError`] on the caller side, [`RequestHandler`] and
-//! [`RepliedHandler`] on the responder side, and the [`CorrelationRegistry`]
-//! (with its RAII [`PendingReply`] guard) correlating a reply back to its
-//! in-flight request. The wire contract between the two sides
+//! [`RepliedHandler`] on the responder side, and the [`RequestRegistry`]
+//! (with its RAII [`PendingReply`] guard) routing a reply back to its
+//! in-flight request by request identity. The wire contract between the two sides
 //! ([`REPLY_STATUS_HEADER`], [`REPLY_STATUS_OK`], [`REPLY_STATUS_ERROR`],
 //! [`REPLY_ERROR_MESSAGE_TYPE`], [`RemoteErrorPayload`]) is documented in
 //! full in `docs/concepts/request-reply.md` in the workspace.
@@ -22,8 +22,6 @@
 //! Backend implementations live in companion crates such as
 //! `hexeract-bus-rabbitmq`.
 
-/// Rendezvous point correlating replies with their in-flight request.
-pub mod correlation;
 /// In-flight representation of a message crossing the bus.
 pub mod envelope;
 /// Errors raised by the bus primitives, transports and workers.
@@ -48,6 +46,9 @@ pub mod request_client;
 pub mod request_error;
 /// Responder-side handler that produces a typed reply for a [`Request`].
 pub mod request_handler;
+/// Rendezvous point between request callers and reply deliveries, keyed by
+/// request identity.
+pub mod request_registry;
 /// Wire constants of the request-reply protocol.
 pub mod rpc_protocol;
 /// Strongly-typed topology declarations shared by transports.
@@ -55,8 +56,6 @@ pub mod topology;
 /// Backend-agnostic publish contract implemented by bus backends.
 pub mod transport;
 
-pub use correlation::CorrelationRegistry;
-pub use correlation::PendingReply;
 pub use envelope::BusEnvelope;
 pub use error::BusError;
 pub use handler::BoxFuture;
@@ -76,6 +75,8 @@ pub use request::Request;
 pub use request_client::RequestClient;
 pub use request_error::RequestError;
 pub use request_handler::RequestHandler;
+pub use request_registry::PendingReply;
+pub use request_registry::RequestRegistry;
 pub use rpc_protocol::PROTOCOL_VERSION;
 pub use rpc_protocol::PROTOCOL_VERSION_HEADER;
 pub use rpc_protocol::REQUEST_ID_HEADER;

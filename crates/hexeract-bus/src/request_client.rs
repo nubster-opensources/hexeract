@@ -3,16 +3,17 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-use crate::correlation::CorrelationRegistry;
 use crate::reply_status::{
     REPLY_STATUS_ERROR, REPLY_STATUS_HEADER, REPLY_STATUS_OK, RemoteErrorPayload,
 };
+use crate::request_registry::RequestRegistry;
+use crate::rpc_protocol::{PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, REQUEST_ID_HEADER};
 use crate::{BusEnvelope, Request, RequestError, Transport};
 
 /// Synchronous-over-async RPC client: send a [`Request`], await its reply.
 pub struct RequestClient<T: Transport> {
     transport: Arc<T>,
-    registry: Arc<CorrelationRegistry>,
+    registry: Arc<RequestRegistry>,
     reply_inbox: Arc<Mutex<String>>,
     default_timeout: Duration,
 }
@@ -23,7 +24,7 @@ impl<T: Transport> RequestClient<T> {
     #[must_use]
     pub fn new(
         transport: Arc<T>,
-        registry: Arc<CorrelationRegistry>,
+        registry: Arc<RequestRegistry>,
         reply_inbox: Arc<Mutex<String>>,
         default_timeout: Duration,
     ) -> Self {
@@ -61,14 +62,22 @@ impl<T: Transport> RequestClient<T> {
         timeout: Duration,
     ) -> Result<R::Reply, RequestError> {
         let mut pending = self.registry.register();
-        let correlation_id: Uuid = *pending.correlation_id().as_uuid();
+        let request_id = pending.request_id();
+        let correlation_id = Uuid::now_v7();
         let inbox = self
             .reply_inbox
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        let envelope = BusEnvelope::with_reply_to(correlation_id, inbox, request)
+        let mut envelope = BusEnvelope::with_reply_to(correlation_id, inbox, request)
             .map_err(RequestError::Decode)?;
+        envelope
+            .headers
+            .insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
+        envelope.headers.insert(
+            PROTOCOL_VERSION_HEADER.to_owned(),
+            PROTOCOL_VERSION.to_string(),
+        );
         self.transport
             .publish_envelope(R::DESTINATION, &envelope)
             .await
@@ -111,6 +120,8 @@ mod tests {
     use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
 
+    use hexeract_core::RequestId;
+
     use super::*;
     use crate::reply_status::REPLY_ERROR_MESSAGE_TYPE;
     use crate::{BusError, Message};
@@ -149,16 +160,30 @@ mod tests {
         }
     }
 
-    fn ok_reply(correlation_id: Uuid, seq: u64) -> BusEnvelope {
-        let mut env = BusEnvelope::new(correlation_id, &Pong { seq }).unwrap();
+    /// Read the request identity the client stamped on its published envelope.
+    fn published_request_id(published: &BusEnvelope) -> RequestId {
+        let raw = published
+            .headers
+            .get(REQUEST_ID_HEADER)
+            .expect("client stamps a request id header on every request");
+        RequestId::from(
+            raw.parse::<Uuid>()
+                .expect("request id header must be a valid uuid"),
+        )
+    }
+
+    fn ok_reply(request_id: RequestId, seq: u64) -> BusEnvelope {
+        let mut env = BusEnvelope::new(Uuid::now_v7(), &Pong { seq }).unwrap();
         env.headers
             .insert(REPLY_STATUS_HEADER.to_owned(), REPLY_STATUS_OK.to_owned());
+        env.headers
+            .insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
         env
     }
 
     fn client(
         transport: Arc<CapturingTransport>,
-        registry: Arc<CorrelationRegistry>,
+        registry: Arc<RequestRegistry>,
     ) -> RequestClient<CapturingTransport> {
         RequestClient::new(
             transport,
@@ -173,7 +198,7 @@ mod tests {
         let transport = Arc::new(CapturingTransport {
             last: StdMutex::new(None),
         });
-        let registry = Arc::new(CorrelationRegistry::new());
+        let registry = Arc::new(RequestRegistry::new());
         let client = client(Arc::clone(&transport), Arc::clone(&registry));
 
         let request_fut = client.request(&Ping { seq: 3 });
@@ -185,7 +210,7 @@ mod tests {
         }
         let published = transport.last.lock().unwrap().clone().unwrap();
         assert_eq!(published.reply_to.as_deref(), Some("reply.inbox"));
-        registry.resolve(ok_reply(published.correlation_id, 3));
+        registry.resolve(ok_reply(published_request_id(&published), 3));
         let pong = request_fut.await.expect("reply");
         assert_eq!(pong, Pong { seq: 3 });
     }
@@ -195,7 +220,7 @@ mod tests {
         let transport = Arc::new(CapturingTransport {
             last: StdMutex::new(None),
         });
-        let registry = Arc::new(CorrelationRegistry::new());
+        let registry = Arc::new(RequestRegistry::new());
         let client = client(transport, Arc::clone(&registry));
         let err = client
             .request_with_timeout(&Ping { seq: 1 }, Duration::from_millis(30))
@@ -210,7 +235,7 @@ mod tests {
         let transport = Arc::new(CapturingTransport {
             last: StdMutex::new(None),
         });
-        let registry = Arc::new(CorrelationRegistry::new());
+        let registry = Arc::new(RequestRegistry::new());
         let client = client(Arc::clone(&transport), Arc::clone(&registry));
 
         let request_fut = client.request(&Ping { seq: 9 });
@@ -230,10 +255,16 @@ mod tests {
             serde_json::to_vec(&payload).unwrap(),
             published.correlation_id,
             None,
-            HashMap::from([(
-                REPLY_STATUS_HEADER.to_owned(),
-                REPLY_STATUS_ERROR.to_owned(),
-            )]),
+            HashMap::from([
+                (
+                    REPLY_STATUS_HEADER.to_owned(),
+                    REPLY_STATUS_ERROR.to_owned(),
+                ),
+                (
+                    REQUEST_ID_HEADER.to_owned(),
+                    published_request_id(&published).to_string(),
+                ),
+            ]),
             std::time::SystemTime::UNIX_EPOCH,
         );
         registry.resolve(err_env);
