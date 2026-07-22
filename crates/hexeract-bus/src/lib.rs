@@ -20,7 +20,7 @@
 //! stays on the responder side. The wire contract between the two sides
 //! ([`REPLY_STATUS_HEADER`], [`REPLY_STATUS_OK`], [`REPLY_STATUS_ERROR`],
 //! [`REPLY_ERROR_MESSAGE_TYPE`], [`RemoteErrorPayload`]) is documented in
-//! full in `docs/concepts/request-reply.md` in the workspace.
+//! full in `docs/architecture/rpc-protocol.md` in the workspace.
 //!
 //! Backend implementations live in companion crates such as
 //! `hexeract-bus-rabbitmq`.
