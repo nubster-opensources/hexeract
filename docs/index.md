@@ -1,6 +1,6 @@
 # Hexeract Documentation
 
-Hexeract is a six-dimension Rust messaging framework: **Mediator**, **Bus**, **Outbox**, **Sagas**, **Scheduler**, **Request/Reply** (Sagas and Request/Reply are on the roadmap). This index points at the documentation that is shipped today (v0.6.0).
+Hexeract is a six-dimension Rust messaging framework: **Mediator**, **Bus**, **Outbox**, **Sagas**, **Scheduler**, **Request/Reply** (Sagas is on the roadmap; Request/Reply is implemented and pending release). This index points at the documentation for the current codebase (v0.6.0).
 
 ## Start here
 
@@ -50,6 +50,7 @@ One file per cross-cutting concept the API exposes.
 - [Correlation ID propagation](concepts/correlation-id.md)
 - [Scheduler triggers](concepts/scheduler-triggers.md) (one-shot delay and cron-style recurrence)
 - [Scheduler delivery](concepts/scheduler-delivery.md) (lease, retry, jitter, dead-letter)
+- [Request-reply](concepts/request-reply.md) (`RequestClient`, `RequestHandler`, correlation registry, reply inbox lifecycle)
 
 ## Cookbook
 

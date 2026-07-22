@@ -20,6 +20,9 @@ use hexeract_bus::BusError;
 use hexeract_bus::ErasedHandler;
 use hexeract_bus::Handler;
 use hexeract_bus::Message;
+use hexeract_bus::RepliedHandler;
+use hexeract_bus::Request;
+use hexeract_bus::RequestHandler;
 use hexeract_bus::TypedHandler;
 use hexeract_core::CorrelationId;
 use hexeract_core::HandlerContext;
@@ -44,6 +47,7 @@ use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
 use crate::connection::RabbitMqConnection;
+use crate::transport::RabbitMqTransport;
 use crate::transport::to_short_string;
 
 /// Default consumer prefetch (`basic.qos`).
@@ -374,6 +378,29 @@ impl RabbitMqWorkerBuilder {
     {
         let erased: Arc<dyn ErasedHandler> = Arc::new(TypedHandler::<M, H>::new(handler));
         self.handlers.insert(M::MESSAGE_TYPE, erased);
+        self
+    }
+
+    /// Register a request handler: decodes `R`, runs the handler, and
+    /// auto-publishes the typed reply (or an encoded error) to the request
+    /// `reply_to` via `transport`.
+    ///
+    /// Registering twice for the same `R::MESSAGE_TYPE` silently replaces
+    /// the previous entry, same as [`Self::register_handler`].
+    #[must_use]
+    pub fn register_request_handler<R, H>(
+        mut self,
+        handler: H,
+        transport: Arc<RabbitMqTransport>,
+    ) -> Self
+    where
+        R: Request,
+        H: RequestHandler<R>,
+    {
+        let erased: Arc<dyn ErasedHandler> = Arc::new(
+            RepliedHandler::<R, H, RabbitMqTransport>::new(handler, transport),
+        );
+        self.handlers.insert(R::MESSAGE_TYPE, erased);
         self
     }
 

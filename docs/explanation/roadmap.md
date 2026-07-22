@@ -8,7 +8,7 @@
 | v0.4.0 | Outbox Multi-Database | Shipped |
 | v0.5.0 | Reliability | Shipped |
 | v0.6.0 | Scheduler | Shipped |
-| v0.7.0 | Request and Reply | Planned |
+| v0.7.0 | Request and Reply | In progress |
 | v0.8.0 | Sagas | Planned |
 | v0.9.0 | Polyglot Transports | Planned |
 | v0.10.0 | Polish and Stability | Planned |
@@ -111,9 +111,14 @@ Released as v0.1.0 on crates.io. The seven shipped crates are `hexeract-core`, `
 - Automatic promotion to the dead-letter queue after exhausted retries.
 - Native integration with the Bus (publish later via a broker) and the Outbox (commit later in a business transaction).
 
-## v0.7.0: Request and Reply
+## v0.7.0: Request and Reply (IN PROGRESS)
 
 **Goal.** Synchronous RPC pattern over the asynchronous bus, via correlation IDs.
+
+Implemented in code on the request-reply feature branch: see the CHANGELOG's
+`[Unreleased]` section for the added symbols. The crate versions stay at
+0.6.0 and the release is a separate decision once every v0.7.0 issue is
+closed.
 
 **Scope:**
 
