@@ -34,6 +34,8 @@ pub mod handler;
 pub mod message;
 /// Contract for publishing a raw message with a caller-supplied id.
 pub mod raw_publish;
+/// Sanitized failure payload published on the request-reply error channel.
+pub mod remote_error;
 /// Adapter that erases a [`RequestHandler`] into an [`ErasedHandler`].
 pub mod replied_handler;
 /// Wire contract for the request-reply error path.
@@ -46,6 +48,8 @@ pub mod request_client;
 pub mod request_error;
 /// Responder-side handler that produces a typed reply for a [`Request`].
 pub mod request_handler;
+/// Wire constants of the request-reply protocol.
+pub mod rpc_protocol;
 /// Strongly-typed topology declarations shared by transports.
 pub mod topology;
 /// Backend-agnostic publish contract implemented by bus backends.
@@ -61,16 +65,20 @@ pub use handler::Handler;
 pub use handler::TypedHandler;
 pub use message::Message;
 pub use raw_publish::RawBusPublish;
+pub use remote_error::RemoteErrorPayload;
+pub use remote_error::RemoteErrorType;
 pub use replied_handler::RepliedHandler;
 pub use reply_status::REPLY_ERROR_MESSAGE_TYPE;
 pub use reply_status::REPLY_STATUS_ERROR;
 pub use reply_status::REPLY_STATUS_HEADER;
 pub use reply_status::REPLY_STATUS_OK;
-pub use reply_status::RemoteErrorPayload;
 pub use request::Request;
 pub use request_client::RequestClient;
 pub use request_error::RequestError;
 pub use request_handler::RequestHandler;
+pub use rpc_protocol::PROTOCOL_VERSION;
+pub use rpc_protocol::PROTOCOL_VERSION_HEADER;
+pub use rpc_protocol::REQUEST_ID_HEADER;
 pub use topology::Binding;
 pub use topology::Exchange;
 pub use topology::ExchangeKind;
