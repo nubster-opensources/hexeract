@@ -4,7 +4,7 @@ Two independent processes, a caller and a responder, agree on the request-reply 
 
 ## Addressing a request
 
-A request is published to `Request::DESTINATION`, the routing key `RabbitMqTransport::publish_envelope` targets. `DESTINATION` defaults to `Message::MESSAGE_TYPE`, so for the common case of one responder per request type, the responder queue is simply named after the type. Override `DESTINATION` when a request must reach a queue distinct from the type's usual destination, for example when several request types share one responder queue. Whichever value it resolves to, the responder side is responsible for declaring and binding, out-of-band, a queue named exactly `DESTINATION`: see [Request-reply: declaring the responder queue](../concepts/request-reply.md#declaring-the-responder-queue).
+A request is published to `Request::DESTINATION`, the routing key that `RabbitMqTransport::publish_envelope` targets. `DESTINATION` defaults to `Message::MESSAGE_TYPE`, so for the common case of one responder per request type, the responder queue is simply named after the type. Override `DESTINATION` when a request must reach a queue distinct from the type's usual destination, for example when several request types share one responder queue. Whichever value it resolves to, the responder side is responsible for declaring and binding, out-of-band, a queue named exactly `DESTINATION`: see [Request-reply: declaring the responder queue](../concepts/request-reply.md#declaring-the-responder-queue).
 
 ## Reserved namespace
 
