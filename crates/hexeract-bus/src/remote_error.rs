@@ -18,7 +18,8 @@ pub enum RemoteErrorType {
     Internal,
     /// The request could not be decoded, or its payload was rejected.
     Malformed,
-    /// A dependency was unavailable or the responder was saturated.
+    /// A connection or transport failure occurred, or the request could
+    /// not be routed to any queue.
     Unavailable,
     /// The announced protocol version is not supported by the responder.
     Unsupported,

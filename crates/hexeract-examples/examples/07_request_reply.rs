@@ -12,7 +12,7 @@
 //! - Act 3: a genuine remote fault. The `Faulty` responder always fails
 //!   [`Explode`] with an internal error, and the failure reaches the
 //!   caller as [`RequestError::Remote`]: the protocol's error channel is
-//!   reserved for exactly this, a panne the caller cannot resolve.
+//!   reserved for exactly this, a fault the caller cannot resolve.
 //! - Act 4: a business rejection. The `Divider` responder never fails a
 //!   [`Divide`] request: a zero denominator is an expected, named
 //!   outcome carried by the [`DivisionOutcome`] reply, not a protocol
@@ -57,8 +57,9 @@ use uuid::Uuid;
 
 // `RabbitMqTransport` publishes on the default exchange, which only ever
 // routes a message to the queue whose name equals the routing key. The
-// request client uses `Request::MESSAGE_TYPE` as that routing key (see
-// `RequestClient::request`), so each queue below must be named exactly
+// request client uses `Request::DESTINATION` as that routing key (see
+// `RequestClient::request`), which defaults to `MESSAGE_TYPE` and none of
+// the requests below override it, so each queue must be named exactly
 // after the matching request's `MESSAGE_TYPE`, not after the queue's role.
 const PING_QUEUE: &str = "examples.ping";
 const DIVIDE_QUEUE: &str = "examples.divide";
@@ -153,7 +154,7 @@ impl Message for Ack {
 }
 
 /// Responder that always fails with an internal error, standing in for a
-/// downstream dependency the responder cannot reach. This is a panne,
+/// downstream dependency the responder cannot reach. This is a fault,
 /// not a business outcome, so it belongs on the protocol's error
 /// channel rather than in a `Reply` value.
 struct Faulty;
@@ -183,7 +184,7 @@ impl Request for Divide {
 /// Reply carrying either the quotient or the business rejection of a
 /// zero denominator. A zero denominator is an expected, named outcome
 /// the caller pattern-matches on, never a protocol failure: the error
-/// channel of the protocol is reserved for pannes.
+/// channel of the protocol is reserved for faults.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 enum DivisionOutcome {
     Quotient(i64),
@@ -358,8 +359,11 @@ async fn spawn_responders(
     // inside its handler, distinct from the transport it uses to publish
     // its own reply to `RelayedPing`.
     let relay_correlation = Arc::new(StdMutex::new(None));
+    // Shorter than the outer client's timeout (below), so on a slow broker
+    // the inner hop times out first: a relay timeout is then unambiguously
+    // attributable to the forwarded call, never to the outer one.
     let relay_client =
-        Arc::new(connect_request_client(uri, Duration::from_secs(10), cancel.clone()).await?);
+        Arc::new(connect_request_client(uri, Duration::from_secs(5), cancel.clone()).await?);
     let relay_reply_transport = Arc::new(RabbitMqTransport::new(uri).await?);
     let relay_worker = RabbitMqWorkerBuilder::new(
         RabbitMqConnection::connect_with_retry(uri, RETRY_ATTEMPTS, RETRY_BASE_DELAY).await?,
@@ -428,7 +432,7 @@ async fn run_timeout(client: &RequestClient<RabbitMqTransport>) -> Result<(), Bo
 
 /// Act 3: a genuine remote fault. `Faulty` always fails, and the
 /// failure reaches the caller as [`RequestError::Remote`]: the
-/// protocol's error channel is reserved for exactly this, a panne the
+/// protocol's error channel is reserved for exactly this, a fault the
 /// caller cannot resolve by matching on a value.
 async fn run_remote_fault(client: &RequestClient<RabbitMqTransport>) -> Result<(), Box<dyn Error>> {
     tracing::info!("act 3: a genuine remote fault reaches the caller");

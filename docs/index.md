@@ -32,6 +32,7 @@ Visual overview of the building blocks and the flows they implement.
 - [Outbox flow](architecture/outbox-flow.md) (business transaction → envelope → worker → handler)
 - [Bus flow](architecture/bus-flow.md) (publish → AMQP → consume → ack)
 - [Scheduler flow](architecture/scheduler-flow.md) (schedule -> store -> worker -> sink, reschedule or dead-letter)
+- [RPC protocol](architecture/rpc-protocol.md) (wire version 1: addressing, reserved headers, error categories, version rules)
 
 ## Concepts
 
