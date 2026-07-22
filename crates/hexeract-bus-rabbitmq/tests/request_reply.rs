@@ -19,6 +19,8 @@ use std::time::Instant;
 use hexeract_bus::BusEnvelope;
 use hexeract_bus::BusError;
 use hexeract_bus::Message;
+use hexeract_bus::PROTOCOL_VERSION;
+use hexeract_bus::PROTOCOL_VERSION_HEADER;
 use hexeract_bus::REQUEST_ID_HEADER;
 use hexeract_bus::RemoteErrorType;
 use hexeract_bus::Request;
@@ -34,6 +36,7 @@ use hexeract_bus_rabbitmq::run_reply_inbox_for_test;
 use hexeract_core::HandlerContext;
 use lapin::options::BasicGetOptions;
 use lapin::options::QueueDeclareOptions;
+use lapin::types::AMQPValue;
 use lapin::types::FieldTable;
 use serde::Deserialize;
 use serde::Serialize;
@@ -228,6 +231,77 @@ async fn end_to_end_request_reply_round_trip() {
     let _ = worker_handle.await;
 }
 
+/// The one test that a broker can fail where no unit test could: it
+/// inspects a request exactly as it sits on the queue, straight off the
+/// AMQP wire, rather than trusting the client's own view of what it built.
+/// A header dropped or mangled anywhere between [`hexeract_bus::RequestClient`]
+/// and the broker would be invisible to every unit test in this workspace
+/// and would only ever show up here.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn a_round_trip_carries_the_protocol_headers_over_the_wire() {
+    let broker = harness::start_rabbitmq().await;
+    let cancel = CancellationToken::new();
+
+    declare_ping_queue(broker.uri(), "tests.ping").await;
+
+    let client = connect_request_client(broker.uri(), Duration::from_secs(10), cancel.clone())
+        .await
+        .unwrap();
+
+    // No responder consumes tests.ping: the request just sits on the queue,
+    // available for a direct basic_get, timing out client-side instead of
+    // waiting for a reply that will never come.
+    let _ = client
+        .request_with_timeout(&Ping { seq: 1 }, Duration::from_millis(500))
+        .await;
+
+    let inspect_connection = RabbitMqConnection::connect(broker.uri()).await.unwrap();
+    let inspect_channel = inspect_connection.create_channel().await.unwrap();
+    let mut attempts = 0;
+    let request = loop {
+        if let Some(delivery) = inspect_channel
+            .basic_get("tests.ping".into(), BasicGetOptions::default())
+            .await
+            .unwrap()
+        {
+            break delivery;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 100,
+            "no request reached the broker after 100 attempts"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    let headers = request
+        .properties
+        .headers()
+        .as_ref()
+        .expect("a request must carry AMQP headers");
+    assert!(
+        headers.inner().contains_key(REQUEST_ID_HEADER),
+        "the request must carry {REQUEST_ID_HEADER} on the wire, got {headers:?}"
+    );
+    match headers.inner().get(PROTOCOL_VERSION_HEADER) {
+        Some(AMQPValue::LongString(value)) => {
+            assert_eq!(
+                value.as_bytes(),
+                PROTOCOL_VERSION.to_string().as_bytes(),
+                "the request must announce protocol version {PROTOCOL_VERSION} on the wire"
+            );
+        }
+        other => panic!("expected {PROTOCOL_VERSION_HEADER} as a long string, got {other:?}"),
+    }
+    assert!(
+        request.properties.reply_to().is_some(),
+        "the request must carry a reply_to on the wire"
+    );
+
+    cancel.cancel();
+}
+
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn remote_error_reaches_caller_fast() {
@@ -272,6 +346,12 @@ async fn remote_error_reaches_caller_fast() {
         elapsed < Duration::from_secs(5),
         "a remote error must reach the caller fast, well under the 30s timeout, took {elapsed:?}"
     );
+    let rendered = format!("{err:?}");
+    assert!(
+        !rendered.contains("deliberate handler failure"),
+        "the responder's internal failure message leaked to the caller, across a real \
+         broker, not just the in-process error path: {rendered}"
+    );
 
     cancel.cancel();
     let _ = worker_handle.await;
@@ -305,20 +385,29 @@ async fn request_without_reply_to_is_non_fatal() {
     let envelope = BusEnvelope::new(Uuid::now_v7(), &Ping { seq: 99 }).unwrap();
     harness::publish_to_default_exchange(&publish_channel, "tests.ping", &envelope).await;
 
-    // give the worker time to consume and settle the delivery
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
     // the delivery must be fully settled (acked), never left unsettled or
-    // redelivered, proving the missing reply_to did not crash the worker
+    // redelivered, proving the missing reply_to did not crash the worker.
+    // Scrutinize with a bounded number of attempts instead of a fixed
+    // sleep, so a slow agent gets more wall time rather than a flaky
+    // false failure.
     let probe_channel = publish_connection.create_channel().await.unwrap();
-    let redelivered = probe_channel
-        .basic_get("tests.ping".into(), BasicGetOptions::default())
-        .await
-        .unwrap();
-    assert!(
-        redelivered.is_none(),
-        "a request without reply_to must be acked normally, not left unsettled"
-    );
+    let mut attempts = 0;
+    loop {
+        let probe = probe_channel
+            .basic_get("tests.ping".into(), BasicGetOptions::default())
+            .await
+            .unwrap();
+        if probe.is_none() {
+            break;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 100,
+            "a request without reply_to was still queued after 100 attempts, proving \
+             it was never settled by the worker"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     // the worker must still be alive and answer a normal request afterward
     let client = connect_request_client(broker.uri(), Duration::from_secs(10), cancel.clone())
