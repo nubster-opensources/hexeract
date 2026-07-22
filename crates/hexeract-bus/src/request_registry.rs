@@ -249,27 +249,39 @@ mod tests {
         assert!(pending.wait().await.is_err());
     }
 
+    /// Resolves replies in an order decorrelated from slot-creation order: the
+    /// resolver visits index `(i * 7) % SLOT_COUNT` on its `i`-th step. Since 7
+    /// and `SLOT_COUNT` (64) are coprime, this sequence still visits every one
+    /// of the 64 slots exactly once, but never in creation order. Waiting
+    /// happens in plain creation order, so this decorrelation is what makes
+    /// the test probant: a routing bug that delivers the `n`-th resolved reply
+    /// to the `n`-th waiting caller (FIFO), or the last resolved reply to the
+    /// first waiting caller (LIFO), would both fail here, whereas a test that
+    /// merely reversed the resolution order would only catch the LIFO case.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn many_concurrent_calls_each_receive_their_own_reply() {
+        const SLOT_COUNT: usize = 64;
+
         let registry = Arc::new(RequestRegistry::new());
         let chain = Uuid::now_v7();
-        let mut pendings: Vec<_> = (0..64).map(|_| registry.register()).collect();
+        let mut pendings: Vec<_> = (0..SLOT_COUNT).map(|_| registry.register()).collect();
         let ids: Vec<RequestId> = pendings.iter().map(PendingReply::request_id).collect();
 
         let resolver = Arc::clone(&registry);
         let resolver_ids = ids.clone();
         let task = tokio::spawn(async move {
-            for (seq, request_id) in resolver_ids.into_iter().enumerate() {
-                let seq = u64::try_from(seq).expect("seq fits in u64");
-                resolver.resolve(reply_for(request_id, chain, seq));
+            for i in 0..SLOT_COUNT {
+                let resolve_index = (i * 7) % SLOT_COUNT;
+                let seq = u64::try_from(resolve_index).expect("seq fits in u64");
+                resolver.resolve(reply_for(resolver_ids[resolve_index], chain, seq));
             }
         });
 
-        for (seq, pending) in pendings.iter_mut().enumerate() {
-            let seq = u64::try_from(seq).expect("seq fits in u64");
+        for (index, pending) in pendings.iter_mut().enumerate() {
+            let expected_seq = u64::try_from(index).expect("seq fits in u64");
             let envelope = pending.wait().await.expect("each caller gets a reply");
             let reply: Pong = envelope.decode().expect("decode");
-            assert_eq!(reply.seq, seq, "reply routed to the wrong caller");
+            assert_eq!(reply.seq, expected_seq, "reply routed to the wrong caller");
         }
         task.await.expect("resolver task must finish");
     }
