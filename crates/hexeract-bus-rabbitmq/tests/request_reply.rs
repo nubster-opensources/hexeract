@@ -21,6 +21,8 @@ use hexeract_bus::BusError;
 use hexeract_bus::Message;
 use hexeract_bus::PROTOCOL_VERSION;
 use hexeract_bus::PROTOCOL_VERSION_HEADER;
+use hexeract_bus::REPLY_STATUS_HEADER;
+use hexeract_bus::REPLY_STATUS_OK;
 use hexeract_bus::REQUEST_ID_HEADER;
 use hexeract_bus::RemoteErrorType;
 use hexeract_bus::Request;
@@ -96,10 +98,14 @@ async fn reply_published_to_inbox_is_resolved() {
     let mut reply = BusEnvelope::new(Uuid::now_v7(), &Pong { seq: 42 }).unwrap();
     reply
         .headers
-        .insert("x-hexeract-reply-status".to_owned(), "ok".to_owned());
+        .insert(REPLY_STATUS_HEADER.to_owned(), REPLY_STATUS_OK.to_owned());
     reply
         .headers
         .insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
+    reply.headers.insert(
+        PROTOCOL_VERSION_HEADER.to_owned(),
+        PROTOCOL_VERSION.to_string(),
+    );
     harness::publish_to_default_exchange(&publish_channel, &inbox, &reply).await;
 
     let received = tokio::time::timeout(Duration::from_secs(5), pending.wait())
