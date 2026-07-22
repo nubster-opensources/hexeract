@@ -44,6 +44,25 @@ Both the request and the reply carry the header `x-hexeract-protocol-version`. A
 
 A request published without a `reply_to` (bypassing `RequestClient`, for example a hand-crafted envelope) is handled fire-and-forget: `RepliedHandler` still runs the handler for its side effect, logging a warning instead of publishing a reply. The handler's `Result` still drives the delivery, though: on `Ok`, `handle` returns `Ok(())` and the delivery is acked normally, exactly as if a reply had been sent; on `Err`, the handler's error is propagated out of `RepliedHandler::handle` unchanged, exactly as it would from a plain `Handler<M>`, so the worker's usual nack, retry and dead-letter policy applies (see [Retry policy](retry-policy.md) and [Ack modes](ack-modes.md)). A real `RequestClient` always stamps `reply_to`, so this path only matters for a `Request` type deliberately used fire-and-forget, bypassing `RequestClient`.
 
+## Business rejection versus protocol failure
+
+An expected domain outcome, an unknown account, a frozen one, an empty search result, is not a failure of the request-reply protocol: it is a value the responder always knows how to produce and the caller always knows how to handle. It belongs in `Request::Reply`, encoded as an ordinary successful reply, never on the protocol's error channel.
+
+```rust
+#[derive(Debug, Serialize, Deserialize)]
+enum GetBalanceReply {
+    Found { cents: u64 },
+    UnknownAccount { account_id: Uuid },
+    Frozen { since: String },
+}
+
+impl Request for GetBalance {
+    type Reply = GetBalanceReply;
+}
+```
+
+The rule: a business rejection is a return value, carried like any other reply. The protocol's error channel (`RemoteErrorPayload`, described above) is reserved for a panne the caller cannot resolve by matching on a value: the handler failed, the request could not be decoded, or the announced protocol version is unsupported. See [RPC protocol](../architecture/rpc-protocol.md) for the full contract this boundary is part of.
+
 ## Declaring the responder queue
 
 `RabbitMqTransport::publish_envelope` publishes every request `mandatory` and awaits the publisher confirm, so a request published to a routing key with no bound queue is returned by the broker as NO_ROUTE and surfaces immediately as `RequestError::Transport(BusError::Unroutable)`, never as a hang: a misconfigured responder fails the caller's very first request outright instead of leaving it to wait out its timeout.
