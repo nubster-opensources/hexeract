@@ -56,9 +56,14 @@ impl<T: Transport> RequestClient<T> {
     /// - [`RequestError::Transport`] if publishing fails or the reply channel
     ///   is lost (connection dropped).
     /// - [`RequestError::Timeout`] if no reply arrives within `timeout`.
-    /// - [`RequestError::Remote`] if the responder returned an error.
-    /// - [`RequestError::Decode`] if the request cannot be serialized or the
-    ///   reply cannot be decoded (including a malformed or missing status).
+    /// - [`RequestError::Protocol`] if the reply violates the request-reply
+    ///   protocol: an unsupported or missing protocol version, a missing or
+    ///   unrecognized reply status, or a reply message type other than the
+    ///   one expected.
+    /// - [`RequestError::Remote`] if the responder reported a failure.
+    /// - [`RequestError::Decode`] if the request cannot be serialized, or a
+    ///   reply that already passed protocol and status validation cannot be
+    ///   decoded into the expected reply type.
     pub async fn request_with_timeout<R: Request>(
         &self,
         request: &R,
@@ -403,8 +408,14 @@ mod tests {
     /// Drive one round trip against a capturing transport, letting `mutate`
     /// tamper with the reply before it is resolved, and return the resulting
     /// client error.
+    ///
+    /// Uses the same deterministic idiom as `nominal_round_trip_returns_typed_reply`
+    /// and `remote_error_reply_maps_to_remote`: the request future is
+    /// pinned and driven with `select!` until it has published and
+    /// registered its slot, in line rather than through a detached task or
+    /// a polling loop.
     async fn client_error_for_reply(
-        mutate: impl FnOnce(RequestId, &mut BusEnvelope) + Send + 'static,
+        mutate: impl FnOnce(RequestId, &mut BusEnvelope),
     ) -> RequestError {
         let transport = Arc::new(CapturingTransport::default());
         let registry = Arc::new(RequestRegistry::new());
@@ -415,43 +426,40 @@ mod tests {
             Duration::from_secs(5),
         );
 
-        let resolver = Arc::clone(&registry);
-        let responder = tokio::spawn(async move {
-            let published = loop {
-                if let Some(published) = transport.last_published() {
-                    break published;
-                }
-                tokio::task::yield_now().await;
-            };
-            let request_id = RequestId::from(
-                published
-                    .headers
-                    .get(REQUEST_ID_HEADER)
-                    .expect("request id header")
-                    .parse::<Uuid>()
-                    .expect("request id must parse"),
-            );
-            let mut reply = BusEnvelope::new(published.correlation_id, &Pong { seq: 1 })
-                .expect("pong must serialize");
-            reply
+        let request_fut = client.request(&Ping { seq: 1 });
+        tokio::pin!(request_fut);
+        tokio::select! {
+            _ = &mut request_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let published = transport
+            .last_published()
+            .expect("request must have published by now");
+        let request_id = RequestId::from(
+            published
                 .headers
-                .insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
-            reply.headers.insert(
-                PROTOCOL_VERSION_HEADER.to_owned(),
-                PROTOCOL_VERSION.to_string(),
-            );
-            reply
-                .headers
-                .insert(REPLY_STATUS_HEADER.to_owned(), REPLY_STATUS_OK.to_owned());
-            mutate(request_id, &mut reply);
-            resolver.resolve(reply);
-        });
+                .get(REQUEST_ID_HEADER)
+                .expect("request id header")
+                .parse::<Uuid>()
+                .expect("request id must parse"),
+        );
+        let mut reply = BusEnvelope::new(published.correlation_id, &Pong { seq: 1 })
+            .expect("pong must serialize");
+        reply
+            .headers
+            .insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
+        reply.headers.insert(
+            PROTOCOL_VERSION_HEADER.to_owned(),
+            PROTOCOL_VERSION.to_string(),
+        );
+        reply
+            .headers
+            .insert(REPLY_STATUS_HEADER.to_owned(), REPLY_STATUS_OK.to_owned());
+        mutate(request_id, &mut reply);
+        registry.resolve(reply);
 
-        let error = client
-            .request(&Ping { seq: 1 })
+        request_fut
             .await
-            .expect_err("the tampered reply must be rejected");
-        responder.await.expect("responder task must finish");
-        error
+            .expect_err("the tampered reply must be rejected")
     }
 }
