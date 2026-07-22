@@ -63,6 +63,17 @@ A `correlation_id` is a means to ask "which inbound request triggered this work?
 
 The `correlation_id` rides through the AMQP property of the same name. The bus serialises it as a UUID string (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) and consumers parse it back through `Uuid::parse_str`. If the parse fails (a non-UUID `correlation_id` produced by another framework), the worker falls back to a fresh UUIDv7 so the chain is broken but the handler still runs.
 
+## Correlation identity versus request identity
+
+Request-reply layers a second identifier on top of `correlation_id`: the reserved header `x-hexeract-request-id`, minted fresh by `RequestClient` on every call. The two answer different questions and must never be confused:
+
+- `correlation_id` labels a causal chain and is shared by every message that chain contains, request-reply calls included. `RequestClient::request_in` deliberately inherits the `correlation_id` of the `HandlerContext` it is given, exactly like `publish_with_correlation_id`.
+- `request_id` identifies exactly one request-reply call and is never shared, not even by two calls on the same causal chain. `RequestRegistry` keys its in-flight slots on `request_id` for precisely this reason: keying on `correlation_id` would let two concurrent replies on the same chain cross into the wrong caller.
+
+Two concurrent `request_in` calls issued from the same handler, on the same `HandlerContext`, therefore share their `correlation_id` and always mint distinct `request_id`s. Each call is routed to its own waiting slot regardless of which reply arrives first.
+
+See [RPC protocol](../architecture/rpc-protocol.md) for the full wire contract, and [Request-reply](request-reply.md) for the pattern this identifier pair supports.
+
 ## Tracing integration (v0.10.0)
 
 Full OpenTelemetry span coverage lands in v0.10.0. Until then, the recommended setup is:

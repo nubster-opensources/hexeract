@@ -19,7 +19,8 @@ pub mod envelope;
 pub mod error;
 /// Async handler traits dispatched by the mediator.
 pub mod handler;
-/// Unique identifier newtypes for messages and correlations.
+/// Unique identifier newtypes for messages, correlations and request-reply
+/// calls.
 pub mod ids;
 /// Middleware pipeline primitives.
 pub mod middleware;
@@ -36,7 +37,7 @@ pub use context::HandlerContext;
 pub use envelope::MessageEnvelope;
 pub use error::{HexeractError, NotificationFailure};
 pub use handler::{CommandHandler, NotificationHandler, QueryHandler};
-pub use ids::{CorrelationId, MessageId};
+pub use ids::{CorrelationId, MessageId, RequestId};
 pub use middleware::{BoxOutput, DynMiddleware, Middleware, Next, Terminal};
 pub use notification::Notification;
 pub use query::Query;

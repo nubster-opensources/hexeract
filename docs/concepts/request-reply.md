@@ -1,6 +1,6 @@
 # Request-reply
 
-Hexeract's request-reply pattern layers a synchronous-over-async RPC call on top of the fire-and-forget bus: a caller publishes a typed request and awaits a typed reply, correlated back to it by a freshly minted identifier. This page covers the correlation registry and its drop-guard, the wire contract two independent processes agree on for a reply envelope, the four ways a request can fail, and the lifecycle of the exclusive reply inbox.
+Hexeract's request-reply pattern layers a synchronous-over-async RPC call on top of the fire-and-forget bus: a caller publishes a typed request and awaits a typed reply, correlated back to it by a freshly minted identifier. This page covers the request registry and its drop-guard, the wire contract two independent processes agree on for a reply envelope, the four ways a request can fail, and the lifecycle of the exclusive reply inbox.
 
 ## The pattern
 
@@ -10,54 +10,76 @@ A `Request` is a `Message` that names its own reply type via the associated `Rep
 sequenceDiagram
     autonumber
     participant Client as RequestClient
-    participant Reg as CorrelationRegistry
+    participant Reg as RequestRegistry
     participant Broker as RabbitMQ
     participant Worker as RabbitMqWorker
     participant Handler as RequestHandler<R>
 
-    Client->>Reg: register() -> PendingReply(cid)
-    Client->>Broker: publish(reply_to = inbox, correlation_id = cid)
+    Client->>Reg: register() -> PendingReply(rid)
+    Client->>Broker: publish(reply_to = inbox, x-hexeract-request-id = rid)
     Broker->>Worker: Delivery
     Worker->>Handler: handle(request, ctx)
     Handler-->>Worker: Ok(reply) or Err(error)
-    Worker->>Broker: publish(reply_to, status header, correlation_id = cid)
+    Worker->>Broker: publish(reply_to, status header, x-hexeract-request-id = rid)
     Broker->>Reg: Delivery on inbox
-    Reg->>Client: resolve(cid) wakes PendingReply
+    Reg->>Client: resolve(rid) wakes PendingReply
 ```
 
-## Correlation registry and the drop-guard
+## Request registry and the drop-guard
 
-`CorrelationRegistry` is the rendezvous point between a waiting caller and an inbound reply. `register()` mints a fresh correlation id, opens a `tokio::sync::oneshot` channel, and returns a `PendingReply`: an RAII guard over that channel. The inbox consumer calls `resolve(envelope)` to route a delivered reply to its waiting slot by correlation id; an unknown or already-resolved id is dropped with a warning, never an error, and the first reply for a slot wins.
+`RequestRegistry` is the rendezvous point between a waiting caller and an inbound reply. `register()` mints a fresh request id, opens a `tokio::sync::oneshot` channel, and returns a `PendingReply`: an RAII guard over that channel. The inbox consumer calls `resolve(envelope)` to route a delivered reply to its waiting slot by request identity, read from the reserved `x-hexeract-request-id` header; an unknown or already-resolved id is dropped with a warning, never an error, and the first reply for a slot wins.
 
-The drop-guard is what makes the registry leak-free. `PendingReply`'s `Drop` implementation removes its slot from the registry on every exit path, whatever gets the caller out: a successful `wait()`, a timeout racing the `wait()` future, a cancellation, or a panic unwinding through the caller. A slot is never left behind for a reply that never arrives, and `CorrelationRegistry::drain()` (used on connection loss) closes every outstanding channel at once so every waiting caller observes a closed channel immediately instead of waiting out its timeout.
+The drop-guard is what makes the registry leak-free. `PendingReply`'s `Drop` implementation removes its slot from the registry on every exit path, whatever gets the caller out: a successful `wait()`, a timeout racing the `wait()` future, a cancellation, or a panic unwinding through the caller. A slot is never left behind for a reply that never arrives, and `RequestRegistry::drain()` (used on connection loss) closes every outstanding channel at once so every waiting caller observes a closed channel immediately instead of waiting out its timeout.
 
 ## Wire contract
 
 Requester and responder agree on the reply shape purely through envelope conventions, with no shared connection state:
 
-- The request envelope carries `reply_to` (the inbox queue name) and `correlation_id` (the fresh id the caller registered).
+- The request envelope carries `reply_to` (the inbox queue name), the header `x-hexeract-request-id` (the fresh request identity the caller registered, used to route the reply) and `correlation_id` (the causal-chain identifier, unrelated to routing).
 - The reply envelope stamps the header `x-hexeract-reply-status` to either `ok` or `error`, and carries the same `correlation_id` as the request.
 - On success, the reply payload decodes as `R::Reply` like any other message.
-- On failure, the reply's `message_type` is stamped with the sentinel `hexeract.reply.error` and the payload decodes as `RemoteErrorPayload`, a protocol type deliberately not a `Message`: a remote fault is not a domain message. `RemoteErrorPayload` carries `error_type` (a stable-ish category, the name of the `BusError` variant the responder's error converted into) and `message` (the human-readable failure text).
+- On failure, the reply's `message_type` is stamped with the sentinel `hexeract.rpc.error` and the payload decodes as `RemoteErrorPayload`, a protocol type deliberately not a `Message`: a remote fault is not a domain message. See [RPC protocol: error payload and categories](../architecture/rpc-protocol.md#error-payload-and-categories) for the payload shape and the closed set of categories.
+
+Both the request and the reply carry the header `x-hexeract-protocol-version`. An unsupported or undecodable version is rejected before decoding, with a categorized error rather than a silent drop. See [RPC protocol: version rules and coexistence](../architecture/rpc-protocol.md#version-rules-and-coexistence) for the exact rules.
 
 A request published without a `reply_to` (bypassing `RequestClient`, for example a hand-crafted envelope) is handled fire-and-forget: `RepliedHandler` still runs the handler for its side effect, logging a warning instead of publishing a reply. The handler's `Result` still drives the delivery, though: on `Ok`, `handle` returns `Ok(())` and the delivery is acked normally, exactly as if a reply had been sent; on `Err`, the handler's error is propagated out of `RepliedHandler::handle` unchanged, exactly as it would from a plain `Handler<M>`, so the worker's usual nack, retry and dead-letter policy applies (see [Retry policy](retry-policy.md) and [Ack modes](ack-modes.md)). A real `RequestClient` always stamps `reply_to`, so this path only matters for a `Request` type deliberately used fire-and-forget, bypassing `RequestClient`.
+
+## Business rejection versus protocol failure
+
+An expected domain outcome, an unknown account, a frozen one, an empty search result, is not a failure of the request-reply protocol: it is a value the responder always knows how to produce and the caller always knows how to handle. It belongs in `Request::Reply`, encoded as an ordinary successful reply, never on the protocol's error channel.
+
+```rust
+#[derive(Debug, Serialize, Deserialize)]
+enum GetBalanceReply {
+    Found { cents: u64 },
+    UnknownAccount { account_id: Uuid },
+    Frozen { since: String },
+}
+
+impl Request for GetBalance {
+    type Reply = GetBalanceReply;
+}
+```
+
+The rule: a business rejection is a return value, carried like any other reply. The protocol's error channel is reserved for a fault the caller cannot resolve by matching on a value: the handler failed, the request could not be decoded, or the announced protocol version is unsupported. See [RPC protocol](../architecture/rpc-protocol.md) for the full contract, including the error payload shape and the version rules.
 
 ## Declaring the responder queue
 
 `RabbitMqTransport::publish_envelope` publishes every request `mandatory` and awaits the publisher confirm, so a request published to a routing key with no bound queue is returned by the broker as NO_ROUTE and surfaces immediately as `RequestError::Transport(BusError::Unroutable)`, never as a hang: a misconfigured responder fails the caller's very first request outright instead of leaving it to wait out its timeout.
 
-For that fast failure to be useful, the responder side must declare and bind, out-of-band, a queue named exactly the request's `MESSAGE_TYPE`: `RequestClient` publishes to that routing key, and the default exchange routes a message to the queue of the same name. `RabbitMqWorkerBuilder` does not auto-declare the queue it consumes from, no more than it does for a plain `Handler<M>`: at startup the worker declares only its own retry (`<queue>.retry`) and dead-letter queues, never the queue passed to `.queue(...)`. The request queue's topology, like any other queue the worker consumes from, is declared out-of-band before the worker starts (see [Worker](worker.md)).
+For that fast failure to be useful, the responder side must declare and bind, out-of-band, a queue named exactly the request's `Request::DESTINATION` (which defaults to `MESSAGE_TYPE`): `RequestClient` publishes to that routing key, and the default exchange routes a message to the queue of the same name. See [RPC protocol: addressing a request](../architecture/rpc-protocol.md#addressing-a-request) for when to override `DESTINATION`. `RabbitMqWorkerBuilder` does not auto-declare the queue it consumes from, no more than it does for a plain `Handler<M>`: at startup the worker declares only its own retry (`<queue>.retry`) and dead-letter queues, never the queue passed to `.queue(...)`. The request queue's topology, like any other queue the worker consumes from, is declared out-of-band before the worker starts (see [Worker](worker.md)).
 
 This is a deliberate asymmetry with the reply inbox described below: the inbox is exclusive to one connection, so only the client that owns that connection can declare it, and it does so on every reconnect. The request queue, by contrast, is shared: any number of client processes publish to it and any number of worker instances may consume from it, so it is owned by whoever operates the responder, not minted by the framework.
 
 ## Failure modes
 
-`RequestError` has four variants, all reachable from `RequestClient::request_with_timeout`:
+`RequestError` has five variants, all reachable from `RequestClient::request_with_timeout`:
 
 - **`Timeout(Duration)`**: no reply arrived within the deadline. The `PendingReply` is dropped along with the `tokio::time::timeout` future, so the slot is cleaned up immediately rather than lingering until a reply eventually shows up.
-- **`Remote { error_type, message }`**: the responder's `RequestHandler` returned an error, decoded from a `RemoteErrorPayload` reply.
+- **`Remote { error_type, request_id }`**: the responder's `RequestHandler` returned an error, decoded from a `RemoteErrorPayload` reply. The category is deliberately coarse and carries no detail; the full trace lives on the responder side, indexed by `request_id`.
+- **`Protocol(ProtocolViolation)`**: the reply does not honor the protocol, either because a required header is missing or unparsable (`MissingHeader`), the announced protocol version is not implemented by this crate (`UnsupportedVersion`), or the reply's `message_type` does not match what was expected for this call (`UnexpectedReplyType`).
 - **`Transport(BusError)`**: the request could not be published, or the reply channel was lost, most notably when the reply inbox's connection drops and the supervisor drains the registry so every in-flight `PendingReply` fails fast instead of waiting out its timeout.
-- **`Decode(BusError)`**: the request could not be serialized, or the reply could not be decoded into `R::Reply`, including a missing or unrecognized status header.
+- **`Decode(BusError)`**: the request could not be serialized, or the reply's payload could not be decoded into `R::Reply` (or `RemoteErrorPayload` for an error reply).
 
 ## The reply inbox lifecycle
 
@@ -66,7 +88,7 @@ This is a deliberate asymmetry with the reply inbox described below: the inbox i
 The inbox itself, declared by `declare_reply_inbox`, is exclusive, auto-delete and server-named: it dies with the connection that declared it. On reconnect there is no way to resume consuming the old inbox, so the supervisor mints a fresh name over the new connection and publishes it into the shared, mutex-guarded name `RequestClient` reads on every request. Concretely, on a broker drop:
 
 1. `run_reply_inbox` returns `Err` (a `BusError::Connection`, always retryable).
-2. The supervisor calls `CorrelationRegistry::drain()`, so every request in flight against the dead inbox observes `RequestError::Transport` immediately instead of waiting out its timeout.
+2. The supervisor calls `RequestRegistry::drain()`, so every request in flight against the dead inbox observes `RequestError::Transport` immediately instead of waiting out its timeout.
 3. The supervisor reconnects, declares a fresh exclusive inbox (a new name), and republishes it for future requests.
 4. `run_reply_inbox` resumes on the new inbox.
 

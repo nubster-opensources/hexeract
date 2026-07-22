@@ -32,6 +32,7 @@ Visual overview of the building blocks and the flows they implement.
 - [Outbox flow](architecture/outbox-flow.md) (business transaction → envelope → worker → handler)
 - [Bus flow](architecture/bus-flow.md) (publish → AMQP → consume → ack)
 - [Scheduler flow](architecture/scheduler-flow.md) (schedule -> store -> worker -> sink, reschedule or dead-letter)
+- [RPC protocol](architecture/rpc-protocol.md) (wire version 1: addressing, reserved headers, error categories, version rules)
 
 ## Concepts
 
@@ -50,7 +51,7 @@ One file per cross-cutting concept the API exposes.
 - [Correlation ID propagation](concepts/correlation-id.md)
 - [Scheduler triggers](concepts/scheduler-triggers.md) (one-shot delay and cron-style recurrence)
 - [Scheduler delivery](concepts/scheduler-delivery.md) (lease, retry, jitter, dead-letter)
-- [Request-reply](concepts/request-reply.md) (`RequestClient`, `RequestHandler`, correlation registry, reply inbox lifecycle)
+- [Request-reply](concepts/request-reply.md) (`RequestClient`, `RequestHandler`, request registry, reply inbox lifecycle)
 
 ## Cookbook
 

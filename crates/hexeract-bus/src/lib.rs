@@ -11,19 +11,20 @@
 //!
 //! It also ships the backend-agnostic request-reply primitives: the
 //! [`Request`] trait naming a typed reply, [`RequestClient`] and
-//! [`RequestError`] on the caller side, [`RequestHandler`] and
-//! [`RepliedHandler`] on the responder side, and the [`CorrelationRegistry`]
-//! (with its RAII [`PendingReply`] guard) correlating a reply back to its
-//! in-flight request. The wire contract between the two sides
+//! [`RequestError`] (with its [`ProtocolViolation`] source) on the caller
+//! side, [`RequestHandler`] and [`RepliedHandler`] on the responder side,
+//! and the [`RequestRegistry`] (with its RAII [`PendingReply`] guard)
+//! routing a reply back to its in-flight request by request identity. A
+//! failed reply carries only a closed-set [`RemoteErrorType`] category plus
+//! the request identity, never a free-form failure message: the full trace
+//! stays on the responder side. The wire contract between the two sides
 //! ([`REPLY_STATUS_HEADER`], [`REPLY_STATUS_OK`], [`REPLY_STATUS_ERROR`],
 //! [`REPLY_ERROR_MESSAGE_TYPE`], [`RemoteErrorPayload`]) is documented in
-//! full in `docs/concepts/request-reply.md` in the workspace.
+//! full in `docs/architecture/rpc-protocol.md` in the workspace.
 //!
 //! Backend implementations live in companion crates such as
 //! `hexeract-bus-rabbitmq`.
 
-/// Rendezvous point correlating replies with their in-flight request.
-pub mod correlation;
 /// In-flight representation of a message crossing the bus.
 pub mod envelope;
 /// Errors raised by the bus primitives, transports and workers.
@@ -34,10 +35,10 @@ pub mod handler;
 pub mod message;
 /// Contract for publishing a raw message with a caller-supplied id.
 pub mod raw_publish;
+/// Sanitized failure payload published on the request-reply error channel.
+pub mod remote_error;
 /// Adapter that erases a [`RequestHandler`] into an [`ErasedHandler`].
 pub mod replied_handler;
-/// Wire contract for the request-reply error path.
-pub mod reply_status;
 /// Trait for messages that expect a single typed reply.
 pub mod request;
 /// Generic request-reply client built on top of a [`Transport`].
@@ -46,13 +47,16 @@ pub mod request_client;
 pub mod request_error;
 /// Responder-side handler that produces a typed reply for a [`Request`].
 pub mod request_handler;
+/// Rendezvous point between request callers and reply deliveries, keyed by
+/// request identity.
+pub mod request_registry;
+/// Wire constants of the request-reply protocol.
+pub mod rpc_protocol;
 /// Strongly-typed topology declarations shared by transports.
 pub mod topology;
 /// Backend-agnostic publish contract implemented by bus backends.
 pub mod transport;
 
-pub use correlation::CorrelationRegistry;
-pub use correlation::PendingReply;
 pub use envelope::BusEnvelope;
 pub use error::BusError;
 pub use handler::BoxFuture;
@@ -61,16 +65,23 @@ pub use handler::Handler;
 pub use handler::TypedHandler;
 pub use message::Message;
 pub use raw_publish::RawBusPublish;
+pub use remote_error::RemoteErrorPayload;
+pub use remote_error::RemoteErrorType;
 pub use replied_handler::RepliedHandler;
-pub use reply_status::REPLY_ERROR_MESSAGE_TYPE;
-pub use reply_status::REPLY_STATUS_ERROR;
-pub use reply_status::REPLY_STATUS_HEADER;
-pub use reply_status::REPLY_STATUS_OK;
-pub use reply_status::RemoteErrorPayload;
 pub use request::Request;
 pub use request_client::RequestClient;
+pub use request_error::ProtocolViolation;
 pub use request_error::RequestError;
 pub use request_handler::RequestHandler;
+pub use request_registry::PendingReply;
+pub use request_registry::RequestRegistry;
+pub use rpc_protocol::PROTOCOL_VERSION;
+pub use rpc_protocol::PROTOCOL_VERSION_HEADER;
+pub use rpc_protocol::REPLY_ERROR_MESSAGE_TYPE;
+pub use rpc_protocol::REPLY_STATUS_ERROR;
+pub use rpc_protocol::REPLY_STATUS_HEADER;
+pub use rpc_protocol::REPLY_STATUS_OK;
+pub use rpc_protocol::REQUEST_ID_HEADER;
 pub use topology::Binding;
 pub use topology::Exchange;
 pub use topology::ExchangeKind;

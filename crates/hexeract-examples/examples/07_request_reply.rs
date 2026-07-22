@@ -1,6 +1,6 @@
 //! Synchronous-over-async RPC against a real RabbitMQ broker.
 //!
-//! One [`RequestClient`] plays out three acts against two responder
+//! One [`RequestClient`] plays out five acts against four responder
 //! workers on the same broker:
 //!
 //! - Act 1: a nominal round trip. The `Echo` responder answers every
@@ -9,9 +9,19 @@
 //!   that exists (so the publish is routable) but that no worker ever
 //!   consumes from: a mute responder. The client's `request_with_timeout`
 //!   gives up well before its deadline would starve the example.
-//! - Act 3: a remote error. The `Failing` responder always rejects
-//!   [`Divide`] requests, and the rejection reaches the caller as
-//!   [`RequestError::Remote`] rather than a timeout.
+//! - Act 3: a genuine remote fault. The `Faulty` responder always fails
+//!   [`Explode`] with an internal error, and the failure reaches the
+//!   caller as [`RequestError::Remote`]: the protocol's error channel is
+//!   reserved for exactly this, a fault the caller cannot resolve.
+//! - Act 4: a business rejection. The `Divider` responder never fails a
+//!   [`Divide`] request: a zero denominator is an expected, named
+//!   outcome carried by the [`DivisionOutcome`] reply, not a protocol
+//!   failure.
+//! - Act 5: causal propagation through `request_in`. The `Relay`
+//!   responder receives a [`RelayedPing`] and forwards it to `Echo` as a
+//!   second request-reply hop, on the same causal chain: the two calls
+//!   share their `correlation_id` and get distinct, unrelated
+//!   `request_id`s.
 //!
 //! Run with (requires a running Docker daemon):
 //!
@@ -20,13 +30,14 @@
 //! ```
 
 use std::error::Error;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 
 use hexeract::bus::BusError;
 use hexeract::bus::Message;
 use hexeract::bus::Queue;
 use hexeract::bus::Request;
+use hexeract::bus::RequestClient;
 use hexeract::bus::RequestError;
 use hexeract::bus::RequestHandler;
 use hexeract::bus_rabbitmq::RabbitMqConnection;
@@ -42,15 +53,19 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::rabbitmq::RabbitMq;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 // `RabbitMqTransport` publishes on the default exchange, which only ever
 // routes a message to the queue whose name equals the routing key. The
-// request client uses `Request::MESSAGE_TYPE` as that routing key (see
-// `RequestClient::request`), so each queue below must be named exactly
+// request client uses `Request::DESTINATION` as that routing key (see
+// `RequestClient::request`), which defaults to `MESSAGE_TYPE` and none of
+// the requests below override it, so each queue must be named exactly
 // after the matching request's `MESSAGE_TYPE`, not after the queue's role.
 const PING_QUEUE: &str = "examples.ping";
 const DIVIDE_QUEUE: &str = "examples.divide";
 const SILENCE_QUEUE: &str = "examples.silence";
+const EXPLODE_QUEUE: &str = "examples.explode";
+const RELAY_QUEUE: &str = "examples.relayed_ping";
 const RETRY_ATTEMPTS: u32 = 5;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
 
@@ -67,7 +82,7 @@ impl Request for Ping {
 }
 
 /// Reply carrying back the `seq` the caller sent in its [`Ping`].
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct Pong {
     seq: u64,
 }
@@ -75,12 +90,20 @@ impl Message for Pong {
     const MESSAGE_TYPE: &'static str = "examples.pong";
 }
 
-/// Responder that echoes the request's `seq` back in the reply.
-struct Echo;
+/// Responder that echoes the request's `seq` back in the reply, and
+/// records the `correlation_id` of the last request it handled so the
+/// relay act below can prove the causal chain survived the extra hop.
+struct Echo {
+    last_correlation: Arc<StdMutex<Option<Uuid>>>,
+}
 impl RequestHandler<Ping> for Echo {
     type Error = BusError;
 
-    async fn handle(&self, request: Ping, _ctx: &HandlerContext) -> Result<Pong, BusError> {
+    async fn handle(&self, request: Ping, ctx: &HandlerContext) -> Result<Pong, BusError> {
+        *self
+            .last_correlation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(*ctx.correlation_id.as_uuid());
         Ok(Pong { seq: request.seq })
     }
 }
@@ -107,8 +130,45 @@ impl Message for NeverReplied {
     const MESSAGE_TYPE: &'static str = "examples.never_replied";
 }
 
-/// Request always rejected by the `Failing` responder, to prove a
-/// remote error reaches the caller as [`RequestError::Remote`].
+/// Request whose responder always fails with a genuine fault, to prove
+/// such a failure reaches the caller as [`RequestError::Remote`] rather
+/// than a timeout or a decoded business outcome.
+#[derive(Debug, Serialize, Deserialize)]
+struct Explode {
+    reason: String,
+}
+impl Message for Explode {
+    const MESSAGE_TYPE: &'static str = "examples.explode";
+}
+impl Request for Explode {
+    type Reply = Ack;
+}
+
+/// Reply type for [`Explode`]. Never actually produced: the `Faulty`
+/// responder always fails, so this type only needs to exist to satisfy
+/// [`Request::Reply`].
+#[derive(Debug, Serialize, Deserialize)]
+struct Ack;
+impl Message for Ack {
+    const MESSAGE_TYPE: &'static str = "examples.ack";
+}
+
+/// Responder that always fails with an internal error, standing in for a
+/// downstream dependency the responder cannot reach. This is a fault,
+/// not a business outcome, so it belongs on the protocol's error
+/// channel rather than in a `Reply` value.
+struct Faulty;
+impl RequestHandler<Explode> for Faulty {
+    type Error = BusError;
+
+    async fn handle(&self, _request: Explode, _ctx: &HandlerContext) -> Result<Ack, BusError> {
+        Err(BusError::Internal(
+            "downstream dependency unreachable".to_owned(),
+        ))
+    }
+}
+
+/// Request whose reply models a business rejection as a value.
 #[derive(Debug, Serialize, Deserialize)]
 struct Divide {
     numerator: i64,
@@ -118,29 +178,76 @@ impl Message for Divide {
     const MESSAGE_TYPE: &'static str = "examples.divide";
 }
 impl Request for Divide {
-    type Reply = Quotient;
+    type Reply = DivisionOutcome;
 }
 
-/// Reply carrying the result of a [`Divide`] request. Never actually
-/// produced by the `Failing` responder in this example.
-#[derive(Debug, Serialize, Deserialize)]
-struct Quotient {
-    value: i64,
+/// Reply carrying either the quotient or the business rejection of a
+/// zero denominator. A zero denominator is an expected, named outcome
+/// the caller pattern-matches on, never a protocol failure: the error
+/// channel of the protocol is reserved for faults.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+enum DivisionOutcome {
+    Quotient(i64),
+    DivisionByZero,
 }
-impl Message for Quotient {
-    const MESSAGE_TYPE: &'static str = "examples.quotient";
+impl Message for DivisionOutcome {
+    const MESSAGE_TYPE: &'static str = "examples.division_outcome";
 }
 
-/// Responder that always fails, standing in for a downstream that
-/// refuses to serve a request (here: division is not offered).
-struct Failing;
-impl RequestHandler<Divide> for Failing {
+/// Responder that never fails on a zero denominator: it replies with
+/// [`DivisionOutcome::DivisionByZero`] instead.
+struct Divider;
+impl RequestHandler<Divide> for Divider {
     type Error = BusError;
 
-    async fn handle(&self, _request: Divide, _ctx: &HandlerContext) -> Result<Quotient, BusError> {
-        Err(BusError::Internal(
-            "division is not available in this example".to_owned(),
+    async fn handle(
+        &self,
+        request: Divide,
+        _ctx: &HandlerContext,
+    ) -> Result<DivisionOutcome, BusError> {
+        if request.denominator == 0 {
+            return Ok(DivisionOutcome::DivisionByZero);
+        }
+        Ok(DivisionOutcome::Quotient(
+            request.numerator / request.denominator,
         ))
+    }
+}
+
+/// Request whose handler forwards to `Echo` via `request_in`, to
+/// demonstrate a handler continuing the caller's causal chain into a
+/// second request-reply hop rather than starting a fresh one.
+#[derive(Debug, Serialize, Deserialize)]
+struct RelayedPing {
+    seq: u64,
+}
+impl Message for RelayedPing {
+    const MESSAGE_TYPE: &'static str = "examples.relayed_ping";
+}
+impl Request for RelayedPing {
+    type Reply = Pong;
+}
+
+/// Responder whose handler issues its own request on the caller's
+/// `correlation_id`, via `request_in(ctx, &request)`, and records that
+/// `correlation_id` so the example can prove `Echo` observed the same
+/// one on the forwarded call.
+struct Relay {
+    client: Arc<RequestClient<RabbitMqTransport>>,
+    last_correlation: Arc<StdMutex<Option<Uuid>>>,
+}
+impl RequestHandler<RelayedPing> for Relay {
+    type Error = BusError;
+
+    async fn handle(&self, request: RelayedPing, ctx: &HandlerContext) -> Result<Pong, BusError> {
+        *self
+            .last_correlation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(*ctx.correlation_id.as_uuid());
+        self.client
+            .request_in(ctx, &Ping { seq: request.seq })
+            .await
+            .map_err(|error| BusError::Internal(error.to_string()))
     }
 }
 
@@ -165,54 +272,145 @@ async fn declare_request_queue(uri: &str, name: &str) -> Result<(), Box<dyn Erro
     Ok(())
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> Result<(), Box<dyn Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
-    let (_rabbitmq, uri) = setup_rabbit().await?;
-
+/// Declare every queue a responder below consumes from, or that a
+/// request in this example routes to.
+async fn declare_all_request_queues(uri: &str) -> Result<(), Box<dyn Error>> {
     // The silence queue is declared but never consumed: a routable
     // publish target with a mute responder behind it.
-    declare_request_queue(&uri, PING_QUEUE).await?;
-    declare_request_queue(&uri, DIVIDE_QUEUE).await?;
-    declare_request_queue(&uri, SILENCE_QUEUE).await?;
+    declare_request_queue(uri, PING_QUEUE).await?;
+    declare_request_queue(uri, DIVIDE_QUEUE).await?;
+    declare_request_queue(uri, SILENCE_QUEUE).await?;
+    declare_request_queue(uri, EXPLODE_QUEUE).await?;
+    declare_request_queue(uri, RELAY_QUEUE).await?;
+    Ok(())
+}
 
-    let cancel = CancellationToken::new();
+/// Join handles of every responder worker spawned for this example.
+struct ResponderHandles {
+    echo: tokio::task::JoinHandle<Result<(), BusError>>,
+    divide: tokio::task::JoinHandle<Result<(), BusError>>,
+    explode: tokio::task::JoinHandle<Result<(), BusError>>,
+    relay: tokio::task::JoinHandle<Result<(), BusError>>,
+}
 
-    let echo_transport = Arc::new(RabbitMqTransport::new(&uri).await?);
+impl ResponderHandles {
+    /// Await every responder task after the cancellation token has been
+    /// fired, surfacing the first failure encountered.
+    async fn join_all(self) -> Result<(), Box<dyn Error>> {
+        self.echo.await??;
+        self.divide.await??;
+        self.explode.await??;
+        self.relay.await??;
+        Ok(())
+    }
+}
+
+/// Correlation ids captured mid-flight by `Echo` and `Relay`, so act 5
+/// can prove the causal chain survived the relay hop.
+struct CorrelationCaptures {
+    echo: Arc<StdMutex<Option<Uuid>>>,
+    relay: Arc<StdMutex<Option<Uuid>>>,
+}
+
+/// Spawn every responder worker this example needs: `Echo`, `Divider`,
+/// `Faulty` and `Relay`.
+async fn spawn_responders(
+    uri: &str,
+    cancel: &CancellationToken,
+) -> Result<(ResponderHandles, CorrelationCaptures), Box<dyn Error>> {
+    let echo_correlation = Arc::new(StdMutex::new(None));
+    let echo_transport = Arc::new(RabbitMqTransport::new(uri).await?);
     let echo_worker = RabbitMqWorkerBuilder::new(
-        RabbitMqConnection::connect_with_retry(&uri, RETRY_ATTEMPTS, RETRY_BASE_DELAY).await?,
+        RabbitMqConnection::connect_with_retry(uri, RETRY_ATTEMPTS, RETRY_BASE_DELAY).await?,
     )
     .queue(PING_QUEUE)
-    .register_request_handler::<Ping, _>(Echo, Arc::clone(&echo_transport))
+    .register_request_handler::<Ping, _>(
+        Echo {
+            last_correlation: Arc::clone(&echo_correlation),
+        },
+        Arc::clone(&echo_transport),
+    )
     .build()?;
     let echo_cancel = cancel.clone();
-    let echo_handle = tokio::spawn(async move { echo_worker.run(echo_cancel).await });
+    let echo = tokio::spawn(async move { echo_worker.run(echo_cancel).await });
 
-    let failing_transport = Arc::new(RabbitMqTransport::new(&uri).await?);
-    let failing_worker = RabbitMqWorkerBuilder::new(
-        RabbitMqConnection::connect_with_retry(&uri, RETRY_ATTEMPTS, RETRY_BASE_DELAY).await?,
+    let divide_transport = Arc::new(RabbitMqTransport::new(uri).await?);
+    let divide_worker = RabbitMqWorkerBuilder::new(
+        RabbitMqConnection::connect_with_retry(uri, RETRY_ATTEMPTS, RETRY_BASE_DELAY).await?,
     )
     .queue(DIVIDE_QUEUE)
-    .register_request_handler::<Divide, _>(Failing, Arc::clone(&failing_transport))
+    .register_request_handler::<Divide, _>(Divider, Arc::clone(&divide_transport))
     .build()?;
-    let failing_cancel = cancel.clone();
-    let failing_handle = tokio::spawn(async move { failing_worker.run(failing_cancel).await });
+    let divide_cancel = cancel.clone();
+    let divide = tokio::spawn(async move { divide_worker.run(divide_cancel).await });
 
-    let client = connect_request_client(&uri, Duration::from_secs(10), cancel.clone()).await?;
-    tracing::info!("request client and both responders ready");
+    let explode_transport = Arc::new(RabbitMqTransport::new(uri).await?);
+    let explode_worker = RabbitMqWorkerBuilder::new(
+        RabbitMqConnection::connect_with_retry(uri, RETRY_ATTEMPTS, RETRY_BASE_DELAY).await?,
+    )
+    .queue(EXPLODE_QUEUE)
+    .register_request_handler::<Explode, _>(Faulty, Arc::clone(&explode_transport))
+    .build()?;
+    let explode_cancel = cancel.clone();
+    let explode = tokio::spawn(async move { explode_worker.run(explode_cancel).await });
 
+    // The relay responder needs its own request client (a second,
+    // independent connection pair) to issue the forwarded `Ping` from
+    // inside its handler, distinct from the transport it uses to publish
+    // its own reply to `RelayedPing`.
+    let relay_correlation = Arc::new(StdMutex::new(None));
+    // Shorter than the outer client's timeout (below), so on a slow broker
+    // the inner hop times out first: a relay timeout is then unambiguously
+    // attributable to the forwarded call, never to the outer one.
+    let relay_client =
+        Arc::new(connect_request_client(uri, Duration::from_secs(5), cancel.clone()).await?);
+    let relay_reply_transport = Arc::new(RabbitMqTransport::new(uri).await?);
+    let relay_worker = RabbitMqWorkerBuilder::new(
+        RabbitMqConnection::connect_with_retry(uri, RETRY_ATTEMPTS, RETRY_BASE_DELAY).await?,
+    )
+    .queue(RELAY_QUEUE)
+    .register_request_handler::<RelayedPing, _>(
+        Relay {
+            client: relay_client,
+            last_correlation: Arc::clone(&relay_correlation),
+        },
+        Arc::clone(&relay_reply_transport),
+    )
+    .build()?;
+    let relay_cancel = cancel.clone();
+    let relay = tokio::spawn(async move { relay_worker.run(relay_cancel).await });
+
+    Ok((
+        ResponderHandles {
+            echo,
+            divide,
+            explode,
+            relay,
+        },
+        CorrelationCaptures {
+            echo: echo_correlation,
+            relay: relay_correlation,
+        },
+    ))
+}
+
+/// Act 1: a nominal round trip. `Echo` answers a [`Ping`] with a
+/// [`Pong`] carrying the same sequence number.
+async fn run_nominal_round_trip(
+    client: &RequestClient<RabbitMqTransport>,
+) -> Result<(), Box<dyn Error>> {
     tracing::info!("act 1: nominal round trip");
     let pong = client.request(&Ping { seq: 7 }).await?;
     if pong.seq != 7 {
         return Err(format!("expected echo of 7, got {}", pong.seq).into());
     }
     tracing::info!(seq = pong.seq, "echo replied");
+    Ok(())
+}
 
+/// Act 2: a mute responder. No worker consumes the silence queue, so
+/// the call times out rather than hangs forever.
+async fn run_timeout(client: &RequestClient<RabbitMqTransport>) -> Result<(), Box<dyn Error>> {
     tracing::info!("act 2: mute responder times out");
     let outcome = client
         .request_with_timeout(
@@ -225,32 +423,129 @@ async fn main() -> Result<(), Box<dyn Error>> {
     match outcome {
         Err(RequestError::Timeout(after)) => {
             tracing::info!(?after, "mute responder timed out as expected");
+            Ok(())
         }
-        Ok(_) => return Err("expected a timeout, got a reply from a mute responder".into()),
-        Err(other) => return Err(format!("expected RequestError::Timeout, got {other:?}").into()),
+        Ok(_) => Err("expected a timeout, got a reply from a mute responder".into()),
+        Err(other) => Err(format!("expected RequestError::Timeout, got {other:?}").into()),
     }
+}
 
-    tracing::info!("act 3: remote error reaches the caller");
+/// Act 3: a genuine remote fault. `Faulty` always fails, and the
+/// failure reaches the caller as [`RequestError::Remote`]: the
+/// protocol's error channel is reserved for exactly this, a fault the
+/// caller cannot resolve by matching on a value.
+async fn run_remote_fault(client: &RequestClient<RabbitMqTransport>) -> Result<(), Box<dyn Error>> {
+    tracing::info!("act 3: a genuine remote fault reaches the caller");
     let outcome = client
-        .request(&Divide {
-            numerator: 10,
-            denominator: 0,
+        .request(&Explode {
+            reason: "simulated dependency outage".to_owned(),
         })
         .await;
     match outcome {
         Err(RequestError::Remote {
             error_type,
-            message,
+            request_id,
         }) => {
-            tracing::info!(error_type, message, "remote handler error received");
+            tracing::info!(?error_type, %request_id, "remote fault received");
+            Ok(())
         }
-        Ok(_) => return Err("expected a remote error, got a reply".into()),
-        Err(other) => return Err(format!("expected RequestError::Remote, got {other:?}").into()),
+        Ok(_) => Err("expected a remote error, got a reply".into()),
+        Err(other) => Err(format!("expected RequestError::Remote, got {other:?}").into()),
+    }
+}
+
+/// Act 4: a business rejection travels as a `Reply` value, never as a
+/// protocol failure. `Divider` never fails on a zero denominator: it
+/// replies with the named outcome instead.
+async fn run_business_rejection(
+    client: &RequestClient<RabbitMqTransport>,
+) -> Result<(), Box<dyn Error>> {
+    tracing::info!("act 4: a business rejection travels as a Reply value");
+    let outcome = client
+        .request(&Divide {
+            numerator: 10,
+            denominator: 2,
+        })
+        .await?;
+    if outcome != DivisionOutcome::Quotient(5) {
+        return Err(format!("expected Quotient(5), got {outcome:?}").into());
+    }
+    tracing::info!("division succeeded");
+
+    let outcome = client
+        .request(&Divide {
+            numerator: 10,
+            denominator: 0,
+        })
+        .await?;
+    if outcome != DivisionOutcome::DivisionByZero {
+        return Err(format!("expected DivisionByZero, got {outcome:?}").into());
+    }
+    tracing::info!("division by zero rejected as a business outcome, not a protocol error");
+    Ok(())
+}
+
+/// Act 5: `request_in` propagates the causal chain through a relay hop.
+/// `Relay` forwards the inbound [`RelayedPing`] to `Echo` on the same
+/// `correlation_id` it received, minting its own, unrelated
+/// `request_id` for that second call.
+async fn run_causal_propagation(
+    client: &RequestClient<RabbitMqTransport>,
+    correlations: &CorrelationCaptures,
+) -> Result<(), Box<dyn Error>> {
+    tracing::info!("act 5: request_in propagates the causal chain through a relay hop");
+    let relayed = client.request(&RelayedPing { seq: 21 }).await?;
+    if relayed.seq != 21 {
+        return Err(format!("expected echo of 21, got {}", relayed.seq).into());
     }
 
+    let relay_seen = *correlations
+        .relay
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let echo_seen = *correlations
+        .echo
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if relay_seen.is_none() || relay_seen != echo_seen {
+        return Err(format!(
+            "expected the relayed call and the forwarded ping to share their correlation_id, \
+             got relay={relay_seen:?} echo={echo_seen:?}"
+        )
+        .into());
+    }
+    tracing::info!(
+        correlation_id = ?relay_seen,
+        "the relay hop kept the caller's causal chain"
+    );
+    Ok(())
+}
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+async fn main() -> Result<(), Box<dyn Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
+    let (_rabbitmq, uri) = setup_rabbit().await?;
+    declare_all_request_queues(&uri).await?;
+
+    let cancel = CancellationToken::new();
+    let (responders, correlations) = spawn_responders(&uri, &cancel).await?;
+
+    let client = connect_request_client(&uri, Duration::from_secs(10), cancel.clone()).await?;
+    tracing::info!("request client and all responders ready");
+
+    run_nominal_round_trip(&client).await?;
+    run_timeout(&client).await?;
+    run_remote_fault(&client).await?;
+    run_business_rejection(&client).await?;
+    run_causal_propagation(&client, &correlations).await?;
+
     cancel.cancel();
-    echo_handle.await??;
-    failing_handle.await??;
+    responders.join_all().await?;
     tracing::info!("request-reply example completed");
     Ok(())
 }

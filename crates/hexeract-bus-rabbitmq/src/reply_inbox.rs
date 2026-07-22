@@ -4,7 +4,7 @@
 //! [`declare_reply_inbox`] declares a server-named exclusive queue that
 //! dies with the connection; [`run_reply_inbox`] consumes it with
 //! `no_ack` and routes every delivery to a
-//! [`hexeract_bus::CorrelationRegistry`] by correlation id, so a caller
+//! [`hexeract_bus::RequestRegistry`] by request id, so a caller
 //! waiting on a [`hexeract_bus::PendingReply`] is woken as soon as its
 //! reply arrives.
 //!
@@ -21,7 +21,7 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use hexeract_bus::BusEnvelope;
 use hexeract_bus::BusError;
-use hexeract_bus::CorrelationRegistry;
+use hexeract_bus::RequestRegistry;
 use lapin::Channel;
 use lapin::options::BasicConsumeOptions;
 use lapin::options::QueueDeclareOptions;
@@ -76,7 +76,7 @@ fn decode_delivery(delivery: &lapin::message::Delivery) -> Result<BusEnvelope, B
 }
 
 /// Consume the reply inbox with `no_ack` and route each delivery to
-/// `registry` by correlation id.
+/// `registry` by request id.
 ///
 /// Runs until `cancel` fires, returning `Ok(())`. A delivery that fails
 /// to decode into a [`BusEnvelope`] is logged and dropped rather than
@@ -92,7 +92,7 @@ fn decode_delivery(delivery: &lapin::message::Delivery) -> Result<BusEnvelope, B
 pub async fn run_reply_inbox(
     channel: Channel,
     inbox: String,
-    registry: Arc<CorrelationRegistry>,
+    registry: Arc<RequestRegistry>,
     cancel: CancellationToken,
 ) -> Result<(), BusError> {
     let mut consumer = channel

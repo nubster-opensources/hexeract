@@ -14,7 +14,7 @@
 //!
 //! - On cancellation, or a plain `Ok(())` return, the task stops.
 //! - On `Err` (the broker connection was lost), the task
-//!   [`hexeract_bus::CorrelationRegistry::drain`]s every in-flight slot
+//!   [`hexeract_bus::RequestRegistry::drain`]s every in-flight slot
 //!   so a caller waiting on a reply observes
 //!   [`hexeract_bus::RequestError::Transport`] immediately instead of
 //!   waiting out its timeout, reconnects over a fresh supervised
@@ -26,7 +26,7 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use hexeract_bus::{BusError, CorrelationRegistry, RequestClient};
+use hexeract_bus::{BusError, RequestClient, RequestRegistry};
 use lapin::Channel;
 use tokio_util::sync::CancellationToken;
 
@@ -54,7 +54,7 @@ pub async fn connect_request_client(
     cancel: CancellationToken,
 ) -> Result<RequestClient<RabbitMqTransport>, BusError> {
     let transport = Arc::new(RabbitMqTransport::new(uri).await?);
-    let registry = Arc::new(CorrelationRegistry::new());
+    let registry = Arc::new(RequestRegistry::new());
 
     // Supervised connection for the inbox consumer: NOT the recovering
     // connection used by the publisher above.
@@ -95,7 +95,7 @@ fn spawn_reply_inbox_supervisor(
     uri: String,
     channel: Channel,
     inbox: String,
-    registry: Arc<CorrelationRegistry>,
+    registry: Arc<RequestRegistry>,
     reply_inbox: Arc<Mutex<String>>,
     cancel: CancellationToken,
 ) {
