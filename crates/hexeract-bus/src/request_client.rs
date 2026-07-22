@@ -70,7 +70,7 @@ impl<T: Transport> RequestClient<T> {
         let envelope = BusEnvelope::with_reply_to(correlation_id, inbox, request)
             .map_err(RequestError::Decode)?;
         self.transport
-            .publish_envelope(R::MESSAGE_TYPE, &envelope)
+            .publish_envelope(R::DESTINATION, &envelope)
             .await
             .map_err(RequestError::Transport)?;
 
