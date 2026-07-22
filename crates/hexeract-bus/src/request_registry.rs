@@ -1,6 +1,6 @@
 //! Rendezvous point between request callers and reply deliveries.
 //!
-//! A caller registers a slot keyed by a freshly minted [`RequestId`] and
+//! A caller registers a slot keyed by a freshly minted [`hexeract_core::RequestId`] and
 //! awaits its [`PendingReply`]. The transport-side inbox consumer calls
 //! [`RequestRegistry::resolve`] to route an incoming reply to the waiting
 //! caller, reading the request identity from the reserved header.

@@ -53,8 +53,9 @@ where
     /// [`RequestId`] exactly once, up front, and that single value feeds
     /// every branch below: the ok-reply header, the error-reply header, and
     /// the error-reply payload all share the same identity rather than
-    /// risking divergent views of it (see [`error_reply`] for why that
-    /// matters).
+    /// risking divergent views of it: a header echoing the raw inbound string
+    /// while the payload fell back to a nil identity would describe the same
+    /// call two different ways.
     ///
     /// The protocol version check runs before the `reply_to` guard,
     /// deliberately: a request announcing a version this crate does not
