@@ -47,16 +47,29 @@ where
         R::MESSAGE_TYPE
     }
 
+    /// Decode the inbound request, run the handler, and publish the reply.
+    ///
+    /// The inbound `x-hexeract-request-id` header is parsed into a
+    /// [`RequestId`] exactly once, up front, and that single value feeds
+    /// every branch below: the ok-reply header, the error-reply header, and
+    /// the error-reply payload all share the same identity rather than
+    /// risking divergent views of it (see [`error_reply`] for why that
+    /// matters).
+    ///
+    /// The protocol version check runs before the `reply_to` guard,
+    /// deliberately: a request announcing a version this crate does not
+    /// implement must never reach the handler, whether or not it can be
+    /// told so.
+    ///
+    /// A nominal reply the framework fails to serialize is treated the same
+    /// as an undecodable request: an opaque internal error is published
+    /// instead of leaving the caller to exhaust its timeout in silence.
     fn handle<'a>(
         &'a self,
         envelope: &'a BusEnvelope,
         ctx: &'a HandlerContext,
     ) -> BoxFuture<'a, Result<(), BusError>> {
         Box::pin(async move {
-            // Parsed once here so every branch below (both the ok-reply
-            // header and the error-reply header and payload) shares the
-            // exact same identity: see `error_reply`'s doc comment for why
-            // that matters.
             let request_id: Option<RequestId> = envelope
                 .headers
                 .get(REQUEST_ID_HEADER)
@@ -65,9 +78,6 @@ where
             let correlation_id = envelope.correlation_id;
             let reply_to = envelope.reply_to.clone();
 
-            // The version check runs before the reply_to guard, deliberately:
-            // a request announcing a version this crate does not implement
-            // must never reach the handler, whether or not it can be told so.
             if read_protocol_version(&envelope.headers) != Some(PROTOCOL_VERSION) {
                 let Some(reply_to) = reply_to else {
                     tracing::warn!(
@@ -131,10 +141,6 @@ where
                         env
                     }
                     Err(error) => {
-                        // Same asymmetry as an undecodable request, mirrored on
-                        // the reply side: a nominal reply the framework cannot
-                        // serialize must not leave the caller waiting out its
-                        // full timeout in silence.
                         tracing::error!(
                             request_id = %request_id.map(|id| id.to_string()).unwrap_or_default(),
                             message_type = R::MESSAGE_TYPE,
@@ -650,5 +656,45 @@ mod tests {
         let payload: RemoteErrorPayload =
             serde_json::from_slice(&published.payload).expect("payload must decode");
         assert_eq!(payload.error_type, RemoteErrorType::Internal);
+    }
+
+    /// An inbound `x-hexeract-request-id` header that does not parse as a
+    /// UUID must not leak into the reply as a divergent identity: the header
+    /// is omitted and the payload falls back to `Uuid::nil()`, so the two
+    /// channels agree on "no known identity" rather than disagreeing about
+    /// it.
+    #[tokio::test]
+    async fn an_unparsable_request_id_header_yields_a_reply_with_no_header_and_a_nil_payload_id() {
+        let transport = Arc::new(CapturingTransport::default());
+        let handler = RepliedHandler::new(Boom, Arc::clone(&transport));
+        let mut request =
+            BusEnvelope::with_reply_to(Uuid::now_v7(), "caller.inbox".to_owned(), &Ping { seq: 1 })
+                .expect("ping must serialize");
+        request
+            .headers
+            .insert(REQUEST_ID_HEADER.to_owned(), "not-a-uuid".to_owned());
+        request.headers.insert(
+            PROTOCOL_VERSION_HEADER.to_owned(),
+            PROTOCOL_VERSION.to_string(),
+        );
+
+        let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
+        handler
+            .handle(&request, &ctx)
+            .await
+            .expect("reply must publish");
+
+        let published = transport.last_published().expect("a reply was published");
+        assert!(
+            !published.headers.contains_key(REQUEST_ID_HEADER),
+            "the reply must omit the request id header when the inbound one did not parse"
+        );
+        let payload: RemoteErrorPayload =
+            serde_json::from_slice(&published.payload).expect("payload must decode");
+        assert_eq!(
+            payload.request_id,
+            Uuid::nil(),
+            "the payload must fall back to nil, agreeing with the omitted header"
+        );
     }
 }

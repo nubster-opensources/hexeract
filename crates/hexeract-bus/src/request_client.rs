@@ -61,9 +61,11 @@ impl<T: Transport> RequestClient<T> {
     ///   unrecognized reply status, or a reply message type other than the
     ///   one expected.
     /// - [`RequestError::Remote`] if the responder reported a failure.
-    /// - [`RequestError::Decode`] if the request cannot be serialized, or a
-    ///   reply that already passed protocol and status validation cannot be
-    ///   decoded into the expected reply type.
+    /// - [`RequestError::Decode`] if the request cannot be serialized, or if
+    ///   a reply that already passed protocol and status validation cannot be
+    ///   decoded: either an ok reply whose payload does not decode into the
+    ///   expected reply type, or an error reply whose `message_type` matches
+    ///   but whose payload does not decode into a [`RemoteErrorPayload`].
     pub async fn request_with_timeout<R: Request>(
         &self,
         request: &R,
