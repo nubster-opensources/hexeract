@@ -12,7 +12,9 @@ use crate::{BoxFuture, BusEnvelope, BusError, ErasedHandler, Request, RequestHan
 
 /// Adapts a [`RequestHandler<R>`] into an [`ErasedHandler`] that decodes the
 /// request, runs the handler, and publishes the reply (or an encoded error)
-/// to the request `reply_to`, preserving the inbound correlation id.
+/// to the request `reply_to`, preserving the inbound correlation id and the
+/// inbound request identity (the `x-hexeract-request-id` header the caller's
+/// [`RequestRegistry`](crate::RequestRegistry) routes the reply on).
 pub struct RepliedHandler<R, H, T> {
     handler: Arc<H>,
     transport: Arc<T>,
@@ -201,6 +203,8 @@ mod tests {
     fn request_envelope(reply_to: Option<&str>) -> BusEnvelope {
         let mut env = BusEnvelope::new(Uuid::now_v7(), &Ping { seq: 8 }).unwrap();
         env.reply_to = reply_to.map(str::to_owned);
+        env.headers
+            .insert(REQUEST_ID_HEADER.to_owned(), "request-42".to_owned());
         env
     }
     fn ctx() -> HandlerContext {
@@ -227,6 +231,15 @@ mod tests {
                 .map(String::as_str),
             Some("ok")
         );
+        assert_eq!(
+            env.headers.get(REQUEST_ID_HEADER).map(String::as_str),
+            request.headers.get(REQUEST_ID_HEADER).map(String::as_str),
+            "reply must carry the exact inbound request id"
+        );
+        assert_eq!(
+            env.headers.get(PROTOCOL_VERSION_HEADER).map(String::as_str),
+            Some(PROTOCOL_VERSION.to_string()).as_deref()
+        );
         let pong: Pong = env.decode().unwrap();
         assert_eq!(pong, Pong { seq: 8 });
     }
@@ -237,10 +250,8 @@ mod tests {
             published: StdMutex::new(Vec::new()),
         });
         let erased = RepliedHandler::new(Boom, Arc::clone(&transport));
-        erased
-            .handle(&request_envelope(Some("reply.inbox")), &ctx())
-            .await
-            .unwrap();
+        let request = request_envelope(Some("reply.inbox"));
+        erased.handle(&request, &ctx()).await.unwrap();
 
         let published = transport.published.lock().unwrap();
         let (_, env) = &published[0];
@@ -251,6 +262,15 @@ mod tests {
             Some("error")
         );
         assert_eq!(env.message_type, "hexeract.reply.error");
+        assert_eq!(
+            env.headers.get(REQUEST_ID_HEADER).map(String::as_str),
+            request.headers.get(REQUEST_ID_HEADER).map(String::as_str),
+            "an error reply must still carry the exact inbound request id"
+        );
+        assert_eq!(
+            env.headers.get(PROTOCOL_VERSION_HEADER).map(String::as_str),
+            Some(PROTOCOL_VERSION.to_string()).as_deref()
+        );
         let payload: RemoteErrorPayload = serde_json::from_slice(&env.payload).unwrap();
         assert_eq!(payload.error_type, "Internal");
         assert!(payload.message.contains("kaboom"));

@@ -67,7 +67,8 @@ impl RequestRegistry {
             return;
         };
         let request_id = RequestId::from(uuid);
-        if let Some(sender) = self.slots().remove(&request_id) {
+        let sender = self.slots().remove(&request_id);
+        if let Some(sender) = sender {
             let _ = sender.send(envelope);
         } else {
             tracing::debug!(%request_id, "reply for an unknown or already-resolved request");
@@ -117,6 +118,10 @@ impl PendingReply {
 
     /// Await the reply envelope. Borrows `self` so the RAII guard stays live
     /// and cleans the slot when the caller drops the [`PendingReply`].
+    ///
+    /// Call at most once to completion: the underlying channel is consumed
+    /// on the first resolved call (`Ok` or `Err`), and awaiting it again
+    /// panics.
     ///
     /// # Errors
     ///
@@ -279,7 +284,10 @@ mod tests {
 
         for (index, pending) in pendings.iter_mut().enumerate() {
             let expected_seq = u64::try_from(index).expect("seq fits in u64");
-            let envelope = pending.wait().await.expect("each caller gets a reply");
+            let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), pending.wait())
+                .await
+                .unwrap_or_else(|_| panic!("caller at index {index} never received a reply"))
+                .expect("each caller gets a reply");
             let reply: Pong = envelope.decode().expect("decode");
             assert_eq!(reply.seq, expected_seq, "reply routed to the wrong caller");
         }
