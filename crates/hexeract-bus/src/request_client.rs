@@ -237,25 +237,55 @@ mod tests {
         type Reply = Pong;
     }
 
-    /// Records the last published envelope so tests can craft a reply.
+    /// A request whose destination is a dedicated queue, distinct from its
+    /// message type, so tests can tell the two apart on the wire.
+    #[derive(Debug, Serialize, Deserialize)]
+    struct PingToDedicatedQueue {
+        seq: u64,
+    }
+    impl Message for PingToDedicatedQueue {
+        const MESSAGE_TYPE: &'static str = "tests.ping.dedicated";
+    }
+    impl Request for PingToDedicatedQueue {
+        type Reply = Pong;
+        const DESTINATION: &'static str = "tests.dedicated.queue";
+    }
+
+    /// Records every published (routing key, envelope) pair so tests can
+    /// craft a reply and assert on the routing decision.
     #[derive(Default)]
     struct CapturingTransport {
-        last: StdMutex<Option<BusEnvelope>>,
+        published: StdMutex<Vec<(String, BusEnvelope)>>,
     }
     #[async_trait]
     impl Transport for CapturingTransport {
         async fn publish_envelope(
             &self,
-            _routing_key: &str,
+            routing_key: &str,
             envelope: &BusEnvelope,
         ) -> Result<Uuid, BusError> {
-            *self.last.lock().unwrap() = Some(envelope.clone());
+            self.published
+                .lock()
+                .unwrap()
+                .push((routing_key.to_owned(), envelope.clone()));
             Ok(envelope.message_id)
         }
     }
     impl CapturingTransport {
         fn last_published(&self) -> Option<BusEnvelope> {
-            self.last.lock().unwrap().clone()
+            self.published
+                .lock()
+                .unwrap()
+                .last()
+                .map(|(_, envelope)| envelope.clone())
+        }
+
+        fn last_routing_key(&self) -> Option<String> {
+            self.published
+                .lock()
+                .unwrap()
+                .last()
+                .map(|(routing_key, _)| routing_key.clone())
         }
     }
 
@@ -298,9 +328,7 @@ mod tests {
 
     #[tokio::test]
     async fn nominal_round_trip_returns_typed_reply() {
-        let transport = Arc::new(CapturingTransport {
-            last: StdMutex::new(None),
-        });
+        let transport = Arc::new(CapturingTransport::default());
         let registry = Arc::new(RequestRegistry::new());
         let client = client(Arc::clone(&transport), Arc::clone(&registry));
 
@@ -311,7 +339,7 @@ mod tests {
             _ = &mut request_fut => panic!("should still be pending"),
             () = tokio::time::sleep(Duration::from_millis(20)) => {}
         }
-        let published = transport.last.lock().unwrap().clone().unwrap();
+        let published = transport.last_published().expect("a request was published");
         assert_eq!(published.reply_to.as_deref(), Some("reply.inbox"));
         registry.resolve(ok_reply(published_request_id(&published), 3));
         let pong = request_fut.await.expect("reply");
@@ -320,9 +348,7 @@ mod tests {
 
     #[tokio::test]
     async fn silent_responder_times_out() {
-        let transport = Arc::new(CapturingTransport {
-            last: StdMutex::new(None),
-        });
+        let transport = Arc::new(CapturingTransport::default());
         let registry = Arc::new(RequestRegistry::new());
         let client = client(transport, Arc::clone(&registry));
         let err = client
@@ -335,9 +361,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_error_reply_maps_to_remote() {
-        let transport = Arc::new(CapturingTransport {
-            last: StdMutex::new(None),
-        });
+        let transport = Arc::new(CapturingTransport::default());
         let registry = Arc::new(RequestRegistry::new());
         let client = client(Arc::clone(&transport), Arc::clone(&registry));
 
@@ -347,7 +371,7 @@ mod tests {
             _ = &mut request_fut => panic!("pending"),
             () = tokio::time::sleep(Duration::from_millis(20)) => {}
         }
-        let published = transport.last.lock().unwrap().clone().unwrap();
+        let published = transport.last_published().expect("a request was published");
         let request_id = published_request_id(&published);
         let payload = RemoteErrorPayload {
             error_type: RemoteErrorType::Internal,
@@ -536,6 +560,31 @@ mod tests {
         let second = transport.last_published().expect("second request");
 
         assert_ne!(first.correlation_id, second.correlation_id);
+    }
+
+    #[tokio::test]
+    async fn request_publishes_to_the_declared_destination_not_the_message_type() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::new());
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            registry,
+            Arc::new(Mutex::new("caller.inbox".to_owned())),
+            Duration::from_secs(5),
+        );
+
+        let request_fut = client.request(&PingToDedicatedQueue { seq: 1 });
+        tokio::pin!(request_fut);
+        tokio::select! {
+            _ = &mut request_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        let routing_key = transport
+            .last_routing_key()
+            .expect("a request was published");
+        assert_eq!(routing_key, PingToDedicatedQueue::DESTINATION);
+        assert_ne!(routing_key, PingToDedicatedQueue::MESSAGE_TYPE);
     }
 
     /// Drive one round trip against a capturing transport, letting `mutate`
