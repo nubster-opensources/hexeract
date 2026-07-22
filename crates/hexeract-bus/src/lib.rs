@@ -11,10 +11,13 @@
 //!
 //! It also ships the backend-agnostic request-reply primitives: the
 //! [`Request`] trait naming a typed reply, [`RequestClient`] and
-//! [`RequestError`] on the caller side, [`RequestHandler`] and
-//! [`RepliedHandler`] on the responder side, and the [`RequestRegistry`]
-//! (with its RAII [`PendingReply`] guard) routing a reply back to its
-//! in-flight request by request identity. The wire contract between the two sides
+//! [`RequestError`] (with its [`ProtocolViolation`] source) on the caller
+//! side, [`RequestHandler`] and [`RepliedHandler`] on the responder side,
+//! and the [`RequestRegistry`] (with its RAII [`PendingReply`] guard)
+//! routing a reply back to its in-flight request by request identity. A
+//! failed reply carries only a closed-set [`RemoteErrorType`] category plus
+//! the request identity, never a free-form failure message: the full trace
+//! stays on the responder side. The wire contract between the two sides
 //! ([`REPLY_STATUS_HEADER`], [`REPLY_STATUS_OK`], [`REPLY_STATUS_ERROR`],
 //! [`REPLY_ERROR_MESSAGE_TYPE`], [`RemoteErrorPayload`]) is documented in
 //! full in `docs/concepts/request-reply.md` in the workspace.
@@ -36,8 +39,6 @@ pub mod raw_publish;
 pub mod remote_error;
 /// Adapter that erases a [`RequestHandler`] into an [`ErasedHandler`].
 pub mod replied_handler;
-/// Wire contract for the request-reply error path.
-pub mod reply_status;
 /// Trait for messages that expect a single typed reply.
 pub mod request;
 /// Generic request-reply client built on top of a [`Transport`].
@@ -67,18 +68,19 @@ pub use raw_publish::RawBusPublish;
 pub use remote_error::RemoteErrorPayload;
 pub use remote_error::RemoteErrorType;
 pub use replied_handler::RepliedHandler;
-pub use reply_status::REPLY_ERROR_MESSAGE_TYPE;
-pub use reply_status::REPLY_STATUS_ERROR;
-pub use reply_status::REPLY_STATUS_HEADER;
-pub use reply_status::REPLY_STATUS_OK;
 pub use request::Request;
 pub use request_client::RequestClient;
+pub use request_error::ProtocolViolation;
 pub use request_error::RequestError;
 pub use request_handler::RequestHandler;
 pub use request_registry::PendingReply;
 pub use request_registry::RequestRegistry;
 pub use rpc_protocol::PROTOCOL_VERSION;
 pub use rpc_protocol::PROTOCOL_VERSION_HEADER;
+pub use rpc_protocol::REPLY_ERROR_MESSAGE_TYPE;
+pub use rpc_protocol::REPLY_STATUS_ERROR;
+pub use rpc_protocol::REPLY_STATUS_HEADER;
+pub use rpc_protocol::REPLY_STATUS_OK;
 pub use rpc_protocol::REQUEST_ID_HEADER;
 pub use topology::Binding;
 pub use topology::Exchange;

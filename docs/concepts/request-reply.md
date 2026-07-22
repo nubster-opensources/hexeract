@@ -38,7 +38,9 @@ Requester and responder agree on the reply shape purely through envelope convent
 - The request envelope carries `reply_to` (the inbox queue name), the header `x-hexeract-request-id` (the fresh request identity the caller registered, used to route the reply) and `correlation_id` (the causal-chain identifier, unrelated to routing).
 - The reply envelope stamps the header `x-hexeract-reply-status` to either `ok` or `error`, and carries the same `correlation_id` as the request.
 - On success, the reply payload decodes as `R::Reply` like any other message.
-- On failure, the reply's `message_type` is stamped with the sentinel `hexeract.reply.error` and the payload decodes as `RemoteErrorPayload`, a protocol type deliberately not a `Message`: a remote fault is not a domain message. `RemoteErrorPayload` carries `error_type` (a stable-ish category, the name of the `BusError` variant the responder's error converted into) and `message` (the human-readable failure text).
+- On failure, the reply's `message_type` is stamped with the sentinel `hexeract.rpc.error` and the payload decodes as `RemoteErrorPayload`, a protocol type deliberately not a `Message`: a remote fault is not a domain message. `RemoteErrorPayload` carries `error_type` (a `RemoteErrorType`, a closed-set public category) and `request_id` (the identity of the call, correlating with the full failure trace recorded on the responder side). The payload deliberately never carries a free-form failure message: an internal detail (a connection string, a host, a serialization error) must never cross the wire to a remote caller.
+
+Both the request and the reply carry the header `x-hexeract-protocol-version`. A request that has a `reply_to` but announces a version other than the one this crate implements is rejected before decoding: `RepliedHandler` replies with `RemoteErrorType::Unsupported` and never runs the handler. A request that announces a supported version but fails to decode is rejected the same way, with `RemoteErrorType::Malformed`: either way the caller gets a fast, categorized answer instead of a silently dropped request.
 
 A request published without a `reply_to` (bypassing `RequestClient`, for example a hand-crafted envelope) is handled fire-and-forget: `RepliedHandler` still runs the handler for its side effect, logging a warning instead of publishing a reply. The handler's `Result` still drives the delivery, though: on `Ok`, `handle` returns `Ok(())` and the delivery is acked normally, exactly as if a reply had been sent; on `Err`, the handler's error is propagated out of `RepliedHandler::handle` unchanged, exactly as it would from a plain `Handler<M>`, so the worker's usual nack, retry and dead-letter policy applies (see [Retry policy](retry-policy.md) and [Ack modes](ack-modes.md)). A real `RequestClient` always stamps `reply_to`, so this path only matters for a `Request` type deliberately used fire-and-forget, bypassing `RequestClient`.
 
@@ -52,12 +54,13 @@ This is a deliberate asymmetry with the reply inbox described below: the inbox i
 
 ## Failure modes
 
-`RequestError` has four variants, all reachable from `RequestClient::request_with_timeout`:
+`RequestError` has five variants, all reachable from `RequestClient::request_with_timeout`:
 
 - **`Timeout(Duration)`**: no reply arrived within the deadline. The `PendingReply` is dropped along with the `tokio::time::timeout` future, so the slot is cleaned up immediately rather than lingering until a reply eventually shows up.
-- **`Remote { error_type, message }`**: the responder's `RequestHandler` returned an error, decoded from a `RemoteErrorPayload` reply.
+- **`Remote { error_type, request_id }`**: the responder's `RequestHandler` returned an error, decoded from a `RemoteErrorPayload` reply. The category is deliberately coarse and carries no detail; the full trace lives on the responder side, indexed by `request_id`.
+- **`Protocol(ProtocolViolation)`**: the reply does not honor the protocol, either because a required header is missing or unparsable (`MissingHeader`), the announced protocol version is not implemented by this crate (`UnsupportedVersion`), or the reply's `message_type` does not match what was expected for this call (`UnexpectedReplyType`).
 - **`Transport(BusError)`**: the request could not be published, or the reply channel was lost, most notably when the reply inbox's connection drops and the supervisor drains the registry so every in-flight `PendingReply` fails fast instead of waiting out its timeout.
-- **`Decode(BusError)`**: the request could not be serialized, or the reply could not be decoded into `R::Reply`, including a missing or unrecognized status header.
+- **`Decode(BusError)`**: the request could not be serialized, or the reply's payload could not be decoded into `R::Reply` (or `RemoteErrorPayload` for an error reply).
 
 ## The reply inbox lifecycle
 

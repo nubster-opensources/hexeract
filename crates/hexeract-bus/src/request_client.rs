@@ -1,14 +1,17 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use hexeract_core::RequestId;
 use uuid::Uuid;
 
-use crate::reply_status::{
-    REPLY_STATUS_ERROR, REPLY_STATUS_HEADER, REPLY_STATUS_OK, RemoteErrorPayload,
-};
+use crate::remote_error::RemoteErrorPayload;
+use crate::request_error::ProtocolViolation;
 use crate::request_registry::RequestRegistry;
-use crate::rpc_protocol::{PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, REQUEST_ID_HEADER};
-use crate::{BusEnvelope, Request, RequestError, Transport};
+use crate::rpc_protocol::{
+    PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, REPLY_ERROR_MESSAGE_TYPE, REPLY_STATUS_ERROR,
+    REPLY_STATUS_HEADER, REPLY_STATUS_OK, REQUEST_ID_HEADER, read_protocol_version,
+};
+use crate::{BusEnvelope, Message, Request, RequestError, Transport};
 
 /// Synchronous-over-async RPC client: send a [`Request`], await its reply.
 pub struct RequestClient<T: Transport> {
@@ -91,25 +94,66 @@ impl<T: Transport> RequestClient<T> {
             Ok(Ok(envelope)) => envelope,
         };
 
-        match reply.headers.get(REPLY_STATUS_HEADER).map(String::as_str) {
-            Some(REPLY_STATUS_OK) => reply.decode::<R::Reply>().map_err(RequestError::Decode),
-            Some(REPLY_STATUS_ERROR) => {
-                let payload: RemoteErrorPayload = serde_json::from_slice(&reply.payload)
-                    .map_err(|e| RequestError::Decode(e.into()))?;
-                Err(RequestError::Remote {
-                    error_type: payload.error_type,
-                    message: payload.message,
-                })
-            }
-            _ => Err(RequestError::Decode(crate::BusError::Internal(
-                "reply is missing a valid x-hexeract-reply-status header".to_owned(),
-            ))),
-        }
+        decode_reply::<R>(reply)
     }
 }
 
 fn reply_channel_lost() -> crate::BusError {
     crate::BusError::connection("reply inbox channel closed before a reply arrived", true)
+}
+
+/// Validate a reply against the protocol, then decode it.
+///
+/// Checks are ordered from the most structural to the most specific: an
+/// unsupported version makes every later check meaningless, so it comes
+/// first.
+fn decode_reply<R: Request>(reply: BusEnvelope) -> Result<R::Reply, RequestError> {
+    match read_protocol_version(&reply.headers) {
+        Some(PROTOCOL_VERSION) => {}
+        Some(version) => {
+            return Err(RequestError::Protocol(
+                ProtocolViolation::UnsupportedVersion { version },
+            ));
+        }
+        None => {
+            return Err(RequestError::Protocol(ProtocolViolation::MissingHeader {
+                header: PROTOCOL_VERSION_HEADER,
+            }));
+        }
+    }
+
+    match reply.headers.get(REPLY_STATUS_HEADER).map(String::as_str) {
+        Some(REPLY_STATUS_OK) => {
+            if reply.message_type != R::Reply::MESSAGE_TYPE {
+                return Err(RequestError::Protocol(
+                    ProtocolViolation::UnexpectedReplyType {
+                        expected: R::Reply::MESSAGE_TYPE,
+                        actual: reply.message_type,
+                    },
+                ));
+            }
+            reply.decode::<R::Reply>().map_err(RequestError::Decode)
+        }
+        Some(REPLY_STATUS_ERROR) => {
+            if reply.message_type != REPLY_ERROR_MESSAGE_TYPE {
+                return Err(RequestError::Protocol(
+                    ProtocolViolation::UnexpectedReplyType {
+                        expected: REPLY_ERROR_MESSAGE_TYPE,
+                        actual: reply.message_type,
+                    },
+                ));
+            }
+            let payload: RemoteErrorPayload = serde_json::from_slice(&reply.payload)
+                .map_err(|error| RequestError::Decode(error.into()))?;
+            Err(RequestError::Remote {
+                error_type: payload.error_type,
+                request_id: RequestId::from(payload.request_id),
+            })
+        }
+        _ => Err(RequestError::Protocol(ProtocolViolation::MissingHeader {
+            header: REPLY_STATUS_HEADER,
+        })),
+    }
 }
 
 #[cfg(test)]
@@ -123,8 +167,8 @@ mod tests {
     use hexeract_core::RequestId;
 
     use super::*;
-    use crate::reply_status::REPLY_ERROR_MESSAGE_TYPE;
-    use crate::{BusError, Message};
+    use crate::BusError;
+    use crate::remote_error::RemoteErrorType;
 
     #[derive(Debug, Serialize, Deserialize)]
     struct Ping {
@@ -145,6 +189,7 @@ mod tests {
     }
 
     /// Records the last published envelope so tests can craft a reply.
+    #[derive(Default)]
     struct CapturingTransport {
         last: StdMutex<Option<BusEnvelope>>,
     }
@@ -157,6 +202,11 @@ mod tests {
         ) -> Result<Uuid, BusError> {
             *self.last.lock().unwrap() = Some(envelope.clone());
             Ok(envelope.message_id)
+        }
+    }
+    impl CapturingTransport {
+        fn last_published(&self) -> Option<BusEnvelope> {
+            self.last.lock().unwrap().clone()
         }
     }
 
@@ -178,6 +228,10 @@ mod tests {
             .insert(REPLY_STATUS_HEADER.to_owned(), REPLY_STATUS_OK.to_owned());
         env.headers
             .insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
+        env.headers.insert(
+            PROTOCOL_VERSION_HEADER.to_owned(),
+            PROTOCOL_VERSION.to_string(),
+        );
         env
     }
 
@@ -245,9 +299,10 @@ mod tests {
             () = tokio::time::sleep(Duration::from_millis(20)) => {}
         }
         let published = transport.last.lock().unwrap().clone().unwrap();
+        let request_id = published_request_id(&published);
         let payload = RemoteErrorPayload {
-            error_type: "Internal".to_owned(),
-            message: "downstream down".to_owned(),
+            error_type: RemoteErrorType::Internal,
+            request_id: *request_id.as_uuid(),
         };
         let err_env = BusEnvelope::restore(
             Uuid::now_v7(),
@@ -260,24 +315,143 @@ mod tests {
                     REPLY_STATUS_HEADER.to_owned(),
                     REPLY_STATUS_ERROR.to_owned(),
                 ),
+                (REQUEST_ID_HEADER.to_owned(), request_id.to_string()),
                 (
-                    REQUEST_ID_HEADER.to_owned(),
-                    published_request_id(&published).to_string(),
+                    PROTOCOL_VERSION_HEADER.to_owned(),
+                    PROTOCOL_VERSION.to_string(),
                 ),
             ]),
             std::time::SystemTime::UNIX_EPOCH,
         );
         registry.resolve(err_env);
         let err = request_fut.await.expect_err("remote error");
-        match err {
+        assert!(matches!(
+            err,
             RequestError::Remote {
-                error_type,
-                message,
-            } => {
-                assert_eq!(error_type, "Internal");
-                assert_eq!(message, "downstream down");
-            }
-            other => panic!("expected Remote, got {other:?}"),
-        }
+                error_type: RemoteErrorType::Internal,
+                request_id: resolved_id,
+            } if resolved_id == request_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_reply_without_a_status_header_is_a_protocol_violation() {
+        let error = client_error_for_reply(|_request_id, reply| {
+            reply.headers.remove(REPLY_STATUS_HEADER);
+        })
+        .await;
+        assert!(matches!(
+            error,
+            RequestError::Protocol(ProtocolViolation::MissingHeader { header })
+                if header == REPLY_STATUS_HEADER
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_reply_announcing_an_unknown_version_is_a_protocol_violation() {
+        let error = client_error_for_reply(|_request_id, reply| {
+            reply
+                .headers
+                .insert(PROTOCOL_VERSION_HEADER.to_owned(), "99".to_owned());
+        })
+        .await;
+        assert!(matches!(
+            error,
+            RequestError::Protocol(ProtocolViolation::UnsupportedVersion { version: 99 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_reply_of_an_unexpected_type_is_a_protocol_violation() {
+        let error = client_error_for_reply(|_request_id, reply| {
+            reply.message_type = "accounts.something_else".to_owned();
+        })
+        .await;
+        assert!(matches!(
+            error,
+            RequestError::Protocol(ProtocolViolation::UnexpectedReplyType { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_remote_failure_surfaces_its_category_and_request_id() {
+        let request_id = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured = std::sync::Arc::clone(&request_id);
+        let error = client_error_for_reply(move |id, reply| {
+            *captured.lock().expect("lock") = Some(id);
+            reply.message_type = REPLY_ERROR_MESSAGE_TYPE.to_owned();
+            reply.payload = serde_json::to_vec(&RemoteErrorPayload {
+                error_type: RemoteErrorType::Unavailable,
+                request_id: *id.as_uuid(),
+            })
+            .expect("payload must serialize");
+            reply.headers.insert(
+                REPLY_STATUS_HEADER.to_owned(),
+                REPLY_STATUS_ERROR.to_owned(),
+            );
+        })
+        .await;
+
+        let expected = request_id.lock().expect("lock").expect("captured");
+        assert!(matches!(
+            error,
+            RequestError::Remote { error_type: RemoteErrorType::Unavailable, request_id }
+                if request_id == expected
+        ));
+    }
+
+    /// Drive one round trip against a capturing transport, letting `mutate`
+    /// tamper with the reply before it is resolved, and return the resulting
+    /// client error.
+    async fn client_error_for_reply(
+        mutate: impl FnOnce(RequestId, &mut BusEnvelope) + Send + 'static,
+    ) -> RequestError {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::new());
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            Arc::clone(&registry),
+            Arc::new(Mutex::new("caller.inbox".to_owned())),
+            Duration::from_secs(5),
+        );
+
+        let resolver = Arc::clone(&registry);
+        let responder = tokio::spawn(async move {
+            let published = loop {
+                if let Some(published) = transport.last_published() {
+                    break published;
+                }
+                tokio::task::yield_now().await;
+            };
+            let request_id = RequestId::from(
+                published
+                    .headers
+                    .get(REQUEST_ID_HEADER)
+                    .expect("request id header")
+                    .parse::<Uuid>()
+                    .expect("request id must parse"),
+            );
+            let mut reply = BusEnvelope::new(published.correlation_id, &Pong { seq: 1 })
+                .expect("pong must serialize");
+            reply
+                .headers
+                .insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
+            reply.headers.insert(
+                PROTOCOL_VERSION_HEADER.to_owned(),
+                PROTOCOL_VERSION.to_string(),
+            );
+            reply
+                .headers
+                .insert(REPLY_STATUS_HEADER.to_owned(), REPLY_STATUS_OK.to_owned());
+            mutate(request_id, &mut reply);
+            resolver.resolve(reply);
+        });
+
+        let error = client
+            .request(&Ping { seq: 1 })
+            .await
+            .expect_err("the tampered reply must be rejected");
+        responder.await.expect("responder task must finish");
+        error
     }
 }

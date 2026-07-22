@@ -20,6 +20,7 @@ use hexeract_bus::BusEnvelope;
 use hexeract_bus::BusError;
 use hexeract_bus::Message;
 use hexeract_bus::REQUEST_ID_HEADER;
+use hexeract_bus::RemoteErrorType;
 use hexeract_bus::Request;
 use hexeract_bus::RequestError;
 use hexeract_bus::RequestHandler;
@@ -262,12 +263,8 @@ async fn remote_error_reaches_caller_fast() {
     let elapsed = started.elapsed();
 
     match err {
-        RequestError::Remote {
-            error_type,
-            message,
-        } => {
-            assert_eq!(error_type, "Internal");
-            assert!(message.contains("deliberate handler failure"));
+        RequestError::Remote { error_type, .. } => {
+            assert_eq!(error_type, RemoteErrorType::Internal);
         }
         other => panic!("expected RequestError::Remote, got {other:?}"),
     }

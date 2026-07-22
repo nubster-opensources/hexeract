@@ -240,9 +240,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     match outcome {
         Err(RequestError::Remote {
             error_type,
-            message,
+            request_id,
         }) => {
-            tracing::info!(error_type, message, "remote handler error received");
+            tracing::info!(?error_type, %request_id, "remote handler error received");
         }
         Ok(_) => return Err("expected a remote error, got a reply".into()),
         Err(other) => return Err(format!("expected RequestError::Remote, got {other:?}").into()),
