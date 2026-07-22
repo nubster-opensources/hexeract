@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use hexeract_core::HandlerContext;
+use hexeract_core::{HandlerContext, RequestId};
 
 use crate::remote_error::{RemoteErrorPayload, RemoteErrorType};
 use crate::rpc_protocol::{
@@ -53,9 +53,40 @@ where
         ctx: &'a HandlerContext,
     ) -> BoxFuture<'a, Result<(), BusError>> {
         Box::pin(async move {
-            let request_id = envelope.headers.get(REQUEST_ID_HEADER).cloned();
+            // Parsed once here so every branch below (both the ok-reply
+            // header and the error-reply header and payload) shares the
+            // exact same identity: see `error_reply`'s doc comment for why
+            // that matters.
+            let request_id: Option<RequestId> = envelope
+                .headers
+                .get(REQUEST_ID_HEADER)
+                .and_then(|raw| raw.parse::<uuid::Uuid>().ok())
+                .map(RequestId::from);
             let correlation_id = envelope.correlation_id;
-            let Some(reply_to) = envelope.reply_to.clone() else {
+            let reply_to = envelope.reply_to.clone();
+
+            // The version check runs before the reply_to guard, deliberately:
+            // a request announcing a version this crate does not implement
+            // must never reach the handler, whether or not it can be told so.
+            if read_protocol_version(&envelope.headers) != Some(PROTOCOL_VERSION) {
+                let Some(reply_to) = reply_to else {
+                    tracing::warn!(
+                        message_type = R::MESSAGE_TYPE,
+                        "request announces an unsupported protocol version and carries no \
+                         reply_to; dropping without running the handler"
+                    );
+                    return Ok(());
+                };
+                tracing::warn!(
+                    message_type = R::MESSAGE_TYPE,
+                    "request announces an unsupported protocol version, rejecting"
+                );
+                let reply = error_reply(RemoteErrorType::Unsupported, correlation_id, request_id)?;
+                self.transport.publish_envelope(&reply_to, &reply).await?;
+                return Ok(());
+            }
+
+            let Some(reply_to) = reply_to else {
                 tracing::warn!(
                     message_type = R::MESSAGE_TYPE,
                     "request without reply_to, handled fire-and-forget without a reply"
@@ -69,20 +100,6 @@ where
                 return Ok(());
             };
 
-            if read_protocol_version(&envelope.headers) != Some(PROTOCOL_VERSION) {
-                tracing::warn!(
-                    message_type = R::MESSAGE_TYPE,
-                    "request announces an unsupported protocol version, rejecting"
-                );
-                let reply = error_reply(
-                    RemoteErrorType::Unsupported,
-                    correlation_id,
-                    request_id.as_deref(),
-                )?;
-                self.transport.publish_envelope(&reply_to, &reply).await?;
-                return Ok(());
-            }
-
             let request: R = match envelope.decode() {
                 Ok(request) => request,
                 Err(error) => {
@@ -91,35 +108,46 @@ where
                         %error,
                         "undecodable request, replying with an opaque category"
                     );
-                    let reply = error_reply(
-                        RemoteErrorType::Malformed,
-                        correlation_id,
-                        request_id.as_deref(),
-                    )?;
+                    let reply =
+                        error_reply(RemoteErrorType::Malformed, correlation_id, request_id)?;
                     self.transport.publish_envelope(&reply_to, &reply).await?;
                     return Ok(());
                 }
             };
 
             let reply_envelope = match self.handler.handle(request, ctx).await {
-                Ok(reply) => {
-                    let mut env = BusEnvelope::new(correlation_id, &reply)?;
-                    env.headers
-                        .insert(REPLY_STATUS_HEADER.to_owned(), REPLY_STATUS_OK.to_owned());
-                    if let Some(request_id) = request_id.as_ref() {
+                Ok(reply) => match BusEnvelope::new(correlation_id, &reply) {
+                    Ok(mut env) => {
                         env.headers
-                            .insert(REQUEST_ID_HEADER.to_owned(), request_id.clone());
+                            .insert(REPLY_STATUS_HEADER.to_owned(), REPLY_STATUS_OK.to_owned());
+                        if let Some(request_id) = request_id {
+                            env.headers
+                                .insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
+                        }
+                        env.headers.insert(
+                            PROTOCOL_VERSION_HEADER.to_owned(),
+                            PROTOCOL_VERSION.to_string(),
+                        );
+                        env
                     }
-                    env.headers.insert(
-                        PROTOCOL_VERSION_HEADER.to_owned(),
-                        PROTOCOL_VERSION.to_string(),
-                    );
-                    env
-                }
+                    Err(error) => {
+                        // Same asymmetry as an undecodable request, mirrored on
+                        // the reply side: a nominal reply the framework cannot
+                        // serialize must not leave the caller waiting out its
+                        // full timeout in silence.
+                        tracing::error!(
+                            request_id = %request_id.map(|id| id.to_string()).unwrap_or_default(),
+                            message_type = R::MESSAGE_TYPE,
+                            %error,
+                            "reply serialization failed, replying with an opaque category"
+                        );
+                        error_reply(RemoteErrorType::Internal, correlation_id, request_id)?
+                    }
+                },
                 Err(error) => {
                     let error: BusError = error.into();
                     tracing::error!(
-                        request_id = %request_id.clone().unwrap_or_default(),
+                        request_id = %request_id.map(|id| id.to_string()).unwrap_or_default(),
                         message_type = R::MESSAGE_TYPE,
                         %error,
                         "request handler failed, replying with an opaque category"
@@ -127,7 +155,7 @@ where
                     error_reply(
                         RemoteErrorType::from_bus_error(&error),
                         correlation_id,
-                        request_id.as_deref(),
+                        request_id,
                     )?
                 }
             };
@@ -143,16 +171,23 @@ where
 ///
 /// The failure detail is deliberately absent from the wire: it has already
 /// been recorded on the responder side, indexed by the request identity.
+///
+/// `request_id` is parsed exactly once by the caller into a single
+/// [`RequestId`], and that same value feeds both the header and the
+/// payload below: the two can no longer disagree about the request
+/// identity the way a header copied verbatim and a payload silently
+/// defaulting to nil once could. The chosen convention for "no known
+/// identity" (the inbound header was absent or did not parse as a UUID)
+/// is to agree on absence everywhere: the header is omitted from the
+/// reply and the payload carries `Uuid::nil()`.
 fn error_reply(
     category: RemoteErrorType,
     correlation_id: uuid::Uuid,
-    request_id: Option<&str>,
+    request_id: Option<RequestId>,
 ) -> Result<BusEnvelope, BusError> {
     let payload = RemoteErrorPayload {
         error_type: category,
-        request_id: request_id
-            .and_then(|raw| raw.parse().ok())
-            .unwrap_or_else(uuid::Uuid::nil),
+        request_id: request_id.map_or_else(uuid::Uuid::nil, |id| *id.as_uuid()),
     };
     let mut headers = std::collections::HashMap::from([
         (
@@ -165,7 +200,7 @@ fn error_reply(
         ),
     ]);
     if let Some(request_id) = request_id {
-        headers.insert(REQUEST_ID_HEADER.to_owned(), request_id.to_owned());
+        headers.insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
     }
     Ok(BusEnvelope::restore(
         uuid::Uuid::now_v7(),
@@ -255,7 +290,7 @@ mod tests {
         let mut env = BusEnvelope::new(Uuid::now_v7(), &Ping { seq: 8 }).unwrap();
         env.reply_to = reply_to.map(str::to_owned);
         env.headers
-            .insert(REQUEST_ID_HEADER.to_owned(), "request-42".to_owned());
+            .insert(REQUEST_ID_HEADER.to_owned(), RequestId::new().to_string());
         env.headers.insert(
             PROTOCOL_VERSION_HEADER.to_owned(),
             PROTOCOL_VERSION.to_string(),
@@ -328,6 +363,10 @@ mod tests {
         );
         let payload: RemoteErrorPayload = serde_json::from_slice(&env.payload).unwrap();
         assert_eq!(payload.error_type, RemoteErrorType::Internal);
+        assert!(
+            !String::from_utf8_lossy(&env.payload).contains("kaboom"),
+            "the handler's failure message must never reach the wire"
+        );
     }
 
     #[tokio::test]
@@ -344,8 +383,10 @@ mod tests {
     }
 
     /// Security assertion, not a serialization test: no fragment of an
-    /// internal failure message may cross the boundary. This test must fail
-    /// loudly if a `to_string()` is ever reintroduced on the error path.
+    /// internal failure message may cross the boundary, on any channel of
+    /// the envelope, headers and `message_type` included, not only the
+    /// payload. This test must fail loudly if a `to_string()` is ever
+    /// reintroduced on the error path, wherever it lands on the wire.
     #[tokio::test]
     async fn an_internal_failure_message_never_reaches_the_wire() {
         const SECRET: &str = "connection to 10.0.0.7:5432 refused for user vault_admin";
@@ -382,7 +423,16 @@ mod tests {
             .expect("reply must publish");
 
         let published = transport.last_published().expect("a reply was published");
-        let wire = String::from_utf8_lossy(&published.payload).to_string();
+        // Scan every channel the envelope exposes on the wire, not only the
+        // payload: a header or a dynamically built message_type travel the
+        // same fabric and could leak just as easily.
+        let mut wire = String::new();
+        wire.push_str(&published.message_type);
+        for (key, value) in &published.headers {
+            wire.push_str(key);
+            wire.push_str(value);
+        }
+        wire.push_str(&String::from_utf8_lossy(&published.payload));
         for fragment in ["10.0.0.7", "5432", "vault_admin", "refused"] {
             assert!(
                 !wire.contains(fragment),
@@ -439,6 +489,42 @@ mod tests {
         assert_eq!(payload.error_type, RemoteErrorType::Unsupported);
     }
 
+    /// The version check must run before the `reply_to` guard: a request
+    /// with no `reply_to` cannot be told about its rejection, but it must
+    /// still be rejected rather than silently executed with side effects.
+    #[tokio::test]
+    async fn an_unsupported_version_without_reply_to_is_dropped_without_running_the_handler() {
+        let transport = Arc::new(CapturingTransport::default());
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler = RepliedHandler::new(
+            RecordingHandler {
+                ran: Arc::clone(&ran),
+            },
+            Arc::clone(&transport),
+        );
+        let mut request =
+            BusEnvelope::new(Uuid::now_v7(), &Ping { seq: 1 }).expect("ping must serialize");
+        request
+            .headers
+            .insert(PROTOCOL_VERSION_HEADER.to_owned(), "99".to_owned());
+        // Deliberately no reply_to.
+
+        let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
+        handler
+            .handle(&request, &ctx)
+            .await
+            .expect("dropping must not surface as a framework error");
+
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "handler ran despite the unsupported version"
+        );
+        assert!(
+            transport.published.lock().unwrap().is_empty(),
+            "nothing can be published without a reply_to"
+        );
+    }
+
     #[tokio::test]
     async fn an_undecodable_request_replies_malformed_without_running_the_handler() {
         let transport = Arc::new(CapturingTransport::default());
@@ -472,5 +558,97 @@ mod tests {
         let payload: RemoteErrorPayload =
             serde_json::from_slice(&published.payload).expect("payload must decode");
         assert_eq!(payload.error_type, RemoteErrorType::Malformed);
+    }
+
+    /// A reply type whose `Serialize` implementation always fails, so tests
+    /// can force `BusEnvelope::new` to reject a nominal reply.
+    struct UnserializableReply;
+    impl Message for UnserializableReply {
+        const MESSAGE_TYPE: &'static str = "tests.unserializable_reply";
+    }
+    impl Serialize for UnserializableReply {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom(
+                "reply intentionally refuses to serialize",
+            ))
+        }
+    }
+    impl<'de> Deserialize<'de> for UnserializableReply {
+        fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            Ok(UnserializableReply)
+        }
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct WeirdPing {
+        seq: u64,
+    }
+    impl Message for WeirdPing {
+        const MESSAGE_TYPE: &'static str = "tests.weird_ping";
+    }
+    impl Request for WeirdPing {
+        type Reply = UnserializableReply;
+    }
+
+    struct BrokenReplyHandler;
+    impl RequestHandler<WeirdPing> for BrokenReplyHandler {
+        type Error = BusError;
+        async fn handle(
+            &self,
+            _request: WeirdPing,
+            _ctx: &HandlerContext,
+        ) -> Result<UnserializableReply, BusError> {
+            Ok(UnserializableReply)
+        }
+    }
+
+    /// The same asymmetry already fixed for an undecodable request must not
+    /// reappear on the reply side: a nominal reply the framework fails to
+    /// serialize must still publish an opaque error rather than leave the
+    /// caller to exhaust its timeout in silence.
+    #[tokio::test]
+    async fn an_unserializable_nominal_reply_publishes_an_internal_error_instead_of_silence() {
+        let transport = Arc::new(CapturingTransport::default());
+        let handler = RepliedHandler::new(BrokenReplyHandler, Arc::clone(&transport));
+        let mut request = BusEnvelope::with_reply_to(
+            Uuid::now_v7(),
+            "caller.inbox".to_owned(),
+            &WeirdPing { seq: 1 },
+        )
+        .expect("weird ping must serialize");
+        request
+            .headers
+            .insert(REQUEST_ID_HEADER.to_owned(), RequestId::new().to_string());
+        request.headers.insert(
+            PROTOCOL_VERSION_HEADER.to_owned(),
+            PROTOCOL_VERSION.to_string(),
+        );
+
+        let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
+        handler
+            .handle(&request, &ctx)
+            .await
+            .expect("the serialization failure must not surface as a framework error");
+
+        let published = transport
+            .last_published()
+            .expect("a reply must still be published despite the serialization failure");
+        assert_eq!(
+            published
+                .headers
+                .get("x-hexeract-reply-status")
+                .map(String::as_str),
+            Some("error")
+        );
+        assert_eq!(published.message_type, REPLY_ERROR_MESSAGE_TYPE);
+        let payload: RemoteErrorPayload =
+            serde_json::from_slice(&published.payload).expect("payload must decode");
+        assert_eq!(payload.error_type, RemoteErrorType::Internal);
     }
 }
