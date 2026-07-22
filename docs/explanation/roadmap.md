@@ -113,7 +113,7 @@ Released as v0.1.0 on crates.io. The seven shipped crates are `hexeract-core`, `
 
 ## v0.7.0: Request and Reply (IN PROGRESS)
 
-**Goal.** Synchronous RPC pattern over the asynchronous bus, via correlation IDs.
+**Goal.** Synchronous RPC pattern over the asynchronous bus, via a dedicated request id.
 
 Implemented in code on the request-reply feature branch: see the CHANGELOG's
 `[Unreleased]` section for the added symbols. The crate versions stay at
@@ -122,7 +122,7 @@ closed.
 
 **Scope:**
 
-- `tokio::sync::oneshot` correlation map keyed by `CorrelationId`.
+- `tokio::sync::oneshot` request registry keyed by `RequestId`.
 - Per-call timeouts and context propagation.
 - Cancellation-safe: a dropped request stops the wait without leaking the reply slot.
 - Reply queue management via the existing `reply_to` field on `BusEnvelope`.

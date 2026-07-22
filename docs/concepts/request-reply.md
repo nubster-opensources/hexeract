@@ -10,32 +10,32 @@ A `Request` is a `Message` that names its own reply type via the associated `Rep
 sequenceDiagram
     autonumber
     participant Client as RequestClient
-    participant Reg as CorrelationRegistry
+    participant Reg as RequestRegistry
     participant Broker as RabbitMQ
     participant Worker as RabbitMqWorker
     participant Handler as RequestHandler<R>
 
-    Client->>Reg: register() -> PendingReply(cid)
-    Client->>Broker: publish(reply_to = inbox, correlation_id = cid)
+    Client->>Reg: register() -> PendingReply(rid)
+    Client->>Broker: publish(reply_to = inbox, x-hexeract-request-id = rid)
     Broker->>Worker: Delivery
     Worker->>Handler: handle(request, ctx)
     Handler-->>Worker: Ok(reply) or Err(error)
-    Worker->>Broker: publish(reply_to, status header, correlation_id = cid)
+    Worker->>Broker: publish(reply_to, status header, x-hexeract-request-id = rid)
     Broker->>Reg: Delivery on inbox
-    Reg->>Client: resolve(cid) wakes PendingReply
+    Reg->>Client: resolve(rid) wakes PendingReply
 ```
 
-## Correlation registry and the drop-guard
+## Request registry and the drop-guard
 
-`CorrelationRegistry` is the rendezvous point between a waiting caller and an inbound reply. `register()` mints a fresh correlation id, opens a `tokio::sync::oneshot` channel, and returns a `PendingReply`: an RAII guard over that channel. The inbox consumer calls `resolve(envelope)` to route a delivered reply to its waiting slot by correlation id; an unknown or already-resolved id is dropped with a warning, never an error, and the first reply for a slot wins.
+`RequestRegistry` is the rendezvous point between a waiting caller and an inbound reply. `register()` mints a fresh request id, opens a `tokio::sync::oneshot` channel, and returns a `PendingReply`: an RAII guard over that channel. The inbox consumer calls `resolve(envelope)` to route a delivered reply to its waiting slot by request identity, read from the reserved `x-hexeract-request-id` header; an unknown or already-resolved id is dropped with a warning, never an error, and the first reply for a slot wins.
 
-The drop-guard is what makes the registry leak-free. `PendingReply`'s `Drop` implementation removes its slot from the registry on every exit path, whatever gets the caller out: a successful `wait()`, a timeout racing the `wait()` future, a cancellation, or a panic unwinding through the caller. A slot is never left behind for a reply that never arrives, and `CorrelationRegistry::drain()` (used on connection loss) closes every outstanding channel at once so every waiting caller observes a closed channel immediately instead of waiting out its timeout.
+The drop-guard is what makes the registry leak-free. `PendingReply`'s `Drop` implementation removes its slot from the registry on every exit path, whatever gets the caller out: a successful `wait()`, a timeout racing the `wait()` future, a cancellation, or a panic unwinding through the caller. A slot is never left behind for a reply that never arrives, and `RequestRegistry::drain()` (used on connection loss) closes every outstanding channel at once so every waiting caller observes a closed channel immediately instead of waiting out its timeout.
 
 ## Wire contract
 
 Requester and responder agree on the reply shape purely through envelope conventions, with no shared connection state:
 
-- The request envelope carries `reply_to` (the inbox queue name) and `correlation_id` (the fresh id the caller registered).
+- The request envelope carries `reply_to` (the inbox queue name), the header `x-hexeract-request-id` (the fresh request identity the caller registered, used to route the reply) and `correlation_id` (the causal-chain identifier, unrelated to routing).
 - The reply envelope stamps the header `x-hexeract-reply-status` to either `ok` or `error`, and carries the same `correlation_id` as the request.
 - On success, the reply payload decodes as `R::Reply` like any other message.
 - On failure, the reply's `message_type` is stamped with the sentinel `hexeract.reply.error` and the payload decodes as `RemoteErrorPayload`, a protocol type deliberately not a `Message`: a remote fault is not a domain message. `RemoteErrorPayload` carries `error_type` (a stable-ish category, the name of the `BusError` variant the responder's error converted into) and `message` (the human-readable failure text).
@@ -66,7 +66,7 @@ This is a deliberate asymmetry with the reply inbox described below: the inbox i
 The inbox itself, declared by `declare_reply_inbox`, is exclusive, auto-delete and server-named: it dies with the connection that declared it. On reconnect there is no way to resume consuming the old inbox, so the supervisor mints a fresh name over the new connection and publishes it into the shared, mutex-guarded name `RequestClient` reads on every request. Concretely, on a broker drop:
 
 1. `run_reply_inbox` returns `Err` (a `BusError::Connection`, always retryable).
-2. The supervisor calls `CorrelationRegistry::drain()`, so every request in flight against the dead inbox observes `RequestError::Transport` immediately instead of waiting out its timeout.
+2. The supervisor calls `RequestRegistry::drain()`, so every request in flight against the dead inbox observes `RequestError::Transport` immediately instead of waiting out its timeout.
 3. The supervisor reconnects, declares a fresh exclusive inbox (a new name), and republishes it for future requests.
 4. `run_reply_inbox` resumes on the new inbox.
 
