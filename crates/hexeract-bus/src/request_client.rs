@@ -1,8 +1,7 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use hexeract_core::RequestId;
-use uuid::Uuid;
+use hexeract_core::{CorrelationId, HandlerContext, RequestId};
 
 use crate::remote_error::RemoteErrorPayload;
 use crate::request_error::ProtocolViolation;
@@ -39,17 +38,48 @@ impl<T: Transport> RequestClient<T> {
         }
     }
 
-    /// Send `request` and await its reply within the default timeout.
+    /// Send `request` on a fresh causal chain, within the default timeout.
+    ///
+    /// Use this at the root of a flow, where no handler context exists: a
+    /// command-line entry point, an HTTP edge, a scheduled task.
     ///
     /// # Errors
     ///
-    /// See [`RequestClient::request_with_timeout`].
+    /// See [`RequestClient::request_in_with_timeout`].
     pub async fn request<R: Request>(&self, request: &R) -> Result<R::Reply, RequestError> {
-        self.request_with_timeout(request, self.default_timeout)
+        self.request_inner(CorrelationId::new(), request, self.default_timeout)
             .await
     }
 
-    /// Send `request` and await its reply within `timeout`.
+    /// Send `request` on the causal chain of `ctx`, within the default timeout.
+    ///
+    /// # Errors
+    ///
+    /// See [`RequestClient::request_in_with_timeout`].
+    pub async fn request_in<R: Request>(
+        &self,
+        ctx: &HandlerContext,
+        request: &R,
+    ) -> Result<R::Reply, RequestError> {
+        self.request_inner(ctx.correlation_id, request, self.default_timeout)
+            .await
+    }
+
+    /// Send `request` on a fresh causal chain, within `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// See [`RequestClient::request_in_with_timeout`].
+    pub async fn request_with_timeout<R: Request>(
+        &self,
+        request: &R,
+        timeout: Duration,
+    ) -> Result<R::Reply, RequestError> {
+        self.request_inner(CorrelationId::new(), request, timeout)
+            .await
+    }
+
+    /// Send `request` on the causal chain of `ctx`, within `timeout`.
     ///
     /// # Errors
     ///
@@ -66,14 +96,25 @@ impl<T: Transport> RequestClient<T> {
     ///   decoded: either an ok reply whose payload does not decode into the
     ///   expected reply type, or an error reply whose `message_type` matches
     ///   but whose payload does not decode into a [`RemoteErrorPayload`].
-    pub async fn request_with_timeout<R: Request>(
+    pub async fn request_in_with_timeout<R: Request>(
         &self,
+        ctx: &HandlerContext,
+        request: &R,
+        timeout: Duration,
+    ) -> Result<R::Reply, RequestError> {
+        self.request_inner(ctx.correlation_id, request, timeout)
+            .await
+    }
+
+    async fn request_inner<R: Request>(
+        &self,
+        correlation_id: CorrelationId,
         request: &R,
         timeout: Duration,
     ) -> Result<R::Reply, RequestError> {
         let mut pending = self.registry.register();
         let request_id = pending.request_id();
-        let correlation_id = Uuid::now_v7();
+        let correlation_id = *correlation_id.as_uuid();
         let inbox = self
             .reply_inbox
             .lock()
@@ -171,7 +212,8 @@ mod tests {
     use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
 
-    use hexeract_core::RequestId;
+    use hexeract_core::MessageId;
+    use uuid::Uuid;
 
     use super::*;
     use crate::BusError;
@@ -405,6 +447,95 @@ mod tests {
             RequestError::Remote { error_type: RemoteErrorType::Unavailable, request_id }
                 if request_id == expected
         ));
+    }
+
+    #[tokio::test]
+    async fn request_in_inherits_the_caller_causal_chain() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::new());
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            registry,
+            Arc::new(Mutex::new("caller.inbox".to_owned())),
+            Duration::from_secs(5),
+        );
+        let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
+        let expected = *ctx.correlation_id.as_uuid();
+
+        let request_fut = client.request_in(&ctx, &Ping { seq: 1 });
+        tokio::pin!(request_fut);
+        tokio::select! {
+            _ = &mut request_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        let published = transport.last_published().expect("a request was published");
+        assert_eq!(published.correlation_id, expected);
+    }
+
+    #[tokio::test]
+    async fn two_calls_in_one_chain_share_correlation_and_differ_in_request_id() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::new());
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            registry,
+            Arc::new(Mutex::new("caller.inbox".to_owned())),
+            Duration::from_secs(5),
+        );
+        let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
+
+        let first_fut = client.request_in(&ctx, &Ping { seq: 1 });
+        tokio::pin!(first_fut);
+        tokio::select! {
+            _ = &mut first_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let first = transport.last_published().expect("first request");
+
+        let second_fut = client.request_in(&ctx, &Ping { seq: 2 });
+        tokio::pin!(second_fut);
+        tokio::select! {
+            _ = &mut second_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let second = transport.last_published().expect("second request");
+
+        assert_eq!(first.correlation_id, second.correlation_id);
+        assert_ne!(
+            first.headers.get(REQUEST_ID_HEADER),
+            second.headers.get(REQUEST_ID_HEADER)
+        );
+    }
+
+    #[tokio::test]
+    async fn request_starts_a_fresh_chain() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::new());
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            registry,
+            Arc::new(Mutex::new("caller.inbox".to_owned())),
+            Duration::from_secs(5),
+        );
+
+        let first_fut = client.request(&Ping { seq: 1 });
+        tokio::pin!(first_fut);
+        tokio::select! {
+            _ = &mut first_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let first = transport.last_published().expect("first request");
+
+        let second_fut = client.request(&Ping { seq: 2 });
+        tokio::pin!(second_fut);
+        tokio::select! {
+            _ = &mut second_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let second = transport.last_published().expect("second request");
+
+        assert_ne!(first.correlation_id, second.correlation_id);
     }
 
     /// Drive one round trip against a capturing transport, letting `mutate`
