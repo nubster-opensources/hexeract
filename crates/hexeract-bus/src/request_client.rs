@@ -123,9 +123,9 @@ impl<T: Transport> RequestClient<T> {
         request: &R,
         timeout: Duration,
     ) -> Result<R::Reply, RequestError> {
-        let mut pending = self.registry.register(ReplyExpectation {
-            reply_message_type: R::Reply::MESSAGE_TYPE,
-        });
+        let mut pending = self
+            .registry
+            .register(ReplyExpectation::new(R::Reply::MESSAGE_TYPE));
         let request_id = pending.request_id();
         let correlation_id = *correlation_id.as_uuid();
         let inbox = self
@@ -524,6 +524,111 @@ mod tests {
                 actual,
             }) if actual == "accounts.something_else"
         ));
+    }
+
+    /// An error reply for `request_id`, well-formed enough to decode: valid
+    /// protocol version, error status, the error sentinel message type and a
+    /// serialized [`RemoteErrorPayload`].
+    fn error_reply(request_id: RequestId) -> BusEnvelope {
+        let payload = RemoteErrorPayload {
+            error_type: RemoteErrorType::Internal,
+            request_id: *request_id.as_uuid(),
+        };
+        BusEnvelope::restore(
+            Uuid::now_v7(),
+            REPLY_ERROR_MESSAGE_TYPE.to_owned(),
+            serde_json::to_vec(&payload).expect("payload must serialize"),
+            Uuid::now_v7(),
+            None,
+            HashMap::from([
+                (
+                    REPLY_STATUS_HEADER.to_owned(),
+                    REPLY_STATUS_ERROR.to_owned(),
+                ),
+                (REQUEST_ID_HEADER.to_owned(), request_id.to_string()),
+                (
+                    PROTOCOL_VERSION_HEADER.to_owned(),
+                    PROTOCOL_VERSION.to_string(),
+                ),
+            ]),
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+    }
+
+    /// `accepts` (the registry's gate) and `decode_reply` (the client's
+    /// defense-in-depth gate) implement the same protocol rules twice, each
+    /// with its own test suite, but nothing else asserts the two agree on
+    /// which deliveries are acceptable. If `accepts` ever relaxed a rule, a
+    /// delivery would slip past the registry and only then be rejected here,
+    /// surfacing as `RequestError::Protocol` to the caller instead of
+    /// leaving the slot open for the real reply.
+    ///
+    /// `decode_reply`'s `Result` also carries legitimate, non-protocol
+    /// outcomes as `Err`: a well-formed error reply decodes successfully but
+    /// still surfaces as `Err(RequestError::Remote { .. })`, since that is
+    /// how the caller learns the responder failed. So the boundary this
+    /// test compares against `accepts` is specifically whether `decode_reply`
+    /// flags a delivery as `RequestError::Protocol`, not its raw `is_err()`:
+    /// the two must agree on which deliveries are protocol violations,
+    /// without needing to agree on the specific variant reported (see the
+    /// "unknown reply status" case below, where `accepts` reports
+    /// `ReplyRejection::UnknownStatus` and `decode_reply` reports
+    /// `ProtocolViolation::MissingHeader`).
+    #[test]
+    fn accepts_and_decode_reply_agree_on_whether_a_delivery_is_a_protocol_violation() {
+        let expectation = ReplyExpectation::new(Pong::MESSAGE_TYPE);
+        let request_id = RequestId::new();
+
+        let cases: Vec<(&str, BusEnvelope)> = vec![
+            ("missing protocol version", {
+                let mut envelope = ok_reply(request_id, 1);
+                envelope.headers.remove(PROTOCOL_VERSION_HEADER);
+                envelope
+            }),
+            ("unsupported protocol version", {
+                let mut envelope = ok_reply(request_id, 1);
+                envelope
+                    .headers
+                    .insert(PROTOCOL_VERSION_HEADER.to_owned(), "99".to_owned());
+                envelope
+            }),
+            ("missing reply status", {
+                let mut envelope = ok_reply(request_id, 1);
+                envelope.headers.remove(REPLY_STATUS_HEADER);
+                envelope
+            }),
+            ("unknown reply status", {
+                let mut envelope = ok_reply(request_id, 1);
+                envelope
+                    .headers
+                    .insert(REPLY_STATUS_HEADER.to_owned(), "pending".to_owned());
+                envelope
+            }),
+            ("unexpected message type on an ok status", {
+                let mut envelope = ok_reply(request_id, 1);
+                envelope.message_type = "accounts.something_else".to_owned();
+                envelope
+            }),
+            ("non sentinel message type on an error status", {
+                let mut envelope = error_reply(request_id);
+                envelope.message_type = "accounts.something_else".to_owned();
+                envelope
+            }),
+            ("a nominal ok reply", ok_reply(request_id, 1)),
+            ("a nominal error reply", error_reply(request_id)),
+        ];
+
+        for (label, envelope) in cases {
+            let accepts_is_err = crate::reply_acceptance::accepts(&expectation, &envelope).is_err();
+            let decode_is_protocol_violation = matches!(
+                decode_reply::<Ping>(envelope),
+                Err(RequestError::Protocol(_))
+            );
+            assert_eq!(
+                accepts_is_err, decode_is_protocol_violation,
+                "accepts and decode_reply disagree on whether this delivery is a protocol violation: {label}"
+            );
+        }
     }
 
     #[tokio::test]

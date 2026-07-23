@@ -101,9 +101,7 @@ async fn reply_published_to_inbox_is_resolved() {
         })
     };
 
-    let mut pending = registry.register(ReplyExpectation {
-        reply_message_type: Pong::MESSAGE_TYPE,
-    });
+    let mut pending = registry.register(ReplyExpectation::new(Pong::MESSAGE_TYPE));
     let request_id = pending.request_id();
 
     // publish a reply envelope straight to the inbox via a fresh channel

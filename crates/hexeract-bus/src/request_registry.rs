@@ -23,7 +23,7 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::BusEnvelope;
-use crate::reply_acceptance::{ReplyExpectation, accepts};
+use crate::reply_acceptance::{self, ReplyExpectation};
 use crate::rpc_protocol::REQUEST_ID_HEADER;
 
 #[derive(Debug)]
@@ -123,7 +123,7 @@ impl RequestRegistry {
             return;
         };
 
-        if let Err(rejection) = accepts(&slot.expectation, &envelope) {
+        if let Err(rejection) = reply_acceptance::accepts(&slot.expectation, &envelope) {
             drop(slots);
             self.counters.invalid.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(%request_id, ?rejection, "invalid reply, slot left pending");
@@ -257,9 +257,7 @@ mod tests {
     }
 
     fn pong_expectation() -> ReplyExpectation {
-        ReplyExpectation {
-            reply_message_type: Pong::MESSAGE_TYPE,
-        }
+        ReplyExpectation::new(Pong::MESSAGE_TYPE)
     }
 
     fn ok_reply(message_type: &str) -> BusEnvelope {
@@ -293,9 +291,7 @@ mod tests {
     const EXPECTED_REPLY: &str = "test.reply";
 
     fn expectation() -> ReplyExpectation {
-        ReplyExpectation {
-            reply_message_type: EXPECTED_REPLY,
-        }
+        ReplyExpectation::new(EXPECTED_REPLY)
     }
 
     #[tokio::test]

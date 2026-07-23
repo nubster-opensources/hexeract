@@ -72,7 +72,6 @@ pub use remote_error::RemoteErrorType;
 pub use replied_handler::RepliedHandler;
 pub use reply_acceptance::ReplyExpectation;
 pub use reply_acceptance::ReplyRejection;
-pub use reply_acceptance::accepts;
 pub use request::Request;
 pub use request_client::RequestClient;
 pub use request_error::ProtocolViolation;

@@ -14,9 +14,18 @@ use crate::rpc_protocol::{
 
 /// What a pending slot accepts as its reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReplyExpectation {
     /// Message type of the nominal reply this call awaits.
     pub reply_message_type: &'static str,
+}
+
+impl ReplyExpectation {
+    /// Build the expectation for a call awaiting `reply_message_type`.
+    #[must_use]
+    pub fn new(reply_message_type: &'static str) -> Self {
+        Self { reply_message_type }
+    }
 }
 
 /// Why a delivery is not an acceptable reply.
@@ -96,9 +105,7 @@ mod tests {
     const EXPECTED_REPLY: &str = "test.reply";
 
     fn expectation() -> ReplyExpectation {
-        ReplyExpectation {
-            reply_message_type: EXPECTED_REPLY,
-        }
+        ReplyExpectation::new(EXPECTED_REPLY)
     }
 
     fn envelope(message_type: &str, headers: HashMap<String, String>) -> BusEnvelope {
