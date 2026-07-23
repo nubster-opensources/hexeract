@@ -42,6 +42,7 @@ type Slots = HashMap<RequestId, Slot>;
 /// requires retaining resolved identities for a short window, which belongs
 /// to the observability work (#441).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReplyCountersSnapshot {
     /// Deliveries whose identity was known but which `accepts` refused.
     pub invalid: u64,
@@ -345,6 +346,7 @@ mod tests {
             .insert(REQUEST_ID_HEADER.to_owned(), "not-a-uuid".to_owned());
         registry.resolve(envelope);
         assert_eq!(registry.len(), 1, "the slot must stay in flight");
+        assert_eq!(registry.counters().orphaned, 1);
     }
 
     #[tokio::test]
@@ -364,6 +366,11 @@ mod tests {
             .decode()
             .expect("decode");
         assert_eq!(reply.seq, 1);
+        assert_eq!(
+            registry.counters().orphaned,
+            1,
+            "the second valid delivery arrives after the slot is gone, so it is indistinguishable from an orphan"
+        );
     }
 
     #[tokio::test]

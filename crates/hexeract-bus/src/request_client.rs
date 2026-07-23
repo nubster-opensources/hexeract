@@ -86,11 +86,21 @@ impl<T: Transport> RequestClient<T> {
     ///
     /// - [`RequestError::Transport`] if publishing fails or the reply channel
     ///   is lost (connection dropped).
-    /// - [`RequestError::Timeout`] if no reply arrives within `timeout`.
-    /// - [`RequestError::Protocol`] if the reply violates the request-reply
-    ///   protocol: an unsupported or missing protocol version, a missing or
-    ///   unrecognized reply status, or a reply message type other than the
-    ///   one expected.
+    /// - [`RequestError::Timeout`] if no reply arrives within `timeout`. This
+    ///   is also what a legitimate call observes when every delivery bearing
+    ///   its request identity violates the request-reply protocol: an
+    ///   unsupported or missing protocol version, a missing or unrecognized
+    ///   reply status, or a reply message type other than the one expected.
+    ///   The registry ignores such deliveries without waking the caller, so
+    ///   the slot stays open for the real reply; if none arrives before
+    ///   `timeout`, the call times out rather than surfacing the violation
+    ///   that caused the delivery to be ignored.
+    /// - [`RequestError::Protocol`] if a delivery still reaches this decoding
+    ///   step while failing one of those same checks: an unsupported or
+    ///   missing protocol version, a missing or unrecognized reply status, or
+    ///   a reply message type other than the one expected. This remains a
+    ///   reachable defense-in-depth path, not one exercised by a well-behaved
+    ///   registry today.
     /// - [`RequestError::Remote`] if the responder reported a failure.
     /// - [`RequestError::Decode`] if the request cannot be serialized, or if
     ///   a reply that already passed protocol and status validation cannot be
@@ -441,6 +451,79 @@ mod tests {
         .await;
         assert!(matches!(error, RequestError::Timeout(_)));
         assert_eq!(counters.invalid, 1);
+    }
+
+    /// `decode_reply` is the client's defense-in-depth check: the registry is
+    /// expected to filter out a protocol-violating delivery upstream (see
+    /// `a_reply_without_a_status_header_never_reaches_the_caller` and its
+    /// neighbors above), but `decode_reply` itself must still reject one if a
+    /// violation ever reaches this step, whatever the reason. These tests
+    /// call it directly, bypassing transport, registry and timeout, so the
+    /// nominal path above stays free to observe `RequestError::Timeout`
+    /// while this defense stays exercised on its own terms.
+    #[test]
+    fn decode_reply_defense_in_depth_rejects_a_missing_or_unsupported_protocol_version() {
+        let mut missing_version = ok_reply(RequestId::new(), 1);
+        missing_version.headers.remove(PROTOCOL_VERSION_HEADER);
+        let error =
+            decode_reply::<Ping>(missing_version).expect_err("missing protocol version header");
+        assert!(matches!(
+            error,
+            RequestError::Protocol(ProtocolViolation::MissingHeader {
+                header: PROTOCOL_VERSION_HEADER
+            })
+        ));
+
+        let mut unsupported_version = ok_reply(RequestId::new(), 1);
+        unsupported_version
+            .headers
+            .insert(PROTOCOL_VERSION_HEADER.to_owned(), "99".to_owned());
+        let error =
+            decode_reply::<Ping>(unsupported_version).expect_err("unsupported protocol version");
+        assert!(matches!(
+            error,
+            RequestError::Protocol(ProtocolViolation::UnsupportedVersion { version: 99 })
+        ));
+    }
+
+    #[test]
+    fn decode_reply_defense_in_depth_rejects_a_missing_or_unrecognized_reply_status() {
+        let mut missing_status = ok_reply(RequestId::new(), 1);
+        missing_status.headers.remove(REPLY_STATUS_HEADER);
+        let error = decode_reply::<Ping>(missing_status).expect_err("missing reply status header");
+        assert!(matches!(
+            error,
+            RequestError::Protocol(ProtocolViolation::MissingHeader {
+                header: REPLY_STATUS_HEADER
+            })
+        ));
+
+        let mut unrecognized_status = ok_reply(RequestId::new(), 1);
+        unrecognized_status
+            .headers
+            .insert(REPLY_STATUS_HEADER.to_owned(), "pending".to_owned());
+        let error =
+            decode_reply::<Ping>(unrecognized_status).expect_err("unrecognized reply status");
+        assert!(matches!(
+            error,
+            RequestError::Protocol(ProtocolViolation::MissingHeader {
+                header: REPLY_STATUS_HEADER
+            })
+        ));
+    }
+
+    #[test]
+    fn decode_reply_defense_in_depth_rejects_an_unexpected_reply_message_type() {
+        let mut reply = ok_reply(RequestId::new(), 1);
+        reply.message_type = "accounts.something_else".to_owned();
+        let error = decode_reply::<Ping>(reply).expect_err("unexpected reply message type");
+        assert!(matches!(
+            error,
+            RequestError::Protocol(ProtocolViolation::UnexpectedReplyType {
+                expected: Pong::MESSAGE_TYPE,
+                actual,
+            }) if actual == "accounts.something_else"
+        ));
     }
 
     #[tokio::test]

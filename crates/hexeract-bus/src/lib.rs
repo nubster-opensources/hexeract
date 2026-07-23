@@ -79,6 +79,7 @@ pub use request_error::ProtocolViolation;
 pub use request_error::RequestError;
 pub use request_handler::RequestHandler;
 pub use request_registry::PendingReply;
+pub use request_registry::ReplyCountersSnapshot;
 pub use request_registry::RequestRegistry;
 pub use rpc_protocol::PROTOCOL_VERSION;
 pub use rpc_protocol::PROTOCOL_VERSION_HEADER;
