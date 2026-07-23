@@ -53,7 +53,7 @@ trybuild = "1"
 proc-macro-crate = "3"
 proc-macro2 = "1"
 quote = "1"
-syn = { version = "2", features = ["full"] }
+syn = { version = "3", features = ["full"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring"] }
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 fastrand = "2"

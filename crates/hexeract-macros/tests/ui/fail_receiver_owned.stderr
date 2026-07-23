@@ -1,0 +1,5 @@
+error: `handle` must take `&self` as first argument
+  --> tests/ui/fail_receiver_owned.rs:10:9
+   |
+10 |         self,
+   |         ^^^^
