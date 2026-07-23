@@ -24,6 +24,7 @@ pub struct ReplyExpectation {
 /// Deliberately carries no free-form text: it is built from untrusted input
 /// and feeds diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReplyRejection {
     /// No protocol version header.
     MissingVersion,
