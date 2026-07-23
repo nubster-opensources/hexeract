@@ -667,6 +667,78 @@ mod tests {
         assert_ne!(routing_key, PingToDedicatedQueue::MESSAGE_TYPE);
     }
 
+    /// The request id of the single call currently in flight on `registry`.
+    ///
+    /// Panics if zero or more than one slot is registered: this helper is
+    /// for tests that drive exactly one call at a time.
+    fn registry_single_request_id(registry: &Arc<RequestRegistry>) -> RequestId {
+        let ids = registry.in_flight_ids();
+        assert_eq!(ids.len(), 1, "exactly one call must be in flight");
+        ids[0]
+    }
+
+    /// A well-formed but unexpected reply, tagged with `request_id`: valid
+    /// protocol version and status, but a message type the caller never
+    /// asked for.
+    fn forged_reply(message_type: &str, request_id: RequestId) -> BusEnvelope {
+        let mut headers = HashMap::new();
+        headers.insert(
+            PROTOCOL_VERSION_HEADER.to_owned(),
+            PROTOCOL_VERSION.to_string(),
+        );
+        headers.insert(REPLY_STATUS_HEADER.to_owned(), REPLY_STATUS_OK.to_owned());
+        headers.insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
+        BusEnvelope::restore(
+            Uuid::now_v7(),
+            message_type.to_owned(),
+            Vec::new(),
+            Uuid::now_v7(),
+            None,
+            headers,
+            std::time::SystemTime::now(),
+        )
+    }
+
+    /// The legitimate reply to a `Ping`, tagged with `request_id`.
+    fn pong_reply(request_id: RequestId, seq: u64) -> BusEnvelope {
+        let mut envelope = forged_reply(<Pong as Message>::MESSAGE_TYPE, request_id);
+        envelope.payload = serde_json::to_vec(&Pong { seq }).expect("Pong serializes");
+        envelope
+    }
+
+    /// A forged reply that arrives before the legitimate one must not end
+    /// the call: the registry leaves the slot intact for a delivery it
+    /// refuses, so the real reply that follows still reaches the caller.
+    ///
+    /// This is the end-to-end counterpart of
+    /// `an_invalid_reply_arriving_first_does_not_consume_the_slot` in
+    /// `request_registry`: that test proves the property at the registry
+    /// alone, this one proves it survives the full `RequestClient::request`
+    /// path. If the registry ever regressed to consuming a slot before
+    /// validating the delivery, the forged reply would complete this call
+    /// first, `decode_reply` would reject its unexpected message type, and
+    /// the assertions below on a successful `Pong` would fail.
+    #[tokio::test]
+    async fn a_forged_reply_of_the_wrong_type_does_not_end_the_call() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::new());
+        let client = client(Arc::clone(&transport), Arc::clone(&registry));
+
+        let call = tokio::spawn(async move { client.request(&Ping { seq: 7 }).await });
+        tokio::task::yield_now().await;
+
+        let request_id = registry_single_request_id(&registry);
+        registry.resolve(forged_reply("attacker.reply", request_id));
+        registry.resolve(pong_reply(request_id, 7));
+
+        let reply = call
+            .await
+            .expect("task panicked")
+            .expect("call must succeed");
+        assert_eq!(reply, Pong { seq: 7 });
+        assert_eq!(registry.counters().invalid, 1);
+    }
+
     /// Drive one round trip against a capturing transport, letting `mutate`
     /// tamper with the reply before it is resolved, and return the resulting
     /// client error together with the registry's refused-delivery counters.

@@ -167,6 +167,16 @@ impl RequestRegistry {
     fn remove(&self, request_id: RequestId) {
         self.slots().remove(&request_id);
     }
+
+    /// Identities of every slot currently in flight.
+    ///
+    /// Test-only: lets a test at the `RequestClient` level find the request
+    /// id its own call registered, without widening this crate's public
+    /// surface.
+    #[cfg(test)]
+    pub(crate) fn in_flight_ids(&self) -> Vec<RequestId> {
+        self.slots().keys().copied().collect()
+    }
 }
 
 /// RAII guard for one in-flight request slot.
