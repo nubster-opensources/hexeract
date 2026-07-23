@@ -25,6 +25,7 @@ use hexeract_bus::REPLY_STATUS_HEADER;
 use hexeract_bus::REPLY_STATUS_OK;
 use hexeract_bus::REQUEST_ID_HEADER;
 use hexeract_bus::RemoteErrorType;
+use hexeract_bus::ReplyExpectation;
 use hexeract_bus::Request;
 use hexeract_bus::RequestError;
 use hexeract_bus::RequestHandler;
@@ -90,7 +91,9 @@ async fn reply_published_to_inbox_is_resolved() {
         })
     };
 
-    let mut pending = registry.register();
+    let mut pending = registry.register(ReplyExpectation {
+        reply_message_type: Pong::MESSAGE_TYPE,
+    });
     let request_id = pending.request_id();
 
     // publish a reply envelope straight to the inbox via a fresh channel

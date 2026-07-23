@@ -4,6 +4,7 @@ use std::time::Duration;
 use hexeract_core::{CorrelationId, HandlerContext, RequestId};
 
 use crate::remote_error::RemoteErrorPayload;
+use crate::reply_acceptance::ReplyExpectation;
 use crate::request_error::ProtocolViolation;
 use crate::request_registry::RequestRegistry;
 use crate::rpc_protocol::{
@@ -112,7 +113,9 @@ impl<T: Transport> RequestClient<T> {
         request: &R,
         timeout: Duration,
     ) -> Result<R::Reply, RequestError> {
-        let mut pending = self.registry.register();
+        let mut pending = self.registry.register(ReplyExpectation {
+            reply_message_type: R::Reply::MESSAGE_TYPE,
+        });
         let request_id = pending.request_id();
         let correlation_id = *correlation_id.as_uuid();
         let inbox = self
@@ -218,6 +221,7 @@ mod tests {
     use super::*;
     use crate::BusError;
     use crate::remote_error::RemoteErrorType;
+    use crate::request_registry::ReplyCountersSnapshot;
 
     #[derive(Debug, Serialize, Deserialize)]
     struct Ping {
@@ -408,49 +412,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reply_without_a_status_header_is_a_protocol_violation() {
-        let error = client_error_for_reply(|_request_id, reply| {
+    async fn a_reply_without_a_status_header_never_reaches_the_caller() {
+        let (error, counters) = client_error_for_reply(|_request_id, reply| {
             reply.headers.remove(REPLY_STATUS_HEADER);
         })
         .await;
-        assert!(matches!(
-            error,
-            RequestError::Protocol(ProtocolViolation::MissingHeader { header })
-                if header == REPLY_STATUS_HEADER
-        ));
+        assert!(matches!(error, RequestError::Timeout(_)));
+        assert_eq!(counters.invalid, 1);
     }
 
     #[tokio::test]
-    async fn a_reply_announcing_an_unknown_version_is_a_protocol_violation() {
-        let error = client_error_for_reply(|_request_id, reply| {
+    async fn a_reply_announcing_an_unknown_version_never_reaches_the_caller() {
+        let (error, counters) = client_error_for_reply(|_request_id, reply| {
             reply
                 .headers
                 .insert(PROTOCOL_VERSION_HEADER.to_owned(), "99".to_owned());
         })
         .await;
-        assert!(matches!(
-            error,
-            RequestError::Protocol(ProtocolViolation::UnsupportedVersion { version: 99 })
-        ));
+        assert!(matches!(error, RequestError::Timeout(_)));
+        assert_eq!(counters.invalid, 1);
     }
 
     #[tokio::test]
-    async fn a_reply_of_an_unexpected_type_is_a_protocol_violation() {
-        let error = client_error_for_reply(|_request_id, reply| {
+    async fn a_reply_of_an_unexpected_type_never_reaches_the_caller() {
+        let (error, counters) = client_error_for_reply(|_request_id, reply| {
             reply.message_type = "accounts.something_else".to_owned();
         })
         .await;
-        assert!(matches!(
-            error,
-            RequestError::Protocol(ProtocolViolation::UnexpectedReplyType { .. })
-        ));
+        assert!(matches!(error, RequestError::Timeout(_)));
+        assert_eq!(counters.invalid, 1);
     }
 
     #[tokio::test]
     async fn a_remote_failure_surfaces_its_category_and_request_id() {
         let request_id = std::sync::Arc::new(std::sync::Mutex::new(None));
         let captured = std::sync::Arc::clone(&request_id);
-        let error = client_error_for_reply(move |id, reply| {
+        let (error, _counters) = client_error_for_reply(move |id, reply| {
             *captured.lock().expect("lock") = Some(id);
             reply.message_type = REPLY_ERROR_MESSAGE_TYPE.to_owned();
             reply.payload = serde_json::to_vec(&RemoteErrorPayload {
@@ -589,7 +586,13 @@ mod tests {
 
     /// Drive one round trip against a capturing transport, letting `mutate`
     /// tamper with the reply before it is resolved, and return the resulting
-    /// client error.
+    /// client error together with the registry's refused-delivery counters.
+    ///
+    /// A reply `mutate` makes structurally invalid never reaches the caller
+    /// at all: the registry refuses it before the slot is consumed, so the
+    /// call observes a plain timeout rather than a decoded protocol error.
+    /// The timeout is kept short so this stays a fast test rather than a
+    /// slow one.
     ///
     /// Uses the same deterministic idiom as `nominal_round_trip_returns_typed_reply`
     /// and `remote_error_reply_maps_to_remote`: the request future is
@@ -598,14 +601,14 @@ mod tests {
     /// a polling loop.
     async fn client_error_for_reply(
         mutate: impl FnOnce(RequestId, &mut BusEnvelope),
-    ) -> RequestError {
+    ) -> (RequestError, ReplyCountersSnapshot) {
         let transport = Arc::new(CapturingTransport::default());
         let registry = Arc::new(RequestRegistry::new());
         let client = RequestClient::new(
             Arc::clone(&transport),
             Arc::clone(&registry),
             Arc::new(Mutex::new("caller.inbox".to_owned())),
-            Duration::from_secs(5),
+            Duration::from_millis(100),
         );
 
         let request_fut = client.request(&Ping { seq: 1 });
@@ -640,8 +643,9 @@ mod tests {
         mutate(request_id, &mut reply);
         registry.resolve(reply);
 
-        request_fut
+        let error = request_fut
             .await
-            .expect_err("the tampered reply must be rejected")
+            .expect_err("the tampered reply must be rejected");
+        (error, registry.counters())
     }
 }
