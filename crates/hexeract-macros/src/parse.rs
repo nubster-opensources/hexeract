@@ -3,7 +3,7 @@
 use proc_macro2::{Span, TokenStream};
 use syn::{
     FnArg, GenericArgument, GenericParam, Generics, Ident, ImplItem, ImplItemFn, ItemFn, ItemImpl,
-    PathArguments, ReturnType, Signature, Type,
+    PathArguments, ReceiverKind, ReturnType, Signature, Type,
 };
 
 /// Kind argument parsed from `#[handler(command|query|notification)]`.
@@ -182,7 +182,7 @@ fn extract_method_signature(
     reject_generics(&sig.generics)?;
     let mut inputs = sig.inputs.iter();
     match inputs.next() {
-        Some(FnArg::Receiver(r)) if r.reference.is_some() && r.mutability.is_none() => {}
+        Some(FnArg::Receiver(r)) if matches!(r.kind, ReceiverKind::Reference(_, _, None)) => {}
         Some(other) => {
             return Err(syn::Error::new_spanned(
                 other,
