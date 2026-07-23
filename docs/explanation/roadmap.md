@@ -8,14 +8,22 @@
 | v0.4.0 | Outbox Multi-Database | Shipped |
 | v0.5.0 | Reliability | Shipped |
 | v0.6.0 | Scheduler | Shipped |
-| v0.7.0 | Request and Reply | In progress |
-| v0.8.0 | Sagas | Planned |
-| v0.9.0 | Polyglot Transports | Planned |
-| v0.10.0 | Polish and Stability | Planned |
+| v0.7.0 | Secure Request and Reply | In progress |
+| v0.8.0 | Inbox and Consumer Reliability | Planned |
+| v0.9.0 | Durable Sagas | Planned |
+| v0.10.0 | External Adoption and v1.0 Readiness | Planned |
+| v1.0.0 | Stable Contract | Planned |
 
 Hexeract is pre-stable. This document captures the intended trajectory of the project up to v1.0, ordered by release. **No dates are committed.** The project is sponsored on a best-effort basis by Nubster, and releases ship when they are ready, not when a calendar says so.
 
 The roadmap mirrors the [repository milestones](https://github.com/nubster-opensources/hexeract/milestones) one-for-one. Each section here is the public, prose form of a milestone; each milestone groups the issues that must close before the release ships. The full design notes for any given release live under `docs/design/`.
+
+From v0.7 onward, each release has an explicit exit gate:
+
+- Security and reliability work required by the release contract is not deferred as "polish".
+- A milestone closes only when its documented guarantees are backed by tests.
+- A later milestone may depend on an earlier one, but it must not silently absorb unfinished work from it.
+- Speculative framework conveniences and additional transports wait until after v1.0 and external adopter feedback.
 
 ## Out of scope
 
@@ -111,65 +119,142 @@ Released as v0.1.0 on crates.io. The seven shipped crates are `hexeract-core`, `
 - Automatic promotion to the dead-letter queue after exhausted retries.
 - Native integration with the Bus (publish later via a broker) and the Outbox (commit later in a business transaction).
 
-## v0.7.0: Request and Reply (IN PROGRESS)
+## v0.7.0: Secure Request and Reply (IN PROGRESS)
 
-**Goal.** Synchronous RPC pattern over the asynchronous bus, via a dedicated request id.
+**Tracking:** [Request/Reply epic #442](https://github.com/nubster-opensources/hexeract/issues/442)
 
-Implemented in code on the request-reply feature branch: see the CHANGELOG's
-`[Unreleased]` section for the added symbols. The crate versions stay at
-0.6.0 and the release is a separate decision once every v0.7.0 issue is
-closed.
+**Goal.** Deliver typed Request/Reply over the asynchronous bus without treating
+broker metadata as an application trust boundary.
 
-**Scope:**
-
-- `tokio::sync::oneshot` request registry keyed by `RequestId`.
-- Per-call timeouts and context propagation.
-- Cancellation-safe: a dropped request stops the wait without leaking the reply slot.
-- Reply queue management via the existing `reply_to` field on `BusEnvelope`.
-
-## v0.8.0: Sagas
-
-**Goal.** Long-running stateful workflows with explicit compensation.
+The versioned RPC v1 wire protocol is implemented on `main`: `RequestId` is
+distinct from causal `correlation_id`, destinations are explicit, response
+status/version/type are validated and internal error strings do not cross the
+wire. Crate versions remain at 0.6.0 until every v0.7 release gate closes.
 
 **Scope:**
 
-- State machine persisted in the same database as the Outbox (atomic transition + outbox dispatch).
-- Explicit compensation steps invoked on terminal failure.
-- Saga-level retries, timeouts and correlation strategies.
-- Test harness for fast-forwarding saga state in unit tests.
+- `tokio::sync::oneshot` registry keyed by `RequestId`, bounded by configurable
+  backpressure.
+- Per-call timeout, distributed deadline and causal context propagation.
+- Cancellation-safe lifecycle: drop, timeout, reconnect and shutdown release
+  every slot and permit exactly once.
+- Exclusive RabbitMQ reply inbox with readiness gating across reconnects.
+- First **valid** authenticated reply wins; malformed, late and duplicate
+  replies cannot consume another call's slot.
+- Dedicated, confirmed reply publication with a validated and authenticated
+  `reply_to`.
+- End-to-end envelope integrity, publisher identity and intended audience,
+  complemented by least-privilege RabbitMQ ACLs and mTLS.
+- Bounded payload and AMQP metadata, with a protected `x-hexeract-*` protocol
+  namespace.
+- RPC lifecycle spans and metrics that never expose payloads, secrets or
+  internal error messages.
 
-## v0.9.0: Polyglot Transports
+**Non-guarantee.** v0.7 does not claim global exactly-once processing. A valid
+unchanged message can still be redelivered. Persistent cross-process duplicate
+and replay suppression belongs to the v0.8 Inbox transaction boundary.
 
-**Goal.** Cover the rest of the brokered transport landscape so non-Rust services can join the conversation.
+## v0.8.0: Inbox and Consumer Reliability
+
+**Tracking:** [Inbox and consumer reliability epic #447](https://github.com/nubster-opensources/hexeract/issues/447)
+
+**Goal.** Make consumer-side reliability as explicit as the transactional
+Outbox before building long-running workflow orchestration on top.
 
 **Scope:**
 
-- `hexeract-bus-nats` via `async-nats`.
-- `hexeract-bus-kafka` via `rdkafka`.
-- `hexeract-bus-sqs` for SQS-compatible queues.
-- Per-message-route transport selection (a single application can publish to RabbitMQ for some events and Kafka for others).
-- Integration tests via `testcontainers` for each broker.
+- Backend-agnostic persistent Inbox keyed by authenticated issuer, audience and
+  message/request identity.
+- Transactional idempotency middleware for PostgreSQL, MySQL and SQLite.
+- Duplicate and replay suppression within a precisely documented database
+  transaction boundary; no global exactly-once claim.
+- Fenced claims and settlements so stale workers cannot overwrite newer work.
+- Crash-safe Outbox and Scheduler failure handling, backoff, retention and
+  terminal-row cleanup.
+- Bounded batch concurrency and cancellation-aware worker drain.
+- Public in-memory transport and conformance harnesses for deterministic tests.
+- Priority and time-to-live semantics propagated consistently through Bus,
+  Outbox and Scheduler.
 
-## v0.10.0: Polish and Stability
+This milestone is the durability foundation required by v0.9 Sagas.
 
-**Goal.** Hexeract is usable by external early adopters without hand holding, the public API is frozen, and the documentation lives somewhere permanent.
+## v0.9.0: Durable Sagas
+
+**Tracking:** [Durable Sagas epic #455](https://github.com/nubster-opensources/hexeract/issues/455)
+
+**Goal.** Deliver long-running, versioned stateful workflows with atomic Outbox
+transitions and explicit compensation.
 
 **Scope:**
 
-- Dedicated documentation site, either standalone or as a section on the Nubster portal.
-- Onboarding tutorials per primary use case (web service, worker, CLI integration).
-- Throughput and latency benchmarks covering Outbox, Bus and Scheduler.
-- Full OpenTelemetry span coverage across the framework.
-- Prometheus-compatible metrics endpoint exposed by the worker runtime.
-- Dependency audit and minimal version selection review.
-- Public Rust API surface frozen, with the migration plan towards v1.0 documented.
+- Typed, backend-independent saga definition and transition contract.
+- Versioned persisted state with an explicit migration/upcasting policy.
+- SQL saga store for PostgreSQL, MySQL and SQLite.
+- Atomic saga-state transition plus Outbox append.
+- Fenced multi-worker claims, correlation strategies and per-instance
+  concurrency control.
+- Durable timeouts through the Scheduler, bounded retries and terminal failure
+  handling.
+- Explicit, idempotent compensation whose progress survives restart.
+- Deterministic virtual-time and crash-interleaving test harness.
+- Operational metrics, CLI inspection, recovery guidance and an end-to-end
+  runnable example.
+
+## v0.10.0: External Adoption and v1.0 Readiness
+
+**Tracking:** [External adoption and v1 readiness epic #467](https://github.com/nubster-opensources/hexeract/issues/467)
+
+**Goal.** Make Hexeract usable by external early adopters without maintainer
+hand-holding and turn the pre-stable surface into an intentional v1 contract.
+
+**Scope:**
+
+- Versioned documentation site and CI-verified production onboarding paths.
+- Host ergonomics, configuration presets, feature bundles and actionable CLI
+  diagnostics that stay inside the messaging-framework boundary.
+- Full tracing and metrics coverage with versioned dashboards.
+- Reproducible throughput, latency, allocation and resource baselines with
+  documented regression budgets.
+- Public API, feature-graph, MSRV, minimal-version, dependency, license and
+  security audits.
+- Supported database, broker, Rust and platform matrix.
+- Wire/schema rolling-upgrade policy and final 0.x to v1 migration guide.
+- Public Rust API freeze, semver/deprecation checklist and release packaging
+  dry-runs.
+
+Large convention-based features such as automatic handler construction,
+cascading messages and DI-like resource resolution are not v1 blockers and
+remain in the post-1.0 expansion backlog.
+
+## v1.0.0: Stable Contract
+
+**Tracking:** [v1.0 release gate #466](https://github.com/nubster-opensources/hexeract/issues/466)
+
+**Goal.** Publish the already-qualified v0.10 surface as a stable contract.
+
+No feature is added in this milestone. The release is cut only after the
+documentation, performance, compatibility, migration, security and packaging
+gates are complete, all earlier milestones are closed and a clean external
+project has consumed the crates from crates.io.
 
 ## Post-1.0 backlog
 
-The items below have been discussed during the design phase but are not committed to any release. They will only ship if the project gains enough traction to justify the maintenance cost, and each will require its own design pass before any code lands.
+The items below have been discussed during the design phase but are not
+committed to any pre-1.0 release. They will only ship if external feedback
+justifies the maintenance cost, and each requires its own design pass.
 
-- **gRPC transport.** A `hexeract-bus-grpc` backend for service-to-service messaging where stream semantics matter.
-- **Inbox pattern.** Symmetric to the Outbox on the consumer side, deduplicating `message_id` at the database boundary.
+- **Additional broker transports.** NATS/JetStream, Kafka, SQS, Azure Service
+  Bus and gRPC are evaluated one at a time. Hexeract will prefer capability
+  traits (`Publish`, `Consume`, `RequestReply`, `TopologyAdmin`,
+  `OrderedDelivery`, `ScheduledDelivery`) over forcing every broker into one
+  universal topology abstraction.
+- **Pluggable wire codecs.** Protobuf, Avro and schema-registry integration,
+  designed alongside the first transport that requires them.
+- **Per-route multi-broker selection.** Deferred until at least two production
+  transport backends prove the routing contract.
+- **Framework conveniences.** Automatic handler construction, cascading
+  messages, convention-based routing and DI-like resources require adopter
+  evidence and must remain inside the messaging boundary.
 - **WASM hosts.** Run handlers compiled to WebAssembly in a sandbox for untrusted plugin scenarios.
 - **Visual saga inspector.** Web UI to observe saga state transitions in real time.
 - **Sustainability.** Open Core or hosted premium tier, the sponsoring page of the repository.

@@ -52,7 +52,7 @@ sequenceDiagram
 ## What an outbox is NOT
 
 - **Not a message broker.** The outbox is a durable buffer between your business transaction and whatever side effect needs to happen. The handler is typically the bridge that actually publishes to RabbitMQ, Kafka, etc.
-- **Not a workflow engine.** The outbox dispatches one event to one handler. Sagas, orchestration and compensation live in v0.8.0 (Sagas milestone).
+- **Not a workflow engine.** The outbox dispatches one event to one handler. Sagas, orchestration and compensation live in v0.9.0 (Durable Sagas milestone), after the v0.8 Inbox and consumer-reliability foundation.
 - **Not synchronous.** Dispatch latency is bounded by `poll_interval`, default `100 ms`. For latency-critical paths, drop the interval or scale workers horizontally.
 
 ## When to reach for the outbox
