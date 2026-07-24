@@ -19,12 +19,21 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 - `hexeract-bus`: `RequestHandler`, the responder-side counterpart of `Handler` that returns a typed reply instead of performing a side effect. (#401)
 - `hexeract-bus`: `RepliedHandler`, adapting a `RequestHandler` into an `ErasedHandler` that publishes the reply, or an encoded error, back to the request's `reply_to`, preserving the inbound request identity. (#401)
 - `hexeract-bus`: `ReplyExpectation`, `ReplyRejection` and the `accepts` validation function (module-private, called by `RequestRegistry`), plus `ReplyCountersSnapshot` and `RequestRegistry::counters()`. `ReplyExpectation` describes what a pending slot accepts as its reply; `accepts` checks a delivery against it before the registry consumes the slot; `ReplyRejection` is the closed set of reasons a delivery can fail that check; `counters()` exposes, as `ReplyCountersSnapshot`, how many deliveries were refused as invalid (known identity, failed validation) versus orphaned (absent, unparsable or unknown identity). (#445)
+- `hexeract-bus`: `ReplyPublisher`, the trait a backend implements to publish a reply, the only way a responder emits one; its `accept_destination` default method applies the transport-neutral rules of `ReplyDestination`. `ReplyDestination` and `ReplyDestinationError`, the validated reply destination parsed from a caller-supplied `reply_to` and the closed set of reasons it can be refused. (#446)
+- `hexeract-bus-rabbitmq`: `RabbitMqReplyPublisher`, a reply publisher that always targets the AMQP default exchange and restricts a reply destination to a server-named inbox (the `amq.gen-` prefix the broker generates). (#446)
 
 Request-reply is available in code on this branch but not yet released; see [`docs/explanation/roadmap.md`](docs/explanation/roadmap.md) for v0.7.0 status.
+
+### Changed
+
+- `hexeract-bus`: `RepliedHandler::new` now takes a `ReplyPublisher` instead of a `Transport`. A responder publishes its reply through the dedicated publisher, which always targets the AMQP default exchange, whatever exchange its application transport uses. (#446)
+- `hexeract-bus`: a request without a `reply_to` no longer runs the handler; it is dropped. A `Request` has a reply by definition, so running side-effecting work with no way to report on it served no legitimate case. It was previously handled fire-and-forget. (#446)
+- `hexeract-bus-rabbitmq`: a request whose `reply_to` is not a server-named reply inbox (the `amq.gen-` prefix) is dropped without running the handler. (#446)
 
 ### Security
 
 - `hexeract-bus`: **[P1]** `RequestRegistry::resolve` no longer removes a call's pending slot before validating the delivery. Previously, the first delivery to arrive for a `request_id`, whether or not it was a legitimate reply, consumed the slot and ended the call: a forged reply arriving before the real one won the race. The slot is now consumed only once a delivery passes validation, so the first *valid* reply wins; a delivery that fails validation is refused, logged and counted, and leaves the slot open for the legitimate reply. The request identity remains something the responder observes on every call, so it is not by itself an authorization boundary; this fix bounds what a forged delivery can do rather than authenticating where it came from. (#445)
+- `hexeract-bus`: **[P1]** a responder no longer publishes a reply through the transport it uses for application traffic. A caller-supplied `reply_to` was cloned and published through the responder's application transport, so a forged `reply_to` could route a trusted responder's output through unrelated application bindings; the version-mismatch path published to that unvalidated `reply_to` before any other guard. Replies now transit a dedicated publisher on the AMQP default exchange, and `reply_to` is validated before any exit path can publish. Confining publication is complementary to, not a substitute for, authenticating the responder itself (#350). (#446)
 
 ## [0.6.0] - 2026-07-11
 
