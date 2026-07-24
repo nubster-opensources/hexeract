@@ -33,6 +33,8 @@ pub mod pool;
 /// Consumer for the exclusive, auto-delete reply inbox of the
 /// request-reply client path.
 pub(crate) mod reply_inbox;
+/// Dedicated reply publisher, always targeting the AMQP default exchange.
+pub mod reply_publisher;
 /// Facade assembling a supervised request-reply client.
 pub mod request_client;
 /// Topology declaration helpers backed by lapin.
@@ -46,6 +48,7 @@ pub use connection::RabbitMqConnection;
 pub use connection::redact_uri;
 pub use pool::ChannelPool;
 pub use pool::PooledChannel;
+pub use reply_publisher::RabbitMqReplyPublisher;
 pub use request_client::connect_request_client;
 pub use topology::bind_queue;
 pub use topology::declare_exchange;

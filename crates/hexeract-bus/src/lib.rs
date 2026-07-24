@@ -43,6 +43,8 @@ pub mod replied_handler;
 pub mod reply_acceptance;
 /// The destination a reply is published to, validated at construction.
 pub mod reply_destination;
+/// Contract for publishing a reply, isolated from application routing.
+pub mod reply_publisher;
 /// Trait for messages that expect a single typed reply.
 pub mod request;
 /// Generic request-reply client built on top of a [`Transport`].
@@ -76,6 +78,7 @@ pub use reply_acceptance::ReplyExpectation;
 pub use reply_acceptance::ReplyRejection;
 pub use reply_destination::ReplyDestination;
 pub use reply_destination::ReplyDestinationError;
+pub use reply_publisher::ReplyPublisher;
 pub use request::Request;
 pub use request_client::RequestClient;
 pub use request_error::ProtocolViolation;
