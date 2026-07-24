@@ -8,40 +8,47 @@ use crate::rpc_protocol::{
     PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, REPLY_ERROR_MESSAGE_TYPE, REPLY_STATUS_ERROR,
     REPLY_STATUS_HEADER, REPLY_STATUS_OK, REQUEST_ID_HEADER, read_protocol_version,
 };
-use crate::{BoxFuture, BusEnvelope, BusError, ErasedHandler, Request, RequestHandler, Transport};
+use crate::{
+    BoxFuture, BusEnvelope, BusError, ErasedHandler, ReplyPublisher, Request, RequestHandler,
+};
 
 /// Adapts a [`RequestHandler<R>`] into an [`ErasedHandler`] that decodes the
 /// request, runs the handler, and publishes the reply (or an encoded error)
 /// to the request `reply_to`, preserving the inbound correlation id and the
 /// inbound request identity (the `x-hexeract-request-id` header the caller's
 /// [`RequestRegistry`](crate::RequestRegistry) routes the reply on).
-pub struct RepliedHandler<R, H, T> {
+///
+/// Replies are published through the injected [`ReplyPublisher`], which
+/// targets the AMQP default exchange, never through an application
+/// transport: a caller-supplied `reply_to` must never be routed by the
+/// responder's own application bindings.
+pub struct RepliedHandler<R, H, P> {
     handler: Arc<H>,
-    transport: Arc<T>,
+    replies: Arc<P>,
     _phantom: PhantomData<fn() -> R>,
 }
 
-impl<R, H, T> RepliedHandler<R, H, T>
+impl<R, H, P> RepliedHandler<R, H, P>
 where
     R: Request,
     H: RequestHandler<R>,
-    T: Transport,
+    P: ReplyPublisher,
 {
-    /// Wrap a handler and the transport used to publish replies.
-    pub fn new(handler: H, transport: Arc<T>) -> Self {
+    /// Wrap a handler and the reply publisher used to publish replies.
+    pub fn new(handler: H, replies: Arc<P>) -> Self {
         Self {
             handler: Arc::new(handler),
-            transport,
+            replies,
             _phantom: PhantomData,
         }
     }
 }
 
-impl<R, H, T> ErasedHandler for RepliedHandler<R, H, T>
+impl<R, H, P> ErasedHandler for RepliedHandler<R, H, P>
 where
     R: Request,
     H: RequestHandler<R>,
-    T: Transport,
+    P: ReplyPublisher,
 {
     fn message_type(&self) -> &'static str {
         R::MESSAGE_TYPE
@@ -57,10 +64,20 @@ where
     /// while the payload fell back to a nil identity would describe the same
     /// call two different ways.
     ///
-    /// The protocol version check runs before the `reply_to` guard,
-    /// deliberately: a request announcing a version this crate does not
-    /// implement must never reach the handler, whether or not it can be
-    /// told so.
+    /// `reply_to` is parsed and validated against [`ReplyPublisher::accept_destination`]
+    /// FIRST, before any other guard. An absent or rejected `reply_to` drops
+    /// the request without running the handler and without publishing
+    /// anything. This order was inverted from an earlier revision that ran
+    /// the protocol-version check before the `reply_to` guard: a guard
+    /// placed after an early return can never protect that path, so once
+    /// the version-mismatch branch publishes an error reply, that publish
+    /// must not be reachable with an unvalidated destination. Otherwise the
+    /// version check is a publication relay: a third party could have a
+    /// trusted responder emit a message to an arbitrary destination without
+    /// a decodable payload and without ever reaching the handler. Only once
+    /// `reply_to` is validated does the version check run, publishing (when
+    /// needed) to the already-validated destination, followed by decode and
+    /// the handler.
     ///
     /// A nominal reply the framework fails to serialize is treated the same
     /// as an undecodable request: an opaque internal error is published
@@ -77,39 +94,35 @@ where
                 .and_then(|raw| raw.parse::<uuid::Uuid>().ok())
                 .map(RequestId::from);
             let correlation_id = envelope.correlation_id;
-            let reply_to = envelope.reply_to.clone();
 
-            if read_protocol_version(&envelope.headers) != Some(PROTOCOL_VERSION) {
-                let Some(reply_to) = reply_to else {
+            let Some(raw_reply_to) = envelope.reply_to.as_deref() else {
+                tracing::warn!(
+                    message_type = R::MESSAGE_TYPE,
+                    "request without reply_to, dropping without running the handler"
+                );
+                return Ok(());
+            };
+            let reply_to = match self.replies.accept_destination(raw_reply_to) {
+                Ok(reply_to) => reply_to,
+                Err(rejection) => {
                     tracing::warn!(
                         message_type = R::MESSAGE_TYPE,
-                        "request announces an unsupported protocol version and carries no \
-                         reply_to; dropping without running the handler"
+                        ?rejection,
+                        "request carries an unusable reply_to, dropping without running the handler"
                     );
                     return Ok(());
-                };
+                }
+            };
+
+            if read_protocol_version(&envelope.headers) != Some(PROTOCOL_VERSION) {
                 tracing::warn!(
                     message_type = R::MESSAGE_TYPE,
                     "request announces an unsupported protocol version, rejecting"
                 );
                 let reply = error_reply(RemoteErrorType::Unsupported, correlation_id, request_id)?;
-                self.transport.publish_envelope(&reply_to, &reply).await?;
+                self.replies.publish_reply(&reply_to, &reply).await?;
                 return Ok(());
             }
-
-            let Some(reply_to) = reply_to else {
-                tracing::warn!(
-                    message_type = R::MESSAGE_TYPE,
-                    "request without reply_to, handled fire-and-forget without a reply"
-                );
-                let request: R = envelope.decode()?;
-                let _ = self
-                    .handler
-                    .handle(request, ctx)
-                    .await
-                    .map_err(Into::into)?;
-                return Ok(());
-            };
 
             let request: R = match envelope.decode() {
                 Ok(request) => request,
@@ -121,7 +134,7 @@ where
                     );
                     let reply =
                         error_reply(RemoteErrorType::Malformed, correlation_id, request_id)?;
-                    self.transport.publish_envelope(&reply_to, &reply).await?;
+                    self.replies.publish_reply(&reply_to, &reply).await?;
                     return Ok(());
                 }
             };
@@ -166,8 +179,8 @@ where
                     )?
                 }
             };
-            self.transport
-                .publish_envelope(&reply_to, &reply_envelope)
+            self.replies
+                .publish_reply(&reply_to, &reply_envelope)
                 .await?;
             Ok(())
         })
@@ -224,13 +237,13 @@ fn error_reply(
 mod tests {
     use std::sync::Mutex as StdMutex;
 
-    use async_trait::async_trait;
     use hexeract_core::{CorrelationId, MessageId, RequestId};
     use serde::{Deserialize, Serialize};
     use uuid::Uuid;
 
     use super::*;
     use crate::Message;
+    use crate::{ReplyDestination, ReplyDestinationError, ReplyPublisher};
 
     #[derive(Debug, Serialize, Deserialize)]
     struct Ping {
@@ -266,24 +279,34 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct CapturingTransport {
+    struct RecordingReplyPublisher {
         published: StdMutex<Vec<(String, BusEnvelope)>>,
     }
-    #[async_trait]
-    impl Transport for CapturingTransport {
-        async fn publish_envelope(
-            &self,
-            routing_key: &str,
-            envelope: &BusEnvelope,
-        ) -> Result<Uuid, BusError> {
+
+    impl ReplyPublisher for RecordingReplyPublisher {
+        fn publish_reply<'a>(
+            &'a self,
+            destination: &'a ReplyDestination,
+            envelope: &'a BusEnvelope,
+        ) -> BoxFuture<'a, Result<(), BusError>> {
             self.published
                 .lock()
                 .unwrap()
-                .push((routing_key.to_owned(), envelope.clone()));
-            Ok(envelope.message_id)
+                .push((destination.as_str().to_owned(), envelope.clone()));
+            Box::pin(async { Ok(()) })
+        }
+
+        fn accept_destination(&self, raw: &str) -> Result<ReplyDestination, ReplyDestinationError> {
+            let destination = ReplyDestination::parse(raw)?;
+            if destination.as_str().starts_with("amq.gen-") {
+                Ok(destination)
+            } else {
+                Err(ReplyDestinationError::OutsideReplyNamespace)
+            }
         }
     }
-    impl CapturingTransport {
+
+    impl RecordingReplyPublisher {
         fn last_published(&self) -> Option<BusEnvelope> {
             self.published
                 .lock()
@@ -310,17 +333,15 @@ mod tests {
 
     #[tokio::test]
     async fn ok_reply_is_published_with_status_ok() {
-        let transport = Arc::new(CapturingTransport {
-            published: StdMutex::new(Vec::new()),
-        });
-        let erased = RepliedHandler::new(Echo, Arc::clone(&transport));
-        let request = request_envelope(Some("reply.inbox"));
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let erased = RepliedHandler::new(Echo, Arc::clone(&publisher));
+        let request = request_envelope(Some("amq.gen-inbox"));
         erased.handle(&request, &ctx()).await.unwrap();
 
-        let published = transport.published.lock().unwrap();
-        assert_eq!(published.len(), 1);
-        let (rk, env) = &published[0];
-        assert_eq!(rk, "reply.inbox");
+        let recorded = publisher.published.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        let (rk, env) = &recorded[0];
+        assert_eq!(rk, "amq.gen-inbox");
         assert_eq!(env.correlation_id, request.correlation_id);
         assert_eq!(
             env.headers
@@ -343,15 +364,13 @@ mod tests {
 
     #[tokio::test]
     async fn handler_error_is_published_with_status_error() {
-        let transport = Arc::new(CapturingTransport {
-            published: StdMutex::new(Vec::new()),
-        });
-        let erased = RepliedHandler::new(Boom, Arc::clone(&transport));
-        let request = request_envelope(Some("reply.inbox"));
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let erased = RepliedHandler::new(Boom, Arc::clone(&publisher));
+        let request = request_envelope(Some("amq.gen-inbox"));
         erased.handle(&request, &ctx()).await.unwrap();
 
-        let published = transport.published.lock().unwrap();
-        let (_, env) = &published[0];
+        let recorded = publisher.published.lock().unwrap();
+        let (_, env) = &recorded[0];
         assert_eq!(
             env.headers
                 .get("x-hexeract-reply-status")
@@ -376,19 +395,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn request_without_reply_to_publishes_nothing() {
-        let transport = Arc::new(CapturingTransport {
-            published: StdMutex::new(Vec::new()),
-        });
-        let erased = RepliedHandler::new(Echo, Arc::clone(&transport));
-        erased
-            .handle(&request_envelope(None), &ctx())
-            .await
-            .unwrap();
-        assert!(transport.published.lock().unwrap().is_empty());
-    }
-
     /// Security assertion, not a serialization test: no fragment of an
     /// internal failure message may cross the boundary, on any channel of
     /// the envelope, headers and `message_type` included, not only the
@@ -410,11 +416,14 @@ mod tests {
             }
         }
 
-        let transport = Arc::new(CapturingTransport::default());
-        let handler = RepliedHandler::new(FailingHandler, Arc::clone(&transport));
-        let mut request =
-            BusEnvelope::with_reply_to(Uuid::now_v7(), "caller.inbox".to_owned(), &Ping { seq: 1 })
-                .expect("ping must serialize");
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let handler = RepliedHandler::new(FailingHandler, Arc::clone(&publisher));
+        let mut request = BusEnvelope::with_reply_to(
+            Uuid::now_v7(),
+            "amq.gen-inbox".to_owned(),
+            &Ping { seq: 1 },
+        )
+        .expect("ping must serialize");
         request
             .headers
             .insert(REQUEST_ID_HEADER.to_owned(), RequestId::new().to_string());
@@ -429,17 +438,17 @@ mod tests {
             .await
             .expect("reply must publish");
 
-        let published = transport.last_published().expect("a reply was published");
+        let recorded = publisher.last_published().expect("a reply was published");
         // Scan every channel the envelope exposes on the wire, not only the
         // payload: a header or a dynamically built message_type travel the
         // same fabric and could leak just as easily.
         let mut wire = String::new();
-        wire.push_str(&published.message_type);
-        for (key, value) in &published.headers {
+        wire.push_str(&recorded.message_type);
+        for (key, value) in &recorded.headers {
             wire.push_str(key);
             wire.push_str(value);
         }
-        wire.push_str(&String::from_utf8_lossy(&published.payload));
+        wire.push_str(&String::from_utf8_lossy(&recorded.payload));
         for fragment in ["10.0.0.7", "5432", "vault_admin", "refused"] {
             assert!(
                 !wire.contains(fragment),
@@ -447,7 +456,7 @@ mod tests {
             );
         }
         let payload: RemoteErrorPayload =
-            serde_json::from_slice(&published.payload).expect("payload must decode");
+            serde_json::from_slice(&recorded.payload).expect("payload must decode");
         assert_eq!(payload.error_type, RemoteErrorType::Internal);
     }
 
@@ -465,17 +474,20 @@ mod tests {
 
     #[tokio::test]
     async fn an_unsupported_version_is_rejected_without_running_the_handler() {
-        let transport = Arc::new(CapturingTransport::default());
+        let publisher = Arc::new(RecordingReplyPublisher::default());
         let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let handler = RepliedHandler::new(
             RecordingHandler {
                 ran: Arc::clone(&ran),
             },
-            Arc::clone(&transport),
+            Arc::clone(&publisher),
         );
-        let mut request =
-            BusEnvelope::with_reply_to(Uuid::now_v7(), "caller.inbox".to_owned(), &Ping { seq: 1 })
-                .expect("ping must serialize");
+        let mut request = BusEnvelope::with_reply_to(
+            Uuid::now_v7(),
+            "amq.gen-inbox".to_owned(),
+            &Ping { seq: 1 },
+        )
+        .expect("ping must serialize");
         request
             .headers
             .insert(PROTOCOL_VERSION_HEADER.to_owned(), "99".to_owned());
@@ -490,24 +502,25 @@ mod tests {
             !ran.load(std::sync::atomic::Ordering::SeqCst),
             "handler ran"
         );
-        let published = transport.last_published().expect("a reply was published");
+        let recorded = publisher.last_published().expect("a reply was published");
         let payload: RemoteErrorPayload =
-            serde_json::from_slice(&published.payload).expect("payload must decode");
+            serde_json::from_slice(&recorded.payload).expect("payload must decode");
         assert_eq!(payload.error_type, RemoteErrorType::Unsupported);
     }
 
-    /// The version check must run before the `reply_to` guard: a request
-    /// with no `reply_to` cannot be told about its rejection, but it must
-    /// still be rejected rather than silently executed with side effects.
+    /// A request with no `reply_to` is dropped at the very first guard,
+    /// before the version check ever runs: there is no validated
+    /// destination to report the rejection to, and D5 already forbids
+    /// running the handler without one.
     #[tokio::test]
     async fn an_unsupported_version_without_reply_to_is_dropped_without_running_the_handler() {
-        let transport = Arc::new(CapturingTransport::default());
+        let publisher = Arc::new(RecordingReplyPublisher::default());
         let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let handler = RepliedHandler::new(
             RecordingHandler {
                 ran: Arc::clone(&ran),
             },
-            Arc::clone(&transport),
+            Arc::clone(&publisher),
         );
         let mut request =
             BusEnvelope::new(Uuid::now_v7(), &Ping { seq: 1 }).expect("ping must serialize");
@@ -524,27 +537,30 @@ mod tests {
 
         assert!(
             !ran.load(std::sync::atomic::Ordering::SeqCst),
-            "handler ran despite the unsupported version"
+            "handler ran despite the missing reply_to"
         );
         assert!(
-            transport.published.lock().unwrap().is_empty(),
+            publisher.published.lock().unwrap().is_empty(),
             "nothing can be published without a reply_to"
         );
     }
 
     #[tokio::test]
     async fn an_undecodable_request_replies_malformed_without_running_the_handler() {
-        let transport = Arc::new(CapturingTransport::default());
+        let publisher = Arc::new(RecordingReplyPublisher::default());
         let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let handler = RepliedHandler::new(
             RecordingHandler {
                 ran: Arc::clone(&ran),
             },
-            Arc::clone(&transport),
+            Arc::clone(&publisher),
         );
-        let mut request =
-            BusEnvelope::with_reply_to(Uuid::now_v7(), "caller.inbox".to_owned(), &Ping { seq: 1 })
-                .expect("ping must serialize");
+        let mut request = BusEnvelope::with_reply_to(
+            Uuid::now_v7(),
+            "amq.gen-inbox".to_owned(),
+            &Ping { seq: 1 },
+        )
+        .expect("ping must serialize");
         request.payload = b"{ not json".to_vec();
         request.headers.insert(
             PROTOCOL_VERSION_HEADER.to_owned(),
@@ -561,9 +577,9 @@ mod tests {
             !ran.load(std::sync::atomic::Ordering::SeqCst),
             "handler ran"
         );
-        let published = transport.last_published().expect("a reply was published");
+        let recorded = publisher.last_published().expect("a reply was published");
         let payload: RemoteErrorPayload =
-            serde_json::from_slice(&published.payload).expect("payload must decode");
+            serde_json::from_slice(&recorded.payload).expect("payload must decode");
         assert_eq!(payload.error_type, RemoteErrorType::Malformed);
     }
 
@@ -621,11 +637,11 @@ mod tests {
     /// caller to exhaust its timeout in silence.
     #[tokio::test]
     async fn an_unserializable_nominal_reply_publishes_an_internal_error_instead_of_silence() {
-        let transport = Arc::new(CapturingTransport::default());
-        let handler = RepliedHandler::new(BrokenReplyHandler, Arc::clone(&transport));
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let handler = RepliedHandler::new(BrokenReplyHandler, Arc::clone(&publisher));
         let mut request = BusEnvelope::with_reply_to(
             Uuid::now_v7(),
-            "caller.inbox".to_owned(),
+            "amq.gen-inbox".to_owned(),
             &WeirdPing { seq: 1 },
         )
         .expect("weird ping must serialize");
@@ -643,19 +659,19 @@ mod tests {
             .await
             .expect("the serialization failure must not surface as a framework error");
 
-        let published = transport
+        let recorded = publisher
             .last_published()
             .expect("a reply must still be published despite the serialization failure");
         assert_eq!(
-            published
+            recorded
                 .headers
                 .get("x-hexeract-reply-status")
                 .map(String::as_str),
             Some("error")
         );
-        assert_eq!(published.message_type, REPLY_ERROR_MESSAGE_TYPE);
+        assert_eq!(recorded.message_type, REPLY_ERROR_MESSAGE_TYPE);
         let payload: RemoteErrorPayload =
-            serde_json::from_slice(&published.payload).expect("payload must decode");
+            serde_json::from_slice(&recorded.payload).expect("payload must decode");
         assert_eq!(payload.error_type, RemoteErrorType::Internal);
     }
 
@@ -666,11 +682,14 @@ mod tests {
     /// it.
     #[tokio::test]
     async fn an_unparsable_request_id_header_yields_a_reply_with_no_header_and_a_nil_payload_id() {
-        let transport = Arc::new(CapturingTransport::default());
-        let handler = RepliedHandler::new(Boom, Arc::clone(&transport));
-        let mut request =
-            BusEnvelope::with_reply_to(Uuid::now_v7(), "caller.inbox".to_owned(), &Ping { seq: 1 })
-                .expect("ping must serialize");
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let handler = RepliedHandler::new(Boom, Arc::clone(&publisher));
+        let mut request = BusEnvelope::with_reply_to(
+            Uuid::now_v7(),
+            "amq.gen-inbox".to_owned(),
+            &Ping { seq: 1 },
+        )
+        .expect("ping must serialize");
         request
             .headers
             .insert(REQUEST_ID_HEADER.to_owned(), "not-a-uuid".to_owned());
@@ -685,17 +704,91 @@ mod tests {
             .await
             .expect("reply must publish");
 
-        let published = transport.last_published().expect("a reply was published");
+        let recorded = publisher.last_published().expect("a reply was published");
         assert!(
-            !published.headers.contains_key(REQUEST_ID_HEADER),
+            !recorded.headers.contains_key(REQUEST_ID_HEADER),
             "the reply must omit the request id header when the inbound one did not parse"
         );
         let payload: RemoteErrorPayload =
-            serde_json::from_slice(&published.payload).expect("payload must decode");
+            serde_json::from_slice(&recorded.payload).expect("payload must decode");
         assert_eq!(
             payload.request_id,
             Uuid::nil(),
             "the payload must fall back to nil, agreeing with the omitted header"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_without_reply_to_does_not_run_the_handler() {
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler = RepliedHandler::new(
+            RecordingHandler {
+                ran: Arc::clone(&ran),
+            },
+            Arc::clone(&publisher),
+        );
+        handler
+            .handle(&request_envelope(None), &ctx())
+            .await
+            .expect("dropping must not surface as a framework error");
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the handler must not run"
+        );
+        assert!(publisher.published.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_request_with_an_application_queue_as_reply_to_is_refused() {
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler = RepliedHandler::new(
+            RecordingHandler {
+                ran: Arc::clone(&ran),
+            },
+            Arc::clone(&publisher),
+        );
+        // An application queue name is not a server-named reply inbox.
+        handler
+            .handle(&request_envelope(Some("orders.inbox")), &ctx())
+            .await
+            .expect("refusing must not surface as a framework error");
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the handler must not run"
+        );
+        assert!(
+            publisher.published.lock().unwrap().is_empty(),
+            "nothing may be published towards an unvalidated destination"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_version_never_publishes_to_an_unvalidated_destination() {
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler = RepliedHandler::new(
+            RecordingHandler {
+                ran: Arc::clone(&ran),
+            },
+            Arc::clone(&publisher),
+        );
+        let mut request = request_envelope(Some("orders.inbox"));
+        request
+            .headers
+            .insert(PROTOCOL_VERSION_HEADER.to_owned(), "99".to_owned());
+        handler
+            .handle(&request, &ctx())
+            .await
+            .expect("must not surface as a framework error");
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the handler must not run"
+        );
+        assert!(
+            publisher.published.lock().unwrap().is_empty(),
+            "the version path must not be usable as a publication relay: reply_to was invalid"
         );
     }
 }
