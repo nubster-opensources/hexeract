@@ -13,9 +13,11 @@
 #![cfg(test)]
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 
+use async_trait::async_trait;
 use hexeract_bus::BusEnvelope;
 use hexeract_bus::BusError;
 use hexeract_bus::Message;
@@ -25,10 +27,13 @@ use hexeract_bus::REPLY_STATUS_HEADER;
 use hexeract_bus::REPLY_STATUS_OK;
 use hexeract_bus::REQUEST_ID_HEADER;
 use hexeract_bus::RemoteErrorType;
+use hexeract_bus::ReplyExpectation;
 use hexeract_bus::Request;
+use hexeract_bus::RequestClient;
 use hexeract_bus::RequestError;
 use hexeract_bus::RequestHandler;
 use hexeract_bus::RequestRegistry;
+use hexeract_bus::Transport;
 use hexeract_bus_rabbitmq::RabbitMqConnection;
 use hexeract_bus_rabbitmq::RabbitMqTransport;
 use hexeract_bus_rabbitmq::RabbitMqWorkerBuilder;
@@ -36,10 +41,16 @@ use hexeract_bus_rabbitmq::connect_request_client;
 use hexeract_bus_rabbitmq::declare_reply_inbox_for_test;
 use hexeract_bus_rabbitmq::run_reply_inbox_for_test;
 use hexeract_core::HandlerContext;
+use lapin::BasicProperties;
+use lapin::Channel;
+use lapin::Confirmation;
 use lapin::options::BasicGetOptions;
+use lapin::options::BasicPublishOptions;
+use lapin::options::ConfirmSelectOptions;
 use lapin::options::QueueDeclareOptions;
 use lapin::types::AMQPValue;
 use lapin::types::FieldTable;
+use lapin::types::ShortString;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
@@ -90,7 +101,7 @@ async fn reply_published_to_inbox_is_resolved() {
         })
     };
 
-    let mut pending = registry.register();
+    let mut pending = registry.register(ReplyExpectation::new(Pong::MESSAGE_TYPE));
     let request_id = pending.request_id();
 
     // publish a reply envelope straight to the inbox via a fresh channel
@@ -424,4 +435,215 @@ async fn request_without_reply_to_is_non_fatal() {
 
     cancel.cancel();
     let _ = worker_handle.await;
+}
+
+/// Responder that echoes the request's `seq` back after a deliberate
+/// delay.
+///
+/// A wide margin between the forged reply already sitting in the inbox and
+/// this responder's own reply, redundant with the harder guarantee the
+/// test below establishes by only starting this responder once the forged
+/// publish has already confirmed.
+struct SlowEcho {
+    delay: Duration,
+}
+impl RequestHandler<Ping> for SlowEcho {
+    type Error = BusError;
+    async fn handle(&self, request: Ping, _ctx: &HandlerContext) -> Result<Pong, BusError> {
+        tokio::time::sleep(self.delay).await;
+        Ok(Pong { seq: request.seq })
+    }
+}
+
+/// [`Transport`] wrapper recording the request id header of the last
+/// envelope it publishes.
+///
+/// [`RequestRegistry::in_flight_ids`] is test-only and crate-private to
+/// `hexeract-bus`; this suite lives in a separate crate and has no other
+/// way to learn the identity of the call in flight, so it reads the
+/// header exactly as [`RequestClient`] stamps it, on the way out to the
+/// broker.
+struct RecordingTransport {
+    inner: RabbitMqTransport,
+    last_request_id: Mutex<Option<String>>,
+}
+impl RecordingTransport {
+    fn new(inner: RabbitMqTransport) -> Self {
+        Self {
+            inner,
+            last_request_id: Mutex::new(None),
+        }
+    }
+
+    fn last_request_id(&self) -> Option<String> {
+        self.last_request_id.lock().unwrap().clone()
+    }
+}
+#[async_trait]
+impl Transport for RecordingTransport {
+    async fn publish_envelope(
+        &self,
+        routing_key: &str,
+        envelope: &BusEnvelope,
+    ) -> Result<Uuid, BusError> {
+        if let Some(request_id) = envelope.headers.get(REQUEST_ID_HEADER) {
+            *self.last_request_id.lock().unwrap() = Some(request_id.clone());
+        }
+        self.inner.publish_envelope(routing_key, envelope).await
+    }
+}
+
+/// Poll `transport` for the request id it recorded, bounded rather than a
+/// fixed sleep so a slow agent gets more wall time instead of a flaky
+/// false failure, matching the idiom used elsewhere in this file.
+async fn wait_for_recorded_request_id(transport: &RecordingTransport) -> String {
+    let mut attempts = 0;
+    loop {
+        if let Some(request_id) = transport.last_request_id() {
+            return request_id;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 100,
+            "no request id was recorded after 100 attempts"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Publish a forged reply straight into `inbox`, on `channel`, through the
+/// default exchange with `inbox` as the routing key: exactly as the
+/// attacker of the threat model would, from a connection distinct from
+/// the legitimate caller's. Every AMQP property the registry inspects is
+/// set by hand, not through [`BusEnvelope`] or [`Transport`]: the `type`
+/// (message type), the `correlation_id`, and the `x-hexeract-*` headers.
+///
+/// Enables publisher confirms on `channel` and awaits the broker's ack, so
+/// the caller knows the forged reply is durably queued, and therefore
+/// strictly ahead of any reply a responder started afterward, before it
+/// proceeds.
+async fn publish_forged_reply(channel: &Channel, inbox: &str, request_id: &str) {
+    channel
+        .confirm_select(ConfirmSelectOptions::default())
+        .await
+        .expect("confirm select must succeed");
+
+    let mut headers = FieldTable::default();
+    headers.insert(
+        ShortString::from(PROTOCOL_VERSION_HEADER),
+        AMQPValue::LongString(PROTOCOL_VERSION.to_string().into()),
+    );
+    headers.insert(
+        ShortString::from(REPLY_STATUS_HEADER),
+        AMQPValue::LongString(REPLY_STATUS_OK.into()),
+    );
+    headers.insert(
+        ShortString::from(REQUEST_ID_HEADER),
+        AMQPValue::LongString(request_id.into()),
+    );
+    let properties = BasicProperties::default()
+        .with_type("attacker.reply".into())
+        .with_correlation_id(Uuid::now_v7().to_string().into())
+        .with_headers(headers);
+
+    let confirmation = channel
+        .basic_publish(
+            ShortString::from(""),
+            ShortString::from(inbox),
+            BasicPublishOptions::default(),
+            &[],
+            properties,
+        )
+        .await
+        .expect("forged publish must be accepted")
+        .await
+        .expect("forged publish confirmation must resolve");
+    assert!(
+        matches!(confirmation, Confirmation::Ack(None)),
+        "the forged reply must be durably queued before the test proceeds, got {confirmation:?}"
+    );
+}
+
+/// The property #445 fixed, proven on the wire rather than in memory.
+///
+/// A unit test on [`RequestRegistry`] alone cannot rule out a bug in how a
+/// RabbitMQ delivery is reconstructed into a [`BusEnvelope`]: headers,
+/// `message_type` and payload travel over distinct AMQP channels, and
+/// `delivery_to_envelope` is real code that could drop or mangle one of
+/// them. This test publishes a forged reply straight into the client's
+/// own inbox, from a connection distinct from the client's, exactly as
+/// the attacker of the threat model would, and only starts the
+/// legitimate (deliberately slow) responder once that forged publish has
+/// confirmed: the forged reply is therefore durably queued before the
+/// legitimate one can possibly exist, not merely likely to arrive first.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn a_forged_reply_published_into_the_inbox_does_not_end_the_call() {
+    let broker = harness::start_rabbitmq().await;
+    let cancel = CancellationToken::new();
+
+    declare_ping_queue(broker.uri(), "tests.ping").await;
+
+    let registry = Arc::new(RequestRegistry::new());
+    let inbox_connection =
+        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+            .await
+            .unwrap();
+    let inbox_channel = inbox_connection.create_channel().await.unwrap();
+    let inbox = declare_reply_inbox_for_test(&inbox_channel).await.unwrap();
+    let reply_inbox = Arc::new(Mutex::new(inbox.clone()));
+    let inbox_cancel = cancel.clone();
+    let inbox_registry = Arc::clone(&registry);
+    let inbox_name = inbox.clone();
+    let inbox_handle = tokio::spawn(async move {
+        let _ =
+            run_reply_inbox_for_test(inbox_channel, inbox_name, inbox_registry, inbox_cancel).await;
+    });
+
+    let publisher_transport = Arc::new(RecordingTransport::new(
+        RabbitMqTransport::new(broker.uri()).await.unwrap(),
+    ));
+    let client = RequestClient::new(
+        Arc::clone(&publisher_transport),
+        Arc::clone(&registry),
+        reply_inbox,
+        Duration::from_secs(10),
+    );
+
+    let call = tokio::spawn(async move { client.request(&Ping { seq: 1 }).await });
+
+    let request_id = wait_for_recorded_request_id(&publisher_transport).await;
+
+    let forger_connection = RabbitMqConnection::connect(broker.uri()).await.unwrap();
+    let forger_channel = forger_connection.create_channel().await.unwrap();
+    publish_forged_reply(&forger_channel, &inbox, &request_id).await;
+
+    let responder_transport = Arc::new(RabbitMqTransport::new(broker.uri()).await.unwrap());
+    let worker = RabbitMqWorkerBuilder::new(
+        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+            .await
+            .unwrap(),
+    )
+    .queue("tests.ping")
+    .register_request_handler::<Ping, _>(
+        SlowEcho {
+            delay: Duration::from_millis(400),
+        },
+        Arc::clone(&responder_transport),
+    )
+    .build()
+    .unwrap();
+    let worker_cancel = cancel.clone();
+    let worker_handle = tokio::spawn(async move { worker.run(worker_cancel).await });
+
+    let reply = call
+        .await
+        .expect("task panicked")
+        .expect("the legitimate reply must win");
+    assert_eq!(reply.seq, 1);
+    assert_eq!(registry.counters().invalid, 1);
+
+    cancel.cancel();
+    let _ = worker_handle.await;
+    let _ = inbox_handle.await;
 }

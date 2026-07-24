@@ -4,6 +4,7 @@ use std::time::Duration;
 use hexeract_core::{CorrelationId, HandlerContext, RequestId};
 
 use crate::remote_error::RemoteErrorPayload;
+use crate::reply_acceptance::ReplyExpectation;
 use crate::request_error::ProtocolViolation;
 use crate::request_registry::RequestRegistry;
 use crate::rpc_protocol::{
@@ -85,11 +86,21 @@ impl<T: Transport> RequestClient<T> {
     ///
     /// - [`RequestError::Transport`] if publishing fails or the reply channel
     ///   is lost (connection dropped).
-    /// - [`RequestError::Timeout`] if no reply arrives within `timeout`.
-    /// - [`RequestError::Protocol`] if the reply violates the request-reply
-    ///   protocol: an unsupported or missing protocol version, a missing or
-    ///   unrecognized reply status, or a reply message type other than the
-    ///   one expected.
+    /// - [`RequestError::Timeout`] if no reply arrives within `timeout`. This
+    ///   is also what a legitimate call observes when every delivery bearing
+    ///   its request identity violates the request-reply protocol: an
+    ///   unsupported or missing protocol version, a missing or unrecognized
+    ///   reply status, or a reply message type other than the one expected.
+    ///   The registry ignores such deliveries without waking the caller, so
+    ///   the slot stays open for the real reply; if none arrives before
+    ///   `timeout`, the call times out rather than surfacing the violation
+    ///   that caused the delivery to be ignored.
+    /// - [`RequestError::Protocol`] if a delivery still reaches this decoding
+    ///   step while failing one of those same checks: an unsupported or
+    ///   missing protocol version, a missing or unrecognized reply status, or
+    ///   a reply message type other than the one expected. This remains a
+    ///   reachable defense-in-depth path, not one exercised by a well-behaved
+    ///   registry today.
     /// - [`RequestError::Remote`] if the responder reported a failure.
     /// - [`RequestError::Decode`] if the request cannot be serialized, or if
     ///   a reply that already passed protocol and status validation cannot be
@@ -112,7 +123,9 @@ impl<T: Transport> RequestClient<T> {
         request: &R,
         timeout: Duration,
     ) -> Result<R::Reply, RequestError> {
-        let mut pending = self.registry.register();
+        let mut pending = self
+            .registry
+            .register(ReplyExpectation::new(R::Reply::MESSAGE_TYPE));
         let request_id = pending.request_id();
         let correlation_id = *correlation_id.as_uuid();
         let inbox = self
@@ -218,6 +231,7 @@ mod tests {
     use super::*;
     use crate::BusError;
     use crate::remote_error::RemoteErrorType;
+    use crate::request_registry::ReplyCountersSnapshot;
 
     #[derive(Debug, Serialize, Deserialize)]
     struct Ping {
@@ -408,49 +422,220 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reply_without_a_status_header_is_a_protocol_violation() {
-        let error = client_error_for_reply(|_request_id, reply| {
+    async fn a_reply_without_a_status_header_never_reaches_the_caller() {
+        let (error, counters) = client_error_for_reply(|_request_id, reply| {
             reply.headers.remove(REPLY_STATUS_HEADER);
         })
         .await;
-        assert!(matches!(
-            error,
-            RequestError::Protocol(ProtocolViolation::MissingHeader { header })
-                if header == REPLY_STATUS_HEADER
-        ));
+        assert!(matches!(error, RequestError::Timeout(_)));
+        assert_eq!(counters.invalid, 1);
     }
 
     #[tokio::test]
-    async fn a_reply_announcing_an_unknown_version_is_a_protocol_violation() {
-        let error = client_error_for_reply(|_request_id, reply| {
+    async fn a_reply_announcing_an_unknown_version_never_reaches_the_caller() {
+        let (error, counters) = client_error_for_reply(|_request_id, reply| {
             reply
                 .headers
                 .insert(PROTOCOL_VERSION_HEADER.to_owned(), "99".to_owned());
         })
         .await;
+        assert!(matches!(error, RequestError::Timeout(_)));
+        assert_eq!(counters.invalid, 1);
+    }
+
+    #[tokio::test]
+    async fn a_reply_of_an_unexpected_type_never_reaches_the_caller() {
+        let (error, counters) = client_error_for_reply(|_request_id, reply| {
+            reply.message_type = "accounts.something_else".to_owned();
+        })
+        .await;
+        assert!(matches!(error, RequestError::Timeout(_)));
+        assert_eq!(counters.invalid, 1);
+    }
+
+    /// `decode_reply` is the client's defense-in-depth check: the registry is
+    /// expected to filter out a protocol-violating delivery upstream (see
+    /// `a_reply_without_a_status_header_never_reaches_the_caller` and its
+    /// neighbors above), but `decode_reply` itself must still reject one if a
+    /// violation ever reaches this step, whatever the reason. These tests
+    /// call it directly, bypassing transport, registry and timeout, so the
+    /// nominal path above stays free to observe `RequestError::Timeout`
+    /// while this defense stays exercised on its own terms.
+    #[test]
+    fn decode_reply_defense_in_depth_rejects_a_missing_or_unsupported_protocol_version() {
+        let mut missing_version = ok_reply(RequestId::new(), 1);
+        missing_version.headers.remove(PROTOCOL_VERSION_HEADER);
+        let error =
+            decode_reply::<Ping>(missing_version).expect_err("missing protocol version header");
+        assert!(matches!(
+            error,
+            RequestError::Protocol(ProtocolViolation::MissingHeader {
+                header: PROTOCOL_VERSION_HEADER
+            })
+        ));
+
+        let mut unsupported_version = ok_reply(RequestId::new(), 1);
+        unsupported_version
+            .headers
+            .insert(PROTOCOL_VERSION_HEADER.to_owned(), "99".to_owned());
+        let error =
+            decode_reply::<Ping>(unsupported_version).expect_err("unsupported protocol version");
         assert!(matches!(
             error,
             RequestError::Protocol(ProtocolViolation::UnsupportedVersion { version: 99 })
         ));
     }
 
-    #[tokio::test]
-    async fn a_reply_of_an_unexpected_type_is_a_protocol_violation() {
-        let error = client_error_for_reply(|_request_id, reply| {
-            reply.message_type = "accounts.something_else".to_owned();
-        })
-        .await;
+    #[test]
+    fn decode_reply_defense_in_depth_rejects_a_missing_or_unrecognized_reply_status() {
+        let mut missing_status = ok_reply(RequestId::new(), 1);
+        missing_status.headers.remove(REPLY_STATUS_HEADER);
+        let error = decode_reply::<Ping>(missing_status).expect_err("missing reply status header");
         assert!(matches!(
             error,
-            RequestError::Protocol(ProtocolViolation::UnexpectedReplyType { .. })
+            RequestError::Protocol(ProtocolViolation::MissingHeader {
+                header: REPLY_STATUS_HEADER
+            })
         ));
+
+        let mut unrecognized_status = ok_reply(RequestId::new(), 1);
+        unrecognized_status
+            .headers
+            .insert(REPLY_STATUS_HEADER.to_owned(), "pending".to_owned());
+        let error =
+            decode_reply::<Ping>(unrecognized_status).expect_err("unrecognized reply status");
+        assert!(matches!(
+            error,
+            RequestError::Protocol(ProtocolViolation::MissingHeader {
+                header: REPLY_STATUS_HEADER
+            })
+        ));
+    }
+
+    #[test]
+    fn decode_reply_defense_in_depth_rejects_an_unexpected_reply_message_type() {
+        let mut reply = ok_reply(RequestId::new(), 1);
+        reply.message_type = "accounts.something_else".to_owned();
+        let error = decode_reply::<Ping>(reply).expect_err("unexpected reply message type");
+        assert!(matches!(
+            error,
+            RequestError::Protocol(ProtocolViolation::UnexpectedReplyType {
+                expected: Pong::MESSAGE_TYPE,
+                actual,
+            }) if actual == "accounts.something_else"
+        ));
+    }
+
+    /// An error reply for `request_id`, well-formed enough to decode: valid
+    /// protocol version, error status, the error sentinel message type and a
+    /// serialized [`RemoteErrorPayload`].
+    fn error_reply(request_id: RequestId) -> BusEnvelope {
+        let payload = RemoteErrorPayload {
+            error_type: RemoteErrorType::Internal,
+            request_id: *request_id.as_uuid(),
+        };
+        BusEnvelope::restore(
+            Uuid::now_v7(),
+            REPLY_ERROR_MESSAGE_TYPE.to_owned(),
+            serde_json::to_vec(&payload).expect("payload must serialize"),
+            Uuid::now_v7(),
+            None,
+            HashMap::from([
+                (
+                    REPLY_STATUS_HEADER.to_owned(),
+                    REPLY_STATUS_ERROR.to_owned(),
+                ),
+                (REQUEST_ID_HEADER.to_owned(), request_id.to_string()),
+                (
+                    PROTOCOL_VERSION_HEADER.to_owned(),
+                    PROTOCOL_VERSION.to_string(),
+                ),
+            ]),
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+    }
+
+    /// `accepts` (the registry's gate) and `decode_reply` (the client's
+    /// defense-in-depth gate) implement the same protocol rules twice, each
+    /// with its own test suite, but nothing else asserts the two agree on
+    /// which deliveries are acceptable. If `accepts` ever relaxed a rule, a
+    /// delivery would slip past the registry and only then be rejected here,
+    /// surfacing as `RequestError::Protocol` to the caller instead of
+    /// leaving the slot open for the real reply.
+    ///
+    /// `decode_reply`'s `Result` also carries legitimate, non-protocol
+    /// outcomes as `Err`: a well-formed error reply decodes successfully but
+    /// still surfaces as `Err(RequestError::Remote { .. })`, since that is
+    /// how the caller learns the responder failed. So the boundary this
+    /// test compares against `accepts` is specifically whether `decode_reply`
+    /// flags a delivery as `RequestError::Protocol`, not its raw `is_err()`:
+    /// the two must agree on which deliveries are protocol violations,
+    /// without needing to agree on the specific variant reported (see the
+    /// "unknown reply status" case below, where `accepts` reports
+    /// `ReplyRejection::UnknownStatus` and `decode_reply` reports
+    /// `ProtocolViolation::MissingHeader`).
+    #[test]
+    fn accepts_and_decode_reply_agree_on_whether_a_delivery_is_a_protocol_violation() {
+        let expectation = ReplyExpectation::new(Pong::MESSAGE_TYPE);
+        let request_id = RequestId::new();
+
+        let cases: Vec<(&str, BusEnvelope)> = vec![
+            ("missing protocol version", {
+                let mut envelope = ok_reply(request_id, 1);
+                envelope.headers.remove(PROTOCOL_VERSION_HEADER);
+                envelope
+            }),
+            ("unsupported protocol version", {
+                let mut envelope = ok_reply(request_id, 1);
+                envelope
+                    .headers
+                    .insert(PROTOCOL_VERSION_HEADER.to_owned(), "99".to_owned());
+                envelope
+            }),
+            ("missing reply status", {
+                let mut envelope = ok_reply(request_id, 1);
+                envelope.headers.remove(REPLY_STATUS_HEADER);
+                envelope
+            }),
+            ("unknown reply status", {
+                let mut envelope = ok_reply(request_id, 1);
+                envelope
+                    .headers
+                    .insert(REPLY_STATUS_HEADER.to_owned(), "pending".to_owned());
+                envelope
+            }),
+            ("unexpected message type on an ok status", {
+                let mut envelope = ok_reply(request_id, 1);
+                envelope.message_type = "accounts.something_else".to_owned();
+                envelope
+            }),
+            ("non sentinel message type on an error status", {
+                let mut envelope = error_reply(request_id);
+                envelope.message_type = "accounts.something_else".to_owned();
+                envelope
+            }),
+            ("a nominal ok reply", ok_reply(request_id, 1)),
+            ("a nominal error reply", error_reply(request_id)),
+        ];
+
+        for (label, envelope) in cases {
+            let accepts_is_err = crate::reply_acceptance::accepts(&expectation, &envelope).is_err();
+            let decode_is_protocol_violation = matches!(
+                decode_reply::<Ping>(envelope),
+                Err(RequestError::Protocol(_))
+            );
+            assert_eq!(
+                accepts_is_err, decode_is_protocol_violation,
+                "accepts and decode_reply disagree on whether this delivery is a protocol violation: {label}"
+            );
+        }
     }
 
     #[tokio::test]
     async fn a_remote_failure_surfaces_its_category_and_request_id() {
         let request_id = std::sync::Arc::new(std::sync::Mutex::new(None));
         let captured = std::sync::Arc::clone(&request_id);
-        let error = client_error_for_reply(move |id, reply| {
+        let (error, _counters) = client_error_for_reply(move |id, reply| {
             *captured.lock().expect("lock") = Some(id);
             reply.message_type = REPLY_ERROR_MESSAGE_TYPE.to_owned();
             reply.payload = serde_json::to_vec(&RemoteErrorPayload {
@@ -587,9 +772,87 @@ mod tests {
         assert_ne!(routing_key, PingToDedicatedQueue::MESSAGE_TYPE);
     }
 
+    /// The request id of the single call currently in flight on `registry`.
+    ///
+    /// Panics if zero or more than one slot is registered: this helper is
+    /// for tests that drive exactly one call at a time.
+    fn registry_single_request_id(registry: &Arc<RequestRegistry>) -> RequestId {
+        let ids = registry.in_flight_ids();
+        assert_eq!(ids.len(), 1, "exactly one call must be in flight");
+        ids[0]
+    }
+
+    /// A well-formed but unexpected reply, tagged with `request_id`: valid
+    /// protocol version and status, but a message type the caller never
+    /// asked for.
+    fn forged_reply(message_type: &str, request_id: RequestId) -> BusEnvelope {
+        let mut headers = HashMap::new();
+        headers.insert(
+            PROTOCOL_VERSION_HEADER.to_owned(),
+            PROTOCOL_VERSION.to_string(),
+        );
+        headers.insert(REPLY_STATUS_HEADER.to_owned(), REPLY_STATUS_OK.to_owned());
+        headers.insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
+        BusEnvelope::restore(
+            Uuid::now_v7(),
+            message_type.to_owned(),
+            Vec::new(),
+            Uuid::now_v7(),
+            None,
+            headers,
+            std::time::SystemTime::now(),
+        )
+    }
+
+    /// The legitimate reply to a `Ping`, tagged with `request_id`.
+    fn pong_reply(request_id: RequestId, seq: u64) -> BusEnvelope {
+        let mut envelope = forged_reply(<Pong as Message>::MESSAGE_TYPE, request_id);
+        envelope.payload = serde_json::to_vec(&Pong { seq }).expect("Pong serializes");
+        envelope
+    }
+
+    /// A forged reply that arrives before the legitimate one must not end
+    /// the call: the registry leaves the slot intact for a delivery it
+    /// refuses, so the real reply that follows still reaches the caller.
+    ///
+    /// This is the end-to-end counterpart of
+    /// `an_invalid_reply_arriving_first_does_not_consume_the_slot` in
+    /// `request_registry`: that test proves the property at the registry
+    /// alone, this one proves it survives the full `RequestClient::request`
+    /// path. If the registry ever regressed to consuming a slot before
+    /// validating the delivery, the forged reply would complete this call
+    /// first, `decode_reply` would reject its unexpected message type, and
+    /// the assertions below on a successful `Pong` would fail.
+    #[tokio::test]
+    async fn a_forged_reply_of_the_wrong_type_does_not_end_the_call() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::new());
+        let client = client(Arc::clone(&transport), Arc::clone(&registry));
+
+        let call = tokio::spawn(async move { client.request(&Ping { seq: 7 }).await });
+        tokio::task::yield_now().await;
+
+        let request_id = registry_single_request_id(&registry);
+        registry.resolve(forged_reply("attacker.reply", request_id));
+        registry.resolve(pong_reply(request_id, 7));
+
+        let reply = call
+            .await
+            .expect("task panicked")
+            .expect("call must succeed");
+        assert_eq!(reply, Pong { seq: 7 });
+        assert_eq!(registry.counters().invalid, 1);
+    }
+
     /// Drive one round trip against a capturing transport, letting `mutate`
     /// tamper with the reply before it is resolved, and return the resulting
-    /// client error.
+    /// client error together with the registry's refused-delivery counters.
+    ///
+    /// A reply `mutate` makes structurally invalid never reaches the caller
+    /// at all: the registry refuses it before the slot is consumed, so the
+    /// call observes a plain timeout rather than a decoded protocol error.
+    /// The timeout is kept short so this stays a fast test rather than a
+    /// slow one.
     ///
     /// Uses the same deterministic idiom as `nominal_round_trip_returns_typed_reply`
     /// and `remote_error_reply_maps_to_remote`: the request future is
@@ -598,14 +861,14 @@ mod tests {
     /// a polling loop.
     async fn client_error_for_reply(
         mutate: impl FnOnce(RequestId, &mut BusEnvelope),
-    ) -> RequestError {
+    ) -> (RequestError, ReplyCountersSnapshot) {
         let transport = Arc::new(CapturingTransport::default());
         let registry = Arc::new(RequestRegistry::new());
         let client = RequestClient::new(
             Arc::clone(&transport),
             Arc::clone(&registry),
             Arc::new(Mutex::new("caller.inbox".to_owned())),
-            Duration::from_secs(5),
+            Duration::from_millis(100),
         );
 
         let request_fut = client.request(&Ping { seq: 1 });
@@ -640,8 +903,9 @@ mod tests {
         mutate(request_id, &mut reply);
         registry.resolve(reply);
 
-        request_fut
+        let error = request_fut
             .await
-            .expect_err("the tampered reply must be rejected")
+            .expect_err("the tampered reply must be rejected");
+        (error, registry.counters())
     }
 }
