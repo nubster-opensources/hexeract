@@ -20,6 +20,8 @@ use std::time::Instant;
 use async_trait::async_trait;
 use hexeract_bus::BusEnvelope;
 use hexeract_bus::BusError;
+use hexeract_bus::Exchange;
+use hexeract_bus::ExchangeKind;
 use hexeract_bus::Message;
 use hexeract_bus::PROTOCOL_VERSION;
 use hexeract_bus::PROTOCOL_VERSION_HEADER;
@@ -47,6 +49,7 @@ use lapin::Confirmation;
 use lapin::options::BasicGetOptions;
 use lapin::options::BasicPublishOptions;
 use lapin::options::ConfirmSelectOptions;
+use lapin::options::QueueBindOptions;
 use lapin::options::QueueDeclareOptions;
 use lapin::types::AMQPValue;
 use lapin::types::FieldTable;
@@ -646,4 +649,143 @@ async fn a_forged_reply_published_into_the_inbox_does_not_end_the_call() {
     cancel.cancel();
     let _ = worker_handle.await;
     let _ = inbox_handle.await;
+}
+
+/// The textual acceptance criterion of #446, proven on the wire: a
+/// responder whose application transport targets a fanout exchange still
+/// publishes its reply through the AMQP default exchange rather than
+/// through its own application exchange.
+///
+/// A spy queue bound to that fanout would catch any message published
+/// through it, routing key or not (fanout ignores the routing key). Under
+/// the B3a fix the reply never reaches the fanout, so the spy stays
+/// empty. A positive-control probe published straight to the fanout at
+/// the end proves the spy binding is live, so that emptiness is a real
+/// negative and not a mis-bound queue.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn a_responder_on_an_application_exchange_still_replies_through_the_default_exchange() {
+    let broker = harness::start_rabbitmq().await;
+    let cancel = CancellationToken::new();
+
+    declare_ping_queue(broker.uri(), "tests.ping").await;
+
+    // The responder's application transport targets a fanout exchange,
+    // declared here as a side effect of `with_exchange`.
+    let app_exchange = Exchange::new("tests.reply_spy", ExchangeKind::Fanout)
+        .unwrap()
+        .durable(false)
+        .auto_delete(false);
+    let responder_transport = Arc::new(
+        RabbitMqTransport::with_exchange(broker.uri(), app_exchange)
+            .await
+            .unwrap(),
+    );
+
+    // Spy queue bound to the application exchange. A fanout broadcasts to
+    // every bound queue regardless of routing key, so anything published
+    // through the application exchange, including a leaked reply, would
+    // land here.
+    let setup_connection = RabbitMqConnection::connect(broker.uri()).await.unwrap();
+    let setup_channel = setup_connection.create_channel().await.unwrap();
+    setup_channel
+        .queue_declare(
+            "tests.reply_spy.q".into(),
+            QueueDeclareOptions {
+                durable: true,
+                exclusive: false,
+                auto_delete: false,
+                ..QueueDeclareOptions::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .expect("spy queue declare must succeed");
+    setup_channel
+        .queue_bind(
+            "tests.reply_spy.q".into(),
+            "tests.reply_spy".into(),
+            "".into(),
+            QueueBindOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .expect("spy queue bind must succeed");
+
+    let worker = RabbitMqWorkerBuilder::new(
+        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+            .await
+            .unwrap(),
+    )
+    .queue("tests.ping")
+    .register_request_handler::<Ping, _>(Echo, Arc::clone(&responder_transport))
+    .build()
+    .unwrap();
+    let worker_cancel = cancel.clone();
+    let worker_handle = tokio::spawn(async move { worker.run(worker_cancel).await });
+
+    let client = connect_request_client(broker.uri(), Duration::from_secs(10), cancel.clone())
+        .await
+        .unwrap();
+
+    // The round trip succeeding is half the proof: the reply reached the
+    // caller's server-named inbox, which only the default exchange routes
+    // to.
+    let pong = client.request(&Ping { seq: 7 }).await.unwrap();
+    assert_eq!(
+        pong.seq, 7,
+        "the reply must be delivered through the default exchange"
+    );
+
+    // NEGATIVE: no reply transited the application exchange. The round
+    // trip above already resolved, so a reply that was going to leak onto
+    // the fanout would already be sitting in the spy queue; a single
+    // basic_get is the expected proof, not a race.
+    let leaked = setup_channel
+        .basic_get("tests.reply_spy.q".into(), BasicGetOptions::default())
+        .await
+        .expect("spy queue basic_get must succeed");
+    assert!(
+        leaked.is_none(),
+        "a reply transited the application exchange instead of the default exchange"
+    );
+
+    // POSITIVE CONTROL: publish a probe straight to the fanout exchange
+    // and confirm it reaches the spy queue, proving the spy binding is
+    // live so that the emptiness above is a real negative rather than a
+    // mis-bound queue.
+    setup_channel
+        .basic_publish(
+            ShortString::from("tests.reply_spy"),
+            ShortString::from(""),
+            BasicPublishOptions::default(),
+            b"probe",
+            BasicProperties::default(),
+        )
+        .await
+        .expect("probe publish must be accepted")
+        .await
+        .expect("probe publish confirmation must resolve");
+
+    let mut attempts = 0;
+    let probe = loop {
+        if let Some(delivery) = setup_channel
+            .basic_get("tests.reply_spy.q".into(), BasicGetOptions::default())
+            .await
+            .unwrap()
+        {
+            break delivery;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 100,
+            "the positive-control probe never reached the spy queue after 100 attempts, \
+             proving the spy binding was never live"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(probe.data.as_slice(), b"probe");
+
+    cancel.cancel();
+    let _ = worker_handle.await;
 }
