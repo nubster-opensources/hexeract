@@ -95,16 +95,37 @@ RabbitMQ's access control distinguishes three permissions per resource, verified
 
 That last point matters for the default exchange specifically. The default exchange is itself a permission-checked resource, named by the empty string in AMQP 0-9-1: `basic.publish` through it is authorized by `write` on that empty-string exchange name, not by any permission on the destination queue. Delivery to the queue named by the routing key happens through an implicit, pre-existing binding that AMQP 0-9-1 does not allow a client to create, alter, or remove; there is no `queue.bind` step to gate. Consequently, whatever regex a role's `write` permission uses must match the empty string for that role to publish through the default exchange at all, and the tightest way to grant exactly that and nothing else is `^$`, a pattern that matches only the empty string.
 
+The requester's `^amq\.gen-.*$` grant for `configure`/`read` necessarily matches every other requester's server-named inbox too, not just its own; that breadth is safe because a server-generated `amq.gen-*` queue is declared exclusive to the connection that created it, so no other connection, whatever its permissions, can consume from it, and the pattern therefore cannot be used to reach another party's inbox.
+
 The following is a starting template, not a drop-in configuration: adapt the queue and request-destination names to the real topology before using it.
 
 ```
-# Requester: declare and consume only its own broker-generated reply
-# inbox; publish only to the request destinations it is entitled to call.
+# Requester, default transport (RabbitMqTransport::new(), the default
+# exchange -- this is the doc-canonical topology): declare and consume
+# only its own broker-generated reply inbox; publish only through the
+# default exchange, exactly as the responder does below.
 # configure: only auto-generated (amq.gen-*) queues, never an explicitly
 #            named one -- this is what a reply inbox always is.
-# write:     only the request destination(s) this role calls; replace
-#            the alternation with the real destination name(s).
+# write:     "^$" matches the empty string only, i.e. the default
+#            exchange. `Request::DESTINATION` is the ROUTING KEY on that
+#            publish, not the exchange (see "A starting rabbitmqctl
+#            template" above): it is therefore an ungated routing key
+#            under this grant, the same exchange-vs-routing-key split
+#            already stated for the responder's reply publish below.
 # read:      only its own reply inbox, for the same reason as configure.
+rabbitmqctl set_permissions -p "tenant-a" "requester-svc" \
+  "^amq\.gen-.*$" \
+  "^$" \
+  "^amq\.gen-.*$"
+
+# Requester, named-exchange transport (RabbitMqTransport::with_exchange()):
+# here the request is published to a named application exchange, so
+# `write` must instead name that exchange (or those exchanges).
+# configure/read: unchanged from above.
+# write:     only the request exchange(s) this role calls; replace the
+#            alternation with the real exchange name(s) -- this is NOT
+#            the destination queue name, it is the exchange the
+#            transport was constructed with.
 rabbitmqctl set_permissions -p "tenant-a" "requester-svc" \
   "^amq\.gen-.*$" \
   "^(orders\.create|orders\.cancel)$" \
