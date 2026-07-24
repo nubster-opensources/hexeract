@@ -16,6 +16,7 @@ pub struct ReplyDestination(String);
 
 /// Why a `reply_to` value is not a usable reply destination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReplyDestinationError {
     /// The value was empty.
     Empty,
