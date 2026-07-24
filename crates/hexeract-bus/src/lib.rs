@@ -41,6 +41,8 @@ pub mod remote_error;
 pub mod replied_handler;
 /// Whether an inbound delivery is an acceptable reply for a pending slot.
 pub mod reply_acceptance;
+/// The destination a reply is published to, validated at construction.
+pub mod reply_destination;
 /// Trait for messages that expect a single typed reply.
 pub mod request;
 /// Generic request-reply client built on top of a [`Transport`].
@@ -72,6 +74,8 @@ pub use remote_error::RemoteErrorType;
 pub use replied_handler::RepliedHandler;
 pub use reply_acceptance::ReplyExpectation;
 pub use reply_acceptance::ReplyRejection;
+pub use reply_destination::ReplyDestination;
+pub use reply_destination::ReplyDestinationError;
 pub use request::Request;
 pub use request_client::RequestClient;
 pub use request_error::ProtocolViolation;
