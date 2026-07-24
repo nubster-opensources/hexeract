@@ -47,6 +47,7 @@ use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
 use crate::connection::RabbitMqConnection;
+use crate::reply_publisher::RabbitMqReplyPublisher;
 use crate::transport::RabbitMqTransport;
 use crate::transport::to_short_string;
 
@@ -383,11 +384,23 @@ impl RabbitMqWorkerBuilder {
 
     /// Register a request handler: decodes `R`, runs the handler, and
     /// auto-publishes the typed reply (or an encoded error) to the request
-    /// `reply_to` via `transport`.
+    /// `reply_to`.
+    ///
+    /// The reply is published through a dedicated [`RabbitMqReplyPublisher`],
+    /// built internally from `transport`'s connection, which ALWAYS targets
+    /// the AMQP default exchange. `transport`'s own exchange is not used for
+    /// replies; it only sources the connection and pool size. This confines
+    /// a caller-supplied `reply_to` to the default exchange regardless of
+    /// how the responder's application transport is configured.
     ///
     /// Registering twice for the same `R::MESSAGE_TYPE` silently replaces
     /// the previous entry, same as [`Self::register_handler`].
     #[must_use]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the Arc<RabbitMqTransport> parameter is a stable public signature shared by \
+                  every existing call site; only its connection and pool size are read here"
+    )]
     pub fn register_request_handler<R, H>(
         mut self,
         handler: H,
@@ -397,8 +410,12 @@ impl RabbitMqWorkerBuilder {
         R: Request,
         H: RequestHandler<R>,
     {
+        let replies = Arc::new(RabbitMqReplyPublisher::new(
+            transport.pool().connection().clone(),
+            transport.pool().max_size(),
+        ));
         let erased: Arc<dyn ErasedHandler> = Arc::new(
-            RepliedHandler::<R, H, RabbitMqTransport>::new(handler, transport),
+            RepliedHandler::<R, H, RabbitMqReplyPublisher>::new(handler, replies),
         );
         self.handlers.insert(R::MESSAGE_TYPE, erased);
         self

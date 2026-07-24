@@ -1,15 +1,21 @@
 //! Rendezvous point between request callers and reply deliveries.
 //!
-//! A caller registers a slot keyed by a freshly minted [`hexeract_core::RequestId`] and
-//! awaits its [`PendingReply`]. The transport-side inbox consumer calls
-//! [`RequestRegistry::resolve`] to route an incoming reply to the waiting
-//! caller, reading the request identity from the reserved header.
+//! A caller registers a slot keyed by a freshly minted [`hexeract_core::RequestId`],
+//! declaring what it accepts as a reply, and awaits its [`PendingReply`]. The
+//! transport-side inbox consumer calls [`RequestRegistry::resolve`], which
+//! routes a delivery to the waiting caller only if it satisfies that
+//! expectation: the first **valid** reply wins, not the first delivery.
 //!
 //! The key is the request identity and never the correlation id: two calls
 //! issued from the same causal chain share their correlation, so keying on it
 //! would let concurrent replies cross.
+//!
+//! The identity is not an authorization boundary: it is revealed to the
+//! responder on every call. Validation bounds what a forged delivery can do,
+//! it does not authenticate its origin.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use hexeract_core::RequestId;
@@ -17,14 +23,44 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::BusEnvelope;
+use crate::reply_acceptance::{self, ReplyExpectation};
 use crate::rpc_protocol::REQUEST_ID_HEADER;
 
-type Slots = HashMap<RequestId, oneshot::Sender<BusEnvelope>>;
+#[derive(Debug)]
+struct Slot {
+    expectation: ReplyExpectation,
+    sender: oneshot::Sender<BusEnvelope>,
+}
+
+type Slots = HashMap<RequestId, Slot>;
+
+/// Counts of deliveries the registry refused to route.
+///
+/// `duplicate` is deliberately absent: once a slot is consumed by a valid
+/// reply it is removed, so a second valid reply is indistinguishable from an
+/// orphan at this level and is counted as `orphaned`. Telling the two apart
+/// requires retaining resolved identities for a short window, which belongs
+/// to the observability work (#441).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReplyCountersSnapshot {
+    /// Deliveries whose identity was known but which `accepts` refused.
+    pub invalid: u64,
+    /// Deliveries with an absent, unparsable or unknown identity.
+    pub orphaned: u64,
+}
+
+#[derive(Debug, Default)]
+struct ReplyCounters {
+    invalid: AtomicU64,
+    orphaned: AtomicU64,
+}
 
 /// Registry of in-flight request slots.
 #[derive(Debug, Default)]
 pub struct RequestRegistry {
     slots: Mutex<Slots>,
+    counters: ReplyCounters,
 }
 
 impl RequestRegistry {
@@ -33,6 +69,7 @@ impl RequestRegistry {
     pub fn new() -> Self {
         Self {
             slots: Mutex::new(HashMap::new()),
+            counters: ReplyCounters::default(),
         }
     }
 
@@ -40,11 +77,18 @@ impl RequestRegistry {
         self.slots.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Register a fresh slot and return its RAII-guarded pending reply.
-    pub fn register(self: &Arc<Self>) -> PendingReply {
+    /// Register a fresh slot accepting `expectation`, and return its
+    /// RAII-guarded pending reply.
+    pub fn register(self: &Arc<Self>, expectation: ReplyExpectation) -> PendingReply {
         let request_id = RequestId::new();
         let (sender, receiver) = oneshot::channel();
-        self.slots().insert(request_id, sender);
+        self.slots().insert(
+            request_id,
+            Slot {
+                expectation,
+                sender,
+            },
+        );
         PendingReply {
             request_id,
             receiver,
@@ -52,26 +96,53 @@ impl RequestRegistry {
         }
     }
 
-    /// Route `envelope` to its waiting caller, by request identity.
+    /// Route `envelope` to its waiting caller, by request identity, if and
+    /// only if it is an acceptable reply for that caller.
     ///
-    /// A reply whose identity header is absent, unparsable or unknown is
-    /// counted as orphaned and dropped: a late or duplicate reply is expected
-    /// under at-least-once delivery and is never an error.
+    /// A delivery that fails validation leaves the slot **intact**: the
+    /// legitimate reply can still arrive and win. This is what makes the
+    /// first valid reply win rather than the first delivery.
     pub fn resolve(&self, envelope: BusEnvelope) {
         let Some(raw) = envelope.headers.get(REQUEST_ID_HEADER) else {
-            tracing::warn!("reply without a request id header, dropping");
+            self.counters.orphaned.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!("reply without a request id header, dropping");
             return;
         };
         let Ok(uuid) = raw.parse::<Uuid>() else {
-            tracing::warn!("reply with an unparsable request id header, dropping");
+            self.counters.orphaned.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!("reply with an unparsable request id header, dropping");
             return;
         };
         let request_id = RequestId::from(uuid);
-        let sender = self.slots().remove(&request_id);
-        if let Some(sender) = sender {
-            let _ = sender.send(envelope);
-        } else {
+
+        let mut slots = self.slots();
+        let Some(slot) = slots.get(&request_id) else {
+            drop(slots);
+            self.counters.orphaned.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(%request_id, "reply for an unknown or already-resolved request");
+            return;
+        };
+
+        if let Err(rejection) = reply_acceptance::accepts(&slot.expectation, &envelope) {
+            drop(slots);
+            self.counters.invalid.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(%request_id, ?rejection, "invalid reply, slot left pending");
+            return;
+        }
+
+        let slot = slots.remove(&request_id);
+        drop(slots);
+        if let Some(slot) = slot {
+            let _ = slot.sender.send(envelope);
+        }
+    }
+
+    /// Snapshot of the refused-delivery counters.
+    #[must_use]
+    pub fn counters(&self) -> ReplyCountersSnapshot {
+        ReplyCountersSnapshot {
+            invalid: self.counters.invalid.load(Ordering::Relaxed),
+            orphaned: self.counters.orphaned.load(Ordering::Relaxed),
         }
     }
 
@@ -95,6 +166,16 @@ impl RequestRegistry {
 
     fn remove(&self, request_id: RequestId) {
         self.slots().remove(&request_id);
+    }
+
+    /// Identities of every slot currently in flight.
+    ///
+    /// Test-only: lets a test at the `RequestClient` level find the request
+    /// id its own call registered, without widening this crate's public
+    /// surface.
+    #[cfg(test)]
+    pub(crate) fn in_flight_ids(&self) -> Vec<RequestId> {
+        self.slots().keys().copied().collect()
     }
 }
 
@@ -164,7 +245,53 @@ mod tests {
         envelope
             .headers
             .insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
+        envelope.headers.insert(
+            crate::rpc_protocol::PROTOCOL_VERSION_HEADER.to_owned(),
+            crate::rpc_protocol::PROTOCOL_VERSION.to_string(),
+        );
+        envelope.headers.insert(
+            crate::rpc_protocol::REPLY_STATUS_HEADER.to_owned(),
+            crate::rpc_protocol::REPLY_STATUS_OK.to_owned(),
+        );
         envelope
+    }
+
+    fn pong_expectation() -> ReplyExpectation {
+        ReplyExpectation::new(Pong::MESSAGE_TYPE)
+    }
+
+    fn ok_reply(message_type: &str) -> BusEnvelope {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(
+            crate::rpc_protocol::PROTOCOL_VERSION_HEADER.to_owned(),
+            crate::rpc_protocol::PROTOCOL_VERSION.to_string(),
+        );
+        headers.insert(
+            crate::rpc_protocol::REPLY_STATUS_HEADER.to_owned(),
+            crate::rpc_protocol::REPLY_STATUS_OK.to_owned(),
+        );
+        BusEnvelope::restore(
+            Uuid::now_v7(),
+            message_type.to_owned(),
+            Vec::new(),
+            Uuid::now_v7(),
+            None,
+            headers,
+            std::time::SystemTime::now(),
+        )
+    }
+
+    fn tagged(mut envelope: BusEnvelope, request_id: RequestId) -> BusEnvelope {
+        envelope
+            .headers
+            .insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
+        envelope
+    }
+
+    const EXPECTED_REPLY: &str = "test.reply";
+
+    fn expectation() -> ReplyExpectation {
+        ReplyExpectation::new(EXPECTED_REPLY)
     }
 
     #[tokio::test]
@@ -172,8 +299,8 @@ mod tests {
         let registry = Arc::new(RequestRegistry::new());
         let shared_chain = Uuid::now_v7();
 
-        let mut first = registry.register();
-        let mut second = registry.register();
+        let mut first = registry.register(pong_expectation());
+        let mut second = registry.register(pong_expectation());
         assert_ne!(first.request_id(), second.request_id());
 
         registry.resolve(reply_for(second.request_id(), shared_chain, 2));
@@ -198,7 +325,7 @@ mod tests {
     #[test]
     fn dropping_a_pending_reply_frees_its_slot() {
         let registry = Arc::new(RequestRegistry::new());
-        let pending = registry.register();
+        let pending = registry.register(expectation());
         assert_eq!(registry.len(), 1);
         drop(pending);
         assert!(registry.is_empty());
@@ -207,7 +334,7 @@ mod tests {
     #[test]
     fn a_reply_without_a_request_id_header_is_dropped() {
         let registry = Arc::new(RequestRegistry::new());
-        let _pending = registry.register();
+        let _pending = registry.register(expectation());
         let envelope =
             BusEnvelope::new(Uuid::now_v7(), &Pong { seq: 7 }).expect("pong must serialize");
         registry.resolve(envelope);
@@ -217,7 +344,7 @@ mod tests {
     #[test]
     fn an_unparsable_request_id_is_dropped() {
         let registry = Arc::new(RequestRegistry::new());
-        let _pending = registry.register();
+        let _pending = registry.register(expectation());
         let mut envelope =
             BusEnvelope::new(Uuid::now_v7(), &Pong { seq: 7 }).expect("pong must serialize");
         envelope
@@ -225,12 +352,13 @@ mod tests {
             .insert(REQUEST_ID_HEADER.to_owned(), "not-a-uuid".to_owned());
         registry.resolve(envelope);
         assert_eq!(registry.len(), 1, "the slot must stay in flight");
+        assert_eq!(registry.counters().orphaned, 1);
     }
 
     #[tokio::test]
     async fn the_first_valid_reply_wins_and_duplicates_are_dropped() {
         let registry = Arc::new(RequestRegistry::new());
-        let mut pending = registry.register();
+        let mut pending = registry.register(pong_expectation());
         let request_id = pending.request_id();
         let chain = Uuid::now_v7();
 
@@ -244,12 +372,17 @@ mod tests {
             .decode()
             .expect("decode");
         assert_eq!(reply.seq, 1);
+        assert_eq!(
+            registry.counters().orphaned,
+            1,
+            "the second valid delivery arrives after the slot is gone, so it is indistinguishable from an orphan"
+        );
     }
 
     #[tokio::test]
     async fn drain_closes_every_in_flight_slot() {
         let registry = Arc::new(RequestRegistry::new());
-        let mut pending = registry.register();
+        let mut pending = registry.register(expectation());
         registry.drain();
         assert!(pending.wait().await.is_err());
     }
@@ -269,7 +402,9 @@ mod tests {
 
         let registry = Arc::new(RequestRegistry::new());
         let chain = Uuid::now_v7();
-        let mut pendings: Vec<_> = (0..SLOT_COUNT).map(|_| registry.register()).collect();
+        let mut pendings: Vec<_> = (0..SLOT_COUNT)
+            .map(|_| registry.register(pong_expectation()))
+            .collect();
         let ids: Vec<RequestId> = pendings.iter().map(PendingReply::request_id).collect();
 
         let resolver = Arc::clone(&registry);
@@ -292,5 +427,45 @@ mod tests {
             assert_eq!(reply.seq, expected_seq, "reply routed to the wrong caller");
         }
         task.await.expect("resolver task must finish");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_reply_arriving_first_does_not_consume_the_slot() {
+        let registry = Arc::new(RequestRegistry::new());
+        let mut pending = registry.register(expectation());
+        let request_id = pending.request_id();
+
+        registry.resolve(tagged(ok_reply("attacker.reply"), request_id));
+
+        assert_eq!(registry.len(), 1, "the slot must survive an invalid reply");
+        assert_eq!(registry.counters().invalid, 1);
+
+        registry.resolve(tagged(ok_reply(EXPECTED_REPLY), request_id));
+
+        let reply = pending.wait().await.expect("the legitimate reply must win");
+        assert_eq!(reply.message_type, EXPECTED_REPLY);
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_reply_with_an_unknown_identity_is_counted_orphaned() {
+        let registry = Arc::new(RequestRegistry::new());
+        let _pending = registry.register(expectation());
+
+        registry.resolve(tagged(ok_reply(EXPECTED_REPLY), RequestId::new()));
+
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.counters().orphaned, 1);
+        assert_eq!(registry.counters().invalid, 0);
+    }
+
+    #[tokio::test]
+    async fn a_reply_without_an_identity_header_is_counted_orphaned() {
+        let registry = Arc::new(RequestRegistry::new());
+        let _pending = registry.register(expectation());
+
+        registry.resolve(ok_reply(EXPECTED_REPLY));
+
+        assert_eq!(registry.counters().orphaned, 1);
     }
 }
