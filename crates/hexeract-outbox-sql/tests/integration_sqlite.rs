@@ -1,10 +1,10 @@
 //! Integration tests for the SQLite backend of `hexeract-outbox-sql`.
 //!
-//! These tests use a temporary file database (no container needed) and are
-//! marked `#[ignore]` so they run in the dedicated integration workflow.
+//! These tests use a temporary file database, so they need no container and
+//! run in the regular test job on every supported operating system.
 //!
 //! ```sh
-//! cargo test -p hexeract-outbox-sql --features sqlite --test integration_sqlite -- --ignored
+//! cargo test -p hexeract-outbox-sql --features sqlite --test integration_sqlite
 //! ```
 #![cfg(feature = "sqlite")]
 
@@ -112,7 +112,6 @@ async fn delivered_count(pool: &SqlitePool, event_id: Uuid) -> i64 {
 }
 
 #[tokio::test]
-#[ignore = "runs in the integration workflow"]
 async fn publish_in_tx_rollback_discards_the_insert() {
     let (_file, pool) = setup().await;
     let publisher = SqliteOutboxPublisher::new(pool.clone(), TABLE).unwrap();
@@ -133,7 +132,6 @@ async fn publish_in_tx_rollback_discards_the_insert() {
 }
 
 #[tokio::test]
-#[ignore = "runs in the integration workflow"]
 async fn worker_dispatches_published_event_and_marks_delivered() {
     let (_file, pool) = setup().await;
     let publisher = SqliteOutboxPublisher::new(pool.clone(), TABLE).unwrap();
@@ -164,7 +162,6 @@ async fn worker_dispatches_published_event_and_marks_delivered() {
 }
 
 #[tokio::test]
-#[ignore = "runs in the integration workflow"]
 async fn worker_marks_failed_and_increments_attempts_on_handler_error() {
     let (_file, pool) = setup().await;
     let publisher = SqliteOutboxPublisher::new(pool.clone(), TABLE).unwrap();
@@ -210,7 +207,6 @@ async fn worker_marks_failed_and_increments_attempts_on_handler_error() {
 }
 
 #[tokio::test]
-#[ignore = "runs in the integration workflow"]
 async fn future_next_retry_at_excludes_event_from_poll() {
     let (_file, pool) = setup().await;
     let publisher = SqliteOutboxPublisher::new(pool.clone(), TABLE).unwrap();
@@ -258,7 +254,6 @@ async fn future_next_retry_at_excludes_event_from_poll() {
 }
 
 #[tokio::test]
-#[ignore = "runs in the integration workflow"]
 async fn undecodable_row_is_skipped_and_the_rest_of_the_batch_drains() {
     // #214: a row whose created_at is in the SQLite canonical datetime('now')
     // form (space separator, no millis) used to be parseable, but a truly
@@ -314,7 +309,6 @@ async fn undecodable_row_is_skipped_and_the_rest_of_the_batch_drains() {
 }
 
 #[tokio::test]
-#[ignore = "runs in the integration workflow"]
 async fn canonical_datetime_now_created_at_is_accepted() {
     // #214: rows written with the SQLite native datetime('now') form (space
     // separator, no fractional seconds) must be polled, not rejected.
@@ -359,7 +353,6 @@ async fn canonical_datetime_now_created_at_is_accepted() {
 }
 
 #[tokio::test]
-#[ignore = "runs in the integration workflow"]
 async fn enqueue_idempotent_twice_inserts_one_row() {
     let (_file, pool) = setup().await;
     let publisher = SqliteOutboxPublisher::new(pool.clone(), TABLE).unwrap();
@@ -389,7 +382,6 @@ async fn enqueue_idempotent_twice_inserts_one_row() {
 }
 
 #[tokio::test]
-#[ignore = "runs in the integration workflow"]
 async fn claim_consumes_a_retry_slot_even_without_a_clean_failure() {
     // #213: claiming a batch must increment attempts. We simulate a crash
     // between claim and acknowledgement by claiming directly (no dispatch) and

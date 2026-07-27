@@ -1,10 +1,10 @@
 //! Integration tests for the SQLite backend of `hexeract-scheduler-sql`.
 //!
-//! These tests use a temporary file database (no container needed) and are
-//! marked `#[ignore]` so they run in the dedicated integration workflow.
+//! These tests use a temporary file database, so they need no container and
+//! run in the regular test job on every supported operating system.
 //!
 //! ```sh
-//! cargo test -p hexeract-scheduler-sql --features sqlite --test integration_sqlite -- --ignored
+//! cargo test -p hexeract-scheduler-sql --features sqlite --test integration_sqlite
 //! ```
 #![cfg(feature = "sqlite")]
 
@@ -38,7 +38,6 @@ macro_rules! backend_scenarios {
     ($($name:ident),* $(,)?) => {
         $(
             #[tokio::test]
-            #[ignore = "runs in the integration workflow"]
             async fn $name() {
                 let (_guard, store) = setup().await;
                 common::$name(&store).await;
