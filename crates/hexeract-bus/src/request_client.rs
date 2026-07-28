@@ -340,7 +340,7 @@ mod tests {
         )
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn nominal_round_trip_returns_typed_reply() {
         let transport = Arc::new(CapturingTransport::default());
         let registry = Arc::new(RequestRegistry::new());
@@ -373,7 +373,7 @@ mod tests {
         assert_eq!(registry.len(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn remote_error_reply_maps_to_remote() {
         let transport = Arc::new(CapturingTransport::default());
         let registry = Arc::new(RequestRegistry::new());
@@ -421,7 +421,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_reply_without_a_status_header_never_reaches_the_caller() {
         let (error, counters) = client_error_for_reply(|_request_id, reply| {
             reply.headers.remove(REPLY_STATUS_HEADER);
@@ -431,7 +431,7 @@ mod tests {
         assert_eq!(counters.invalid, 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_reply_announcing_an_unknown_version_never_reaches_the_caller() {
         let (error, counters) = client_error_for_reply(|_request_id, reply| {
             reply
@@ -443,7 +443,7 @@ mod tests {
         assert_eq!(counters.invalid, 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_reply_of_an_unexpected_type_never_reaches_the_caller() {
         let (error, counters) = client_error_for_reply(|_request_id, reply| {
             reply.message_type = "accounts.something_else".to_owned();
@@ -631,7 +631,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_remote_failure_surfaces_its_category_and_request_id() {
         let request_id = std::sync::Arc::new(std::sync::Mutex::new(None));
         let captured = std::sync::Arc::clone(&request_id);
@@ -658,7 +658,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn request_in_inherits_the_caller_causal_chain() {
         let transport = Arc::new(CapturingTransport::default());
         let registry = Arc::new(RequestRegistry::new());
@@ -682,7 +682,7 @@ mod tests {
         assert_eq!(published.correlation_id, expected);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn two_calls_in_one_chain_share_correlation_and_differ_in_request_id() {
         let transport = Arc::new(CapturingTransport::default());
         let registry = Arc::new(RequestRegistry::new());
@@ -717,7 +717,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn request_starts_a_fresh_chain() {
         let transport = Arc::new(CapturingTransport::default());
         let registry = Arc::new(RequestRegistry::new());
@@ -747,7 +747,7 @@ mod tests {
         assert_ne!(first.correlation_id, second.correlation_id);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn request_publishes_to_the_declared_destination_not_the_message_type() {
         let transport = Arc::new(CapturingTransport::default());
         let registry = Arc::new(RequestRegistry::new());
