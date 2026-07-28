@@ -35,7 +35,7 @@ jobs:
         run: docker version
 
       - name: Run #[ignore]-d integration tests
-        run: cargo test --workspace --all-features -- --ignored --test-threads=1
+        run: cargo test --workspace --all-features --no-fail-fast -- --ignored --test-threads=1
 
       - name: Run self-asserting examples
         run: |
