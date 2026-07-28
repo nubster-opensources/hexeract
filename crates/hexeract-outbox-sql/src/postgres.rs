@@ -790,9 +790,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builder_build_with_default_table_name_succeeds() {
-        let worker = PgOutboxWorkerBuilder::new(lazy_pool()).build();
-        assert!(worker.is_ok());
+    async fn build_accepts_the_default_table_name() {
+        // Guards the default against its own validator: a stricter
+        // `validate_table_name` would break every caller that never set a
+        // table name, and no other test exercises that pair.
+        PgOutboxWorkerBuilder::new(lazy_pool())
+            .build()
+            .expect("the default table name must pass validation");
     }
 
     #[tokio::test]

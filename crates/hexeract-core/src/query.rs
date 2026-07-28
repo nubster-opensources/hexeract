@@ -28,20 +28,3 @@ pub trait Query: Send + Sync + 'static {
     /// The result type returned by the handler upon successful execution.
     type Output: Send + Sync + 'static;
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct DummyQuery;
-    impl Query for DummyQuery {
-        type Output = String;
-    }
-
-    fn assert_query<Q: Query>() {}
-
-    #[test]
-    fn dummy_query_implements_trait() {
-        assert_query::<DummyQuery>();
-    }
-}
