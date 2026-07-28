@@ -496,22 +496,13 @@ mod tests {
         assert_eq!(*properties.timestamp(), Some(expected));
     }
 
-    #[tokio::test]
-    async fn new_returns_connection_error_on_unreachable_broker() {
-        let err = RabbitMqTransport::new("amqp://127.0.0.1:1")
-            .await
-            .expect_err("must fail to connect");
-        assert!(matches!(err, BusError::Connection { .. }));
-    }
-
-    #[tokio::test]
-    async fn with_exchange_returns_connection_error_on_unreachable_broker() {
-        let exchange = Exchange::new("orders", ExchangeKind::Topic).unwrap();
-        let err = RabbitMqTransport::with_exchange("amqp://127.0.0.1:1", exchange)
-            .await
-            .expect_err("must fail to connect");
-        assert!(matches!(err, BusError::Connection { .. }));
-    }
+    // The connect-failure path of `new` and `with_exchange` is covered by
+    // `connection::tests::connect_with_retry_returns_connection_error_after_max_attempts`.
+    // Both constructors only forward `connect_with_retry_recovering` through
+    // `?`, so exercising them here would re-test the same mapping. Doing it
+    // against a closed port measured 46 s per test, because the recovering
+    // properties stack lapin's own retry budget on top of ours: every one of
+    // our five attempts becomes four TCP connects.
 
     #[test]
     fn default_constants_are_sane() {
