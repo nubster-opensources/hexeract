@@ -497,9 +497,7 @@ impl RabbitMqWorkerBuilder {
     /// Returns [`BusError::Internal`] if [`Self::queue`] was never
     /// called: a worker without a queue has nothing to consume.
     pub fn build(self) -> Result<RabbitMqWorker, BusError> {
-        let queue = self.queue.ok_or_else(|| {
-            BusError::Internal("RabbitMqWorkerBuilder requires a queue name".to_owned())
-        })?;
+        let queue = require_queue(self.queue)?;
         Ok(RabbitMqWorker {
             connection: self.connection,
             queue,
@@ -507,6 +505,22 @@ impl RabbitMqWorkerBuilder {
             config: self.config,
         })
     }
+}
+
+/// Enforce the one setting [`RabbitMqWorkerBuilder`] cannot default.
+///
+/// Split out of [`RabbitMqWorkerBuilder::build`] so the rule holds under
+/// test without a broker: the builder owns a live [`RabbitMqConnection`],
+/// which cannot be constructed offline.
+///
+/// # Errors
+///
+/// Returns [`BusError::Internal`] when no queue was named. Omitting a
+/// builder setting is a caller bug, not untrusted input, so it does not
+/// surface as [`BusError::InvalidTopology`].
+fn require_queue(queue: Option<String>) -> Result<String, BusError> {
+    queue
+        .ok_or_else(|| BusError::Internal("RabbitMqWorkerBuilder requires a queue name".to_owned()))
 }
 
 /// Long-running consumer that dispatches deliveries to typed handlers.
@@ -1833,17 +1847,28 @@ mod tests {
         assert!(disposition.keep_running());
     }
 
-    #[tokio::test]
-    async fn builder_requires_queue_name() {
-        let connection_result = RabbitMqConnection::connect("amqp://127.0.0.1:1").await;
-        // Connect itself fails on the unreachable broker, so the
-        // builder test runs against the success path of *building*
-        // without a queue: we simulate it by constructing the
-        // builder with a connection mocked at higher level. Since we
-        // cannot construct a RabbitMqConnection without a broker, we
-        // only assert that the connection error path is reached and
-        // covered by the integration tests for the build() path.
-        assert!(connection_result.is_err());
+    #[test]
+    fn require_queue_rejects_a_builder_that_never_named_one() {
+        let err = require_queue(None).expect_err("a worker with no queue has nothing to consume");
+
+        match err {
+            BusError::Internal(reason) => assert!(
+                reason.contains("queue"),
+                "the message must name the setting the caller left out, got {reason}"
+            ),
+            other => panic!(
+                "expected Internal (forgetting a builder setting is a caller bug, not untrusted \
+                 input), got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn require_queue_returns_the_name_it_was_given() {
+        let queue = require_queue(Some("orders.received".to_owned()))
+            .expect("a builder that named a queue must build");
+
+        assert_eq!(queue, "orders.received");
     }
 
     /// A dead-letter closure type that can name `None` for the no-DL case.
