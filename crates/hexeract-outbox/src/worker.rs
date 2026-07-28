@@ -556,7 +556,9 @@ mod tests {
     use serde::Serialize;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
+    use tokio::sync::Notify;
 
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
     struct UserRegistered {
@@ -856,6 +858,10 @@ mod tests {
         /// When set, `mark_delivered` returns an error for this event id once,
         /// simulating a transient ack failure (used to test batch isolation).
         fail_mark_delivered_for: Arc<Mutex<Option<Uuid>>>,
+        /// Completed poll cycles, so a test can wait for the worker to have
+        /// actually run instead of sleeping for a duration it guessed.
+        polls: Arc<AtomicUsize>,
+        polled: Arc<Notify>,
     }
 
     impl MockStore {
@@ -868,9 +874,51 @@ mod tests {
                 claimed: Arc::new(Mutex::new(Vec::new())),
                 fail_claim: Arc::new(AtomicBool::new(false)),
                 fail_mark_delivered_for: Arc::new(Mutex::new(None)),
+                polls: Arc::new(AtomicUsize::new(0)),
+                polled: Arc::new(Notify::new()),
             }
         }
+
+        /// Wait until the worker has completed at least `count` poll cycles.
+        ///
+        /// Two cycles prove the first batch was fully settled: the run loop is
+        /// sequential, so reaching poll number two means everything the first
+        /// poll returned has been dispatched and acknowledged. Tests that
+        /// assert an absence need that proof, because "nothing was claimed"
+        /// also holds for a worker that never started.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the worker does not reach `count` cycles within
+        /// [`POLL_CYCLE_TIMEOUT`].
+        async fn await_polls(&self, count: usize) {
+            let wait = async {
+                loop {
+                    // Enqueue the waiter before reading the counter:
+                    // `notified()` alone does not register it until first
+                    // polled, so a notification fired in between would be lost.
+                    let notified = self.polled.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if self.polls.load(Ordering::SeqCst) >= count {
+                        return;
+                    }
+                    notified.await;
+                }
+            };
+            let outcome = tokio::time::timeout(POLL_CYCLE_TIMEOUT, wait).await;
+            assert!(
+                outcome.is_ok(),
+                "worker completed {} poll cycle(s), expected at least {count}",
+                self.polls.load(Ordering::SeqCst)
+            );
+        }
     }
+
+    /// Upper bound on any wait for the worker to complete poll cycles. Under
+    /// `start_paused` this is virtual time, so a stalled worker fails the test
+    /// at once instead of holding the suite for the whole duration.
+    const POLL_CYCLE_TIMEOUT: Duration = Duration::from_secs(5);
 
     struct MockClient;
     struct MockTx;
@@ -897,9 +945,14 @@ mod tests {
             batch_size: usize,
             _max_attempts: u32,
         ) -> Result<Vec<OutboxEnvelope>, OutboxError> {
-            let mut pending = self.pending.lock().unwrap();
-            let take = batch_size.min(pending.len());
-            Ok(pending.drain(..take).collect())
+            let batch = {
+                let mut pending = self.pending.lock().unwrap();
+                let take = batch_size.min(pending.len());
+                pending.drain(..take).collect()
+            };
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            self.polled.notify_waiters();
+            Ok(batch)
         }
 
         async fn mark_delivered<'a>(
@@ -970,7 +1023,7 @@ mod tests {
         map
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn worker_dispatches_pending_envelopes_and_marks_delivered() {
         let envelopes = vec![
             fresh_envelope(Uuid::from_u128(1)),
@@ -989,7 +1042,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let join = tokio::spawn(worker.run(cancel.clone()));
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        store.await_polls(2).await;
         cancel.cancel();
         join.await.unwrap().unwrap();
 
@@ -1001,7 +1054,7 @@ mod tests {
         assert!(store.failed.lock().unwrap().is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn worker_marks_failed_when_handler_errors() {
         let envelope = fresh_envelope(Uuid::from_u128(1));
         let event_id = envelope.event_id;
@@ -1014,7 +1067,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let join = tokio::spawn(worker.run(cancel.clone()));
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        store.await_polls(2).await;
         cancel.cancel();
         join.await.unwrap().unwrap();
 
@@ -1025,7 +1078,7 @@ mod tests {
         assert!(failed[0].1.contains("forced"));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn worker_marks_failed_when_no_handler_registered() {
         let envelope = fresh_envelope(Uuid::from_u128(1));
         let event_id = envelope.event_id;
@@ -1037,7 +1090,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let join = tokio::spawn(worker.run(cancel.clone()));
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        store.await_polls(2).await;
         cancel.cancel();
         join.await.unwrap().unwrap();
 
@@ -1047,7 +1100,7 @@ mod tests {
         assert!(failed[0].1.contains("no handler"));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn worker_dead_letters_envelope_when_max_attempts_exhausted() {
         let envelope = fresh_envelope(Uuid::from_u128(1));
         let event_id = envelope.event_id;
@@ -1065,7 +1118,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let join = tokio::spawn(worker.run(cancel.clone()));
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        store.await_polls(2).await;
         cancel.cancel();
         join.await.unwrap().unwrap();
 
@@ -1076,7 +1129,7 @@ mod tests {
         assert_eq!(dead.as_slice(), &[event_id]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn worker_does_not_dead_letter_before_attempts_exhausted() {
         let envelope = fresh_envelope(Uuid::from_u128(1));
         let event_id = envelope.event_id;
@@ -1094,7 +1147,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let join = tokio::spawn(worker.run(cancel.clone()));
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        store.await_polls(2).await;
         cancel.cancel();
         join.await.unwrap().unwrap();
 
@@ -1107,7 +1160,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn worker_claims_envelopes_before_dispatch() {
         let envelopes = vec![
             fresh_envelope(Uuid::from_u128(1)),
@@ -1126,7 +1179,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let join = tokio::spawn(worker.run(cancel.clone()));
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        store.await_polls(2).await;
         cancel.cancel();
         join.await.unwrap().unwrap();
 
@@ -1138,7 +1191,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn worker_does_not_claim_when_batch_is_empty() {
         let store = MockStore::new(Vec::new());
         let registry = HashMap::new();
@@ -1147,7 +1200,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let join = tokio::spawn(worker.run(cancel.clone()));
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        store.await_polls(2).await;
         cancel.cancel();
         join.await.unwrap().unwrap();
 
@@ -1157,7 +1210,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn worker_aborts_poll_cycle_when_claim_fails_without_dispatching() {
         let envelope = fresh_envelope(Uuid::from_u128(1));
         let store = MockStore::new(vec![envelope]);
@@ -1173,7 +1226,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let join = tokio::spawn(worker.run(cancel.clone()));
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        store.await_polls(2).await;
         cancel.cancel();
         join.await.unwrap().unwrap();
 
@@ -1191,7 +1244,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn worker_derives_context_ids_from_event_id_stable_across_retries() {
         let event_id = Uuid::from_u128(99);
         let e1 = OutboxEnvelope::new(
@@ -1221,7 +1274,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let join = tokio::spawn(worker.run(cancel.clone()));
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        store.await_polls(2).await;
         cancel.cancel();
         join.await.unwrap().unwrap();
 
@@ -1310,7 +1363,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn worker_settles_remaining_batch_when_one_ack_fails() {
         // #231: a transient ack failure on one envelope must not abandon the
         // rest of the claimed batch.
@@ -1335,7 +1388,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let join = tokio::spawn(worker.run(cancel.clone()));
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        store.await_polls(2).await;
         cancel.cancel();
         join.await.unwrap().unwrap();
 
