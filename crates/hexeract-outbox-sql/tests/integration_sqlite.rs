@@ -6,18 +6,25 @@
 //! ```sh
 //! cargo test -p hexeract-outbox-sql --features sqlite --test integration_sqlite
 //! ```
+//!
+//! Behaviour shared with the other dialects lives in [`common`]. Only what
+//! SQLite alone can express stays here.
 #![cfg(feature = "sqlite")]
+
+mod common;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use common::Backend;
+use common::TABLE;
+use common::UserRegistered;
 use hexeract_core::HandlerContext;
 use hexeract_outbox::ErasedHandler;
 use hexeract_outbox::Event;
 use hexeract_outbox::Handler;
-use hexeract_outbox::IdempotentOutboxEnqueue;
 use hexeract_outbox::OutboxError;
 use hexeract_outbox::OutboxPublisher;
 use hexeract_outbox::OutboxWorker;
@@ -26,213 +33,172 @@ use hexeract_outbox::TypedHandler;
 use hexeract_outbox_sql::SqliteOutboxPublisher;
 use hexeract_outbox_sql::SqliteOutboxStore;
 use hexeract_outbox_sql::sqlite::ensure_schema;
-use serde::Deserialize;
-use serde::Serialize;
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
 use tempfile::NamedTempFile;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-const TABLE: &str = "audit_outbox";
-
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-struct UserRegistered {
-    user_id: Uuid,
-    email: String,
+/// A temporary SQLite database, kept alive for the duration of a scenario.
+struct SqliteBackend {
+    _file: NamedTempFile,
+    pool: SqlitePool,
 }
 
-impl Event for UserRegistered {
-    const EVENT_TYPE: &'static str = "users.registered";
-}
-
-async fn setup() -> (NamedTempFile, SqlitePool) {
+async fn setup() -> SqliteBackend {
     let file = NamedTempFile::new().expect("temp file");
     let options = SqliteConnectOptions::new()
         .filename(file.path())
         .create_if_missing(true);
     let pool = SqlitePool::connect_with(options).await.expect("connect");
     ensure_schema(&pool, TABLE).await.expect("schema apply");
-    (file, pool)
+    SqliteBackend { _file: file, pool }
 }
 
-struct RecordingHandler {
-    seen: Arc<Mutex<Vec<UserRegistered>>>,
+impl Backend for SqliteBackend {
+    type Store = SqliteOutboxStore;
+    type Publisher = SqliteOutboxPublisher;
+
+    fn store(&self) -> Self::Store {
+        SqliteOutboxStore::new(self.pool.clone(), TABLE).expect("store")
+    }
+
+    fn publisher(&self) -> Self::Publisher {
+        SqliteOutboxPublisher::new(self.pool.clone(), TABLE).expect("publisher")
+    }
+
+    async fn publish_then_rollback(&self, event: &UserRegistered) -> Uuid {
+        let publisher = self.publisher();
+        let mut tx = self.pool.begin().await.expect("begin");
+        let event_id = publisher
+            .publish_in_tx(&mut tx, event)
+            .await
+            .expect("publish in tx");
+        tx.rollback().await.expect("rollback");
+        event_id
+    }
+
+    async fn row_count(&self, event_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_outbox WHERE event_id = ?")
+            .bind(event_id)
+            .fetch_one(&self.pool)
+            .await
+            .expect("row count")
+    }
+
+    async fn delivered_count(&self, event_id: Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_outbox \
+             WHERE event_id = ? AND delivered_at IS NOT NULL",
+        )
+        .bind(event_id)
+        .fetch_one(&self.pool)
+        .await
+        .expect("delivered count")
+    }
+
+    async fn total_delivered(&self) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_outbox WHERE delivered_at IS NOT NULL")
+            .fetch_one(&self.pool)
+            .await
+            .expect("total delivered")
+    }
+
+    async fn attempts(&self, event_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT attempts FROM audit_outbox WHERE event_id = ?")
+            .bind(event_id)
+            .fetch_one(&self.pool)
+            .await
+            .expect("attempts")
+    }
+
+    async fn has_next_retry_at(&self, event_id: Uuid) -> bool {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_outbox \
+             WHERE event_id = ? AND next_retry_at IS NOT NULL",
+        )
+        .bind(event_id)
+        .fetch_one(&self.pool)
+        .await
+        .expect("next retry probe");
+        count == 1
+    }
+
+    async fn defer_next_retry_by_one_day(&self, event_id: Uuid) {
+        sqlx::query(
+            "UPDATE audit_outbox \
+             SET attempts = 1, next_retry_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+1 day') \
+             WHERE event_id = ?",
+        )
+        .bind(event_id)
+        .execute(&self.pool)
+        .await
+        .expect("defer retry");
+    }
 }
 
-impl Handler<UserRegistered> for RecordingHandler {
+macro_rules! backend_scenarios {
+    ($($name:ident),* $(,)?) => {
+        $(
+            #[tokio::test]
+            async fn $name() {
+                let backend = setup().await;
+                common::$name(&backend).await;
+            }
+        )*
+    };
+}
+
+backend_scenarios!(
+    publish_in_tx_rollback_discards_the_insert,
+    worker_dispatches_published_event_and_marks_delivered,
+    worker_marks_failed_and_increments_attempts_on_handler_error,
+    future_next_retry_at_excludes_event_from_poll,
+    enqueue_idempotent_twice_inserts_one_row,
+    idempotent_enqueue_delivered_once_by_worker,
+    claim_consumes_a_retry_slot_even_without_a_clean_failure,
+);
+
+// The two scenarios below have no equivalent on Postgres or MySQL: both store
+// timestamps in native column types, so neither an unparseable `created_at`
+// nor the SQLite-specific `datetime('now')` form can ever reach the store.
+
+/// Handler recording the addresses it saw, local to the SQLite-only scenarios.
+#[derive(Clone, Default)]
+struct Recorder {
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+impl Handler<UserRegistered> for Recorder {
     type Error = OutboxError;
+
     async fn handle(
         &self,
         event: UserRegistered,
         _ctx: &HandlerContext,
     ) -> Result<(), Self::Error> {
-        self.seen.lock().unwrap().push(event);
+        self.seen.lock().expect("recorder mutex").push(event.email);
         Ok(())
     }
 }
 
-struct FailingHandler;
-impl Handler<UserRegistered> for FailingHandler {
-    type Error = OutboxError;
-    async fn handle(
-        &self,
-        _event: UserRegistered,
-        _ctx: &HandlerContext,
-    ) -> Result<(), Self::Error> {
-        Err(OutboxError::Internal("forced failure".to_owned()))
-    }
-}
-
-fn registry_with<H>(handler: H) -> HashMap<&'static str, Arc<dyn ErasedHandler>>
+/// Run a worker until `probe` reports true, then stop it.
+///
+/// # Panics
+///
+/// Panics when `probe` never reports true, naming `expectation`.
+async fn drain_until<P, F>(backend: &SqliteBackend, expectation: &str, mut probe: P)
 where
-    H: Handler<UserRegistered>,
+    P: FnMut() -> F,
+    F: std::future::Future<Output = bool>,
 {
-    let mut map = HashMap::new();
-    let erased: Arc<dyn ErasedHandler> = Arc::new(TypedHandler::new(handler));
-    map.insert(erased.event_type(), erased);
-    map
-}
+    let mut registry = HashMap::new();
+    let erased: Arc<dyn ErasedHandler> = Arc::new(TypedHandler::new(Recorder::default()));
+    registry.insert(erased.event_type(), erased);
 
-fn sample(email: &str) -> UserRegistered {
-    UserRegistered {
-        user_id: Uuid::now_v7(),
-        email: email.to_owned(),
-    }
-}
-
-async fn delivered_count(pool: &SqlitePool, event_id: Uuid) -> i64 {
-    sqlx::query_scalar(
-        "SELECT COUNT(*) FROM audit_outbox WHERE event_id = ? AND delivered_at IS NOT NULL",
-    )
-    .bind(event_id)
-    .fetch_one(pool)
-    .await
-    .unwrap()
-}
-
-#[tokio::test]
-async fn publish_in_tx_rollback_discards_the_insert() {
-    let (_file, pool) = setup().await;
-    let publisher = SqliteOutboxPublisher::new(pool.clone(), TABLE).unwrap();
-
-    let mut tx = pool.begin().await.unwrap();
-    let event_id = publisher
-        .publish_in_tx(&mut tx, &sample("rollback@example.com"))
-        .await
-        .unwrap();
-    tx.rollback().await.unwrap();
-
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_outbox WHERE event_id = ?")
-        .bind(event_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(count, 0);
-}
-
-#[tokio::test]
-async fn worker_dispatches_published_event_and_marks_delivered() {
-    let (_file, pool) = setup().await;
-    let publisher = SqliteOutboxPublisher::new(pool.clone(), TABLE).unwrap();
-    let store = SqliteOutboxStore::new(pool.clone(), TABLE).unwrap();
-
-    let event_id = publisher
-        .publish(&sample("alice@example.com"))
-        .await
-        .unwrap();
-
-    let seen = Arc::new(Mutex::new(Vec::new()));
     let worker = OutboxWorker::new(
-        store,
-        registry_with(RecordingHandler {
-            seen: Arc::clone(&seen),
-        }),
-        OutboxWorkerConfig::default(),
-    );
-    let cancel = CancellationToken::new();
-    let join = tokio::spawn(worker.run(cancel.clone()));
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    cancel.cancel();
-    join.await.unwrap().unwrap();
-
-    assert_eq!(seen.lock().unwrap().len(), 1);
-    assert_eq!(delivered_count(&pool, event_id).await, 1);
-}
-
-#[tokio::test]
-async fn worker_marks_failed_and_increments_attempts_on_handler_error() {
-    let (_file, pool) = setup().await;
-    let publisher = SqliteOutboxPublisher::new(pool.clone(), TABLE).unwrap();
-    let store = SqliteOutboxStore::new(pool.clone(), TABLE).unwrap();
-
-    let event_id = publisher.publish(&sample("bob@example.com")).await.unwrap();
-
-    let config = OutboxWorkerConfig {
-        poll_interval: Duration::from_millis(20),
-        retry_base_delay: Duration::from_secs(60),
-        retry_max_delay: Duration::from_secs(60),
-        jitter: false,
-        ..OutboxWorkerConfig::default()
-    };
-    let worker = OutboxWorker::new(store, registry_with(FailingHandler), config);
-    let cancel = CancellationToken::new();
-    let join = tokio::spawn(worker.run(cancel.clone()));
-
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    cancel.cancel();
-    join.await.unwrap().unwrap();
-
-    assert_eq!(delivered_count(&pool, event_id).await, 0);
-    let attempts: i64 = sqlx::query_scalar("SELECT attempts FROM audit_outbox WHERE event_id = ?")
-        .bind(event_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert!(
-        attempts >= 1,
-        "attempts should be incremented, got {attempts}"
-    );
-    let next_retry: Option<String> =
-        sqlx::query_scalar("SELECT next_retry_at FROM audit_outbox WHERE event_id = ?")
-            .bind(event_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert!(
-        next_retry.is_some(),
-        "next_retry_at should be set after a failure"
-    );
-}
-
-#[tokio::test]
-async fn future_next_retry_at_excludes_event_from_poll() {
-    let (_file, pool) = setup().await;
-    let publisher = SqliteOutboxPublisher::new(pool.clone(), TABLE).unwrap();
-    let store = SqliteOutboxStore::new(pool.clone(), TABLE).unwrap();
-
-    let event_id = publisher
-        .publish(&sample("carol@example.com"))
-        .await
-        .unwrap();
-
-    sqlx::query(
-        "UPDATE audit_outbox \
-         SET attempts = 1, next_retry_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+1 day') \
-         WHERE event_id = ?",
-    )
-    .bind(event_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let worker = OutboxWorker::new(
-        store,
-        registry_with(RecordingHandler {
-            seen: Arc::clone(&seen),
-        }),
+        backend.store(),
+        registry,
         OutboxWorkerConfig {
             poll_interval: Duration::from_millis(20),
             ..OutboxWorkerConfig::default()
@@ -241,30 +207,29 @@ async fn future_next_retry_at_excludes_event_from_poll() {
     let cancel = CancellationToken::new();
     let join = tokio::spawn(worker.run(cancel.clone()));
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    cancel.cancel();
-    join.await.unwrap().unwrap();
+    let wait = async {
+        loop {
+            if probe().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let outcome = tokio::time::timeout(Duration::from_secs(10), wait).await;
 
-    assert_eq!(
-        seen.lock().unwrap().len(),
-        0,
-        "event scheduled in the future must not be dispatched"
-    );
-    assert_eq!(delivered_count(&pool, event_id).await, 0);
+    cancel.cancel();
+    join.await.expect("worker task").expect("worker run");
+    assert!(outcome.is_ok(), "timed out waiting for {expectation}");
 }
 
 #[tokio::test]
 async fn undecodable_row_is_skipped_and_the_rest_of_the_batch_drains() {
-    // #214: a row whose created_at is in the SQLite canonical datetime('now')
-    // form (space separator, no millis) used to be parseable, but a truly
-    // garbage timestamp must not abort the whole poll. Insert one poison row
-    // ahead of a valid one and assert the valid one is still delivered.
-    let (_file, pool) = setup().await;
-    let publisher = SqliteOutboxPublisher::new(pool.clone(), TABLE).unwrap();
-    let store = SqliteOutboxStore::new(pool.clone(), TABLE).unwrap();
+    // #214: a truly garbage timestamp must not abort the whole poll. Only
+    // SQLite can hold one, since it stores timestamps as TEXT. Insert a poison
+    // row ahead of a valid one and assert the valid one is still delivered.
+    let backend = setup().await;
 
-    // Poison row: an unparseable created_at. event_id is a valid blob so the
-    // skip path can still log its id.
+    // The event_id stays a valid blob so the skip path can log its identifier.
     let poison_id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO audit_outbox (event_id, event_type, payload, created_at) \
@@ -274,37 +239,30 @@ async fn undecodable_row_is_skipped_and_the_rest_of_the_batch_drains() {
     .bind(UserRegistered::EVENT_TYPE)
     .bind("{\"user_id\":\"00000000-0000-0000-0000-000000000000\",\"email\":\"x\"}")
     .bind("totally-not-a-timestamp")
-    .execute(&pool)
+    .execute(&backend.pool)
     .await
-    .unwrap();
+    .expect("poison row insert");
 
-    let good_id = publisher
-        .publish(&sample("dora@example.com"))
+    let good_id = backend
+        .publisher()
+        .publish(&UserRegistered {
+            user_id: Uuid::now_v7(),
+            email: "dora@example.com".to_owned(),
+        })
         .await
-        .unwrap();
+        .expect("publish");
 
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let worker = OutboxWorker::new(
-        store,
-        registry_with(RecordingHandler {
-            seen: Arc::clone(&seen),
-        }),
-        OutboxWorkerConfig {
-            poll_interval: Duration::from_millis(20),
-            ..OutboxWorkerConfig::default()
-        },
-    );
-    let cancel = CancellationToken::new();
-    let join = tokio::spawn(worker.run(cancel.clone()));
-
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    cancel.cancel();
-    join.await.unwrap().unwrap();
+    drain_until(
+        &backend,
+        "the row behind the poison row to drain",
+        || async { backend.delivered_count(good_id).await == 1 },
+    )
+    .await;
 
     assert_eq!(
-        delivered_count(&pool, good_id).await,
-        1,
-        "the valid row behind the poison row must still be delivered"
+        backend.delivered_count(poison_id).await,
+        0,
+        "the poison row must stay undelivered"
     );
 }
 
@@ -312,8 +270,7 @@ async fn undecodable_row_is_skipped_and_the_rest_of_the_batch_drains() {
 async fn canonical_datetime_now_created_at_is_accepted() {
     // #214: rows written with the SQLite native datetime('now') form (space
     // separator, no fractional seconds) must be polled, not rejected.
-    let (_file, pool) = setup().await;
-    let store = SqliteOutboxStore::new(pool.clone(), TABLE).unwrap();
+    let backend = setup().await;
 
     let event_id = Uuid::now_v7();
     sqlx::query(
@@ -323,95 +280,14 @@ async fn canonical_datetime_now_created_at_is_accepted() {
     .bind(event_id)
     .bind(UserRegistered::EVENT_TYPE)
     .bind("{\"user_id\":\"00000000-0000-0000-0000-000000000000\",\"email\":\"y\"}")
-    .execute(&pool)
+    .execute(&backend.pool)
     .await
-    .unwrap();
+    .expect("row insert");
 
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let worker = OutboxWorker::new(
-        store,
-        registry_with(RecordingHandler {
-            seen: Arc::clone(&seen),
-        }),
-        OutboxWorkerConfig {
-            poll_interval: Duration::from_millis(20),
-            ..OutboxWorkerConfig::default()
-        },
-    );
-    let cancel = CancellationToken::new();
-    let join = tokio::spawn(worker.run(cancel.clone()));
-
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    cancel.cancel();
-    join.await.unwrap().unwrap();
-
-    assert_eq!(
-        delivered_count(&pool, event_id).await,
-        1,
-        "a datetime('now') created_at must be parseable and the row delivered"
-    );
-}
-
-#[tokio::test]
-async fn enqueue_idempotent_twice_inserts_one_row() {
-    let (_file, pool) = setup().await;
-    let publisher = SqliteOutboxPublisher::new(pool.clone(), TABLE).unwrap();
-
-    let event_id = Uuid::now_v7();
-    let inserted = publisher
-        .enqueue_idempotent(event_id, "x.due", b"{\"k\":1}")
-        .await
-        .unwrap();
-    assert!(inserted, "first enqueue must insert a new row");
-
-    let duplicate = publisher
-        .enqueue_idempotent(event_id, "x.due", b"{\"k\":1}")
-        .await
-        .unwrap();
-    assert!(
-        !duplicate,
-        "second enqueue with same event_id must be a no-op"
-    );
-
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_outbox WHERE event_id = ?")
-        .bind(event_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(count, 1, "exactly one row must exist after two enqueues");
-}
-
-#[tokio::test]
-async fn claim_consumes_a_retry_slot_even_without_a_clean_failure() {
-    // #213: claiming a batch must increment attempts. We simulate a crash
-    // between claim and acknowledgement by claiming directly (no dispatch) and
-    // asserting attempts advanced from 0 to 1.
-    use hexeract_outbox::OutboxStore;
-
-    let (_file, pool) = setup().await;
-    let publisher = SqliteOutboxPublisher::new(pool.clone(), TABLE).unwrap();
-    let store = SqliteOutboxStore::new(pool.clone(), TABLE).unwrap();
-
-    let event_id = publisher
-        .publish(&sample("erin@example.com"))
-        .await
-        .unwrap();
-
-    let mut client = store.acquire().await.unwrap();
-    let mut tx = store.begin(&mut client).await.unwrap();
-    store
-        .claim(&mut tx, &[event_id], Duration::from_secs(30))
-        .await
-        .unwrap();
-    store.commit(tx).await.unwrap();
-
-    let attempts: i64 = sqlx::query_scalar("SELECT attempts FROM audit_outbox WHERE event_id = ?")
-        .bind(event_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        attempts, 1,
-        "claim alone must consume one retry slot (crash safety, #213)"
-    );
+    drain_until(
+        &backend,
+        "a datetime('now') created_at to be parsed and delivered",
+        || async { backend.delivered_count(event_id).await == 1 },
+    )
+    .await;
 }
