@@ -195,33 +195,16 @@ fn binding_short_names(
 
 #[cfg(test)]
 mod tests {
-    use hexeract_bus::ExchangeKind;
     use hexeract_bus::RoutingKey;
 
     use super::*;
-    use crate::connection::RabbitMqConnection;
 
-    /// All helpers fail with `BusError::Connection` when the broker
-    /// is unreachable because they need a channel to function. End-
-    /// to-end coverage of the success paths lives in the integration
-    /// test under `tests/integration.rs`.
-    #[tokio::test]
-    async fn ensure_topology_returns_connection_error_on_unreachable_broker() {
-        let connection_result = RabbitMqConnection::connect("amqp://127.0.0.1:1").await;
-        // The connect itself already fails: no usable connection to
-        // call ensure_topology on.
-        let err = connection_result.expect_err("must fail to connect");
-        assert!(matches!(err, BusError::Connection { .. }));
-    }
-
-    #[test]
-    fn helpers_compile_for_basic_topology() {
-        // Pure compile-time check that the helper signatures accept
-        // the canonical bus-side topology values.
-        let _exchange = Exchange::new("orders", ExchangeKind::Topic).unwrap();
-        let _queue = Queue::new("orders.received").unwrap();
-        let _key = RoutingKey::new("orders.*").unwrap();
-    }
+    // The helpers here all need a live channel, so an unreachable broker never
+    // reaches them: the connect fails first. That failure is covered by
+    // `connection::tests::connect_returns_connection_error_on_unreachable_broker`,
+    // and the success paths by the integration test under `tests/integration.rs`.
+    // A test named after `ensure_topology` that only asserts on `connect` states
+    // a guarantee it does not hold, while paying for a real connection attempt.
 
     /// `Queue::name` is validated by `Queue::new`, but the field is
     /// `pub`, so a caller can mutate it past the AMQP short-string
