@@ -142,9 +142,13 @@ impl Recorder {
     async fn await_count(&self, expected: usize) {
         let wait = async {
             loop {
-                // Subscribe before reading the count, so a notification fired
-                // between the two is not lost.
+                // Register the waiter before reading the count, so a
+                // notification fired between the two is not lost. `notified()`
+                // alone only builds the future: it does not enqueue the waiter
+                // until first polled, so `enable()` is what closes the window.
                 let notified = self.progress.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 if self.count() >= expected {
                     return;
                 }
@@ -174,13 +178,14 @@ impl Handler<UserRegistered> for Recorder {
     }
 }
 
-/// Handler that always fails, and reports each attempt so a scenario can wait
-/// for the worker to have tried at least once.
-#[derive(Clone, Default)]
-struct FailingHandler {
-    attempts: Arc<Mutex<usize>>,
-    progress: Arc<Notify>,
-}
+/// Handler that always fails, so a scenario can observe the failure path.
+///
+/// It carries no counter of its own: the scenarios assert against the row the
+/// worker writes (`attempts`, `next_retry_at`), which is the behaviour under
+/// test. A second, in-memory counter would only restate what the handler was
+/// told to do.
+#[derive(Clone, Copy)]
+struct FailingHandler;
 
 impl Handler<UserRegistered> for FailingHandler {
     type Error = OutboxError;
@@ -190,8 +195,6 @@ impl Handler<UserRegistered> for FailingHandler {
         _event: UserRegistered,
         _ctx: &HandlerContext,
     ) -> Result<(), Self::Error> {
-        *self.attempts.lock().expect("attempts mutex") += 1;
-        self.progress.notify_waiters();
         Err(OutboxError::Internal("forced failure".to_owned()))
     }
 }
@@ -377,7 +380,7 @@ pub(crate) async fn worker_marks_failed_and_increments_attempts_on_handler_error
         jitter: false,
         ..OutboxWorkerConfig::default()
     };
-    let worker = RunningWorker::spawn(backend.store(), FailingHandler::default(), config);
+    let worker = RunningWorker::spawn(backend.store(), FailingHandler, config);
 
     await_condition("the failed attempt to be recorded", || async {
         backend.attempts(event_id).await >= 1
