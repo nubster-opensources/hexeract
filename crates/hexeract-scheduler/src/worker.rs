@@ -422,6 +422,17 @@ mod tests {
         schedule_id
     }
 
+    /// Wait for a lease of `lease` to expire.
+    ///
+    /// This waits on real time on purpose. The store stamps and compares
+    /// leases against [`SystemTime`], which `tokio::time` does not control, so
+    /// a test marked `start_paused` would advance the runtime clock while the
+    /// lease stayed live forever. The added margin covers the coarse
+    /// `SystemTime` resolution on Windows, around 16 ms.
+    async fn await_lease_expiry(lease: Duration) {
+        tokio::time::sleep(lease + Duration::from_millis(100)).await;
+    }
+
     #[tokio::test]
     async fn delivers_a_delay_schedule_on_success() {
         let store = InMemoryScheduleStore::new();
@@ -592,7 +603,7 @@ mod tests {
             .expect("claim succeeds");
         assert_eq!(claimed.len(), 1);
         assert!(claimed[0].is_exhausted());
-        tokio::time::sleep(short_lease + Duration::from_millis(100)).await;
+        await_lease_expiry(short_lease).await;
 
         let worker = SchedulerWorker::new(store, SuccessSink, test_config());
         worker.poll_cycle().await.expect("cycle succeeds");
@@ -624,7 +635,7 @@ mod tests {
             .claim_due(SystemTime::now(), 10, short_lease)
             .await
             .expect("claim succeeds");
-        tokio::time::sleep(short_lease + Duration::from_millis(100)).await;
+        await_lease_expiry(short_lease).await;
 
         let worker = SchedulerWorker::new(store, SuccessSink, test_config());
         worker.poll_cycle().await.expect("cycle succeeds");
@@ -648,7 +659,7 @@ mod tests {
             .claim_due(SystemTime::now(), 10, short_lease)
             .await
             .expect("claim succeeds");
-        tokio::time::sleep(short_lease + Duration::from_millis(100)).await;
+        await_lease_expiry(short_lease).await;
 
         let worker = SchedulerWorker::new(store, SuccessSink, test_config());
         worker
@@ -684,7 +695,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("occurrence claimed");
-        tokio::time::sleep(short_lease + Duration::from_millis(100)).await;
+        await_lease_expiry(short_lease).await;
 
         // A second worker reclaims the same occurrence and delivers it first.
         let reclaimed = store
