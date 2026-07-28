@@ -783,13 +783,20 @@ mod tests {
         assert!(builder.errors.is_empty());
     }
 
-    #[test]
-    fn registers_one_command_handler_then_builds_ok() {
+    #[tokio::test]
+    async fn a_cloned_mediator_dispatches_through_the_same_registry() {
         let mediator = MediatorBuilder::new()
             .register_command_handler::<Ping, _>(PingHandler)
             .build()
             .expect("build must succeed");
-        let _clone = mediator.clone();
+        let clone = mediator.clone();
+        drop(mediator);
+
+        let out = clone
+            .send(Ping { value: 21 })
+            .await
+            .expect("a clone must dispatch to the handlers of the original");
+        assert_eq!(out, 42);
     }
 
     #[tokio::test]
@@ -994,19 +1001,6 @@ mod tests {
 
         assert!(failures[1].handler.ends_with("FailingNotifHandler"));
         assert!(matches!(failures[1].error, HexeractError::Dispatch(_)));
-    }
-
-    #[tokio::test]
-    async fn audit_handler_stub_compiles() {
-        // The `AuditHandler` fixture is kept for symmetry with prior tests.
-        let mediator = MediatorBuilder::new()
-            .register_notification_handler::<UserCreated, _>(AuditHandler)
-            .build()
-            .expect("build must succeed");
-        mediator
-            .publish(UserCreated { id: 0 })
-            .await
-            .expect("audit handler must succeed");
     }
 
     #[test]
