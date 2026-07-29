@@ -37,16 +37,20 @@ const REQUIRED_COLUMNS: &[&str] = &[
     "delivered_at",
 ];
 
+/// Read the target table's columns from the catalog.
+///
+/// Scoped to `table_schema = current_schema()` so a same-named table in
+/// another schema cannot answer for the one the connection actually
+/// resolves, which would report a missing or malformed table as valid.
+const COLUMN_NAMES_QUERY: &str = "SELECT column_name FROM information_schema.columns \
+                                  WHERE table_name = $1 AND table_schema = current_schema()";
+
 impl CheckArgs {
     pub(crate) async fn run(self) -> Result<(), CliError> {
         let client = connect(&self.conn).await?;
 
         let rows = client
-            .query(
-                "SELECT column_name FROM information_schema.columns \
-                 WHERE table_name = $1 AND table_schema = current_schema()",
-                &[&self.table],
-            )
+            .query(COLUMN_NAMES_QUERY, &[&self.table])
             .await
             .map_err(|e| CliError::Fatal(Box::new(e)))?;
 
@@ -93,13 +97,14 @@ impl CheckArgs {
 
 #[cfg(test)]
 mod tests {
+    use super::COLUMN_NAMES_QUERY;
+
     #[test]
-    fn check_query_includes_table_schema_filter() {
-        let query = "SELECT column_name FROM information_schema.columns \
-                     WHERE table_name = $1 AND table_schema = current_schema()";
+    fn column_lookup_is_scoped_to_the_current_schema() {
         assert!(
-            query.contains("table_schema = current_schema()"),
-            "query must filter by current schema to avoid cross-schema collisions"
+            COLUMN_NAMES_QUERY.contains("table_schema = current_schema()"),
+            "the catalog lookup must filter by schema, otherwise a same-named table in another \
+             schema reports this one as valid, got {COLUMN_NAMES_QUERY}"
         );
     }
 }

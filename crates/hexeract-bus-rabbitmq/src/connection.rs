@@ -366,6 +366,8 @@ impl RabbitMqConnection {
 
 #[cfg(test)]
 mod tests {
+    use lapin::protocol::{AMQPError, AMQPErrorKind, AMQPSoftError};
+
     use super::*;
 
     #[tokio::test]
@@ -489,16 +491,66 @@ mod tests {
         );
     }
 
+    /// Every kind the retry loop must refuse to hammer (#340), asserted
+    /// without a broker: lapin exposes `From<ErrorKind> for Error`, so each
+    /// classification can be pinned at the unit level rather than inferred
+    /// from one live handshake.
+    ///
+    /// `ErrorKind::InvalidProtocolVersion` is deliberately absent: its
+    /// payload type lives in `amq_protocol::frame`, which lapin does not
+    /// re-export, so covering it would mean pinning a second version of
+    /// `amq-protocol` alongside the one lapin resolves.
     #[test]
-    fn is_transient_true_for_io_error() {
-        // A TCP-level failure (refused, reset, timed out) is transient and
-        // worth retrying. lapin exposes `From<std::io::Error>`, so this
-        // branch is unit-testable without a broker; the permanent branches
-        // (ACCESS_REFUSED etc.) are covered by the integration suite.
-        let err: lapin::Error = std::io::Error::other("connection reset").into();
-        assert!(
-            is_transient(&err),
-            "an IO failure must classify as transient"
-        );
+    fn is_transient_is_false_for_permanent_kinds() {
+        let permanent: [(&str, lapin::Error); 3] = [
+            (
+                "ACCESS_REFUSED, the shape bad credentials take",
+                ErrorKind::ProtocolError(AMQPError::new(
+                    AMQPErrorKind::Soft(AMQPSoftError::ACCESSREFUSED),
+                    "ACCESS_REFUSED".into(),
+                ))
+                .into(),
+            ),
+            (
+                "an authentication provider failure",
+                ErrorKind::AuthProviderError("provider rejected the mechanism".to_owned()).into(),
+            ),
+            (
+                "a runtime shutdown",
+                ErrorKind::RuntimeShutdownError(Arc::new(std::io::Error::other("runtime gone")))
+                    .into(),
+            ),
+        ];
+
+        for (label, error) in permanent {
+            assert!(
+                !is_transient(&error),
+                "{label} would fail identically on every retry, so it must classify as permanent"
+            );
+        }
+    }
+
+    /// The complement of the permanent list. The unlisted kind is the load
+    /// bearing case: it locks the polarity of the negated match, so inverting
+    /// the classifier turns a healthy retry into a refusal to connect.
+    #[test]
+    fn is_transient_is_true_for_transport_failures_and_unlisted_kinds() {
+        let transient: [(&str, lapin::Error); 2] = [
+            (
+                "a TCP failure (refused, reset, timed out)",
+                std::io::Error::other("connection reset").into(),
+            ),
+            (
+                "a kind absent from the permanent list",
+                ErrorKind::ChannelsLimitReached.into(),
+            ),
+        ];
+
+        for (label, error) in transient {
+            assert!(
+                is_transient(&error),
+                "{label} may heal, so a retry or auto-recovery must be given a chance"
+            );
+        }
     }
 }
