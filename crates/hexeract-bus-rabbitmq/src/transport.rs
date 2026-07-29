@@ -93,13 +93,17 @@ impl RabbitMqTransport {
     /// Returns [`BusError::Connection`] if the broker remains
     /// unreachable after the retry loop exits.
     ///
-    /// Against an unreachable broker the constructor gives up after
-    /// [`crate::connection::DEFAULT_CONNECT_TIMEOUT`], or earlier when the
-    /// failure classifies as permanent. If the broker answers the probe and
-    /// then degrades within the few milliseconds separating the probe from
-    /// the real session, opening that session is itself capped by
-    /// [`crate::connection::DEFAULT_SESSION_TIMEOUT`], so the absolute worst
-    /// case is the sum of the two. No path blocks forever.
+    /// Against an unreachable broker the constructor retries up to
+    /// [`DEFAULT_RETRY_ATTEMPTS`] times in each phase before giving up, or
+    /// earlier when a failure classifies as permanent (#340): first the
+    /// probe, then, once the broker has proven it answers, the real
+    /// auto-recovering session. [`DEFAULT_RETRY_ATTEMPTS`] therefore governs
+    /// the connection this function actually returns, not just the probe.
+    /// Each phase also carries a time bound for the broker that accepts a
+    /// connection and then never completes it: the probe by
+    /// [`crate::connection::DEFAULT_PROBE_TIMEOUT`], the session by
+    /// [`crate::connection::DEFAULT_SESSION_TIMEOUT`]. No path blocks
+    /// forever.
     pub async fn new(connection_string: &str) -> Result<Self, BusError> {
         let connection = RabbitMqConnection::connect_with_retry_recovering(
             connection_string,
@@ -127,13 +131,17 @@ impl RabbitMqTransport {
     /// or [`BusError::Transport`] if the exchange declaration is
     /// rejected (typically a mismatch with a pre-existing exchange).
     ///
-    /// Against an unreachable broker the constructor gives up after
-    /// [`crate::connection::DEFAULT_CONNECT_TIMEOUT`], or earlier when the
-    /// failure classifies as permanent. If the broker answers the probe and
-    /// then degrades within the few milliseconds separating the probe from
-    /// the real session, opening that session is itself capped by
-    /// [`crate::connection::DEFAULT_SESSION_TIMEOUT`], so the absolute worst
-    /// case is the sum of the two. No path blocks forever.
+    /// Against an unreachable broker the constructor retries up to
+    /// [`DEFAULT_RETRY_ATTEMPTS`] times in each phase before giving up, or
+    /// earlier when a failure classifies as permanent (#340): first the
+    /// probe, then, once the broker has proven it answers, the real
+    /// auto-recovering session. [`DEFAULT_RETRY_ATTEMPTS`] therefore governs
+    /// the connection this function actually returns, not just the probe.
+    /// Each phase also carries a time bound for the broker that accepts a
+    /// connection and then never completes it: the probe by
+    /// [`crate::connection::DEFAULT_PROBE_TIMEOUT`], the session by
+    /// [`crate::connection::DEFAULT_SESSION_TIMEOUT`]. No path blocks
+    /// forever.
     pub async fn with_exchange(
         connection_string: &str,
         exchange: Exchange,
@@ -513,12 +521,10 @@ mod tests {
     }
 
     // The connect-failure path of `new` and `with_exchange` is covered by
-    // `connection::tests::connect_with_retry_returns_connection_error_after_max_attempts`.
+    // `connection::tests::connect_with_retry_returns_connection_error_after_max_attempts`
+    // and by `connection::tests::connect_recovering_gives_up_once_its_bound_elapses`.
     // Both constructors only forward `connect_with_retry_recovering` through
-    // `?`, so exercising them here would re-test the same mapping. Doing it
-    // against a closed port measured 46 s per test, because the recovering
-    // properties stack lapin's own retry budget on top of ours: every one of
-    // our five attempts becomes four TCP connects.
+    // `?`, so exercising them here would re-test the same mapping.
 
     #[test]
     fn default_constants_are_sane() {
