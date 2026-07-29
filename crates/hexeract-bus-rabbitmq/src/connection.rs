@@ -147,8 +147,9 @@ pub const DEFAULT_RETRY_ATTEMPTS: u32 = 5;
 /// Default base delay used by [`RabbitMqConnection::connect_with_retry`].
 pub const DEFAULT_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 
-/// Default bound on the initial connect performed by
-/// [`RabbitMqConnection::connect_with_retry_recovering`].
+/// Default bound on the probe phase of the publisher connect, used by
+/// [`crate::RabbitMqTransport::new`] and
+/// [`crate::RabbitMqTransport::with_exchange`].
 ///
 /// Caps how long the publisher path may spend proving the broker answers
 /// before it gives up. Measured against a closed loopback port, one probe
