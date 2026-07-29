@@ -92,6 +92,14 @@ impl RabbitMqTransport {
     ///
     /// Returns [`BusError::Connection`] if the broker remains
     /// unreachable after the retry loop exits.
+    ///
+    /// Against an unreachable broker the constructor gives up after
+    /// [`crate::connection::DEFAULT_CONNECT_TIMEOUT`], or earlier when the
+    /// failure classifies as permanent. If the broker answers the probe and
+    /// then degrades within the few milliseconds separating the probe from
+    /// the real session, opening that session is itself capped by
+    /// [`crate::connection::DEFAULT_SESSION_TIMEOUT`], so the absolute worst
+    /// case is the sum of the two. No path blocks forever.
     pub async fn new(connection_string: &str) -> Result<Self, BusError> {
         let connection = RabbitMqConnection::connect_with_retry_recovering(
             connection_string,
@@ -118,6 +126,14 @@ impl RabbitMqTransport {
     /// Returns [`BusError::Connection`] if the broker is unreachable
     /// or [`BusError::Transport`] if the exchange declaration is
     /// rejected (typically a mismatch with a pre-existing exchange).
+    ///
+    /// Against an unreachable broker the constructor gives up after
+    /// [`crate::connection::DEFAULT_CONNECT_TIMEOUT`], or earlier when the
+    /// failure classifies as permanent. If the broker answers the probe and
+    /// then degrades within the few milliseconds separating the probe from
+    /// the real session, opening that session is itself capped by
+    /// [`crate::connection::DEFAULT_SESSION_TIMEOUT`], so the absolute worst
+    /// case is the sum of the two. No path blocks forever.
     pub async fn with_exchange(
         connection_string: &str,
         exchange: Exchange,

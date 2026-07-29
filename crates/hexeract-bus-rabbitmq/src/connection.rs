@@ -71,14 +71,18 @@ fn supervised_properties() -> ConnectionProperties {
 /// must heal itself, whereas a consumer is rebuilt by its supervisor (see
 /// [`supervised_properties`]).
 ///
-/// The recovery backoff is deliberately tightened. lapin applies this same
-/// backoff to the initial connection attempt, and its default retries for
-/// minutes: that would defeat [`RabbitMqConnection::connect_with_retry`],
-/// which owns the retry policy, and would delay the permanent-failure
-/// early-break (#340) by hammering a refused handshake before the real
-/// error surfaces. A short, bounded backoff keeps a refused or unreachable
-/// connect fast so our own loop and classifier stay in control, while still
-/// giving a live session a few quick reconnection attempts across a blip.
+/// The recovery backoff is deliberately tightened, but note what it does and
+/// does not buy. lapin applies this same backoff to the initial connection
+/// attempt as well as to reconnections, and its `global_backoff` budget is
+/// rebuilt on every successful connect, so `with_max_times(3)` means three
+/// consecutive failed reconnections before recovery is abandoned. That is the
+/// right budget for a live session (#334) and the wrong one for a first
+/// connect, where it multiplies every attempt by four.
+///
+/// These properties are therefore no longer used for the initial connect.
+/// [`RabbitMqConnection::connect_with_retry_recovering`] probes the broker
+/// first with [`supervised_properties`], under a bound, and only opens an
+/// auto-recovering session once the broker has answered.
 fn recovering_properties() -> ConnectionProperties {
     ConnectionProperties::default()
         .enable_auto_recover()
