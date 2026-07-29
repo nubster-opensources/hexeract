@@ -153,6 +153,20 @@ pub const DEFAULT_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 /// early-break returns long before the bound is reached.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Default bound on opening the auto-recovering session once the probe has
+/// succeeded.
+///
+/// The probe proves the broker answers, so this phase normally completes in
+/// milliseconds. The bound exists for the case the probe cannot rule out: a
+/// broker that accepts the connection and then never sends a frame, which
+/// produces no error for lapin to classify and would otherwise hang forever.
+/// It is more generous than the probe bound because a slow but healthy broker
+/// must not be cut off here.
+// No unit test covers this bound: reaching phase two needs a peer that
+// completes the AMQP handshake and then stalls, which a local listener
+// cannot simulate. The Docker integration suites exercise the success path.
+pub const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Thin wrapper over a shared [`lapin::Connection`].
 ///
 /// The wrapper centralises connection establishment so the rest of the
@@ -277,45 +291,65 @@ impl RabbitMqConnection {
         attempts: u32,
         base_delay: Duration,
     ) -> Result<Self, BusError> {
-        Self::connect_recovering_within(uri, attempts, base_delay, DEFAULT_CONNECT_TIMEOUT).await
+        Self::connect_recovering_within(
+            uri,
+            attempts,
+            base_delay,
+            DEFAULT_CONNECT_TIMEOUT,
+            DEFAULT_SESSION_TIMEOUT,
+        )
+        .await
     }
 
-    /// Establish the publisher connection, giving up once `bound` elapses.
+    /// Establish the publisher connection, giving up once the relevant bound
+    /// elapses.
     ///
     /// Split in two phases. lapin exposes a single backoff for both the
     /// initial connect and later reconnections, so no single setting can be
-    /// fast on the first and patient on the rest. Worse, only the
-    /// non-recovering path is safe to interrupt: abandoning an auto-recovering
-    /// connect leaves lapin's io-loop thread alive and still hammering the
-    /// broker, so a bound placed there would cap the return time without
-    /// capping the load.
+    /// fast on the first and patient on the rest. Worse, interrupting an
+    /// auto-recovering connect can leave lapin's io-loop thread alive on its
+    /// own OS thread: that thread stays silent when the broker stays silent,
+    /// and gives up on its own when the broker errors. Neither phase can be
+    /// abandoned and simply forgotten, so both carry a bound, but they are
+    /// not the same bound.
     ///
-    /// Phase one probes with auto-recovery off, which keeps
-    /// [`Self::connect_with_retry_inner`] in charge of the retry policy and
-    /// [`is_transient`] in charge of the permanent-failure early-break (#340).
-    /// That path is inert once dropped, so bounding it is honest.
+    /// Phase one probes with auto-recovery off, bounded by `probe_timeout`.
+    /// This keeps [`Self::connect_with_retry_inner`] in charge of the retry
+    /// policy and [`is_transient`] in charge of the permanent-failure
+    /// early-break (#340). That path is inert once dropped, so bounding it
+    /// tightly is honest.
     ///
-    /// Phase two opens the real auto-recovering session (#334). The broker has
-    /// just answered the probe, so it is attempted once and left unbounded.
+    /// Phase two opens the real auto-recovering session (#334), bounded by
+    /// `session_timeout`. The probe has just proven the broker answers, so
+    /// this phase normally completes in milliseconds; the bound is there only
+    /// for the broker that accepts the connection and then never sends a
+    /// frame, which produces no error for lapin to classify. `session_timeout`
+    /// is deliberately more generous than `probe_timeout`, since a slow but
+    /// healthy broker must not be cut off here.
     async fn connect_recovering_within(
         uri: &str,
         attempts: u32,
         base_delay: Duration,
-        bound: Duration,
+        probe_timeout: Duration,
+        session_timeout: Duration,
     ) -> Result<Self, BusError> {
         // An expired bound carries no classification of its own; an
         // unreachable broker may heal, so it is reported as transient.
         let probe = tokio::time::timeout(
-            bound,
+            probe_timeout,
             Self::connect_with_retry_inner(uri, attempts, base_delay, false),
         )
         .await
         .map_err(|_elapsed| connection_error(uri, true))??;
         drop(probe);
 
-        let inner = Connection::connect(uri, recovering_properties())
-            .await
-            .map_err(|err| connection_error(uri, is_transient(&err)))?;
+        let inner = tokio::time::timeout(
+            session_timeout,
+            Connection::connect(uri, recovering_properties()),
+        )
+        .await
+        .map_err(|_elapsed| connection_error(uri, true))?
+        .map_err(|err| connection_error(uri, is_transient(&err)))?;
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -527,13 +561,14 @@ mod tests {
     /// loopback port: 2.04 s per supervised attempt, 8.53 s per recovering one.
     #[tokio::test]
     async fn connect_recovering_gives_up_once_its_bound_elapses() {
-        let bound = Duration::from_millis(100);
+        let probe_timeout = Duration::from_millis(100);
         let started = std::time::Instant::now();
         let err = RabbitMqConnection::connect_recovering_within(
             "amqp://127.0.0.1:1",
             DEFAULT_RETRY_ATTEMPTS,
             DEFAULT_RETRY_BASE_DELAY,
-            bound,
+            probe_timeout,
+            DEFAULT_SESSION_TIMEOUT,
         )
         .await
         .expect_err("a closed port must not yield a connection");
@@ -541,7 +576,7 @@ mod tests {
         assert!(matches!(err, BusError::Connection { .. }));
         assert!(
             elapsed < Duration::from_millis(500),
-            "the bound must cut the probe short, took {elapsed:?} for a {bound:?} bound"
+            "the bound must cut the probe short, took {elapsed:?} for a {probe_timeout:?} bound"
         );
     }
 
@@ -555,6 +590,7 @@ mod tests {
             DEFAULT_RETRY_ATTEMPTS,
             DEFAULT_RETRY_BASE_DELAY,
             Duration::from_millis(50),
+            DEFAULT_SESSION_TIMEOUT,
         )
         .await
         .expect_err("a closed port must not yield a connection");
