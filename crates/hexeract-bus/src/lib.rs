@@ -10,9 +10,10 @@
 //! [`TypedHandler`]).
 //!
 //! It also ships the backend-agnostic request-reply primitives: the
-//! [`Request`] trait naming a typed reply, [`RequestClient`] and
-//! [`RequestError`] (with its [`ProtocolViolation`] source) on the caller
-//! side, [`RequestHandler`] and [`RepliedHandler`] on the responder side,
+//! [`Request`] trait naming a typed reply, [`RequestClient`] (configured
+//! per call through [`RequestOptions`]) and [`RequestError`] (with its
+//! [`ProtocolViolation`] source) on the caller side, [`RequestHandler`] and
+//! [`RepliedHandler`] on the responder side,
 //! and the [`RequestRegistry`] (with its RAII [`PendingReply`] guard)
 //! routing a reply back to its in-flight request by request identity. A
 //! failed reply carries only a closed-set [`RemoteErrorType`] category plus
@@ -53,6 +54,8 @@ pub mod request_client;
 pub mod request_error;
 /// Responder-side handler that produces a typed reply for a [`Request`].
 pub mod request_handler;
+/// Per-call overrides for a request issued through a [`RequestClient`].
+pub mod request_options;
 /// Rendezvous point between request callers and reply deliveries, keyed by
 /// request identity.
 pub mod request_registry;
@@ -84,6 +87,7 @@ pub use request_client::RequestClient;
 pub use request_error::ProtocolViolation;
 pub use request_error::RequestError;
 pub use request_handler::RequestHandler;
+pub use request_options::RequestOptions;
 pub use request_registry::PendingReply;
 pub use request_registry::ReplyCountersSnapshot;
 pub use request_registry::RequestRegistry;
