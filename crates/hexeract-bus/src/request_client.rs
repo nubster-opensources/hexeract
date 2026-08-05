@@ -1,11 +1,12 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use hexeract_core::{CorrelationId, HandlerContext, RequestId};
+use hexeract_core::{CorrelationId, RequestId};
 
 use crate::remote_error::RemoteErrorPayload;
 use crate::reply_acceptance::ReplyExpectation;
 use crate::request_error::ProtocolViolation;
+use crate::request_options::RequestOptions;
 use crate::request_registry::RequestRegistry;
 use crate::rpc_protocol::{
     PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, REPLY_ERROR_MESSAGE_TYPE, REPLY_STATUS_ERROR,
@@ -39,62 +40,42 @@ impl<T: Transport> RequestClient<T> {
         }
     }
 
-    /// Send `request` on a fresh causal chain, within the default timeout.
+    /// Send `request` on a fresh causal chain, using this client's default
+    /// timeout and `R::DESTINATION`.
     ///
-    /// Use this at the root of a flow, where no handler context exists: a
-    /// command-line entry point, an HTTP edge, a scheduled task.
-    ///
-    /// # Errors
-    ///
-    /// See [`RequestClient::request_in_with_timeout`].
-    pub async fn request<R: Request>(&self, request: &R) -> Result<R::Reply, RequestError> {
-        self.request_inner(CorrelationId::new(), request, self.default_timeout)
-            .await
-    }
-
-    /// Send `request` on the causal chain of `ctx`, within the default timeout.
+    /// Equivalent to `self.request_with(request, RequestOptions::default())`.
+    /// Use [`Self::request_with`] to override the timeout or the
+    /// destination for a single call.
     ///
     /// # Errors
     ///
-    /// See [`RequestClient::request_in_with_timeout`].
-    pub async fn request_in<R: Request>(
-        &self,
-        ctx: &HandlerContext,
-        request: &R,
-    ) -> Result<R::Reply, RequestError> {
-        self.request_inner(ctx.correlation_id, request, self.default_timeout)
-            .await
+    /// See [`Self::request_with`].
+    pub async fn request<R: Request>(&self, request: R) -> Result<R::Reply, RequestError> {
+        self.request_with(request, RequestOptions::default()).await
     }
 
-    /// Send `request` on a fresh causal chain, within `timeout`.
+    /// Send `request` on a fresh causal chain, applying `options` on top of
+    /// this client's own defaults.
     ///
-    /// # Errors
-    ///
-    /// See [`RequestClient::request_in_with_timeout`].
-    pub async fn request_with_timeout<R: Request>(
-        &self,
-        request: &R,
-        timeout: Duration,
-    ) -> Result<R::Reply, RequestError> {
-        self.request_inner(CorrelationId::new(), request, timeout)
-            .await
-    }
-
-    /// Send `request` on the causal chain of `ctx`, within `timeout`.
+    /// Resolution order:
+    /// - timeout: `options.timeout` if set, otherwise this client's default
+    ///   timeout;
+    /// - destination: `options.destination` if set, otherwise
+    ///   `R::DESTINATION`.
     ///
     /// # Errors
     ///
     /// - [`RequestError::Transport`] if publishing fails or the reply channel
     ///   is lost (connection dropped).
-    /// - [`RequestError::Timeout`] if no reply arrives within `timeout`. This
-    ///   is also what a legitimate call observes when every delivery bearing
-    ///   its request identity violates the request-reply protocol: an
-    ///   unsupported or missing protocol version, a missing or unrecognized
-    ///   reply status, or a reply message type other than the one expected.
-    ///   The registry ignores such deliveries without waking the caller, so
-    ///   the slot stays open for the real reply; if none arrives before
-    ///   `timeout`, the call times out rather than surfacing the violation
-    ///   that caused the delivery to be ignored.
+    /// - [`RequestError::Timeout`] if no reply arrives within the resolved
+    ///   timeout. This is also what a legitimate call observes when every
+    ///   delivery bearing its request identity violates the request-reply
+    ///   protocol: an unsupported or missing protocol version, a missing or
+    ///   unrecognized reply status, or a reply message type other than the
+    ///   one expected. The registry ignores such deliveries without waking
+    ///   the caller, so the slot stays open for the real reply; if none
+    ///   arrives before the timeout, the call times out rather than
+    ///   surfacing the violation that caused the delivery to be ignored.
     /// - [`RequestError::Protocol`] if a delivery still reaches this decoding
     ///   step while failing one of those same checks: an unsupported or
     ///   missing protocol version, a missing or unrecognized reply status, or
@@ -107,27 +88,70 @@ impl<T: Transport> RequestClient<T> {
     ///   decoded: either an ok reply whose payload does not decode into the
     ///   expected reply type, or an error reply whose `message_type` matches
     ///   but whose payload does not decode into a [`RemoteErrorPayload`].
-    pub async fn request_in_with_timeout<R: Request>(
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// use hexeract_bus::{Message, Request, RequestClient, RequestOptions, Transport};
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// #[derive(Debug, Serialize, Deserialize)]
+    /// struct GetBalance {
+    ///     account_id: uuid::Uuid,
+    /// }
+    /// impl Message for GetBalance {
+    ///     const MESSAGE_TYPE: &'static str = "accounts.get_balance";
+    /// }
+    ///
+    /// #[derive(Debug, Serialize, Deserialize)]
+    /// struct Balance {
+    ///     cents: u64,
+    /// }
+    /// impl Message for Balance {
+    ///     const MESSAGE_TYPE: &'static str = "accounts.balance";
+    /// }
+    ///
+    /// impl Request for GetBalance {
+    ///     type Reply = Balance;
+    /// }
+    ///
+    /// async fn priority_lookup<T: Transport>(
+    ///     client: &RequestClient<T>,
+    ///     account_id: uuid::Uuid,
+    /// ) -> Balance {
+    ///     let options = RequestOptions::new()
+    ///         .with_timeout(Duration::from_millis(200))
+    ///         .with_destination("accounts.priority");
+    ///     client
+    ///         .request_with(GetBalance { account_id }, options)
+    ///         .await
+    ///         .unwrap()
+    /// }
+    /// ```
+    pub async fn request_with<R: Request>(
         &self,
-        ctx: &HandlerContext,
-        request: &R,
-        timeout: Duration,
+        request: R,
+        options: RequestOptions,
     ) -> Result<R::Reply, RequestError> {
-        self.request_inner(ctx.correlation_id, request, timeout)
-            .await
+        let timeout = options.timeout.unwrap_or(self.default_timeout);
+        let destination = options.destination.as_deref().unwrap_or(R::DESTINATION);
+        self.request_inner(&request, destination, timeout).await
     }
 
     async fn request_inner<R: Request>(
         &self,
-        correlation_id: CorrelationId,
         request: &R,
+        destination: &str,
         timeout: Duration,
     ) -> Result<R::Reply, RequestError> {
         let mut pending = self
             .registry
             .register(ReplyExpectation::new(R::Reply::MESSAGE_TYPE));
         let request_id = pending.request_id();
-        let correlation_id = *correlation_id.as_uuid();
+        let correlation_id = *CorrelationId::new().as_uuid();
         let inbox = self
             .reply_inbox
             .lock()
@@ -143,7 +167,7 @@ impl<T: Transport> RequestClient<T> {
             PROTOCOL_VERSION.to_string(),
         );
         self.transport
-            .publish_envelope(R::DESTINATION, &envelope)
+            .publish_envelope(destination, &envelope)
             .await
             .map_err(RequestError::Transport)?;
 
@@ -225,12 +249,12 @@ mod tests {
     use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
 
-    use hexeract_core::MessageId;
     use uuid::Uuid;
 
     use super::*;
     use crate::BusError;
     use crate::remote_error::RemoteErrorType;
+    use crate::request_options::RequestOptions;
     use crate::request_registry::ReplyCountersSnapshot;
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -346,7 +370,7 @@ mod tests {
         let registry = Arc::new(RequestRegistry::new());
         let client = client(Arc::clone(&transport), Arc::clone(&registry));
 
-        let request_fut = client.request(&Ping { seq: 3 });
+        let request_fut = client.request(Ping { seq: 3 });
         tokio::pin!(request_fut);
         // drive the request until it has published and registered the slot
         tokio::select! {
@@ -364,11 +388,13 @@ mod tests {
     async fn silent_responder_times_out() {
         let transport = Arc::new(CapturingTransport::default());
         let registry = Arc::new(RequestRegistry::new());
-        let client = client(transport, Arc::clone(&registry));
-        let err = client
-            .request_with_timeout(&Ping { seq: 1 }, Duration::from_millis(30))
-            .await
-            .expect_err("no reply");
+        let client = RequestClient::new(
+            transport,
+            Arc::clone(&registry),
+            Arc::new(Mutex::new("reply.inbox".to_owned())),
+            Duration::from_millis(30),
+        );
+        let err = client.request(Ping { seq: 1 }).await.expect_err("no reply");
         assert!(matches!(err, RequestError::Timeout(_)));
         assert_eq!(registry.len(), 0);
     }
@@ -379,7 +405,7 @@ mod tests {
         let registry = Arc::new(RequestRegistry::new());
         let client = client(Arc::clone(&transport), Arc::clone(&registry));
 
-        let request_fut = client.request(&Ping { seq: 9 });
+        let request_fut = client.request(Ping { seq: 9 });
         tokio::pin!(request_fut);
         tokio::select! {
             _ = &mut request_fut => panic!("pending"),
@@ -658,65 +684,10 @@ mod tests {
         ));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn request_in_inherits_the_caller_causal_chain() {
-        let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
-        let client = RequestClient::new(
-            Arc::clone(&transport),
-            registry,
-            Arc::new(Mutex::new("caller.inbox".to_owned())),
-            Duration::from_secs(5),
-        );
-        let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
-        let expected = *ctx.correlation_id.as_uuid();
-
-        let request_fut = client.request_in(&ctx, &Ping { seq: 1 });
-        tokio::pin!(request_fut);
-        tokio::select! {
-            _ = &mut request_fut => panic!("should still be pending"),
-            () = tokio::time::sleep(Duration::from_millis(20)) => {}
-        }
-
-        let published = transport.last_published().expect("a request was published");
-        assert_eq!(published.correlation_id, expected);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn two_calls_in_one_chain_share_correlation_and_differ_in_request_id() {
-        let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
-        let client = RequestClient::new(
-            Arc::clone(&transport),
-            registry,
-            Arc::new(Mutex::new("caller.inbox".to_owned())),
-            Duration::from_secs(5),
-        );
-        let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
-
-        let first_fut = client.request_in(&ctx, &Ping { seq: 1 });
-        tokio::pin!(first_fut);
-        tokio::select! {
-            _ = &mut first_fut => panic!("should still be pending"),
-            () = tokio::time::sleep(Duration::from_millis(20)) => {}
-        }
-        let first = transport.last_published().expect("first request");
-
-        let second_fut = client.request_in(&ctx, &Ping { seq: 2 });
-        tokio::pin!(second_fut);
-        tokio::select! {
-            _ = &mut second_fut => panic!("should still be pending"),
-            () = tokio::time::sleep(Duration::from_millis(20)) => {}
-        }
-        let second = transport.last_published().expect("second request");
-
-        assert_eq!(first.correlation_id, second.correlation_id);
-        assert_ne!(
-            first.headers.get(REQUEST_ID_HEADER),
-            second.headers.get(REQUEST_ID_HEADER)
-        );
-    }
-
+    /// Every call mints its own fresh causal chain: `RequestClient` no longer
+    /// carries a `HandlerContext` to inherit a `correlation_id` from (see
+    /// `request_with`'s doc comment); two calls in a row must therefore
+    /// never share one.
     #[tokio::test(start_paused = true)]
     async fn request_starts_a_fresh_chain() {
         let transport = Arc::new(CapturingTransport::default());
@@ -728,7 +699,7 @@ mod tests {
             Duration::from_secs(5),
         );
 
-        let first_fut = client.request(&Ping { seq: 1 });
+        let first_fut = client.request(Ping { seq: 1 });
         tokio::pin!(first_fut);
         tokio::select! {
             _ = &mut first_fut => panic!("should still be pending"),
@@ -736,7 +707,7 @@ mod tests {
         }
         let first = transport.last_published().expect("first request");
 
-        let second_fut = client.request(&Ping { seq: 2 });
+        let second_fut = client.request(Ping { seq: 2 });
         tokio::pin!(second_fut);
         tokio::select! {
             _ = &mut second_fut => panic!("should still be pending"),
@@ -758,7 +729,7 @@ mod tests {
             Duration::from_secs(5),
         );
 
-        let request_fut = client.request(&PingToDedicatedQueue { seq: 1 });
+        let request_fut = client.request(PingToDedicatedQueue { seq: 1 });
         tokio::pin!(request_fut);
         tokio::select! {
             _ = &mut request_fut => panic!("should still be pending"),
@@ -770,6 +741,85 @@ mod tests {
             .expect("a request was published");
         assert_eq!(routing_key, PingToDedicatedQueue::DESTINATION);
         assert_ne!(routing_key, PingToDedicatedQueue::MESSAGE_TYPE);
+    }
+
+    /// Without any [`RequestOptions`], `request` must resolve both the
+    /// destination and the timeout from the client's own defaults: the
+    /// request's declared [`Request::DESTINATION`], never overridden here,
+    /// and the client's `default_timeout`, distinguishable from any other
+    /// duration because nothing ever replies.
+    #[tokio::test]
+    async fn request_without_options_uses_request_destination_and_client_default_timeout() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::new());
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            registry,
+            Arc::new(Mutex::new("caller.inbox".to_owned())),
+            Duration::from_millis(30),
+        );
+
+        let error = client
+            .request(PingToDedicatedQueue { seq: 1 })
+            .await
+            .expect_err("no responder ever answers");
+
+        match error {
+            RequestError::Timeout(elapsed) => assert_eq!(elapsed, Duration::from_millis(30)),
+            other => panic!("expected RequestError::Timeout, got {other:?}"),
+        }
+        let routing_key = transport
+            .last_routing_key()
+            .expect("a request was published");
+        assert_eq!(routing_key, PingToDedicatedQueue::DESTINATION);
+    }
+
+    /// `options.destination` takes precedence over `R::DESTINATION`.
+    #[tokio::test]
+    async fn options_destination_overrides_the_request_declared_destination() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::new());
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            registry,
+            Arc::new(Mutex::new("caller.inbox".to_owned())),
+            Duration::from_millis(30),
+        );
+
+        let options = RequestOptions::new().with_destination("tests.overridden.queue");
+        let _ = client
+            .request_with(PingToDedicatedQueue { seq: 1 }, options)
+            .await;
+
+        let routing_key = transport
+            .last_routing_key()
+            .expect("a request was published");
+        assert_eq!(routing_key, "tests.overridden.queue");
+        assert_ne!(routing_key, PingToDedicatedQueue::DESTINATION);
+    }
+
+    /// `options.timeout` takes precedence over the client's default timeout.
+    #[tokio::test]
+    async fn options_timeout_overrides_the_client_default_timeout() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::new());
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            registry,
+            Arc::new(Mutex::new("caller.inbox".to_owned())),
+            Duration::from_secs(30),
+        );
+
+        let options = RequestOptions::new().with_timeout(Duration::from_millis(30));
+        let error = client
+            .request_with(Ping { seq: 1 }, options)
+            .await
+            .expect_err("no responder ever answers");
+
+        match error {
+            RequestError::Timeout(elapsed) => assert_eq!(elapsed, Duration::from_millis(30)),
+            other => panic!("expected RequestError::Timeout, got {other:?}"),
+        }
     }
 
     /// The request id of the single call currently in flight on `registry`.
@@ -829,7 +879,7 @@ mod tests {
         let registry = Arc::new(RequestRegistry::new());
         let client = client(Arc::clone(&transport), Arc::clone(&registry));
 
-        let call = tokio::spawn(async move { client.request(&Ping { seq: 7 }).await });
+        let call = tokio::spawn(async move { client.request(Ping { seq: 7 }).await });
         tokio::task::yield_now().await;
 
         let request_id = registry_single_request_id(&registry);
@@ -871,7 +921,7 @@ mod tests {
             Duration::from_millis(100),
         );
 
-        let request_fut = client.request(&Ping { seq: 1 });
+        let request_fut = client.request(Ping { seq: 1 });
         tokio::pin!(request_fut);
         tokio::select! {
             _ = &mut request_fut => panic!("should still be pending"),

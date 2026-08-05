@@ -4,7 +4,7 @@ Hexeract's request-reply pattern layers a synchronous-over-async RPC call on top
 
 ## The pattern
 
-A `Request` is a `Message` that names its own reply type via the associated `Reply: Message`. `RequestClient::request` (or `RequestClient::request_with_timeout` for an explicit deadline) publishes the request envelope with a fresh correlation id and a `reply_to` inbox name, then awaits the matching reply. On the responder side, `RequestHandler<R>` is the typed counterpart to `Handler<M>` (see [Message and envelope](message-envelope.md)): instead of producing a side effect, it returns `R::Reply`. `RepliedHandler` adapts a `RequestHandler<R>` into an `ErasedHandler` a worker can dispatch: it decodes the request, runs the handler, and publishes the typed reply (or an encoded error) back to the caller's `reply_to`, preserving the inbound correlation id. `RabbitMqWorkerBuilder::register_request_handler` wires a `RequestHandler<R>` into a worker exactly the way `register_handler` wires a plain `Handler<M>`.
+A `Request` is a `Message` that names its own reply type via the associated `Reply: Message`. `RequestClient::request` publishes the request envelope with a fresh correlation id and a `reply_to` inbox name, then awaits the matching reply; `RequestClient::request_with` accepts a `RequestOptions` to override the timeout or the destination for that one call. On the responder side, `RequestHandler<R>` is the typed counterpart to `Handler<M>` (see [Message and envelope](message-envelope.md)): instead of producing a side effect, it returns `R::Reply`. `RepliedHandler` adapts a `RequestHandler<R>` into an `ErasedHandler` a worker can dispatch: it decodes the request, runs the handler, and publishes the typed reply (or an encoded error) back to the caller's `reply_to`, preserving the inbound correlation id. `RabbitMqWorkerBuilder::register_request_handler` wires a `RequestHandler<R>` into a worker exactly the way `register_handler` wires a plain `Handler<M>`.
 
 ```mermaid
 sequenceDiagram
@@ -73,7 +73,7 @@ This is a deliberate asymmetry with the reply inbox described below: the inbox i
 
 ## Failure modes
 
-`RequestError` has five variants, all reachable from `RequestClient::request_with_timeout`:
+`RequestError` has five variants, all reachable from `RequestClient::request` and `RequestClient::request_with`:
 
 - **`Timeout(Duration)`**: no reply arrived within the deadline. The `PendingReply` is dropped along with the `tokio::time::timeout` future, so the slot is cleaned up immediately rather than lingering until a reply eventually shows up.
 - **`Remote { error_type, request_id }`**: the responder's `RequestHandler` returned an error, decoded from a `RemoteErrorPayload` reply. The category is deliberately coarse and carries no detail; the full trace lives on the responder side, indexed by `request_id`.

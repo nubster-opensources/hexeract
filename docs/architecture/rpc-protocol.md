@@ -29,7 +29,7 @@ A request-reply round trip carries three distinct identifiers, each answering a 
 | `correlation_id` | Which causal chain triggered this work? | One per chain, shared by every message in it | The AMQP `correlation_id` property, inherited or minted by the transport (see [Correlation ID propagation](../concepts/correlation-id.md)) |
 | `x-hexeract-request-id` | Which call is this a reply to? | One per request-reply call, never shared even by two concurrent calls on the same chain | The reserved header, minted by `RequestClient` on every call. The responder parses it as a `Uuid` and re-stamps that parsed value on the reply, so a non-canonical form is normalized, not echoed verbatim; when the inbound header is absent or fails to parse, the responder omits it from the reply and the error payload's `request_id` falls back to `Uuid::nil()`. |
 
-`RequestClient::request` starts a fresh causal chain; `RequestClient::request_in` continues the causal chain carried by a `HandlerContext`. Either way, every call mints its own `request_id`: two requests issued from the same handler, on the same `correlation_id`, are routed and resolved independently by `RequestRegistry`, keyed on `request_id` and never on `correlation_id`.
+Every `RequestClient::request` (or `RequestClient::request_with`) call starts a fresh causal chain and mints its own `request_id`: two requests issued from the same handler are routed and resolved independently by `RequestRegistry`, keyed on `request_id` and never on `correlation_id`.
 
 ## Error payload and categories
 

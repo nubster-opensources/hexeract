@@ -34,6 +34,7 @@ use hexeract_bus::Request;
 use hexeract_bus::RequestClient;
 use hexeract_bus::RequestError;
 use hexeract_bus::RequestHandler;
+use hexeract_bus::RequestOptions;
 use hexeract_bus::RequestRegistry;
 use hexeract_bus::Transport;
 use hexeract_bus_rabbitmq::RabbitMqConnection;
@@ -153,7 +154,7 @@ async fn connection_drop_fails_in_flight_fast() {
     .unwrap();
 
     // no responder consumes it; kill the broker while a request is in flight
-    let request = client.request(&Ping { seq: 1 });
+    let request = client.request(Ping { seq: 1 });
     tokio::pin!(request);
     tokio::select! {
         _ = &mut request => panic!("should still be pending before the drop"),
@@ -244,7 +245,7 @@ async fn end_to_end_request_reply_round_trip() {
         .await
         .unwrap();
 
-    let pong = client.request(&Ping { seq: 21 }).await.unwrap();
+    let pong = client.request(Ping { seq: 21 }).await.unwrap();
     assert_eq!(pong.seq, 21);
 
     cancel.cancel();
@@ -273,7 +274,10 @@ async fn a_round_trip_carries_the_protocol_headers_over_the_wire() {
     // available for a direct basic_get, timing out client-side instead of
     // waiting for a reply that will never come.
     let _ = client
-        .request_with_timeout(&Ping { seq: 1 }, Duration::from_millis(500))
+        .request_with(
+            Ping { seq: 1 },
+            RequestOptions::new().with_timeout(Duration::from_millis(500)),
+        )
         .await;
 
     let inspect_connection = RabbitMqConnection::connect(broker.uri()).await.unwrap();
@@ -351,7 +355,7 @@ async fn remote_error_reaches_caller_fast() {
 
     let started = Instant::now();
     let err = client
-        .request(&Ping { seq: 1 })
+        .request(Ping { seq: 1 })
         .await
         .expect_err("a failing handler must surface as an error");
     let elapsed = started.elapsed();
@@ -433,7 +437,7 @@ async fn request_without_reply_to_is_non_fatal() {
     let client = connect_request_client(broker.uri(), Duration::from_secs(10), cancel.clone())
         .await
         .unwrap();
-    let pong = client.request(&Ping { seq: 7 }).await.unwrap();
+    let pong = client.request(Ping { seq: 7 }).await.unwrap();
     assert_eq!(pong.seq, 7);
 
     cancel.cancel();
@@ -613,7 +617,7 @@ async fn a_forged_reply_published_into_the_inbox_does_not_end_the_call() {
         Duration::from_secs(10),
     );
 
-    let call = tokio::spawn(async move { client.request(&Ping { seq: 1 }).await });
+    let call = tokio::spawn(async move { client.request(Ping { seq: 1 }).await });
 
     let request_id = wait_for_recorded_request_id(&publisher_transport).await;
 
@@ -731,7 +735,7 @@ async fn a_responder_on_an_application_exchange_still_replies_through_the_defaul
     // The round trip succeeding is half the proof: the reply reached the
     // caller's server-named inbox, which only the default exchange routes
     // to.
-    let pong = client.request(&Ping { seq: 7 }).await.unwrap();
+    let pong = client.request(Ping { seq: 7 }).await.unwrap();
     assert_eq!(
         pong.seq, 7,
         "the reply must be delivered through the default exchange"
