@@ -96,9 +96,13 @@ impl Default for RequestRegistry {
 
 impl RequestRegistry {
     /// Create an empty registry that admits at most `max_in_flight`
-    /// concurrent slots.
+    /// concurrent slots. A `max_in_flight` of zero admits none, ever.
     #[must_use]
     pub fn new(max_in_flight: usize) -> Self {
+        debug_assert!(
+            max_in_flight > 0,
+            "max_in_flight must be non-zero: a registry that admits no slot is never useful"
+        );
         Self {
             slots: Mutex::new(HashMap::new()),
             counters: ReplyCounters::default(),
@@ -114,8 +118,10 @@ impl RequestRegistry {
     /// return its RAII-guarded pending reply.
     ///
     /// The caller mints `request_id` itself rather than the registry
-    /// generating it: this is what lets a test force two registrations to
-    /// collide on the same identity and observe
+    /// generating it: a caller needs the identity in hand before it stamps
+    /// and publishes the envelope, and must never receive it back only
+    /// after the fact. As a side benefit, this is also what lets a test
+    /// force two registrations to collide on the same identity and observe
     /// [`RegisterRejection::SlotOccupied`] deterministically, something an
     /// internally generated identity could never be made to do on purpose.
     ///
@@ -619,11 +625,22 @@ mod tests {
         assert_eq!(reply.seq, 11);
     }
 
+    /// Capacity is freed on exactly two distinct code paths: `resolve`
+    /// frees it as soon as a valid reply is consumed, and dropping an
+    /// unresolved `PendingReply` frees it otherwise. The drop path is
+    /// exercised once here, not once per reason a caller might drop it: a
+    /// timed-out wait and an outright abandonment both end by dropping the
+    /// identical value through the identical `Drop` impl, so a second drop
+    /// phase would not distinguish anything the first does not already
+    /// prove. Genuine coverage of an actual elapsed deadline, driven for
+    /// real rather than simulated by a bare drop, lives in
+    /// `request_client::tests::silent_responder_times_out`, which asserts
+    /// `registry.len() == 0` after `RequestClient::request` times out.
     #[test]
-    fn capacity_is_freed_on_every_exit_path() {
+    fn capacity_is_freed_on_resolve_and_on_drop() {
         let registry = Arc::new(RequestRegistry::new(1));
 
-        // Success: `resolve` consumes and removes the slot immediately,
+        // Resolve: `resolve` consumes and removes the slot immediately,
         // before the caller ever awaits its `PendingReply`.
         let pending = registry
             .register(RequestId::new(), expectation())
@@ -636,36 +653,21 @@ mod tests {
         );
         drop(pending);
 
-        // Timeout: nothing ever resolves the slot. Dropping the
-        // `PendingReply`, which is what a caller does once its timeout
-        // elapses, frees it.
+        // Drop: nothing ever resolves the slot. Dropping the
+        // `PendingReply` frees it, whatever the caller's reason for
+        // dropping it (timeout elapsed, cancellation, panic unwinding).
         let pending = registry
             .register(RequestId::new(), expectation())
             .expect("capacity was freed by the previous phase");
         drop(pending);
-        assert!(
-            registry.is_empty(),
-            "an unresolved slot must free on drop, as a timing-out call does"
-        );
-
-        // Abandonment: the caller drops the call outright, for example on
-        // cancellation. Same RAII path as timeout, exercised again so this
-        // property does not silently depend on the reply channel's state.
-        let pending = registry
-            .register(RequestId::new(), expectation())
-            .expect("capacity was freed by the previous phase");
-        drop(pending);
-        assert!(
-            registry.is_empty(),
-            "an abandoned call must free its slot on drop"
-        );
+        assert!(registry.is_empty(), "an unresolved slot must free on drop");
     }
 
-    /// Mirrors `many_concurrent_calls_each_receive_their_own_reply` at ten
-    /// times the scale, and additionally asserts the registry returns to
-    /// zero once every call has completed: the property #471 exists to
-    /// guarantee under sustained concurrent load, not just for one call at
-    /// a time.
+    /// Mirrors `many_concurrent_calls_each_receive_their_own_reply` at a
+    /// larger scale, 1_000 slots instead of 64, and additionally asserts
+    /// the registry returns to zero once every call has completed: the
+    /// property #471 exists to guarantee under sustained concurrent load,
+    /// not just for one call at a time.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn one_thousand_concurrent_calls_never_cross_replies_and_the_registry_returns_to_zero() {
         const SLOT_COUNT: usize = 1_000;

@@ -419,6 +419,38 @@ mod tests {
         assert_eq!(registry.len(), 0);
     }
 
+    /// The `RegisterRejection::AtCapacity -> RequestError::AtCapacity`
+    /// mapping is tested directly in `request_error`, but that alone does
+    /// not prove a caller of `RequestClient::request` ever observes it: the
+    /// `?` in `request_inner` is the only path by which a full registry
+    /// becomes visible to a user of this crate. This test drives a first
+    /// call far enough to occupy the registry's only slot, then leaves it
+    /// pending (never resolved) so a second call finds no room.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_when_the_registry_is_at_capacity_surfaces_at_capacity() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::new(1));
+        let client = client(Arc::clone(&transport), Arc::clone(&registry));
+
+        let first_fut = client.request(Ping { seq: 1 });
+        tokio::pin!(first_fut);
+        tokio::select! {
+            _ = &mut first_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        assert_eq!(
+            registry.len(),
+            1,
+            "the first call must occupy the registry's only slot"
+        );
+
+        let error = client
+            .request(Ping { seq: 2 })
+            .await
+            .expect_err("the registry has no free slot for a second call");
+        assert!(matches!(error, RequestError::AtCapacity));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn remote_error_reply_maps_to_remote() {
         let transport = Arc::new(CapturingTransport::default());
