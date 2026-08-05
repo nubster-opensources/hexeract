@@ -54,14 +54,16 @@ impl<T: Transport> RequestClient<T> {
         self.request_with(request, RequestOptions::default()).await
     }
 
-    /// Send `request` on a fresh causal chain, applying `options` on top of
-    /// this client's own defaults.
+    /// Send `request`, applying `options` on top of this client's own
+    /// defaults.
     ///
     /// Resolution order:
     /// - timeout: `options.timeout` if set, otherwise this client's default
     ///   timeout;
     /// - destination: `options.destination` if set, otherwise
-    ///   `R::DESTINATION`.
+    ///   `R::DESTINATION`;
+    /// - causal chain: `options.correlation_id` if set, joining the chain it
+    ///   identifies, otherwise a fresh one minted for this call.
     ///
     /// # Errors
     ///
@@ -130,6 +132,21 @@ impl<T: Transport> RequestClient<T> {
     ///         .await
     ///         .unwrap()
     /// }
+    ///
+    /// // A handler forwards `GetBalance` on the caller's own causal chain
+    /// // instead of opening a new one, by passing the `correlation_id` its
+    /// // `HandlerContext` carried.
+    /// async fn forward_on_the_same_chain<T: Transport>(
+    ///     client: &RequestClient<T>,
+    ///     ctx: &hexeract_core::HandlerContext,
+    ///     account_id: uuid::Uuid,
+    /// ) -> Balance {
+    ///     let options = RequestOptions::new().with_correlation_id(ctx.correlation_id);
+    ///     client
+    ///         .request_with(GetBalance { account_id }, options)
+    ///         .await
+    ///         .unwrap()
+    /// }
     /// ```
     pub async fn request_with<R: Request>(
         &self,
@@ -138,7 +155,9 @@ impl<T: Transport> RequestClient<T> {
     ) -> Result<R::Reply, RequestError> {
         let timeout = options.timeout.unwrap_or(self.default_timeout);
         let destination = options.destination.as_deref().unwrap_or(R::DESTINATION);
-        self.request_inner(&request, destination, timeout).await
+        let correlation_id = options.correlation_id.unwrap_or_default();
+        self.request_inner(&request, destination, timeout, correlation_id)
+            .await
     }
 
     async fn request_inner<R: Request>(
@@ -146,12 +165,13 @@ impl<T: Transport> RequestClient<T> {
         request: &R,
         destination: &str,
         timeout: Duration,
+        correlation_id: CorrelationId,
     ) -> Result<R::Reply, RequestError> {
         let mut pending = self
             .registry
             .register(ReplyExpectation::new(R::Reply::MESSAGE_TYPE));
         let request_id = pending.request_id();
-        let correlation_id = *CorrelationId::new().as_uuid();
+        let correlation_id = *correlation_id.as_uuid();
         let inbox = self
             .reply_inbox
             .lock()
@@ -820,6 +840,116 @@ mod tests {
             RequestError::Timeout(elapsed) => assert_eq!(elapsed, Duration::from_millis(30)),
             other => panic!("expected RequestError::Timeout, got {other:?}"),
         }
+    }
+
+    /// `options.correlation_id` joins an existing causal chain: the supplied
+    /// identifier, not a freshly minted one, must travel on the wire.
+    #[tokio::test]
+    async fn options_correlation_id_is_carried_on_the_wire() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::new());
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            registry,
+            Arc::new(Mutex::new("caller.inbox".to_owned())),
+            Duration::from_millis(30),
+        );
+
+        let correlation_id = CorrelationId::new();
+        let options = RequestOptions::new().with_correlation_id(correlation_id);
+        let _ = client.request_with(Ping { seq: 1 }, options).await;
+
+        let published = transport.last_published().expect("a request was published");
+        assert_eq!(published.correlation_id, *correlation_id.as_uuid());
+    }
+
+    /// Without a `correlation_id` override, `request_with` opens a fresh
+    /// causal chain, exactly like `request` (see `request_starts_a_fresh_chain`):
+    /// two calls under `RequestOptions::default()` never share theirs.
+    #[tokio::test]
+    async fn request_with_default_options_opens_a_fresh_correlation_each_call() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::new());
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            registry,
+            Arc::new(Mutex::new("caller.inbox".to_owned())),
+            Duration::from_millis(30),
+        );
+
+        let _ = client
+            .request_with(Ping { seq: 1 }, RequestOptions::default())
+            .await;
+        let first = transport
+            .last_published()
+            .expect("first request")
+            .correlation_id;
+
+        let _ = client
+            .request_with(Ping { seq: 2 }, RequestOptions::default())
+            .await;
+        let second = transport
+            .last_published()
+            .expect("second request")
+            .correlation_id;
+
+        assert_ne!(first, second);
+    }
+
+    /// Two calls sharing a `correlation_id` (the causal chain) still mint
+    /// distinct `RequestId`s (the per-call identity) and each resolves to
+    /// its own reply rather than crossing over: the shared correlation must
+    /// never be usable to key a pending slot.
+    #[tokio::test]
+    async fn two_calls_sharing_a_correlation_mint_distinct_request_ids_and_do_not_cross_replies() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::new());
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            Arc::clone(&registry),
+            Arc::new(Mutex::new("caller.inbox".to_owned())),
+            Duration::from_secs(5),
+        );
+        let correlation_id = CorrelationId::new();
+
+        let first_fut = client.request_with(
+            Ping { seq: 1 },
+            RequestOptions::new().with_correlation_id(correlation_id),
+        );
+        tokio::pin!(first_fut);
+        tokio::select! {
+            _ = &mut first_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let first = transport.last_published().expect("first request");
+
+        let second_fut = client.request_with(
+            Ping { seq: 2 },
+            RequestOptions::new().with_correlation_id(correlation_id),
+        );
+        tokio::pin!(second_fut);
+        tokio::select! {
+            _ = &mut second_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let second = transport.last_published().expect("second request");
+
+        assert_eq!(first.correlation_id, *correlation_id.as_uuid());
+        assert_eq!(second.correlation_id, *correlation_id.as_uuid());
+        let first_request_id = published_request_id(&first);
+        let second_request_id = published_request_id(&second);
+        assert_ne!(first_request_id, second_request_id);
+
+        // Resolve the second call's reply before the first call's, so a slot
+        // keyed on the shared correlation_id (rather than on request_id)
+        // would deliver the wrong Pong to the wrong caller.
+        registry.resolve(ok_reply(second_request_id, 2));
+        registry.resolve(ok_reply(first_request_id, 1));
+
+        let first_reply = first_fut.await.expect("first reply");
+        let second_reply = second_fut.await.expect("second reply");
+        assert_eq!(first_reply, Pong { seq: 1 });
+        assert_eq!(second_reply, Pong { seq: 2 });
     }
 
     /// The request id of the single call currently in flight on `registry`.

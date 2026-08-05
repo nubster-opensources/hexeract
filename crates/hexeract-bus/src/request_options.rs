@@ -1,14 +1,17 @@
 use std::time::Duration;
 
+use hexeract_core::CorrelationId;
+
 /// Per-call overrides for a request issued through a [`crate::RequestClient`].
 ///
 /// Every field defaults to "inherit the caller's usual behavior": an absent
-/// `timeout` falls back to the client's own default timeout, and an absent
+/// `timeout` falls back to the client's own default timeout, an absent
 /// `destination` falls back to the request type's own
-/// [`crate::Request::DESTINATION`]. Marked `#[non_exhaustive]` so a later
-/// release can grow another per-call override, such as a deadline distinct
-/// from a timeout, without breaking existing callers that build one through
-/// [`RequestOptions::new`].
+/// [`crate::Request::DESTINATION`], and an absent `correlation_id` opens a
+/// fresh causal chain rather than joining one already in progress. Marked
+/// `#[non_exhaustive]` so a later release can grow another per-call
+/// override, such as protocol metadata, without breaking existing callers
+/// that build one through [`RequestOptions::new`].
 ///
 /// # Example
 ///
@@ -31,6 +34,8 @@ pub struct RequestOptions {
     pub timeout: Option<Duration>,
     /// Overrides `Request::DESTINATION` for this call only.
     pub destination: Option<String>,
+    /// Joins an existing causal chain instead of opening a new one.
+    pub correlation_id: Option<CorrelationId>,
 }
 
 impl RequestOptions {
@@ -56,11 +61,28 @@ impl RequestOptions {
         self.destination = Some(destination.into());
         self
     }
+
+    /// Join the causal chain identified by `correlation_id` instead of
+    /// opening a fresh one for this call.
+    ///
+    /// `correlation_id` labels the causal chain and may be shared by
+    /// several calls; it is never the identity of this call itself. Never
+    /// derive one from the other: pass the `correlation_id` an inbound
+    /// [`hexeract_core::HandlerContext`] carried, not a `RequestId`, and
+    /// let `RequestClient` mint its own fresh `RequestId` for this call as
+    /// it always does.
+    #[must_use]
+    pub fn with_correlation_id(mut self, correlation_id: CorrelationId) -> Self {
+        self.correlation_id = Some(correlation_id);
+        self
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    use hexeract_core::CorrelationId;
 
     use super::*;
 
@@ -69,6 +91,7 @@ mod tests {
         let options = RequestOptions::default();
         assert_eq!(options.timeout, None);
         assert_eq!(options.destination, None);
+        assert_eq!(options.correlation_id, None);
     }
 
     #[test]
@@ -76,6 +99,16 @@ mod tests {
         let built = RequestOptions::new();
         assert_eq!(built.timeout, None);
         assert_eq!(built.destination, None);
+        assert_eq!(built.correlation_id, None);
+    }
+
+    #[test]
+    fn with_correlation_id_sets_only_the_correlation_override() {
+        let correlation_id = CorrelationId::new();
+        let options = RequestOptions::new().with_correlation_id(correlation_id);
+        assert_eq!(options.correlation_id, Some(correlation_id));
+        assert_eq!(options.timeout, None);
+        assert_eq!(options.destination, None);
     }
 
     #[test]
