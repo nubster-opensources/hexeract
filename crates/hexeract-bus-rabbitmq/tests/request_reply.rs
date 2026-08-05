@@ -94,7 +94,7 @@ async fn reply_published_to_inbox_is_resolved() {
         .await
         .unwrap();
 
-    let registry = Arc::new(RequestRegistry::new());
+    let registry = Arc::new(RequestRegistry::default());
     let cancel = CancellationToken::new();
     let handle = {
         let registry = Arc::clone(&registry);
@@ -105,8 +105,10 @@ async fn reply_published_to_inbox_is_resolved() {
         })
     };
 
-    let mut pending = registry.register(ReplyExpectation::new(Pong::MESSAGE_TYPE));
-    let request_id = pending.request_id();
+    let request_id = hexeract_core::RequestId::new();
+    let mut pending = registry
+        .register(request_id, ReplyExpectation::new(Pong::MESSAGE_TYPE))
+        .expect("registration succeeds");
 
     // publish a reply envelope straight to the inbox via a fresh channel
     let publish_channel = connection.create_channel().await.unwrap();
@@ -591,7 +593,7 @@ async fn a_forged_reply_published_into_the_inbox_does_not_end_the_call() {
 
     declare_ping_queue(broker.uri(), "tests.ping").await;
 
-    let registry = Arc::new(RequestRegistry::new());
+    let registry = Arc::new(RequestRegistry::default());
     let inbox_connection =
         RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
             .await

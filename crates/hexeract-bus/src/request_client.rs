@@ -167,10 +167,10 @@ impl<T: Transport> RequestClient<T> {
         timeout: Duration,
         correlation_id: CorrelationId,
     ) -> Result<R::Reply, RequestError> {
+        let request_id = RequestId::new();
         let mut pending = self
             .registry
-            .register(ReplyExpectation::new(R::Reply::MESSAGE_TYPE));
-        let request_id = pending.request_id();
+            .register(request_id, ReplyExpectation::new(R::Reply::MESSAGE_TYPE))?;
         let correlation_id = *correlation_id.as_uuid();
         let inbox = self
             .reply_inbox
@@ -387,7 +387,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn nominal_round_trip_returns_typed_reply() {
         let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
+        let registry = Arc::new(RequestRegistry::default());
         let client = client(Arc::clone(&transport), Arc::clone(&registry));
 
         let request_fut = client.request(Ping { seq: 3 });
@@ -407,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn silent_responder_times_out() {
         let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
+        let registry = Arc::new(RequestRegistry::default());
         let client = RequestClient::new(
             transport,
             Arc::clone(&registry),
@@ -422,7 +422,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn remote_error_reply_maps_to_remote() {
         let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
+        let registry = Arc::new(RequestRegistry::default());
         let client = client(Arc::clone(&transport), Arc::clone(&registry));
 
         let request_fut = client.request(Ping { seq: 9 });
@@ -711,7 +711,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn request_starts_a_fresh_chain() {
         let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
+        let registry = Arc::new(RequestRegistry::default());
         let client = RequestClient::new(
             Arc::clone(&transport),
             registry,
@@ -741,7 +741,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn request_publishes_to_the_declared_destination_not_the_message_type() {
         let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
+        let registry = Arc::new(RequestRegistry::default());
         let client = RequestClient::new(
             Arc::clone(&transport),
             registry,
@@ -771,7 +771,7 @@ mod tests {
     #[tokio::test]
     async fn request_without_options_uses_request_destination_and_client_default_timeout() {
         let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
+        let registry = Arc::new(RequestRegistry::default());
         let client = RequestClient::new(
             Arc::clone(&transport),
             registry,
@@ -798,7 +798,7 @@ mod tests {
     #[tokio::test]
     async fn options_destination_overrides_the_request_declared_destination() {
         let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
+        let registry = Arc::new(RequestRegistry::default());
         let client = RequestClient::new(
             Arc::clone(&transport),
             registry,
@@ -822,7 +822,7 @@ mod tests {
     #[tokio::test]
     async fn options_timeout_overrides_the_client_default_timeout() {
         let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
+        let registry = Arc::new(RequestRegistry::default());
         let client = RequestClient::new(
             Arc::clone(&transport),
             registry,
@@ -847,7 +847,7 @@ mod tests {
     #[tokio::test]
     async fn options_correlation_id_is_carried_on_the_wire() {
         let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
+        let registry = Arc::new(RequestRegistry::default());
         let client = RequestClient::new(
             Arc::clone(&transport),
             registry,
@@ -869,7 +869,7 @@ mod tests {
     #[tokio::test]
     async fn request_with_default_options_opens_a_fresh_correlation_each_call() {
         let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
+        let registry = Arc::new(RequestRegistry::default());
         let client = RequestClient::new(
             Arc::clone(&transport),
             registry,
@@ -903,7 +903,7 @@ mod tests {
     #[tokio::test]
     async fn two_calls_sharing_a_correlation_mint_distinct_request_ids_and_do_not_cross_replies() {
         let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
+        let registry = Arc::new(RequestRegistry::default());
         let client = RequestClient::new(
             Arc::clone(&transport),
             Arc::clone(&registry),
@@ -1006,7 +1006,7 @@ mod tests {
     #[tokio::test]
     async fn a_forged_reply_of_the_wrong_type_does_not_end_the_call() {
         let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
+        let registry = Arc::new(RequestRegistry::default());
         let client = client(Arc::clone(&transport), Arc::clone(&registry));
 
         let call = tokio::spawn(async move { client.request(Ping { seq: 7 }).await });
@@ -1043,7 +1043,7 @@ mod tests {
         mutate: impl FnOnce(RequestId, &mut BusEnvelope),
     ) -> (RequestError, ReplyCountersSnapshot) {
         let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
+        let registry = Arc::new(RequestRegistry::default());
         let client = RequestClient::new(
             Arc::clone(&transport),
             Arc::clone(&registry),

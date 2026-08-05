@@ -4,6 +4,7 @@ use hexeract_core::RequestId;
 
 use crate::BusError;
 use crate::remote_error::RemoteErrorType;
+use crate::request_registry::RegisterRejection;
 
 /// A reply that does not honor the request-reply protocol.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -29,6 +30,18 @@ pub enum ProtocolViolation {
         /// Message type actually received.
         actual: String,
     },
+    /// The freshly minted request identity collided with one already in
+    /// flight in the registry.
+    ///
+    /// This is a defect on the caller's own side, not a wire fault from the
+    /// peer: it is raised at registration time, before any envelope is
+    /// published. It is grouped here rather than given its own
+    /// [`RequestError`] variant because it is, at bottom, the same kind of
+    /// failure as the other variants of this enum: a violation of an
+    /// invariant the request-reply protocol depends on, here that request
+    /// identities are unique for the lifetime of a call.
+    #[error("request identity is already in flight")]
+    IdentityCollision,
 }
 
 /// Failure of a request-reply round trip observed by the caller.
@@ -38,6 +51,17 @@ pub enum RequestError {
     /// No reply arrived within the deadline.
     #[error("request timed out after {0:?}")]
     Timeout(Duration),
+    /// The client reached its in-flight capacity.
+    ///
+    /// The registry refuses the call immediately rather than waiting for a
+    /// slot to free up: back-pressure must be visible to the caller, not
+    /// disguised as extra latency.
+    #[error("client reached its in-flight request capacity")]
+    AtCapacity,
+    /// The client was closed while the call was pending, or before it
+    /// started.
+    #[error("client is closed")]
+    Closed,
     /// The responder reported a failure.
     ///
     /// The category is deliberately coarse and carries no detail: the full
@@ -59,6 +83,18 @@ pub enum RequestError {
     /// decoded into the expected type.
     #[error("failed to decode reply")]
     Decode(#[source] BusError),
+}
+
+impl From<RegisterRejection> for RequestError {
+    fn from(rejection: RegisterRejection) -> Self {
+        match rejection {
+            RegisterRejection::AtCapacity => RequestError::AtCapacity,
+            RegisterRejection::Closed => RequestError::Closed,
+            RegisterRejection::SlotOccupied => {
+                RequestError::Protocol(ProtocolViolation::IdentityCollision)
+            }
+        }
+    }
 }
 
 #[cfg(test)]

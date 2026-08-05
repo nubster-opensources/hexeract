@@ -26,7 +26,7 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use hexeract_bus::{BusError, RequestClient, RequestRegistry};
+use hexeract_bus::{BusError, DEFAULT_MAX_IN_FLIGHT, RequestClient, RequestRegistry};
 use lapin::Channel;
 use tokio_util::sync::CancellationToken;
 
@@ -54,7 +54,7 @@ pub async fn connect_request_client(
     cancel: CancellationToken,
 ) -> Result<RequestClient<RabbitMqTransport>, BusError> {
     let transport = Arc::new(RabbitMqTransport::new(uri).await?);
-    let registry = Arc::new(RequestRegistry::new());
+    let registry = Arc::new(RequestRegistry::new(DEFAULT_MAX_IN_FLIGHT));
 
     // Supervised connection for the inbox consumer: NOT the recovering
     // connection used by the publisher above.
