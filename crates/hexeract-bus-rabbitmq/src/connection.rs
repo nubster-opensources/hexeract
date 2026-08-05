@@ -71,14 +71,27 @@ fn supervised_properties() -> ConnectionProperties {
 /// must heal itself, whereas a consumer is rebuilt by its supervisor (see
 /// [`supervised_properties`]).
 ///
-/// The recovery backoff is deliberately tightened. lapin applies this same
-/// backoff to the initial connection attempt, and its default retries for
-/// minutes: that would defeat [`RabbitMqConnection::connect_with_retry`],
-/// which owns the retry policy, and would delay the permanent-failure
-/// early-break (#340) by hammering a refused handshake before the real
-/// error surfaces. A short, bounded backoff keeps a refused or unreachable
-/// connect fast so our own loop and classifier stay in control, while still
-/// giving a live session a few quick reconnection attempts across a blip.
+/// The recovery backoff is deliberately tightened, but note what it does and
+/// does not buy. lapin applies this same backoff to the initial connection
+/// attempt as well as to reconnections, and its `global_backoff` budget is
+/// rebuilt on every successful connect, so `with_max_times(3)` means three
+/// consecutive failed reconnections before recovery is abandoned. That is the
+/// right budget for a live session (#334) and the wrong one for a first
+/// connect, where it multiplies every attempt by four.
+///
+/// These properties are therefore no longer used for the initial connect.
+/// [`RabbitMqConnection::connect_with_retry_recovering`] probes the broker
+/// first with [`supervised_properties`], under a bound, and only opens an
+/// auto-recovering session once the broker has answered.
+///
+/// `with_max_times(3)` also bounds something outside our own control: if the
+/// session bound expires while a connect built from these properties is
+/// in flight, `tokio::time::timeout` drops only our future, not lapin's
+/// io-loop thread, which keeps knocking on the broker on its own budget.
+/// Measured, that abandoned thread exhausts a `with_max_times(3)` budget and
+/// exits in roughly 8.5 s; raising this value lengthens how long the
+/// abandoned thread keeps knocking after we have already given up, so it
+/// must stay small.
 fn recovering_properties() -> ConnectionProperties {
     ConnectionProperties::default()
         .enable_auto_recover()
@@ -142,6 +155,41 @@ pub const DEFAULT_RETRY_ATTEMPTS: u32 = 5;
 
 /// Default base delay used by [`RabbitMqConnection::connect_with_retry`].
 pub const DEFAULT_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+
+/// Default bound on the probe phase of the publisher connect, used by
+/// [`crate::RabbitMqTransport::new`] and
+/// [`crate::RabbitMqTransport::with_exchange`].
+///
+/// Caps how long the publisher path may spend proving the broker answers
+/// before it gives up. Measured against a closed loopback port, one probe
+/// attempt costs about 2 s, so this budget covers roughly two attempts. A
+/// broker that refuses the handshake locally (bad credentials, unsupported
+/// protocol version) returns `ACCESS_REFUSED` and the permanent-failure
+/// early-break (#340) fires long before the bound is reached; a broker whose
+/// authentication depends on a slow or hanging external backend can instead
+/// leave the bound to fire first, and an expired bound always classifies as
+/// transient.
+pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default bound on opening the auto-recovering session once the probe has
+/// succeeded.
+///
+/// The probe proves the broker answers, so this phase normally completes in
+/// milliseconds. The bound exists for the case the probe cannot rule out: a
+/// broker that accepts the connection and then never sends a frame, which
+/// produces no error for lapin to classify and would otherwise hang forever.
+/// It is more generous than the probe bound because a slow but healthy broker
+/// must not be cut off here.
+///
+/// If this bound fires mid-attempt, the abandoned lapin io-loop thread
+/// survives the dropped future and keeps retrying on its own
+/// `recovering_properties` backoff budget before it gives up and exits;
+/// raising that budget's `with_max_times` lengthens the thread's residual
+/// knocking on the broker, so it must stay small.
+// No unit test covers this bound: reaching phase two needs a peer that
+// completes the AMQP handshake and then stalls, which a local listener
+// cannot simulate. The Docker integration suites exercise the success path.
+pub const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Thin wrapper over a shared [`lapin::Connection`].
 ///
@@ -267,7 +315,67 @@ impl RabbitMqConnection {
         attempts: u32,
         base_delay: Duration,
     ) -> Result<Self, BusError> {
-        Self::connect_with_retry_inner(uri, attempts, base_delay, true).await
+        Self::connect_recovering_within(
+            uri,
+            attempts,
+            base_delay,
+            DEFAULT_PROBE_TIMEOUT,
+            DEFAULT_SESSION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Establish the publisher connection, giving up once the relevant bound
+    /// elapses.
+    ///
+    /// Split in two phases, both driven by [`Self::connect_with_retry_inner`]
+    /// so the same retry policy and the same [`is_transient`]
+    /// permanent-failure early-break (#340) govern the connection this
+    /// function actually returns, not just a probe that gets thrown away.
+    /// lapin exposes a single backoff for both the initial connect and later
+    /// reconnections, so no single setting can be fast on the first and
+    /// patient on the rest; interrupting an auto-recovering connect can also
+    /// leave lapin's io-loop thread alive on its own OS thread, so neither
+    /// phase can be abandoned and simply forgotten. Both therefore carry a
+    /// bound, but not the same one.
+    ///
+    /// Phase one probes with auto-recovery off, bounded by `probe_timeout`.
+    /// That path is inert once dropped, so bounding it tightly is honest, and
+    /// it keeps the retry policy and the early-break clear of lapin's own
+    /// reconnection backoff before the broker has even proven it answers.
+    ///
+    /// Phase two retries again, this time with auto-recovery on (#334) so the
+    /// returned connection can heal itself across a later broker blip,
+    /// bounded by `session_timeout`. The probe has just proven the broker
+    /// answers, so this phase normally completes on its first attempt; the
+    /// bound exists for the broker that accepts the connection and then never
+    /// sends a frame, which produces no error for lapin to classify.
+    /// `session_timeout` is deliberately more generous than `probe_timeout`,
+    /// since a slow but healthy broker must not be cut off here.
+    async fn connect_recovering_within(
+        uri: &str,
+        attempts: u32,
+        base_delay: Duration,
+        probe_timeout: Duration,
+        session_timeout: Duration,
+    ) -> Result<Self, BusError> {
+        // An expired bound carries no classification of its own; an
+        // unreachable broker may heal, so it is reported as transient.
+        let probe = tokio::time::timeout(
+            probe_timeout,
+            Self::connect_with_retry_inner(uri, attempts, base_delay, false),
+        )
+        .await
+        .map_err(|_elapsed| connection_error(uri, true))??;
+        drop(probe);
+
+        let inner = tokio::time::timeout(
+            session_timeout,
+            Self::connect_with_retry_inner(uri, attempts, base_delay, true),
+        )
+        .await
+        .map_err(|_elapsed| connection_error(uri, true))??;
+        Ok(inner)
     }
 
     /// Shared retry loop backing both connect-with-retry variants.
@@ -468,6 +576,52 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(BusError::Connection { .. })));
+    }
+
+    /// The bound must cut short a probe against an unreachable broker. Without
+    /// it, `DEFAULT_RETRY_ATTEMPTS` attempts each carrying lapin's own retry
+    /// budget take tens of seconds to give up (#474). Measured on a closed
+    /// loopback port: 2.04 s per supervised attempt, 8.53 s per recovering one.
+    #[tokio::test]
+    async fn connect_recovering_gives_up_once_its_bound_elapses() {
+        let probe_timeout = Duration::from_millis(100);
+        let started = std::time::Instant::now();
+        let err = RabbitMqConnection::connect_recovering_within(
+            "amqp://127.0.0.1:1",
+            DEFAULT_RETRY_ATTEMPTS,
+            DEFAULT_RETRY_BASE_DELAY,
+            probe_timeout,
+            DEFAULT_SESSION_TIMEOUT,
+        )
+        .await
+        .expect_err("a closed port must not yield a connection");
+        let elapsed = started.elapsed();
+        assert!(matches!(err, BusError::Connection { .. }));
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "the bound must cut the probe short, took {elapsed:?} for a {probe_timeout:?} bound"
+        );
+    }
+
+    /// An unreachable broker may come back. A caller that inspects the
+    /// classification before deciding to retry must not read the give-up as a
+    /// permanent refusal.
+    #[tokio::test]
+    async fn giving_up_on_the_bound_stays_retryable() {
+        let err = RabbitMqConnection::connect_recovering_within(
+            "amqp://127.0.0.1:1",
+            DEFAULT_RETRY_ATTEMPTS,
+            DEFAULT_RETRY_BASE_DELAY,
+            Duration::from_millis(50),
+            DEFAULT_SESSION_TIMEOUT,
+        )
+        .await
+        .expect_err("a closed port must not yield a connection");
+        assert_eq!(
+            err.is_retryable_connection(),
+            Some(true),
+            "an unreachable broker may heal, so the give-up must classify as transient"
+        );
     }
 
     #[test]
