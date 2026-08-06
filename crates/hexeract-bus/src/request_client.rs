@@ -41,13 +41,22 @@ impl<T: Transport> Clone for RequestClient<T> {
 /// client's lifecycle (the shutdown [`CancellationToken`] and the reply
 /// consumer's [`JoinHandle`]) is tied to the last handle disappearing,
 /// through its [`Drop`] implementation, rather than to any single clone.
-pub struct RequestClientInner<T: Transport> {
+/// `pub(crate)` rather than `pub`: nothing outside this crate can name it,
+/// since it has no public constructor or method of its own.
+pub(crate) struct RequestClientInner<T: Transport> {
     transport: Arc<T>,
     registry: Arc<RequestRegistry>,
     reply_inbox: Arc<Mutex<String>>,
     default_timeout: Duration,
     cancel: CancellationToken,
     supervisor: Mutex<Option<JoinHandle<()>>>,
+    /// Cancelled by the reply consumer task itself, right before it
+    /// returns, on every exit path. This is what lets a concurrent
+    /// [`RequestClient::close`] caller, one that finds the supervisor
+    /// handle already taken, observe genuine termination instead of
+    /// racing ahead of it: see [`RequestClient::close`] for why a `take`
+    /// alone is not enough once the client is cloned.
+    finished: CancellationToken,
 }
 
 impl<T: Transport> Drop for RequestClientInner<T> {
@@ -73,7 +82,10 @@ impl<T: Transport> RequestClient<T> {
     /// `cancel` is the shutdown signal this client's reply consumer, if any,
     /// observes to stop; `supervisor` is that consumer's join handle, or
     /// `None` for a client with no real consumer, such as one built for a
-    /// unit test.
+    /// unit test. `finished` is the token the consumer itself cancels right
+    /// before it returns, on every exit path; a caller with no real
+    /// consumer must pass one that is already cancelled, so that
+    /// [`Self::close`] never waits on a task that will never signal it.
     #[must_use]
     pub fn new(
         transport: Arc<T>,
@@ -82,6 +94,7 @@ impl<T: Transport> RequestClient<T> {
         default_timeout: Duration,
         cancel: CancellationToken,
         supervisor: Option<JoinHandle<()>>,
+        finished: CancellationToken,
     ) -> Self {
         Self {
             inner: Arc::new(RequestClientInner {
@@ -91,6 +104,7 @@ impl<T: Transport> RequestClient<T> {
                 default_timeout,
                 cancel,
                 supervisor: Mutex::new(supervisor),
+                finished,
             }),
         }
     }
@@ -101,13 +115,34 @@ impl<T: Transport> RequestClient<T> {
     /// This is the strong half of the client's shutdown contract: when this
     /// method returns, the registry is closed and empty, and the reply
     /// consumer task, if this client was built with one, has genuinely
-    /// finished. Compare with the [`Drop`] impl on [`RequestClientInner`],
-    /// which fires when the last handle disappears without an explicit
-    /// `close`: it can only signal (close the registry, cancel the token)
-    /// and never await the consumer.
+    /// finished. That guarantee holds for every caller and every clone,
+    /// including one that calls `close` concurrently with another: the
+    /// caller that finds the supervisor handle already taken does not
+    /// return early, it waits for the same termination signal the
+    /// consumer itself raises right before it exits. Compare with the
+    /// [`Drop`] impl on [`RequestClientInner`], which fires when the last
+    /// handle disappears without an explicit `close`: it can only signal
+    /// (close the registry, cancel the token) and never await the
+    /// consumer.
     ///
-    /// Idempotent: the first call takes the supervisor handle, so a second
-    /// call finds `None` and returns immediately having changed nothing.
+    /// This also cancels the [`CancellationToken`] this client was built
+    /// with. That token is owned by the caller, not private to this
+    /// client, and may be shared with other tasks, such as responder
+    /// workers a caller wants to wind down together with the client; see
+    /// the crate's request-reply example for that pattern.
+    ///
+    /// Idempotent: the first call takes the supervisor handle and awaits it
+    /// directly; every later call, sequential or concurrent, finds `None`
+    /// and awaits the same termination signal instead, without changing
+    /// registry or token state again.
+    ///
+    /// Calling this from the supervisor task itself, the one whose handle
+    /// this method would join, deadlocks: a task can never observe its own
+    /// completion. Nothing in this crate does that today, since the
+    /// supervisor is only ever handed the registry, the inbox and the
+    /// token, never a [`RequestClient`], but the client is clonable and
+    /// nothing stops a caller from handing a clone to a task it spawns
+    /// itself.
     pub async fn close(&self) {
         self.inner.registry.close();
         self.inner.cancel.cancel();
@@ -117,8 +152,11 @@ impl<T: Transport> RequestClient<T> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if let Some(handle) = handle {
-            let _ = handle.await;
+        match handle {
+            Some(handle) => {
+                let _ = handle.await;
+            }
+            None => self.inner.finished.cancelled().await,
         }
     }
 
@@ -281,9 +319,12 @@ impl<T: Transport> RequestClient<T> {
             Ok(Err(_closed)) => {
                 // The registry drops every sender on both `close` (permanent)
                 // and `drain` (transient, on broker loss). `is_closed` is
-                // what tells the two apart for the caller: closed by an
-                // explicit shutdown surfaces as `Closed`, closed by a lost
-                // connection surfaces as `Transport`.
+                // what tells the two apart for the caller, outside of a
+                // concurrent close: a caller woken by a `drain` that reads
+                // `is_closed` after a `close` has since landed sees
+                // `Closed` instead of `Transport`, losing the retryable
+                // signal. Consequence is weak, since a closed client
+                // accepts no further calls anyway.
                 return Err(if self.inner.registry.is_closed() {
                     RequestError::Closed
                 } else {
@@ -468,6 +509,20 @@ mod tests {
         env
     }
 
+    /// A token already in the cancelled state, standing in for a reply
+    /// consumer that will never run. Used wherever a test builds a client
+    /// with no real supervisor task, so there is nothing left that would
+    /// ever cancel a fresh `finished` token itself: without this,
+    /// `RequestClient::close` would wait forever on such a client.
+    fn already_finished_token() -> CancellationToken {
+        let token = CancellationToken::new();
+        token.cancel();
+        token
+    }
+
+    /// A client with no real reply consumer. None of the tests using this
+    /// helper call `close`, but a client built this way must still behave
+    /// sanely if one did, hence the already-cancelled `finished` token.
     fn client(
         transport: Arc<CapturingTransport>,
         registry: Arc<RequestRegistry>,
@@ -479,16 +534,19 @@ mod tests {
             Duration::from_millis(200),
             CancellationToken::new(),
             None,
+            already_finished_token(),
         )
     }
 
-    /// Build a client whose `cancel` token and supervisor handle are under
-    /// the caller's control, for the lifecycle tests below.
+    /// Build a client whose `cancel` token, supervisor handle and
+    /// `finished` token are all under the caller's control, for the
+    /// lifecycle tests below.
     fn client_with_lifecycle(
         transport: Arc<CapturingTransport>,
         registry: Arc<RequestRegistry>,
         cancel: CancellationToken,
         supervisor: Option<tokio::task::JoinHandle<()>>,
+        finished: CancellationToken,
     ) -> RequestClient<CapturingTransport> {
         RequestClient::new(
             transport,
@@ -497,6 +555,7 @@ mod tests {
             Duration::from_millis(200),
             cancel,
             supervisor,
+            finished,
         )
     }
 
@@ -531,6 +590,7 @@ mod tests {
             Duration::from_millis(30),
             CancellationToken::new(),
             None,
+            already_finished_token(),
         );
         let err = client.request(Ping { seq: 1 }).await.expect_err("no reply");
         assert!(matches!(err, RequestError::Timeout(_)));
@@ -869,6 +929,7 @@ mod tests {
             Duration::from_secs(5),
             CancellationToken::new(),
             None,
+            already_finished_token(),
         );
 
         let first_fut = client.request(Ping { seq: 1 });
@@ -901,6 +962,7 @@ mod tests {
             Duration::from_secs(5),
             CancellationToken::new(),
             None,
+            already_finished_token(),
         );
 
         let request_fut = client.request(PingToDedicatedQueue { seq: 1 });
@@ -933,6 +995,7 @@ mod tests {
             Duration::from_millis(30),
             CancellationToken::new(),
             None,
+            already_finished_token(),
         );
 
         let error = client
@@ -962,6 +1025,7 @@ mod tests {
             Duration::from_millis(30),
             CancellationToken::new(),
             None,
+            already_finished_token(),
         );
 
         let options = RequestOptions::new().with_destination("tests.overridden.queue");
@@ -988,6 +1052,7 @@ mod tests {
             Duration::from_secs(30),
             CancellationToken::new(),
             None,
+            already_finished_token(),
         );
 
         let options = RequestOptions::new().with_timeout(Duration::from_millis(30));
@@ -1015,6 +1080,7 @@ mod tests {
             Duration::from_millis(30),
             CancellationToken::new(),
             None,
+            already_finished_token(),
         );
 
         let correlation_id = CorrelationId::new();
@@ -1039,6 +1105,7 @@ mod tests {
             Duration::from_millis(30),
             CancellationToken::new(),
             None,
+            already_finished_token(),
         );
 
         let _ = client
@@ -1075,6 +1142,7 @@ mod tests {
             Duration::from_secs(5),
             CancellationToken::new(),
             None,
+            already_finished_token(),
         );
         let correlation_id = CorrelationId::new();
 
@@ -1217,6 +1285,7 @@ mod tests {
             Duration::from_millis(100),
             CancellationToken::new(),
             None,
+            already_finished_token(),
         );
 
         let request_fut = client.request(Ping { seq: 1 });
@@ -1266,6 +1335,7 @@ mod tests {
             Arc::clone(&registry),
             CancellationToken::new(),
             None,
+            already_finished_token(),
         );
 
         let call = {
@@ -1273,6 +1343,14 @@ mod tests {
             tokio::spawn(async move { client.request(Ping { seq: 1 }).await })
         };
         tokio::task::yield_now().await;
+
+        // Without this, both interleavings of the spawned call against
+        // `close` produce the same `Err(RequestError::Closed)`: whether the
+        // call was genuinely in flight when `close` ran, or never got the
+        // chance to register at all. This assertion is what tells the two
+        // apart and keeps this test distinct from
+        // `request_after_close_is_rejected_with_closed` below.
+        assert_eq!(registry.len(), 1, "the call must be in flight before close");
 
         client.close().await;
 
@@ -1292,6 +1370,7 @@ mod tests {
             Arc::clone(&registry),
             CancellationToken::new(),
             None,
+            already_finished_token(),
         );
 
         client.close().await;
@@ -1304,28 +1383,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_called_twice_does_not_panic_and_is_a_no_op_the_second_time() {
+    async fn close_called_twice_does_not_panic_and_the_second_call_returns_promptly() {
         let transport = Arc::new(CapturingTransport::default());
         let registry = Arc::new(RequestRegistry::default());
         let cancel = CancellationToken::new();
+        let finished_signal = CancellationToken::new();
         let stopped = Arc::new(AtomicBool::new(false));
         let supervisor = tokio::spawn({
             let cancel = cancel.clone();
+            let finished_signal = finished_signal.clone();
             let stopped = Arc::clone(&stopped);
             async move {
                 cancel.cancelled().await;
                 stopped.store(true, Ordering::SeqCst);
+                finished_signal.cancel();
             }
         });
-        let client =
-            client_with_lifecycle(transport, Arc::clone(&registry), cancel, Some(supervisor));
+        let client = client_with_lifecycle(
+            transport,
+            Arc::clone(&registry),
+            cancel,
+            Some(supervisor),
+            finished_signal,
+        );
 
         client.close().await;
         assert!(stopped.load(Ordering::SeqCst));
         assert!(registry.is_closed());
 
-        // Second call: no supervisor handle is left to await, must not panic.
-        client.close().await;
+        // Second call: no supervisor handle is left to await, so it falls
+        // through to waiting on the already-cancelled `finished` token
+        // instead of the join handle. It must not panic, must not change
+        // any observable state again, and above all must not block: a
+        // short timeout is the discriminating assertion, since a `close`
+        // that regressed to waiting on the wrong token, one nothing will
+        // ever cancel again, would hang here instead of merely no-oping.
+        tokio::time::timeout(Duration::from_millis(200), client.close())
+            .await
+            .expect("a second close must not block");
         assert!(registry.is_closed(), "a second close must change nothing");
     }
 
@@ -1335,22 +1430,41 @@ mod tests {
     /// yielding once more: if `close` did not await the handle, this
     /// assertion, which runs immediately after `close` returns, would
     /// observe `finished` still `false`.
+    ///
+    /// This proof is exact under the default `current_thread` flavor
+    /// `#[tokio::test]` uses here: with a single scheduler thread, the
+    /// extra `yield_now` below forces a second scheduler turn the
+    /// supervisor cannot skip, so a `close` that only yielded once instead
+    /// of genuinely awaiting the handle could not observe `finished` as
+    /// `true` yet. Under `flavor = "multi_thread"` the same ordering is
+    /// only overwhelmingly likely, not guaranteed: a second OS thread could
+    /// in principle race the supervisor to completion ahead of the
+    /// assertion regardless of what `close` awaited.
     #[tokio::test]
     async fn close_only_returns_after_the_supervisor_task_has_actually_finished() {
         let transport = Arc::new(CapturingTransport::default());
         let registry = Arc::new(RequestRegistry::default());
         let cancel = CancellationToken::new();
+        let finished_signal = CancellationToken::new();
         let finished = Arc::new(AtomicBool::new(false));
         let supervisor = tokio::spawn({
             let cancel = cancel.clone();
+            let finished_signal = finished_signal.clone();
             let finished = Arc::clone(&finished);
             async move {
                 cancel.cancelled().await;
                 tokio::task::yield_now().await;
                 finished.store(true, Ordering::SeqCst);
+                finished_signal.cancel();
             }
         });
-        let client = client_with_lifecycle(transport, registry, cancel, Some(supervisor));
+        let client = client_with_lifecycle(
+            transport,
+            registry,
+            cancel,
+            Some(supervisor),
+            finished_signal,
+        );
 
         client.close().await;
 
@@ -1360,24 +1474,111 @@ mod tests {
         );
     }
 
+    /// A `close()` call from a second clone, made while a first clone's
+    /// `close()` already holds the supervisor's `JoinHandle`, must wait for
+    /// the supervisor to actually finish rather than returning as soon as
+    /// it finds the handle already taken. Before the `finished` token
+    /// existed, the `None` branch of `close` had nothing to wait on and
+    /// returned immediately, so this second, concurrent caller could
+    /// observe `close` returning before the reply consumer had genuinely
+    /// stopped: exactly the defect this test pins down. Compare with
+    /// `close_only_returns_after_the_supervisor_task_has_actually_finished`
+    /// above, which proves the equivalent property for the first,
+    /// handle-holding caller.
+    #[tokio::test]
+    async fn concurrent_close_from_a_second_clone_also_waits_for_the_supervisor_task() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let cancel = CancellationToken::new();
+        let finished_signal = CancellationToken::new();
+        let finished = Arc::new(AtomicBool::new(false));
+        let supervisor = tokio::spawn({
+            let cancel = cancel.clone();
+            let finished_signal = finished_signal.clone();
+            let finished = Arc::clone(&finished);
+            async move {
+                cancel.cancelled().await;
+                tokio::task::yield_now().await;
+                finished.store(true, Ordering::SeqCst);
+                finished_signal.cancel();
+            }
+        });
+        let client = client_with_lifecycle(
+            transport,
+            registry,
+            cancel,
+            Some(supervisor),
+            finished_signal,
+        );
+        let second = client.clone();
+
+        // Drive the first close() far enough to take the supervisor's
+        // `JoinHandle`, a synchronous step performed before any await
+        // inside `close`, and park it on `handle.await`, before the second
+        // clone starts its own close(). One `yield_now` is the same idiom
+        // already used elsewhere in this module, for example in
+        // `close_fails_every_pending_call_with_closed`, to let a spawned
+        // task run up to its first await point.
+        let first_close = tokio::spawn(async move { client.close().await });
+        tokio::task::yield_now().await;
+
+        second.close().await;
+
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the second, concurrent close() must not return before the supervisor task actually finished"
+        );
+
+        first_close.await.expect("first close task must not panic");
+    }
+
+    /// The limit case of the `None` branch: a `close()` called once the
+    /// supervisor has already finished, with nothing left to take from the
+    /// supervisor mutex and an already-cancelled `finished` token, must
+    /// still return promptly rather than block forever.
+    #[tokio::test]
+    async fn close_after_the_supervisor_has_already_finished_does_not_block() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = client_with_lifecycle(
+            transport,
+            registry,
+            CancellationToken::new(),
+            None,
+            already_finished_token(),
+        );
+
+        tokio::time::timeout(Duration::from_millis(200), client.close())
+            .await
+            .expect("close after the supervisor is already finished must not block");
+    }
+
     #[tokio::test]
     async fn dropping_the_last_handle_closes_the_registry_and_signals_the_consumer() {
         let transport = Arc::new(CapturingTransport::default());
         let registry = Arc::new(RequestRegistry::default());
         let cancel = CancellationToken::new();
         let external_cancel = cancel.clone();
+        let finished_signal = CancellationToken::new();
         let stopped = Arc::new(AtomicBool::new(false));
         let supervisor = tokio::spawn({
             let cancel = cancel.clone();
+            let finished_signal = finished_signal.clone();
             let stopped = Arc::clone(&stopped);
             async move {
                 cancel.cancelled().await;
                 stopped.store(true, Ordering::SeqCst);
+                finished_signal.cancel();
             }
         });
 
-        let client =
-            client_with_lifecycle(transport, Arc::clone(&registry), cancel, Some(supervisor));
+        let client = client_with_lifecycle(
+            transport,
+            Arc::clone(&registry),
+            cancel,
+            Some(supervisor),
+            finished_signal,
+        );
         let _pending = registry
             .register(RequestId::new(), ReplyExpectation::new(Pong::MESSAGE_TYPE))
             .expect("registration succeeds");
@@ -1409,7 +1610,13 @@ mod tests {
         let registry = Arc::new(RequestRegistry::default());
         let cancel = CancellationToken::new();
         let external_cancel = cancel.clone();
-        let client = client_with_lifecycle(transport, Arc::clone(&registry), cancel, None);
+        let client = client_with_lifecycle(
+            transport,
+            Arc::clone(&registry),
+            cancel,
+            None,
+            already_finished_token(),
+        );
         let clone = client.clone();
 
         drop(clone);
