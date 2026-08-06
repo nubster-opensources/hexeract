@@ -2,6 +2,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use hexeract_core::{CorrelationId, RequestId};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::remote_error::RemoteErrorPayload;
 use crate::reply_acceptance::ReplyExpectation;
@@ -15,28 +17,108 @@ use crate::rpc_protocol::{
 use crate::{BusEnvelope, Message, Request, RequestError, Transport};
 
 /// Synchronous-over-async RPC client: send a [`Request`], await its reply.
+///
+/// Cheap to clone: every clone shares the same [`RequestClientInner`]
+/// through an [`Arc`], so cloning is how a caller hands out further handles
+/// to the same registry, reply consumer and lifecycle. The last handle to
+/// drop signals shutdown; see [`Self::close`] for the stronger, awaited
+/// alternative.
 pub struct RequestClient<T: Transport> {
+    inner: Arc<RequestClientInner<T>>,
+}
+
+impl<T: Transport> Clone for RequestClient<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+/// Shared state behind every [`RequestClient`] handle.
+///
+/// Never constructed or named directly by a caller: it exists so the
+/// client's lifecycle (the shutdown [`CancellationToken`] and the reply
+/// consumer's [`JoinHandle`]) is tied to the last handle disappearing,
+/// through its [`Drop`] implementation, rather than to any single clone.
+pub struct RequestClientInner<T: Transport> {
     transport: Arc<T>,
     registry: Arc<RequestRegistry>,
     reply_inbox: Arc<Mutex<String>>,
     default_timeout: Duration,
+    cancel: CancellationToken,
+    supervisor: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl<T: Transport> Drop for RequestClientInner<T> {
+    /// Signal shutdown when the last handle disappears: close the registry
+    /// and cancel the token.
+    ///
+    /// This is the weak half of the client's shutdown contract: it can only
+    /// signal, never wait, since a `drop` that blocks a tokio worker is a
+    /// deadlock under load. It does not join the reply consumer task, which
+    /// may still be mid-teardown when this returns. A caller that needs the
+    /// stronger guarantee, that the consumer has actually stopped, must call
+    /// [`RequestClient::close`] explicitly before dropping its last handle.
+    fn drop(&mut self) {
+        self.registry.close();
+        self.cancel.cancel();
+    }
 }
 
 impl<T: Transport> RequestClient<T> {
     /// Assemble a client from its collaborators. The `reply_inbox` is shared
     /// so a transport supervisor can update it across reconnects.
+    ///
+    /// `cancel` is the shutdown signal this client's reply consumer, if any,
+    /// observes to stop; `supervisor` is that consumer's join handle, or
+    /// `None` for a client with no real consumer, such as one built for a
+    /// unit test.
     #[must_use]
     pub fn new(
         transport: Arc<T>,
         registry: Arc<RequestRegistry>,
         reply_inbox: Arc<Mutex<String>>,
         default_timeout: Duration,
+        cancel: CancellationToken,
+        supervisor: Option<JoinHandle<()>>,
     ) -> Self {
         Self {
-            transport,
-            registry,
-            reply_inbox,
-            default_timeout,
+            inner: Arc::new(RequestClientInner {
+                transport,
+                registry,
+                reply_inbox,
+                default_timeout,
+                cancel,
+                supervisor: Mutex::new(supervisor),
+            }),
+        }
+    }
+
+    /// Reject new calls, fail every pending call with [`RequestError::Closed`],
+    /// then wait for the reply consumer to actually stop.
+    ///
+    /// This is the strong half of the client's shutdown contract: when this
+    /// method returns, the registry is closed and empty, and the reply
+    /// consumer task, if this client was built with one, has genuinely
+    /// finished. Compare with the [`Drop`] impl on [`RequestClientInner`],
+    /// which fires when the last handle disappears without an explicit
+    /// `close`: it can only signal (close the registry, cancel the token)
+    /// and never await the consumer.
+    ///
+    /// Idempotent: the first call takes the supervisor handle, so a second
+    /// call finds `None` and returns immediately having changed nothing.
+    pub async fn close(&self) {
+        self.inner.registry.close();
+        self.inner.cancel.cancel();
+        let handle = self
+            .inner
+            .supervisor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(handle) = handle {
+            let _ = handle.await;
         }
     }
 
@@ -153,7 +235,7 @@ impl<T: Transport> RequestClient<T> {
         request: R,
         options: RequestOptions,
     ) -> Result<R::Reply, RequestError> {
-        let timeout = options.timeout.unwrap_or(self.default_timeout);
+        let timeout = options.timeout.unwrap_or(self.inner.default_timeout);
         let destination = options.destination.as_deref().unwrap_or(R::DESTINATION);
         let correlation_id = options.correlation_id.unwrap_or_default();
         self.request_inner(&request, destination, timeout, correlation_id)
@@ -169,10 +251,12 @@ impl<T: Transport> RequestClient<T> {
     ) -> Result<R::Reply, RequestError> {
         let request_id = RequestId::new();
         let mut pending = self
+            .inner
             .registry
             .register(request_id, ReplyExpectation::new(R::Reply::MESSAGE_TYPE))?;
         let correlation_id = *correlation_id.as_uuid();
         let inbox = self
+            .inner
             .reply_inbox
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -186,7 +270,8 @@ impl<T: Transport> RequestClient<T> {
             PROTOCOL_VERSION_HEADER.to_owned(),
             PROTOCOL_VERSION.to_string(),
         );
-        self.transport
+        self.inner
+            .transport
             .publish_envelope(destination, &envelope)
             .await
             .map_err(RequestError::Transport)?;
@@ -194,7 +279,16 @@ impl<T: Transport> RequestClient<T> {
         let reply = match tokio::time::timeout(timeout, pending.wait()).await {
             Err(_elapsed) => return Err(RequestError::Timeout(timeout)),
             Ok(Err(_closed)) => {
-                return Err(RequestError::Transport(reply_channel_lost()));
+                // The registry drops every sender on both `close` (permanent)
+                // and `drain` (transient, on broker loss). `is_closed` is
+                // what tells the two apart for the caller: closed by an
+                // explicit shutdown surfaces as `Closed`, closed by a lost
+                // connection surfaces as `Transport`.
+                return Err(if self.inner.registry.is_closed() {
+                    RequestError::Closed
+                } else {
+                    RequestError::Transport(reply_channel_lost())
+                });
             }
             Ok(Ok(envelope)) => envelope,
         };
@@ -265,9 +359,11 @@ fn decode_reply<R: Request>(reply: BusEnvelope) -> Result<R::Reply, RequestError
 mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
+    use tokio_util::sync::CancellationToken;
 
     use uuid::Uuid;
 
@@ -381,6 +477,26 @@ mod tests {
             registry,
             Arc::new(Mutex::new("reply.inbox".to_owned())),
             Duration::from_millis(200),
+            CancellationToken::new(),
+            None,
+        )
+    }
+
+    /// Build a client whose `cancel` token and supervisor handle are under
+    /// the caller's control, for the lifecycle tests below.
+    fn client_with_lifecycle(
+        transport: Arc<CapturingTransport>,
+        registry: Arc<RequestRegistry>,
+        cancel: CancellationToken,
+        supervisor: Option<tokio::task::JoinHandle<()>>,
+    ) -> RequestClient<CapturingTransport> {
+        RequestClient::new(
+            transport,
+            registry,
+            Arc::new(Mutex::new("reply.inbox".to_owned())),
+            Duration::from_millis(200),
+            cancel,
+            supervisor,
         )
     }
 
@@ -413,6 +529,8 @@ mod tests {
             Arc::clone(&registry),
             Arc::new(Mutex::new("reply.inbox".to_owned())),
             Duration::from_millis(30),
+            CancellationToken::new(),
+            None,
         );
         let err = client.request(Ping { seq: 1 }).await.expect_err("no reply");
         assert!(matches!(err, RequestError::Timeout(_)));
@@ -749,6 +867,8 @@ mod tests {
             registry,
             Arc::new(Mutex::new("caller.inbox".to_owned())),
             Duration::from_secs(5),
+            CancellationToken::new(),
+            None,
         );
 
         let first_fut = client.request(Ping { seq: 1 });
@@ -779,6 +899,8 @@ mod tests {
             registry,
             Arc::new(Mutex::new("caller.inbox".to_owned())),
             Duration::from_secs(5),
+            CancellationToken::new(),
+            None,
         );
 
         let request_fut = client.request(PingToDedicatedQueue { seq: 1 });
@@ -809,6 +931,8 @@ mod tests {
             registry,
             Arc::new(Mutex::new("caller.inbox".to_owned())),
             Duration::from_millis(30),
+            CancellationToken::new(),
+            None,
         );
 
         let error = client
@@ -836,6 +960,8 @@ mod tests {
             registry,
             Arc::new(Mutex::new("caller.inbox".to_owned())),
             Duration::from_millis(30),
+            CancellationToken::new(),
+            None,
         );
 
         let options = RequestOptions::new().with_destination("tests.overridden.queue");
@@ -860,6 +986,8 @@ mod tests {
             registry,
             Arc::new(Mutex::new("caller.inbox".to_owned())),
             Duration::from_secs(30),
+            CancellationToken::new(),
+            None,
         );
 
         let options = RequestOptions::new().with_timeout(Duration::from_millis(30));
@@ -885,6 +1013,8 @@ mod tests {
             registry,
             Arc::new(Mutex::new("caller.inbox".to_owned())),
             Duration::from_millis(30),
+            CancellationToken::new(),
+            None,
         );
 
         let correlation_id = CorrelationId::new();
@@ -907,6 +1037,8 @@ mod tests {
             registry,
             Arc::new(Mutex::new("caller.inbox".to_owned())),
             Duration::from_millis(30),
+            CancellationToken::new(),
+            None,
         );
 
         let _ = client
@@ -941,6 +1073,8 @@ mod tests {
             Arc::clone(&registry),
             Arc::new(Mutex::new("caller.inbox".to_owned())),
             Duration::from_secs(5),
+            CancellationToken::new(),
+            None,
         );
         let correlation_id = CorrelationId::new();
 
@@ -1081,6 +1215,8 @@ mod tests {
             Arc::clone(&registry),
             Arc::new(Mutex::new("caller.inbox".to_owned())),
             Duration::from_millis(100),
+            CancellationToken::new(),
+            None,
         );
 
         let request_fut = client.request(Ping { seq: 1 });
@@ -1119,5 +1255,178 @@ mod tests {
             .await
             .expect_err("the tampered reply must be rejected");
         (error, registry.counters())
+    }
+
+    #[tokio::test]
+    async fn close_fails_every_pending_call_with_closed() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = client_with_lifecycle(
+            Arc::clone(&transport),
+            Arc::clone(&registry),
+            CancellationToken::new(),
+            None,
+        );
+
+        let call = {
+            let client = client.clone();
+            tokio::spawn(async move { client.request(Ping { seq: 1 }).await })
+        };
+        tokio::task::yield_now().await;
+
+        client.close().await;
+
+        let result = call.await.expect("the spawned call must not panic");
+        assert!(
+            matches!(result, Err(RequestError::Closed)),
+            "expected RequestError::Closed, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_after_close_is_rejected_with_closed() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = client_with_lifecycle(
+            Arc::clone(&transport),
+            Arc::clone(&registry),
+            CancellationToken::new(),
+            None,
+        );
+
+        client.close().await;
+
+        let error = client
+            .request(Ping { seq: 1 })
+            .await
+            .expect_err("a closed client refuses new calls");
+        assert!(matches!(error, RequestError::Closed));
+    }
+
+    #[tokio::test]
+    async fn close_called_twice_does_not_panic_and_is_a_no_op_the_second_time() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let cancel = CancellationToken::new();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let supervisor = tokio::spawn({
+            let cancel = cancel.clone();
+            let stopped = Arc::clone(&stopped);
+            async move {
+                cancel.cancelled().await;
+                stopped.store(true, Ordering::SeqCst);
+            }
+        });
+        let client =
+            client_with_lifecycle(transport, Arc::clone(&registry), cancel, Some(supervisor));
+
+        client.close().await;
+        assert!(stopped.load(Ordering::SeqCst));
+        assert!(registry.is_closed());
+
+        // Second call: no supervisor handle is left to await, must not panic.
+        client.close().await;
+        assert!(registry.is_closed(), "a second close must change nothing");
+    }
+
+    /// Proves `close` actually awaits the supervisor task rather than only
+    /// cancelling its token and returning. The supervisor sets `finished`
+    /// only right before it returns, after observing cancellation and
+    /// yielding once more: if `close` did not await the handle, this
+    /// assertion, which runs immediately after `close` returns, would
+    /// observe `finished` still `false`.
+    #[tokio::test]
+    async fn close_only_returns_after_the_supervisor_task_has_actually_finished() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let cancel = CancellationToken::new();
+        let finished = Arc::new(AtomicBool::new(false));
+        let supervisor = tokio::spawn({
+            let cancel = cancel.clone();
+            let finished = Arc::clone(&finished);
+            async move {
+                cancel.cancelled().await;
+                tokio::task::yield_now().await;
+                finished.store(true, Ordering::SeqCst);
+            }
+        });
+        let client = client_with_lifecycle(transport, registry, cancel, Some(supervisor));
+
+        client.close().await;
+
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "close returned before the supervisor task actually finished"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_handle_closes_the_registry_and_signals_the_consumer() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let cancel = CancellationToken::new();
+        let external_cancel = cancel.clone();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let supervisor = tokio::spawn({
+            let cancel = cancel.clone();
+            let stopped = Arc::clone(&stopped);
+            async move {
+                cancel.cancelled().await;
+                stopped.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let client =
+            client_with_lifecycle(transport, Arc::clone(&registry), cancel, Some(supervisor));
+        let _pending = registry
+            .register(RequestId::new(), ReplyExpectation::new(Pong::MESSAGE_TYPE))
+            .expect("registration succeeds");
+
+        drop(client);
+
+        assert!(
+            registry.is_closed(),
+            "dropping the last handle must close the registry"
+        );
+        assert!(
+            registry.is_empty(),
+            "dropping the last handle must empty the registry"
+        );
+        assert!(
+            external_cancel.is_cancelled(),
+            "dropping the last handle must cancel the token"
+        );
+
+        // Drop can only signal, never await: give the already-cancelled
+        // supervisor task a chance to actually run to completion.
+        tokio::task::yield_now().await;
+        assert!(stopped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn dropping_a_clone_while_another_handle_lives_closes_nothing() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let cancel = CancellationToken::new();
+        let external_cancel = cancel.clone();
+        let client = client_with_lifecycle(transport, Arc::clone(&registry), cancel, None);
+        let clone = client.clone();
+
+        drop(clone);
+
+        assert!(
+            !registry.is_closed(),
+            "a still-live handle must keep the registry open"
+        );
+        assert!(
+            !external_cancel.is_cancelled(),
+            "a still-live handle must keep the token uncancelled"
+        );
+
+        drop(client);
+        assert!(
+            registry.is_closed(),
+            "dropping the last remaining handle must close the registry"
+        );
     }
 }
