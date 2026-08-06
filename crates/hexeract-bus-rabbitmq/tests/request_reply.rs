@@ -617,6 +617,8 @@ async fn a_forged_reply_published_into_the_inbox_does_not_end_the_call() {
         Arc::clone(&registry),
         reply_inbox,
         Duration::from_secs(10),
+        cancel.clone(),
+        None,
     );
 
     let call = tokio::spawn(async move { client.request(Ping { seq: 1 }).await });

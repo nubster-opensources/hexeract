@@ -68,13 +68,13 @@ pub async fn connect_request_client(
     let inbox_name = declare_reply_inbox(&channel).await?;
     let reply_inbox = Arc::new(Mutex::new(inbox_name.clone()));
 
-    spawn_reply_inbox_supervisor(
+    let supervisor = spawn_reply_inbox_supervisor(
         uri.to_owned(),
         channel,
         inbox_name,
         Arc::clone(&registry),
         Arc::clone(&reply_inbox),
-        cancel,
+        cancel.clone(),
     );
 
     Ok(RequestClient::new(
@@ -82,6 +82,8 @@ pub async fn connect_request_client(
         registry,
         reply_inbox,
         default_timeout,
+        cancel,
+        Some(supervisor),
     ))
 }
 
@@ -91,6 +93,11 @@ pub async fn connect_request_client(
 /// On `Err` (connection lost), drains `registry` so in-flight callers
 /// fail fast, then hands off to [`reconnect_reply_inbox`] for a fresh
 /// connection and inbox before resuming.
+///
+/// Returns the spawned task's [`tokio::task::JoinHandle`] rather than
+/// detaching it: [`connect_request_client`] hands that handle to the
+/// [`RequestClient`] it assembles, so `RequestClient::close` can await
+/// this task's actual termination instead of merely cancelling it.
 fn spawn_reply_inbox_supervisor(
     uri: String,
     channel: Channel,
@@ -98,7 +105,7 @@ fn spawn_reply_inbox_supervisor(
     registry: Arc<RequestRegistry>,
     reply_inbox: Arc<Mutex<String>>,
     cancel: CancellationToken,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn(async move {
         let mut channel = channel;
         let mut inbox = inbox;
@@ -124,7 +131,7 @@ fn spawn_reply_inbox_supervisor(
                 None => return,
             }
         }
-    });
+    })
 }
 
 /// Reconnect over a fresh supervised connection and declare a fresh

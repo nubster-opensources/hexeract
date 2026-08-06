@@ -550,7 +550,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     run_business_rejection(&client).await?;
     run_causal_propagation(&client, &correlations).await?;
 
-    cancel.cancel();
+    // Closing the client rejects further calls, fails any still-pending
+    // one with `RequestError::Closed`, and cancels the shared token: since
+    // every responder worker above was spawned on a clone of that same
+    // token, this single call is also what winds them all down. Unlike
+    // simply dropping the client, `close` waits for its own reply consumer
+    // task to have actually stopped before returning.
+    client.close().await;
     responders.join_all().await?;
     tracing::info!("request-reply example completed");
     Ok(())
