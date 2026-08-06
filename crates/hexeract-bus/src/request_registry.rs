@@ -35,6 +35,20 @@ struct Slot {
 
 type Slots = HashMap<RequestId, Slot>;
 
+/// Slot map and closed flag, guarded by the same lock.
+///
+/// The two live under one [`Mutex`] on purpose: `close` must flip
+/// `closed` and clear `slots` atomically with respect to `register`, or a
+/// `register` racing a `close` could read `closed` as still `false`,
+/// insert its slot, and never be undone by `close`'s own clear. Keeping
+/// them apart as an atomic bool checked before a separately locked map
+/// would reopen exactly that window.
+#[derive(Debug, Default)]
+struct RegistryState {
+    slots: Slots,
+    closed: bool,
+}
+
 /// Counts of deliveries the registry refused to route.
 ///
 /// `duplicate` is deliberately absent: once a slot is consumed by a valid
@@ -83,7 +97,7 @@ pub const DEFAULT_MAX_IN_FLIGHT: usize = 1024;
 /// Registry of in-flight request slots.
 #[derive(Debug)]
 pub struct RequestRegistry {
-    slots: Mutex<Slots>,
+    state: Mutex<RegistryState>,
     counters: ReplyCounters,
     max_in_flight: usize,
 }
@@ -104,14 +118,14 @@ impl RequestRegistry {
             "max_in_flight must be non-zero: a registry that admits no slot is never useful"
         );
         Self {
-            slots: Mutex::new(HashMap::new()),
+            state: Mutex::new(RegistryState::default()),
             counters: ReplyCounters::default(),
             max_in_flight,
         }
     }
 
-    fn slots(&self) -> MutexGuard<'_, Slots> {
-        self.slots.lock().unwrap_or_else(PoisonError::into_inner)
+    fn state(&self) -> MutexGuard<'_, RegistryState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Register a fresh slot for `request_id`, accepting `expectation`, and
@@ -144,9 +158,12 @@ impl RequestRegistry {
         request_id: RequestId,
         expectation: ReplyExpectation,
     ) -> Result<PendingReply<'_>, RegisterRejection> {
-        let mut slots = self.slots();
-        let in_flight = slots.len();
-        match slots.entry(request_id) {
+        let mut state = self.state();
+        if state.closed {
+            return Err(RegisterRejection::Closed);
+        }
+        let in_flight = state.slots.len();
+        match state.slots.entry(request_id) {
             Entry::Occupied(_) => Err(RegisterRejection::SlotOccupied),
             Entry::Vacant(vacant) => {
                 if in_flight >= self.max_in_flight {
@@ -185,23 +202,23 @@ impl RequestRegistry {
         };
         let request_id = RequestId::from(uuid);
 
-        let mut slots = self.slots();
-        let Some(slot) = slots.get(&request_id) else {
-            drop(slots);
+        let mut state = self.state();
+        let Some(slot) = state.slots.get(&request_id) else {
+            drop(state);
             self.counters.orphaned.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(%request_id, "reply for an unknown or already-resolved request");
             return;
         };
 
         if let Err(rejection) = reply_acceptance::accepts(&slot.expectation, &envelope) {
-            drop(slots);
+            drop(state);
             self.counters.invalid.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(%request_id, ?rejection, "invalid reply, slot left pending");
             return;
         }
 
-        let slot = slots.remove(&request_id);
-        drop(slots);
+        let slot = state.slots.remove(&request_id);
+        drop(state);
         if let Some(slot) = slot {
             let _ = slot.sender.send(envelope);
         }
@@ -218,14 +235,40 @@ impl RequestRegistry {
 
     /// Drop every in-flight slot: each waiting caller observes a closed
     /// channel. Used on connection loss to fail in-flight requests fast.
+    ///
+    /// Unlike [`Self::close`], this leaves the registry open: a caller may
+    /// still register after a `drain`, which is exactly what a reconnected
+    /// transport needs.
     pub fn drain(&self) {
-        self.slots().clear();
+        self.state().slots.clear();
+    }
+
+    /// Fail every pending call and refuse further registrations.
+    ///
+    /// Sets the closed flag and clears the slot map under the same lock,
+    /// so this is atomic with respect to [`Self::register`]: whichever of
+    /// the two runs first, the outcome is either a slot that survives
+    /// (registered strictly before `close`) or none at all, never an
+    /// orphan inserted after the map was cleared. Every waiting caller
+    /// observes a closed channel, the same signal [`Self::drain`] produces,
+    /// but here no further registration ever succeeds again.
+    pub fn close(&self) {
+        let mut state = self.state();
+        state.closed = true;
+        state.slots.clear();
+    }
+
+    /// Whether the registry has been closed and refuses further
+    /// registrations.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.state().closed
     }
 
     /// Number of in-flight slots.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.slots().len()
+        self.state().slots.len()
     }
 
     /// Whether no slot is in flight.
@@ -235,7 +278,7 @@ impl RequestRegistry {
     }
 
     fn remove(&self, request_id: RequestId) {
-        self.slots().remove(&request_id);
+        self.state().slots.remove(&request_id);
     }
 
     /// Identities of every slot currently in flight.
@@ -245,7 +288,7 @@ impl RequestRegistry {
     /// surface.
     #[cfg(test)]
     pub(crate) fn in_flight_ids(&self) -> Vec<RequestId> {
-        self.slots().keys().copied().collect()
+        self.state().slots.keys().copied().collect()
     }
 }
 
@@ -661,6 +704,103 @@ mod tests {
             .expect("capacity was freed by the previous phase");
         drop(pending);
         assert!(registry.is_empty(), "an unresolved slot must free on drop");
+    }
+
+    #[test]
+    fn a_fresh_registry_is_not_closed() {
+        let registry = RequestRegistry::default();
+        assert!(!registry.is_closed());
+    }
+
+    #[tokio::test]
+    async fn close_drops_every_pending_slot_and_the_waiting_caller_observes_a_closed_channel() {
+        let registry = Arc::new(RequestRegistry::default());
+        let mut pending = registry
+            .register(RequestId::new(), expectation())
+            .expect("registration succeeds");
+
+        registry.close();
+
+        assert!(registry.is_closed());
+        assert!(registry.is_empty(), "close must drop every pending slot");
+        assert!(
+            pending.wait().await.is_err(),
+            "a caller waiting on a closed slot observes a closed channel"
+        );
+    }
+
+    #[test]
+    fn register_after_close_is_rejected() {
+        let registry = RequestRegistry::default();
+        registry.close();
+
+        let rejection = registry
+            .register(RequestId::new(), expectation())
+            .expect_err("a closed registry refuses new registrations");
+        assert_eq!(rejection, RegisterRejection::Closed);
+        assert!(registry.is_empty(), "the refused call must not be inserted");
+    }
+
+    #[test]
+    fn close_called_twice_does_not_panic_and_stays_closed() {
+        let registry = RequestRegistry::default();
+        registry.close();
+        registry.close();
+        assert!(registry.is_closed());
+        assert!(registry.is_empty());
+    }
+
+    /// Races `close` against many concurrent `register` calls on real OS
+    /// threads, not tokio tasks: the `std::sync::Mutex` guarding both the
+    /// closed flag and the slot map is synchronous, so a genuine thread
+    /// race is the faithful way to exercise it.
+    ///
+    /// Successful registrations are kept alive in `successes` rather than
+    /// dropped immediately: dropping a [`PendingReply`] removes its own
+    /// slot, which would silently clean up an orphan left by a buggy
+    /// implementation before this test ever gets to observe it. Holding
+    /// them until after the assertion is what makes an orphan visible.
+    ///
+    /// The whole race is repeated many times with a fresh registry each
+    /// time, to raise the odds of hitting the narrow window a wrong
+    /// implementation would open: one that reads a `closed` flag before
+    /// taking the slots lock lets a `register` observe `closed == false`,
+    /// get preempted, let `close` flip the flag and clear the (still
+    /// empty) map, then resume and insert its slot regardless, orphaning
+    /// it in a map declared closed. With the flag and the map under the
+    /// very same lock, `close` and every `register` are strictly ordered
+    /// by the mutex and that window cannot exist: the map must be empty
+    /// here whichever one wins the race, every time.
+    #[test]
+    fn close_concurrent_with_register_never_leaves_an_orphan_slot() {
+        for _ in 0..50 {
+            let registry = RequestRegistry::new(10_000);
+            let successes: Mutex<Vec<PendingReply<'_>>> = Mutex::new(Vec::new());
+
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    scope.spawn(|| {
+                        for _ in 0..300 {
+                            if let Ok(pending) = registry.register(RequestId::new(), expectation())
+                            {
+                                successes
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .push(pending);
+                            }
+                        }
+                    });
+                }
+                scope.spawn(|| registry.close());
+            });
+
+            assert!(registry.is_closed());
+            assert!(
+                registry.is_empty(),
+                "no slot may survive a close racing concurrent registrations"
+            );
+            drop(successes);
+        }
     }
 
     /// Mirrors `many_concurrent_calls_each_receive_their_own_reply` at a
