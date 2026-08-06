@@ -86,8 +86,7 @@ pub async fn connect_request_client(
         reply_inbox,
         default_timeout,
         cancel,
-        Some(supervisor),
-        finished,
+        Some((supervisor, finished)),
     ))
 }
 
