@@ -619,6 +619,7 @@ async fn a_forged_reply_published_into_the_inbox_does_not_end_the_call() {
         Duration::from_secs(10),
         cancel.clone(),
         None,
+        CancellationToken::new(),
     );
 
     let call = tokio::spawn(async move { client.request(Ping { seq: 1 }).await });
