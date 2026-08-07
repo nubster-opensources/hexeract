@@ -14,8 +14,10 @@
 /// dead inbox: a call that read [`Self::Ready`] and already published
 /// just before the connection dropped still loses that message, which is
 /// inherent to any drop, not a defect this state closes. What it
-/// guarantees is narrower and exact: no caller waits out its full
-/// timeout because of a dead inbox.
+/// guarantees, provided the transport supervisor that owns this state
+/// marks it [`Self::Reconnecting`] before it drains the
+/// [`crate::RequestRegistry`], is narrower and exact: no caller waits out
+/// its full timeout because of a dead inbox.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplyInboxState {

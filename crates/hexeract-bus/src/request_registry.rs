@@ -239,6 +239,11 @@ impl RequestRegistry {
     /// Unlike [`Self::close`], this leaves the registry open: a caller may
     /// still register after a `drain`, which is exactly what a reconnected
     /// transport needs.
+    ///
+    /// A transport supervisor that owns a [`crate::ReplyInboxState`] must
+    /// mark it [`crate::ReplyInboxState::Reconnecting`] before calling
+    /// this: see [`crate::ReplyInboxState`] for the guarantee that order
+    /// gives a waiting caller.
     pub fn drain(&self) {
         self.state().slots.clear();
     }
