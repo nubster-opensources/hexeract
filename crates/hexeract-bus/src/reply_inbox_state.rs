@@ -1,5 +1,6 @@
-//! Shared state of the reply inbox a [`crate::RequestClient`] publishes
-//! its return address into.
+//! Shared state holding the name of the reply inbox a
+//! [`crate::RequestClient`] stamps as the return address of every
+//! request.
 
 /// Whether the client currently has a usable reply inbox.
 ///
