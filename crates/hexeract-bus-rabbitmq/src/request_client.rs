@@ -13,20 +13,27 @@
 //! A background task drives `run_reply_inbox` in a loop:
 //!
 //! - On cancellation, or a plain `Ok(())` return, the task stops.
-//! - On `Err` (the broker connection was lost), the task
-//!   [`hexeract_bus::RequestRegistry::drain`]s every in-flight slot
-//!   so a caller waiting on a reply observes
+//! - On `Err` (the broker connection was lost), the task first marks the
+//!   shared [`hexeract_bus::ReplyInboxState`] as
+//!   [`hexeract_bus::ReplyInboxState::Reconnecting`], then
+//!   [`hexeract_bus::RequestRegistry::drain`]s every in-flight slot so a
+//!   caller waiting on a reply observes
 //!   [`hexeract_bus::RequestError::Transport`] immediately instead of
-//!   waiting out its timeout, reconnects over a fresh supervised
-//!   connection, declares a fresh exclusive inbox (the previous one
-//!   died with its connection), publishes the new name into the
-//!   `Arc<Mutex<String>>` the [`hexeract_bus::RequestClient`] reads on
-//!   every request, and resumes consuming.
+//!   waiting out its timeout. That order, mark before drain, is what
+//!   closes the reconnect race for a call that has not registered yet;
+//!   see [`hexeract_bus::ReplyInboxState`] for the exact guarantee it
+//!   gives such a call. The task then reconnects over a fresh supervised
+//!   connection, declares a fresh exclusive inbox (the previous one died
+//!   with its connection), publishes the new name into the
+//!   `Arc<Mutex<ReplyInboxState>>` the [`hexeract_bus::RequestClient`]
+//!   reads on every request, and resumes consuming.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use hexeract_bus::{BusError, DEFAULT_MAX_IN_FLIGHT, RequestClient, RequestRegistry};
+use hexeract_bus::{
+    BusError, DEFAULT_MAX_IN_FLIGHT, ReplyInboxState, RequestClient, RequestRegistry,
+};
 use lapin::Channel;
 use tokio_util::sync::CancellationToken;
 
@@ -66,7 +73,7 @@ pub async fn connect_request_client(
     .await?;
     let channel = connection.create_channel().await?;
     let inbox_name = declare_reply_inbox(&channel).await?;
-    let reply_inbox = Arc::new(Mutex::new(inbox_name.clone()));
+    let reply_inbox = Arc::new(Mutex::new(ReplyInboxState::Ready(inbox_name.clone())));
 
     let finished = CancellationToken::new();
 
@@ -132,7 +139,7 @@ fn spawn_reply_inbox_supervisor(
     channel: Channel,
     inbox: String,
     registry: Arc<RequestRegistry>,
-    reply_inbox: Arc<Mutex<String>>,
+    reply_inbox: Arc<Mutex<ReplyInboxState>>,
     cancel: CancellationToken,
     finished: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
@@ -151,8 +158,10 @@ fn spawn_reply_inbox_supervisor(
             }
 
             // Connection lost: fail every in-flight request fast rather
-            // than let it run out its timeout against a dead inbox.
-            registry.drain();
+            // than let it run out its timeout against a dead inbox, and
+            // refuse any new call that has not registered yet. The order
+            // is non-negotiable: see `mark_reconnecting_then_drain`.
+            mark_reconnecting_then_drain(&reply_inbox, || registry.drain());
 
             match reconnect_reply_inbox(&uri, &reply_inbox, &cancel).await {
                 Some((new_channel, new_inbox)) => {
@@ -165,6 +174,27 @@ fn spawn_reply_inbox_supervisor(
     })
 }
 
+/// Marks `reply_inbox` as [`ReplyInboxState::Reconnecting`], then runs
+/// `drain`.
+///
+/// This order, mark before drain, is the non-negotiable invariant the
+/// reconnect door depends on: it is what lets a call that registers
+/// after the drain still observe `Reconnecting` rather than a stale
+/// `Ready`, closing the window a caller could otherwise wait its full
+/// timeout in. See [`ReplyInboxState`] for the exact guarantee this
+/// gives such a call, and the module docs for the full supervisor
+/// contract.
+///
+/// `drain` is a closure rather than a direct `registry.drain()` call
+/// specifically so a test can observe, at the instant it runs, that the
+/// mark has already landed: a production edit that swapped the two
+/// operations would make that observation fail, not merely a comment
+/// stop matching the code.
+fn mark_reconnecting_then_drain(reply_inbox: &Mutex<ReplyInboxState>, drain: impl FnOnce()) {
+    *reply_inbox.lock().unwrap_or_else(PoisonError::into_inner) = ReplyInboxState::Reconnecting;
+    drain();
+}
+
 /// Reconnect over a fresh supervised connection and declare a fresh
 /// exclusive reply inbox, retrying until it succeeds or `cancel` fires.
 ///
@@ -175,7 +205,7 @@ fn spawn_reply_inbox_supervisor(
 /// failed attempt loops back for another rather than giving up.
 async fn reconnect_reply_inbox(
     uri: &str,
-    reply_inbox: &Mutex<String>,
+    reply_inbox: &Mutex<ReplyInboxState>,
     cancel: &CancellationToken,
 ) -> Option<(Channel, String)> {
     loop {
@@ -197,10 +227,46 @@ async fn reconnect_reply_inbox(
         let Ok(inbox) = declare_reply_inbox(&channel).await else {
             continue;
         };
-        reply_inbox
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone_from(&inbox);
+        *reply_inbox.lock().unwrap_or_else(PoisonError::into_inner) =
+            ReplyInboxState::Ready(inbox.clone());
         return Some((channel, inbox));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The invariant of resolution 2, attested rather than merely
+    /// documented: `mark_reconnecting_then_drain` must have already
+    /// written `Reconnecting` by the time `drain` runs, not after.
+    ///
+    /// The `drain` closure reads `reply_inbox` itself, synchronously, at
+    /// the exact instant it is invoked: this is what makes the test
+    /// discriminate the two orders. A test that only inspected the final
+    /// state after the call returned would pass whichever order the
+    /// production code used, since both writes happen before either the
+    /// closure captures anything at all: catching that pitfall is the
+    /// whole point of routing `drain` through a closure instead of
+    /// letting this function call `registry.drain()` directly.
+    ///
+    /// Runs with no broker, no tokio runtime at all: `mark_reconnecting_then_drain`
+    /// is plain synchronous code.
+    #[test]
+    fn marks_reconnecting_before_draining() {
+        let reply_inbox = Mutex::new(ReplyInboxState::Ready("inbox-1".to_owned()));
+        let mut drain_observed_reconnecting = false;
+
+        mark_reconnecting_then_drain(&reply_inbox, || {
+            drain_observed_reconnecting = matches!(
+                *reply_inbox.lock().unwrap_or_else(PoisonError::into_inner),
+                ReplyInboxState::Reconnecting
+            );
+        });
+
+        assert!(
+            drain_observed_reconnecting,
+            "drain must observe the inbox already marked Reconnecting"
+        );
     }
 }

@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::remote_error::RemoteErrorPayload;
 use crate::reply_acceptance::ReplyExpectation;
+use crate::reply_inbox_state::ReplyInboxState;
 use crate::request_error::ProtocolViolation;
 use crate::request_options::RequestOptions;
 use crate::request_registry::RequestRegistry;
@@ -46,7 +47,7 @@ impl<T: Transport> Clone for RequestClient<T> {
 pub(crate) struct RequestClientInner<T: Transport> {
     transport: Arc<T>,
     registry: Arc<RequestRegistry>,
-    reply_inbox: Arc<Mutex<String>>,
+    reply_inbox: Arc<Mutex<ReplyInboxState>>,
     default_timeout: Duration,
     cancel: CancellationToken,
     supervisor: Mutex<Option<JoinHandle<()>>>,
@@ -87,6 +88,12 @@ impl<T: Transport> RequestClient<T> {
     /// Assemble a client from its collaborators. The `reply_inbox` is shared
     /// so a transport supervisor can update it across reconnects.
     ///
+    /// [`Self::request_with`] reads `reply_inbox` only after it has
+    /// registered with `registry`, never before: that order is what lets
+    /// [`ReplyInboxState`] close the reconnect race instead of leaving a
+    /// window inside it. See [`ReplyInboxState`] for the exact guarantee
+    /// this gives a caller.
+    ///
     /// `cancel` is the shutdown signal this client's reply consumer, if any,
     /// observes to stop. `supervisor` pairs that consumer's join handle
     /// with the token it cancels right before it returns, on every exit
@@ -100,7 +107,7 @@ impl<T: Transport> RequestClient<T> {
     pub fn new(
         transport: Arc<T>,
         registry: Arc<RequestRegistry>,
-        reply_inbox: Arc<Mutex<String>>,
+        reply_inbox: Arc<Mutex<ReplyInboxState>>,
         default_timeout: Duration,
         cancel: CancellationToken,
         supervisor: Option<(JoinHandle<()>, CancellationToken)>,
@@ -315,17 +322,26 @@ impl<T: Transport> RequestClient<T> {
         correlation_id: CorrelationId,
     ) -> Result<R::Reply, RequestError> {
         let request_id = RequestId::new();
+        // Registering first, and only then reading the inbox state, is
+        // what closes the reconnect race: see the `reply_inbox` doc on
+        // `Self::new` and `ReplyInboxState` for why this order, not the
+        // reverse, is load-bearing rather than incidental.
         let mut pending = self
             .inner
             .registry
             .register(request_id, ReplyExpectation::new(R::Reply::MESSAGE_TYPE))?;
         let correlation_id = *correlation_id.as_uuid();
-        let inbox = self
+        let inbox = match &*self
             .inner
             .reply_inbox
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone();
+        {
+            ReplyInboxState::Ready(inbox) => inbox.clone(),
+            ReplyInboxState::Reconnecting => {
+                return Err(RequestError::Transport(reply_inbox_reconnecting()));
+            }
+        };
         let mut envelope = BusEnvelope::with_reply_to(correlation_id, inbox, request)
             .map_err(RequestError::Decode)?;
         envelope
@@ -367,6 +383,15 @@ impl<T: Transport> RequestClient<T> {
 
 fn reply_channel_lost() -> crate::BusError {
     crate::BusError::connection("reply inbox channel closed before a reply arrived", true)
+}
+
+/// Built when [`ReplyInboxState::Reconnecting`] is observed, refusing to
+/// publish toward an inbox that no longer exists.
+fn reply_inbox_reconnecting() -> crate::BusError {
+    crate::BusError::connection(
+        "reply inbox is reconnecting: no fresh inbox exists yet after a broker drop",
+        true,
+    )
 }
 
 /// Validate a reply against the protocol, then decode it.
@@ -548,7 +573,7 @@ mod tests {
         RequestClient::new(
             transport,
             registry,
-            Arc::new(Mutex::new("reply.inbox".to_owned())),
+            Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
             Duration::from_millis(200),
             CancellationToken::new(),
             None,
@@ -567,11 +592,165 @@ mod tests {
         RequestClient::new(
             transport,
             registry,
-            Arc::new(Mutex::new("reply.inbox".to_owned())),
+            Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
             Duration::from_millis(200),
             cancel,
             supervisor,
         )
+    }
+
+    /// A call that reads `Reconnecting` must fail before it ever reaches
+    /// the transport, and before any timeout elapses: it is refused at
+    /// the door, not by the timer.
+    ///
+    /// "Sans publier" is proven by the transport itself, via
+    /// `CapturingTransport::last_published`, not deduced from the error
+    /// variant alone. The paused clock proves "sans attendre le timeout":
+    /// under `start_paused = true`, any real wait on the 30 second
+    /// timeout would need tokio's virtual clock to advance, which only
+    /// happens if every task is parked on a timer; a call that returns
+    /// without ever registering a timer leaves the clock exactly where it
+    /// started.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_during_reconnecting_fails_fast_without_publishing() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let reply_inbox = Arc::new(Mutex::new(ReplyInboxState::Reconnecting));
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            registry,
+            reply_inbox,
+            Duration::from_secs(30),
+            CancellationToken::new(),
+            None,
+        );
+
+        let started = tokio::time::Instant::now();
+        let error = client
+            .request(Ping { seq: 1 })
+            .await
+            .expect_err("a reconnecting inbox must be refused");
+
+        assert!(matches!(error, RequestError::Transport(_)));
+        assert!(
+            tokio::time::Instant::now() - started < Duration::from_millis(1),
+            "a reconnecting inbox must fail before any timeout elapses"
+        );
+        assert!(
+            transport.last_published().is_none(),
+            "a reconnecting inbox must never be published to"
+        );
+    }
+
+    /// The narrow half of resolution 4: a closed client must be rejected
+    /// as `Closed`, not `Transport`, even while the inbox is
+    /// `Reconnecting`. `register()` runs before the inbox state is ever
+    /// read, so a closed registry short-circuits the call before it gets
+    /// the chance to observe `Reconnecting` at all; this test checks that
+    /// property directly rather than assuming it holds because the code
+    /// happens to be written in that order today.
+    #[tokio::test]
+    async fn a_closed_client_is_rejected_as_closed_even_when_the_inbox_is_reconnecting() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        registry.close();
+        let reply_inbox = Arc::new(Mutex::new(ReplyInboxState::Reconnecting));
+        let client = RequestClient::new(
+            transport,
+            registry,
+            reply_inbox,
+            Duration::from_millis(30),
+            CancellationToken::new(),
+            None,
+        );
+
+        let error = client
+            .request(Ping { seq: 1 })
+            .await
+            .expect_err("a closed client refuses new calls");
+        assert!(matches!(error, RequestError::Closed));
+    }
+
+    /// After the shared state is updated with a fresh inbox name, exactly
+    /// what the supervisor does on reconnect, a subsequent call must
+    /// publish to the new address, never the one it replaces.
+    #[tokio::test(start_paused = true)]
+    async fn after_reconnection_a_call_uses_the_new_inbox_never_the_old() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let reply_inbox = Arc::new(Mutex::new(ReplyInboxState::Ready("old.inbox".to_owned())));
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            Arc::clone(&registry),
+            Arc::clone(&reply_inbox),
+            Duration::from_secs(5),
+            CancellationToken::new(),
+            None,
+        );
+
+        let first_fut = client.request(Ping { seq: 1 });
+        tokio::pin!(first_fut);
+        tokio::select! {
+            _ = &mut first_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let first = transport.last_published().expect("first request published");
+        assert_eq!(first.reply_to.as_deref(), Some("old.inbox"));
+
+        *reply_inbox.lock().unwrap_or_else(PoisonError::into_inner) =
+            ReplyInboxState::Ready("new.inbox".to_owned());
+
+        let second_fut = client.request(Ping { seq: 2 });
+        tokio::pin!(second_fut);
+        tokio::select! {
+            _ = &mut second_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let second = transport
+            .last_published()
+            .expect("second request published");
+        assert_eq!(second.reply_to.as_deref(), Some("new.inbox"));
+        assert_ne!(second.reply_to, first.reply_to);
+    }
+
+    /// Non-regression: a call already in flight when the connection drops
+    /// must still fail fast, exactly as it did before this state existed.
+    /// Mirrors what the supervisor does, in the mandated order: mark
+    /// `Reconnecting`, then drain.
+    #[tokio::test(start_paused = true)]
+    async fn an_in_flight_call_fails_fast_when_the_connection_drops() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let reply_inbox = Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned())));
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            Arc::clone(&registry),
+            Arc::clone(&reply_inbox),
+            Duration::from_secs(30),
+            CancellationToken::new(),
+            None,
+        );
+
+        let request_fut = client.request(Ping { seq: 1 });
+        tokio::pin!(request_fut);
+        tokio::select! {
+            _ = &mut request_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        assert_eq!(
+            registry.len(),
+            1,
+            "the call must be registered before the drop"
+        );
+
+        *reply_inbox.lock().unwrap_or_else(PoisonError::into_inner) = ReplyInboxState::Reconnecting;
+        registry.drain();
+
+        let error = tokio::time::timeout(Duration::from_millis(1), request_fut)
+            .await
+            .expect("a drained slot must resolve well before the 30s timeout")
+            .expect_err("connection loss must surface as an error");
+        assert!(matches!(error, RequestError::Transport(_)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -601,7 +780,7 @@ mod tests {
         let client = RequestClient::new(
             transport,
             Arc::clone(&registry),
-            Arc::new(Mutex::new("reply.inbox".to_owned())),
+            Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
             Duration::from_millis(30),
             CancellationToken::new(),
             None,
@@ -939,7 +1118,9 @@ mod tests {
         let client = RequestClient::new(
             Arc::clone(&transport),
             registry,
-            Arc::new(Mutex::new("caller.inbox".to_owned())),
+            Arc::new(Mutex::new(ReplyInboxState::Ready(
+                "caller.inbox".to_owned(),
+            ))),
             Duration::from_secs(5),
             CancellationToken::new(),
             None,
@@ -971,7 +1152,9 @@ mod tests {
         let client = RequestClient::new(
             Arc::clone(&transport),
             registry,
-            Arc::new(Mutex::new("caller.inbox".to_owned())),
+            Arc::new(Mutex::new(ReplyInboxState::Ready(
+                "caller.inbox".to_owned(),
+            ))),
             Duration::from_secs(5),
             CancellationToken::new(),
             None,
@@ -1003,7 +1186,9 @@ mod tests {
         let client = RequestClient::new(
             Arc::clone(&transport),
             registry,
-            Arc::new(Mutex::new("caller.inbox".to_owned())),
+            Arc::new(Mutex::new(ReplyInboxState::Ready(
+                "caller.inbox".to_owned(),
+            ))),
             Duration::from_millis(30),
             CancellationToken::new(),
             None,
@@ -1032,7 +1217,9 @@ mod tests {
         let client = RequestClient::new(
             Arc::clone(&transport),
             registry,
-            Arc::new(Mutex::new("caller.inbox".to_owned())),
+            Arc::new(Mutex::new(ReplyInboxState::Ready(
+                "caller.inbox".to_owned(),
+            ))),
             Duration::from_millis(30),
             CancellationToken::new(),
             None,
@@ -1058,7 +1245,9 @@ mod tests {
         let client = RequestClient::new(
             Arc::clone(&transport),
             registry,
-            Arc::new(Mutex::new("caller.inbox".to_owned())),
+            Arc::new(Mutex::new(ReplyInboxState::Ready(
+                "caller.inbox".to_owned(),
+            ))),
             Duration::from_secs(30),
             CancellationToken::new(),
             None,
@@ -1085,7 +1274,9 @@ mod tests {
         let client = RequestClient::new(
             Arc::clone(&transport),
             registry,
-            Arc::new(Mutex::new("caller.inbox".to_owned())),
+            Arc::new(Mutex::new(ReplyInboxState::Ready(
+                "caller.inbox".to_owned(),
+            ))),
             Duration::from_millis(30),
             CancellationToken::new(),
             None,
@@ -1109,7 +1300,9 @@ mod tests {
         let client = RequestClient::new(
             Arc::clone(&transport),
             registry,
-            Arc::new(Mutex::new("caller.inbox".to_owned())),
+            Arc::new(Mutex::new(ReplyInboxState::Ready(
+                "caller.inbox".to_owned(),
+            ))),
             Duration::from_millis(30),
             CancellationToken::new(),
             None,
@@ -1145,7 +1338,9 @@ mod tests {
         let client = RequestClient::new(
             Arc::clone(&transport),
             Arc::clone(&registry),
-            Arc::new(Mutex::new("caller.inbox".to_owned())),
+            Arc::new(Mutex::new(ReplyInboxState::Ready(
+                "caller.inbox".to_owned(),
+            ))),
             Duration::from_secs(5),
             CancellationToken::new(),
             None,
@@ -1287,7 +1482,9 @@ mod tests {
         let client = RequestClient::new(
             Arc::clone(&transport),
             Arc::clone(&registry),
-            Arc::new(Mutex::new("caller.inbox".to_owned())),
+            Arc::new(Mutex::new(ReplyInboxState::Ready(
+                "caller.inbox".to_owned(),
+            ))),
             Duration::from_millis(100),
             CancellationToken::new(),
             None,

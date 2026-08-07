@@ -30,6 +30,7 @@ use hexeract_bus::REPLY_STATUS_OK;
 use hexeract_bus::REQUEST_ID_HEADER;
 use hexeract_bus::RemoteErrorType;
 use hexeract_bus::ReplyExpectation;
+use hexeract_bus::ReplyInboxState;
 use hexeract_bus::Request;
 use hexeract_bus::RequestClient;
 use hexeract_bus::RequestError;
@@ -600,7 +601,7 @@ async fn a_forged_reply_published_into_the_inbox_does_not_end_the_call() {
             .unwrap();
     let inbox_channel = inbox_connection.create_channel().await.unwrap();
     let inbox = declare_reply_inbox_for_test(&inbox_channel).await.unwrap();
-    let reply_inbox = Arc::new(Mutex::new(inbox.clone()));
+    let reply_inbox = Arc::new(Mutex::new(ReplyInboxState::Ready(inbox.clone())));
     let inbox_cancel = cancel.clone();
     let inbox_registry = Arc::clone(&registry);
     let inbox_name = inbox.clone();
