@@ -18,10 +18,10 @@ pub struct RequestContext<'a> {
     /// Protocol version carried by the request that reached this handler.
     ///
     /// The responder rejects any request whose version does not match
-    /// [`crate::PROTOCOL_VERSION`] before the handler ever runs, so today
-    /// this field always holds that single value. It exists as the vehicle
-    /// for a future multi-version negotiation, not as a value this handler
-    /// is meant to branch on.
+    /// [`crate::PROTOCOL_VERSION`] before the handler ever runs, so when
+    /// built by [`crate::RepliedHandler`] this field always holds that
+    /// single value. It exists as the vehicle for a future multi-version
+    /// negotiation, not as a value this handler is meant to branch on.
     pub protocol_version: u32,
     /// Local dispatch context: correlation, cancellation, span.
     pub handler: &'a HandlerContext,
@@ -64,10 +64,10 @@ mod tests {
         let request_id = RequestId::new();
         let handler_ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
 
-        let ctx = RequestContext::new(request_id, 1, &handler_ctx);
+        let ctx = RequestContext::new(request_id, 7, &handler_ctx);
 
         assert_eq!(ctx.request_id, request_id);
-        assert_eq!(ctx.protocol_version, 1);
+        assert_eq!(ctx.protocol_version, 7);
         assert_eq!(ctx.handler.correlation_id, handler_ctx.correlation_id);
     }
 }

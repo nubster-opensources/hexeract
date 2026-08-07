@@ -165,8 +165,9 @@ impl<T: Transport> RequestClient<T> {
     /// branch, waiting on `finished` is no better, since nothing else will
     /// ever cancel that token while the task that alone can cancel it is
     /// the one blocked waiting on it. The second case is worse than the
-    /// first: because every concurrent closer waits on that same
-    /// `finished` token, a single misplaced call from the supervisor task
+    /// first: because the other closers are all waiting either on that
+    /// same `finished` token or on the join handle of the very task that
+    /// is blocked, a single misplaced call from the supervisor task
     /// freezes every other, legitimate caller of `close` along with
     /// itself, not just the caller at fault. Nothing in this crate does
     /// that today, since the supervisor is only ever handed the registry,
@@ -675,7 +676,7 @@ mod tests {
     /// what the supervisor does on reconnect, a subsequent call must
     /// publish to the new address, never the one it replaces.
     #[tokio::test(start_paused = true)]
-    async fn after_reconnection_a_call_uses_the_new_inbox_never_the_old() {
+    async fn a_call_uses_the_new_inbox_never_the_old_once_the_supervisor_marks_it_ready() {
         let transport = Arc::new(CapturingTransport::default());
         let registry = Arc::new(RequestRegistry::default());
         let reply_inbox = Arc::new(Mutex::new(ReplyInboxState::Ready("old.inbox".to_owned())));
@@ -718,7 +719,7 @@ mod tests {
     /// Mirrors what the supervisor does, in the mandated order: mark
     /// `Reconnecting`, then drain.
     #[tokio::test(start_paused = true)]
-    async fn an_in_flight_call_fails_fast_when_the_connection_drops() {
+    async fn an_in_flight_call_fails_fast_when_the_supervisor_marks_and_drains() {
         let transport = Arc::new(CapturingTransport::default());
         let registry = Arc::new(RequestRegistry::default());
         let reply_inbox = Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned())));
@@ -1776,14 +1777,14 @@ mod tests {
     /// above: this test reads no `SystemTime`, so tokio's virtual clock
     /// cannot mislead it.
     #[tokio::test(start_paused = true)]
-    async fn close_after_the_supervisor_has_already_finished_does_not_block() {
+    async fn close_on_a_client_built_without_a_supervisor_does_not_block() {
         let transport = Arc::new(CapturingTransport::default());
         let registry = Arc::new(RequestRegistry::default());
         let client = client_with_lifecycle(transport, registry, CancellationToken::new(), None);
 
         tokio::time::timeout(Duration::from_millis(200), client.close())
             .await
-            .expect("close after the supervisor is already finished must not block");
+            .expect("close on a client built without a supervisor must not block");
     }
 
     #[tokio::test]

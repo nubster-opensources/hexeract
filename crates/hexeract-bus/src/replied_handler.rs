@@ -48,7 +48,7 @@ where
     /// Parse and validate `envelope.reply_to` against
     /// [`ReplyPublisher::accept_destination`], logging and returning `None`
     /// for either an absent or a rejected destination. Called first, before
-    /// any other guard: see [`ErasedHandler::handle`] for why.
+    /// any other guard: see [`RepliedHandler::handle`] for why.
     fn validated_reply_to(&self, envelope: &BusEnvelope) -> Option<ReplyDestination> {
         let Some(raw_reply_to) = envelope.reply_to.as_deref() else {
             tracing::warn!(
@@ -232,7 +232,7 @@ where
 /// The failure detail is deliberately absent from the wire: it has already
 /// been recorded on the responder side, indexed by the request identity.
 ///
-/// `request_id` is guaranteed present by the caller: [`ErasedHandler::handle`]
+/// `request_id` is guaranteed present by the caller: [`RepliedHandler::handle`]
 /// rejects a request with no readable identity before any code path that
 /// could reach this function runs, so there is no "no known identity" case
 /// left to represent here. That same value feeds both the header and the
@@ -813,6 +813,50 @@ mod tests {
         assert!(
             publisher.published.lock().unwrap().is_empty(),
             "nothing may be published for a request with no request id header"
+        );
+    }
+
+    /// Combination that the identity guard's placement before the version
+    /// check is meant to close off: a request with neither a readable
+    /// identity nor a supported version must still be dropped silently by
+    /// the identity guard, never answered by the version guard's
+    /// `RemoteErrorType::Unsupported` reply. Pins the guard order so that a
+    /// future refactor making `error_reply` tolerant of a missing identity
+    /// would surface here rather than only in production.
+    #[tokio::test]
+    async fn a_request_with_no_identity_and_an_unsupported_version_is_dropped_by_identity_first() {
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler = RepliedHandler::new(
+            RecordingHandler {
+                ran: Arc::clone(&ran),
+            },
+            Arc::clone(&publisher),
+        );
+        let mut request = BusEnvelope::with_reply_to(
+            Uuid::now_v7(),
+            "amq.gen-inbox".to_owned(),
+            &Ping { seq: 1 },
+        )
+        .expect("ping must serialize");
+        request
+            .headers
+            .insert(PROTOCOL_VERSION_HEADER.to_owned(), "99".to_owned());
+        // Deliberately no REQUEST_ID_HEADER, combined with an unsupported version.
+
+        let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
+        handler
+            .handle(&request, &ctx)
+            .await
+            .expect("dropping must not surface as a framework error");
+
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the handler must not run when neither identity nor version is usable"
+        );
+        assert!(
+            publisher.published.lock().unwrap().is_empty(),
+            "the identity guard must drop the request before the version guard could reply"
         );
     }
 
