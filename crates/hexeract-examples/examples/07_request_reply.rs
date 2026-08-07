@@ -38,6 +38,7 @@ use hexeract::bus::Message;
 use hexeract::bus::Queue;
 use hexeract::bus::Request;
 use hexeract::bus::RequestClient;
+use hexeract::bus::RequestContext;
 use hexeract::bus::RequestError;
 use hexeract::bus::RequestHandler;
 use hexeract::bus::RequestOptions;
@@ -46,7 +47,6 @@ use hexeract::bus_rabbitmq::RabbitMqTransport;
 use hexeract::bus_rabbitmq::RabbitMqWorkerBuilder;
 use hexeract::bus_rabbitmq::connect_request_client;
 use hexeract::bus_rabbitmq::declare_queue;
-use hexeract::core::HandlerContext;
 use serde::Deserialize;
 use serde::Serialize;
 use testcontainers::ContainerAsync;
@@ -100,11 +100,11 @@ struct Echo {
 impl RequestHandler<Ping> for Echo {
     type Error = BusError;
 
-    async fn handle(&self, request: Ping, ctx: &HandlerContext) -> Result<Pong, BusError> {
+    async fn handle(&self, request: Ping, ctx: &RequestContext<'_>) -> Result<Pong, BusError> {
         *self
             .last_correlation
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(*ctx.correlation_id.as_uuid());
+            .unwrap_or_else(PoisonError::into_inner) = Some(*ctx.handler.correlation_id.as_uuid());
         Ok(Pong { seq: request.seq })
     }
 }
@@ -162,7 +162,7 @@ struct Faulty;
 impl RequestHandler<Explode> for Faulty {
     type Error = BusError;
 
-    async fn handle(&self, _request: Explode, _ctx: &HandlerContext) -> Result<Ack, BusError> {
+    async fn handle(&self, _request: Explode, _ctx: &RequestContext<'_>) -> Result<Ack, BusError> {
         Err(BusError::Internal(
             "downstream dependency unreachable".to_owned(),
         ))
@@ -204,7 +204,7 @@ impl RequestHandler<Divide> for Divider {
     async fn handle(
         &self,
         request: Divide,
-        _ctx: &HandlerContext,
+        _ctx: &RequestContext<'_>,
     ) -> Result<DivisionOutcome, BusError> {
         if request.denominator == 0 {
             return Ok(DivisionOutcome::DivisionByZero);
@@ -241,12 +241,16 @@ struct Relay {
 impl RequestHandler<RelayedPing> for Relay {
     type Error = BusError;
 
-    async fn handle(&self, request: RelayedPing, ctx: &HandlerContext) -> Result<Pong, BusError> {
+    async fn handle(
+        &self,
+        request: RelayedPing,
+        ctx: &RequestContext<'_>,
+    ) -> Result<Pong, BusError> {
         *self
             .last_correlation
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(*ctx.correlation_id.as_uuid());
-        let options = RequestOptions::new().with_correlation_id(ctx.correlation_id);
+            .unwrap_or_else(PoisonError::into_inner) = Some(*ctx.handler.correlation_id.as_uuid());
+        let options = RequestOptions::new().with_correlation_id(ctx.handler.correlation_id);
         self.client
             .request_with(Ping { seq: request.seq }, options)
             .await

@@ -33,6 +33,7 @@ use hexeract_bus::ReplyExpectation;
 use hexeract_bus::ReplyInboxState;
 use hexeract_bus::Request;
 use hexeract_bus::RequestClient;
+use hexeract_bus::RequestContext;
 use hexeract_bus::RequestError;
 use hexeract_bus::RequestHandler;
 use hexeract_bus::RequestOptions;
@@ -44,7 +45,6 @@ use hexeract_bus_rabbitmq::RabbitMqWorkerBuilder;
 use hexeract_bus_rabbitmq::connect_request_client;
 use hexeract_bus_rabbitmq::declare_reply_inbox_for_test;
 use hexeract_bus_rabbitmq::run_reply_inbox_for_test;
-use hexeract_core::HandlerContext;
 use lapin::BasicProperties;
 use lapin::Channel;
 use lapin::Confirmation;
@@ -178,7 +178,7 @@ async fn connection_drop_fails_in_flight_fast() {
 struct Echo;
 impl RequestHandler<Ping> for Echo {
     type Error = BusError;
-    async fn handle(&self, request: Ping, _ctx: &HandlerContext) -> Result<Pong, BusError> {
+    async fn handle(&self, request: Ping, _ctx: &RequestContext<'_>) -> Result<Pong, BusError> {
         Ok(Pong { seq: request.seq })
     }
 }
@@ -188,7 +188,7 @@ impl RequestHandler<Ping> for Echo {
 struct Failing;
 impl RequestHandler<Ping> for Failing {
     type Error = BusError;
-    async fn handle(&self, _request: Ping, _ctx: &HandlerContext) -> Result<Pong, BusError> {
+    async fn handle(&self, _request: Ping, _ctx: &RequestContext<'_>) -> Result<Pong, BusError> {
         Err(BusError::Internal("deliberate handler failure".to_owned()))
     }
 }
@@ -459,7 +459,7 @@ struct SlowEcho {
 }
 impl RequestHandler<Ping> for SlowEcho {
     type Error = BusError;
-    async fn handle(&self, request: Ping, _ctx: &HandlerContext) -> Result<Pong, BusError> {
+    async fn handle(&self, request: Ping, _ctx: &RequestContext<'_>) -> Result<Pong, BusError> {
         tokio::time::sleep(self.delay).await;
         Ok(Pong { seq: request.seq })
     }
