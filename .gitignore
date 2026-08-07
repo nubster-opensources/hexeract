@@ -28,7 +28,6 @@ target
 # Local test scratch
 .hexeract/
 .scratch/
-.superpowers/
 
 # Coverage
 *.profraw
