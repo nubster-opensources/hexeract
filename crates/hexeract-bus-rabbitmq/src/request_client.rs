@@ -161,7 +161,7 @@ fn spawn_reply_inbox_supervisor(
             // than let it run out its timeout against a dead inbox, and
             // refuse any new call that has not registered yet. The order
             // is non-negotiable: see `mark_reconnecting_then_drain`.
-            mark_reconnecting_then_drain(&reply_inbox, || registry.drain());
+            on_connection_lost(&reply_inbox, &registry);
 
             match reconnect_reply_inbox(&uri, &reply_inbox, &cancel).await {
                 Some((new_channel, new_inbox)) => {
@@ -172,6 +172,19 @@ fn spawn_reply_inbox_supervisor(
             }
         }
     })
+}
+
+/// Handle connection loss: mark `reply_inbox` [`ReplyInboxState::Reconnecting`]
+/// and drain `registry`.
+///
+/// This is the single named site the composition runs from, and the
+/// single site a test can call to exercise both halves together without
+/// a broker: [`RequestRegistry::drain`] stays `pub` and stays callable on
+/// its own, this function does not close that off, it just gives the two
+/// halves one testable home instead of leaving the composition implicit
+/// at the call site.
+fn on_connection_lost(reply_inbox: &Mutex<ReplyInboxState>, registry: &RequestRegistry) {
+    mark_reconnecting_then_drain(reply_inbox, || registry.drain());
 }
 
 /// Marks `reply_inbox` as [`ReplyInboxState::Reconnecting`], then runs
@@ -235,6 +248,13 @@ async fn reconnect_reply_inbox(
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    use hexeract_bus::ReplyExpectation;
+    use hexeract_core::RequestId;
+
     use super::*;
 
     /// The invariant of resolution 2, attested rather than merely
@@ -249,6 +269,12 @@ mod tests {
     /// closure captures anything at all: catching that pitfall is the
     /// whole point of routing `drain` through a closure instead of
     /// letting this function call `registry.drain()` directly.
+    ///
+    /// The trailing assertion is a postcondition, checked after the call
+    /// returns rather than from inside the closure: it catches a
+    /// production edit that wrote `Reconnecting`, drained, then wrote
+    /// `Ready` back, which the in-closure assertion alone would never
+    /// see since it only inspects the single instant `drain` runs.
     ///
     /// Runs with no broker, no tokio runtime at all: `mark_reconnecting_then_drain`
     /// is plain synchronous code.
@@ -267,6 +293,56 @@ mod tests {
         assert!(
             drain_observed_reconnecting,
             "drain must observe the inbox already marked Reconnecting"
+        );
+        assert_eq!(
+            *reply_inbox.lock().unwrap_or_else(PoisonError::into_inner),
+            ReplyInboxState::Reconnecting,
+            "the mark must still hold once the function has returned, not just at the \
+             instant drain ran"
+        );
+    }
+
+    /// Closes I1/I2: the composition used to be implicit at the call
+    /// site, where dropping the drain half left every other test green.
+    /// This registers a slot in a real `RequestRegistry`, calls
+    /// `on_connection_lost` the same way the supervisor loop does, and
+    /// checks both halves actually ran: the state is `Reconnecting`, and
+    /// the registered slot is gone, its waiting caller observing a
+    /// closed channel rather than merely an absent entry.
+    ///
+    /// The state check alone would not catch a call site that dropped
+    /// the drain: that is exactly the mutation this test exists to
+    /// catch, and it is deliberately called out in `on_connection_lost`
+    /// proof below.
+    ///
+    /// No broker and no tokio runtime: `pending.wait()` is polled once by
+    /// hand with a no-op waker, which is enough since a closed channel
+    /// resolves on its very first poll.
+    #[test]
+    fn on_connection_lost_marks_reconnecting_and_closes_the_waiting_callers_channel() {
+        let registry = RequestRegistry::default();
+        let reply_inbox = Mutex::new(ReplyInboxState::Ready("inbox-1".to_owned()));
+        let mut pending = registry
+            .register(RequestId::new(), ReplyExpectation::new("test.reply"))
+            .expect("registration succeeds");
+
+        on_connection_lost(&reply_inbox, &registry);
+
+        assert_eq!(
+            *reply_inbox.lock().unwrap_or_else(PoisonError::into_inner),
+            ReplyInboxState::Reconnecting
+        );
+        assert!(
+            registry.is_empty(),
+            "on_connection_lost must remove the registered slot, not just mark the state"
+        );
+
+        let mut future = pin!(pending.wait());
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        assert!(
+            matches!(future.as_mut().poll(&mut context), Poll::Ready(Err(_))),
+            "the caller still waiting on its PendingReply must observe a closed channel"
         );
     }
 }
