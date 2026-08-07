@@ -96,8 +96,9 @@ where
     /// Decode the inbound request, run the handler, and publish the reply.
     ///
     /// Four guards run in a fixed order before the handler is ever invoked,
-    /// each one dropping the request (`tracing::warn!` then `return Ok(())`,
-    /// no publish) rather than running the handler on incomplete input:
+    /// each one stopping the request before the handler runs, two of them
+    /// silently and two of them with a categorized error reply, rather than
+    /// running the handler on incomplete input:
     ///
     /// 1. `reply_to` is parsed and validated against
     ///    [`ReplyPublisher::accept_destination`] FIRST, before any other

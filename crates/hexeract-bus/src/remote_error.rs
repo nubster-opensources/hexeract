@@ -54,8 +54,10 @@ impl RemoteErrorType {
 pub struct RemoteErrorPayload {
     /// Public category of the failure.
     pub error_type: RemoteErrorType,
-    /// Identity of the call this failure answers, for correlation with the
-    /// responder-side trace. `Uuid::nil()` when the request carried none.
+    /// Identity of the call this failure answers, as carried by the
+    /// request, for correlation with the responder-side trace. A responder
+    /// never publishes an error reply for a request with no readable
+    /// identity, so this value is always the identity the caller sent.
     pub request_id: Uuid,
 }
 

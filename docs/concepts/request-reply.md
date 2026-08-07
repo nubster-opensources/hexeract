@@ -35,7 +35,7 @@ The drop-guard is what makes the registry leak-free. `PendingReply`'s `Drop` imp
 
 Requester and responder agree on the reply shape purely through envelope conventions, with no shared connection state:
 
-- The request envelope carries `reply_to` (the inbox queue name), the header `x-hexeract-request-id` (the fresh request identity the caller registered, used to route the reply) and `correlation_id` (the causal-chain identifier, unrelated to routing).
+- The request envelope carries `reply_to` (the inbox queue name), the header `x-hexeract-request-id` (the fresh request identity the caller registered, used to route the reply; mandatory, see [RPC protocol: version rules and coexistence](../architecture/rpc-protocol.md#version-rules-and-coexistence) for what happens when it is absent or unreadable) and `correlation_id` (the causal-chain identifier, unrelated to routing).
 - The reply envelope stamps the header `x-hexeract-reply-status` to either `ok` or `error`, and carries the same `correlation_id` as the request.
 - On success, the reply payload decodes as `R::Reply` like any other message.
 - On failure, the reply's `message_type` is stamped with the sentinel `hexeract.rpc.error` and the payload decodes as `RemoteErrorPayload`, a protocol type deliberately not a `Message`: a remote fault is not a domain message. See [RPC protocol: error payload and categories](../architecture/rpc-protocol.md#error-payload-and-categories) for the payload shape and the closed set of categories.
