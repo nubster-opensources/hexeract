@@ -71,16 +71,32 @@ where
     }
 }
 
-/// Parse the inbound `x-hexeract-request-id` header into a [`RequestId`].
+/// Outcome of reading the inbound `x-hexeract-request-id` header.
 ///
-/// Returns `None` when the header is absent or does not parse as a UUID:
-/// both are treated identically by the caller, as no readable identity.
-fn parse_request_id(envelope: &BusEnvelope) -> Option<RequestId> {
-    envelope
-        .headers
-        .get(REQUEST_ID_HEADER)
-        .and_then(|raw| raw.parse::<uuid::Uuid>().ok())
-        .map(RequestId::from)
+/// Kept as two distinct rejection cases, rather than collapsed into a
+/// single `None`, because they call for different diagnoses: a missing
+/// header points at a non-conforming client library or version, an
+/// unreadable one points at an encoding bug in a peer that otherwise
+/// believes it speaks the protocol.
+enum RequestIdHeader {
+    /// The header parsed into a request identity.
+    Present(RequestId),
+    /// The envelope carries no `x-hexeract-request-id` header at all.
+    Missing,
+    /// The header is present but does not parse as a UUID.
+    Unreadable,
+}
+
+/// Parse the inbound `x-hexeract-request-id` header into a [`RequestId`].
+fn parse_request_id(envelope: &BusEnvelope) -> RequestIdHeader {
+    match envelope.headers.get(REQUEST_ID_HEADER) {
+        None => RequestIdHeader::Missing,
+        Some(raw) => raw
+            .parse::<uuid::Uuid>()
+            .map_or(RequestIdHeader::Unreadable, |uuid| {
+                RequestIdHeader::Present(RequestId::from(uuid))
+            }),
+    }
 }
 
 impl<R, H, P> ErasedHandler for RepliedHandler<R, H, P>
@@ -143,12 +159,24 @@ where
                 return Ok(());
             };
 
-            let Some(request_id) = parse_request_id(envelope) else {
-                tracing::warn!(
-                    message_type = R::MESSAGE_TYPE,
-                    "request without a readable request id, dropping without running the handler"
-                );
-                return Ok(());
+            let request_id = match parse_request_id(envelope) {
+                RequestIdHeader::Present(request_id) => request_id,
+                RequestIdHeader::Missing => {
+                    tracing::warn!(
+                        message_type = R::MESSAGE_TYPE,
+                        %correlation_id,
+                        "request without a request id header, dropping without running the handler"
+                    );
+                    return Ok(());
+                }
+                RequestIdHeader::Unreadable => {
+                    tracing::warn!(
+                        message_type = R::MESSAGE_TYPE,
+                        %correlation_id,
+                        "request with an unparsable request id header, dropping without running the handler"
+                    );
+                    return Ok(());
+                }
             };
 
             let protocol_version = match read_protocol_version(&envelope.headers) {
