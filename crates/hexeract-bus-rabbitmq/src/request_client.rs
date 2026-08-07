@@ -160,7 +160,7 @@ fn spawn_reply_inbox_supervisor(
             // Connection lost: fail every in-flight request fast rather
             // than let it run out its timeout against a dead inbox, and
             // refuse any new call that has not registered yet. The order
-            // is non-negotiable: see `mark_reconnecting_then_drain`.
+            // is non-negotiable: see `on_connection_lost`.
             on_connection_lost(&reply_inbox, &registry);
 
             match reconnect_reply_inbox(&uri, &reply_inbox, &cancel).await {
