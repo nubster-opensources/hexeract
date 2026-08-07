@@ -3,12 +3,12 @@
 
 /// Whether the client currently has a usable reply inbox.
 ///
-/// Read by [`crate::RequestClient`] on every call, right after it
-/// registers with the [`crate::RequestRegistry`], never before: see the
-/// [`crate::RequestClient::new`] docs for why that order is what makes
-/// this state's guarantee hold. A call observing [`Self::Reconnecting`]
-/// fails fast with [`crate::RequestError::Transport`] instead of
-/// publishing toward an inbox that no longer exists.
+/// Read by [`crate::RequestClient`] on every call it registers, right
+/// after registering with the [`crate::RequestRegistry`], never before:
+/// see the [`crate::RequestClient::new`] docs for why that order is what
+/// makes this state's guarantee hold. A call observing
+/// [`Self::Reconnecting`] fails fast with [`crate::RequestError::Transport`]
+/// instead of publishing toward an inbox that no longer exists.
 ///
 /// This does not guarantee that no request is ever published toward a
 /// dead inbox: a call that read [`Self::Ready`] and already published
