@@ -53,6 +53,7 @@ where
         let Some(raw_reply_to) = envelope.reply_to.as_deref() else {
             tracing::warn!(
                 message_type = R::MESSAGE_TYPE,
+                correlation_id = %envelope.correlation_id,
                 "request without reply_to, dropping without running the handler"
             );
             return None;
@@ -62,6 +63,7 @@ where
             Err(rejection) => {
                 tracing::warn!(
                     message_type = R::MESSAGE_TYPE,
+                    correlation_id = %envelope.correlation_id,
                     ?rejection,
                     "request carries an unusable reply_to, dropping without running the handler"
                 );
@@ -87,7 +89,7 @@ enum RequestIdHeader {
     Unreadable,
 }
 
-/// Parse the inbound `x-hexeract-request-id` header into a [`RequestId`].
+/// Parse the inbound `x-hexeract-request-id` header into a [`RequestIdHeader`].
 fn parse_request_id(envelope: &BusEnvelope) -> RequestIdHeader {
     match envelope.headers.get(REQUEST_ID_HEADER) {
         None => RequestIdHeader::Missing,
