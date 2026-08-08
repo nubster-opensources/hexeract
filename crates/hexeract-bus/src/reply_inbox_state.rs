@@ -17,8 +17,18 @@
 /// inherent to any drop, not a defect this state closes. What it
 /// guarantees, provided the transport supervisor that owns this state
 /// marks it [`Self::Reconnecting`] before it drains the
-/// [`crate::RequestRegistry`], is narrower and exact: no caller waits out
-/// its full timeout because of a dead inbox.
+/// [`crate::RequestRegistry`], is narrower and exact: from the moment the
+/// supervisor observes the drop, no caller waits out its full timeout
+/// because of a dead inbox.
+///
+/// That qualifier is part of the guarantee, not a caveat on it. This
+/// state says nothing about how long observing the drop takes, and the
+/// supervisor observes it only when its consumer stream ends. A broker
+/// that closes the socket, or a peer that sends an RST, ends that stream
+/// at once. A network partition that silently swallows packets does not:
+/// the drop surfaces only when the AMQP heartbeat expires. A caller whose
+/// timeout is shorter than that interval still waits it out in full,
+/// exactly as it would have without this state.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplyInboxState {

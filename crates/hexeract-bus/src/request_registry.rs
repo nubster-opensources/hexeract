@@ -110,13 +110,16 @@ impl Default for RequestRegistry {
 
 impl RequestRegistry {
     /// Create an empty registry that admits at most `max_in_flight`
-    /// concurrent slots. A `max_in_flight` of zero admits none, ever.
+    /// concurrent slots.
+    ///
+    /// A `max_in_flight` of zero admits none, ever: every registration is
+    /// refused as [`RegisterRejection::AtCapacity`], which makes it a way
+    /// to shut request-reply off without stopping the process. It is
+    /// accepted rather than asserted against, so a caller probing that
+    /// bound observes the documented refusal in every build profile
+    /// instead of a panic in one and a refusal in the other.
     #[must_use]
     pub fn new(max_in_flight: usize) -> Self {
-        debug_assert!(
-            max_in_flight > 0,
-            "max_in_flight must be non-zero: a registry that admits no slot is never useful"
-        );
         Self {
             state: Mutex::new(RegistryState::default()),
             counters: ReplyCounters::default(),

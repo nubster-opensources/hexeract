@@ -96,10 +96,18 @@ impl<T: Transport> RequestClient<T> {
     ///
     /// `cancel` is the shutdown signal this client's reply consumer, if any,
     /// observes to stop. `supervisor` pairs that consumer's join handle
-    /// with the token it cancels right before it returns, on every exit
-    /// path: the two travel together, as one `Option`, so it is impossible
-    /// to construct a client with a consumer but no way to learn when it
-    /// truly stops, or with a token nothing will ever cancel. Pass `None`
+    /// with the token that consumer cancels right before it returns, on
+    /// every exit path: the two travel together, as one `Option`, so a
+    /// client cannot be built with a consumer but no way to learn when it
+    /// truly stops.
+    ///
+    /// That closes the shape, not the pairing. This constructor is public
+    /// and cannot check that the token it is handed is the one the
+    /// supervisor task actually cancels; a caller that passes an unrelated
+    /// token leaves every [`Self::close`] past the first waiting forever on
+    /// a signal that will never be raised. Outside this crate, take both
+    /// values from the same transport that spawned the consumer rather than
+    /// assembling the pair by hand. Pass `None`
     /// for a client with no real consumer, such as one built for a unit
     /// test: [`Self::close`] then has nothing to wait for and returns as
     /// soon as it has closed the registry and cancelled `cancel`.
@@ -222,6 +230,30 @@ impl<T: Transport> RequestClient<T> {
     ///
     /// # Errors
     ///
+    /// The first three are refused by this client before anything is
+    /// published: the responder never saw the request, and the call left no
+    /// trace anywhere. They are grouped because that shared property, not
+    /// their cause, is what decides whether retrying is safe.
+    ///
+    /// - [`RequestError::AtCapacity`] if the client already holds
+    ///   `max_in_flight` calls. Back-pressure is reported as an immediate
+    ///   failure rather than queued behind a free slot, so a saturated
+    ///   client stays distinguishable from a slow responder. Retrying at
+    ///   once cannot succeed, since nothing has been released in the
+    ///   meantime.
+    /// - [`RequestError::Closed`] if [`Self::close`] was called, whether
+    ///   before this call started or while it was pending. Unlike the other
+    ///   two, this is not a symptom of load: the client will never serve
+    ///   another call, so the response is to stop issuing them rather than
+    ///   to retry.
+    /// - [`RequestError::Protocol`] carrying
+    ///   [`ProtocolViolation::IdentityCollision`] if the request identity
+    ///   minted for this call is already registered. Retrying is safe, and
+    ///   is the intended response.
+    ///
+    /// The rest are reported while publishing the request, or after it has
+    /// been published, so the responder may already have acted on it.
+    ///
     /// - [`RequestError::Transport`] if publishing fails or the reply channel
     ///   is lost (connection dropped).
     /// - [`RequestError::Timeout`] if no reply arrives within the resolved
@@ -233,12 +265,13 @@ impl<T: Transport> RequestClient<T> {
     ///   the caller, so the slot stays open for the real reply; if none
     ///   arrives before the timeout, the call times out rather than
     ///   surfacing the violation that caused the delivery to be ignored.
-    /// - [`RequestError::Protocol`] if a delivery still reaches this decoding
-    ///   step while failing one of those same checks: an unsupported or
-    ///   missing protocol version, a missing or unrecognized reply status, or
-    ///   a reply message type other than the one expected. This remains a
-    ///   reachable defense-in-depth path, not one exercised by a well-behaved
-    ///   registry today.
+    /// - [`RequestError::Protocol`] again, this time carrying one of the
+    ///   other [`ProtocolViolation`] variants, if a delivery reaches this
+    ///   decoding step while failing one of those same checks. Unlike the
+    ///   collision above, this one arrives after publication, so retrying
+    ///   may reach a responder that already served the call. It is a
+    ///   reachable defense-in-depth path, not one a well-behaved registry
+    ///   exercises today.
     /// - [`RequestError::Remote`] if the responder reported a failure.
     /// - [`RequestError::Decode`] if the request cannot be serialized, or if
     ///   a reply that already passed protocol and status validation cannot be
