@@ -137,7 +137,7 @@ Hexeract is `Send + Sync` and clonable. Once the mediator is built, you can clon
 
 If you need per-dispatch state (a request id from an HTTP middleware, a user identity, etc.), do not put it on the handler. Two options:
 
-1. **Carry it in the message payload.** Add a `RequestContext` field to `CreateUser`. Honest and explicit.
+1. **Carry it in the message payload.** Add a `DispatchOrigin` field to `CreateUser`. Honest and explicit.
 2. **Carry it on `HandlerContext`.** Hexeract plans to extend `HandlerContext` with a typed extension map (`tracing`-style) for cross-cutting per-dispatch values. Until then, option 1 is the recommended path.
 
 ## Pitfalls
