@@ -1,6 +1,6 @@
 # Request-reply
 
-Hexeract's request-reply pattern layers a synchronous-over-async RPC call on top of the fire-and-forget bus: a caller publishes a typed request and awaits a typed reply, correlated back to it by a freshly minted identifier. This page covers the request registry and its drop-guard, the wire contract two independent processes agree on for a reply envelope, the four ways a request can fail, and the lifecycle of the exclusive reply inbox.
+Hexeract's request-reply pattern layers a synchronous-over-async RPC call on top of the fire-and-forget bus: a caller publishes a typed request and awaits a typed reply, correlated back to it by a freshly minted identifier. This page covers the request registry and its drop-guard, the wire contract two independent processes agree on for a reply envelope, the ways a request can fail, and the lifecycle of the exclusive reply inbox.
 
 ## The pattern
 
@@ -73,9 +73,11 @@ This is a deliberate asymmetry with the reply inbox described below: the inbox i
 
 ## Failure modes
 
-`RequestError` has five variants, all reachable from `RequestClient::request` and `RequestClient::request_with`:
+`RequestError` has seven variants, all reachable from `RequestClient::request` and `RequestClient::request_with`. It is `#[non_exhaustive]`, so a `match` written outside this crate needs a catch-all arm and the compiler will not point out a variant added later: the first three below are local to the caller's own client and are the ones most easily mistaken for one another.
 
 - **`Timeout(Duration)`**: no reply arrived within the deadline. The `PendingReply` is dropped along with the `tokio::time::timeout` future, so the slot is cleaned up immediately rather than lingering until a reply eventually shows up.
+- **`AtCapacity`**: the client already holds `max_in_flight` calls, and this one was refused outright rather than queued behind a free slot. Back-pressure is reported as an immediate failure precisely so it stays distinguishable from a slow responder: a saturated client and a slow remote look identical under a timeout, yet they are relieved at opposite ends. Retrying at once cannot succeed, since nothing has been released in the meantime.
+- **`Closed`**: `close()` was called on the client, either while this call was pending or before it started. Unlike the two above, this one is not a symptom of load: it says the client will never serve another call, so the right response is to stop issuing them, not to retry.
 - **`Remote { error_type, request_id }`**: the responder's `RequestHandler` returned an error, decoded from a `RemoteErrorPayload` reply. The category is deliberately coarse and carries no detail; the full trace lives on the responder side, indexed by `request_id`.
 - **`Protocol(ProtocolViolation)`**: the reply does not honor the protocol, either because a required header is missing or unparsable (`MissingHeader`), the announced protocol version is not implemented by this crate (`UnsupportedVersion`), or the reply's `message_type` does not match what was expected for this call (`UnexpectedReplyType`).
 - **`Transport(BusError)`**: the request could not be published, or the reply channel was lost, most notably when the reply inbox's connection drops and the supervisor drains the registry so every in-flight `PendingReply` fails fast instead of waiting out its timeout.
@@ -102,3 +104,5 @@ Request-reply is strictly one request, one reply: there is no streaming or multi
 - [Message and envelope](message-envelope.md)
 - [`hexeract-bus` API reference](../reference/hexeract-bus.md)
 - [`hexeract-bus-rabbitmq` API reference](../reference/hexeract-bus-rabbitmq.md)
+
+Neither reference page covers the request-reply surface yet. Until they do, the rustdoc of `hexeract-bus` is the per-item reference for `RequestClient`, `RequestHandler`, `RequestContext` and `RequestError`.
