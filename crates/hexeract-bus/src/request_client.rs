@@ -260,15 +260,18 @@ impl<T: Transport> RequestClient<T> {
     ///
     /// - [`RequestError::Transport`] if publishing fails or the reply channel
     ///   is lost (connection dropped).
-    /// - [`RequestError::Timeout`] if no reply arrives within the resolved
-    ///   timeout. This is also what a legitimate call observes when every
-    ///   delivery bearing its request identity violates the request-reply
-    ///   protocol: an unsupported or missing protocol version, a missing or
-    ///   unrecognized reply status, or a reply message type other than the
-    ///   one expected. The registry ignores such deliveries without waking
-    ///   the caller, so the slot stays open for the real reply; if none
-    ///   arrives before the timeout, the call times out rather than
-    ///   surfacing the violation that caused the delivery to be ignored.
+    /// - [`RequestError::Timeout`] if publishing and waiting for a reply do
+    ///   not both complete within the single resolved timeout. A timeout
+    ///   racing publication is ambiguous: the transport future is cancelled,
+    ///   but the broker may already have accepted the request and the
+    ///   responder may act on it. This is also what a legitimate call observes
+    ///   when every delivery bearing its request identity violates the
+    ///   request-reply protocol: an unsupported or missing protocol version,
+    ///   a missing or unrecognized reply status, or a reply message type other
+    ///   than the one expected. The registry ignores such deliveries without
+    ///   waking the caller, so the slot stays open for the real reply; if none
+    ///   arrives before the timeout, the call times out rather than surfacing
+    ///   the violation that caused the delivery to be ignored.
     /// - [`RequestError::Protocol`] again, this time carrying one of the
     ///   other [`ProtocolViolation`] variants, if a delivery reaches this
     ///   decoding step while failing one of those same checks. Unlike the
@@ -360,6 +363,7 @@ impl<T: Transport> RequestClient<T> {
         timeout: Duration,
         correlation_id: CorrelationId,
     ) -> Result<R::Reply, RequestError> {
+        let deadline = tokio::time::Instant::now() + timeout;
         let request_id = RequestId::new();
         // Registering first, and only then reading the inbox state, is
         // what closes the reconnect race: see the `reply_inbox` doc on
@@ -390,13 +394,20 @@ impl<T: Transport> RequestClient<T> {
             PROTOCOL_VERSION_HEADER.to_owned(),
             PROTOCOL_VERSION.to_string(),
         );
-        self.inner
-            .transport
-            .publish_envelope(destination, &envelope)
-            .await
-            .map_err(RequestError::Transport)?;
+        match tokio::time::timeout_at(
+            deadline,
+            self.inner
+                .transport
+                .publish_envelope(destination, &envelope),
+        )
+        .await
+        {
+            Err(_elapsed) => return Err(RequestError::Timeout(timeout)),
+            Ok(Err(error)) => return Err(RequestError::Transport(error)),
+            Ok(Ok(_message_id)) => {}
+        }
 
-        let reply = match tokio::time::timeout(timeout, pending.wait()).await {
+        let reply = match tokio::time::timeout_at(deadline, pending.wait()).await {
             Err(_elapsed) => return Err(RequestError::Timeout(timeout)),
             Ok(Err(_closed)) => {
                 // The registry drops every sender on both `close` (permanent)
@@ -495,6 +506,7 @@ mod tests {
 
     use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
+    use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
 
     use uuid::Uuid;
@@ -598,6 +610,70 @@ mod tests {
                 .last()
                 .map(|(routing_key, _)| routing_key.clone())
         }
+    }
+
+    /// Holds publication at an explicit gate so timeout tests can place the
+    /// client on either side of the broker-acceptance boundary without relying
+    /// on scheduler timing.
+    #[derive(Default)]
+    struct GatedTransport {
+        publish_started: AtomicBool,
+        started: Notify,
+        release: Notify,
+        published: StdMutex<Vec<(String, BusEnvelope)>>,
+    }
+
+    #[async_trait]
+    impl Transport for GatedTransport {
+        async fn publish_envelope(
+            &self,
+            routing_key: &str,
+            envelope: &BusEnvelope,
+        ) -> Result<Uuid, BusError> {
+            self.publish_started.store(true, Ordering::SeqCst);
+            self.started.notify_one();
+            self.release.notified().await;
+            self.published
+                .lock()
+                .unwrap()
+                .push((routing_key.to_owned(), envelope.clone()));
+            Ok(envelope.message_id)
+        }
+    }
+
+    impl GatedTransport {
+        async fn wait_until_publish_started(&self) {
+            if !self.publish_started.load(Ordering::SeqCst) {
+                self.started.notified().await;
+            }
+        }
+
+        fn release_publish(&self) {
+            self.release.notify_one();
+        }
+
+        fn last_published(&self) -> Option<BusEnvelope> {
+            self.published
+                .lock()
+                .unwrap()
+                .last()
+                .map(|(_, envelope)| envelope.clone())
+        }
+    }
+
+    fn gated_client(
+        transport: Arc<GatedTransport>,
+        registry: Arc<RequestRegistry>,
+        default_timeout: Duration,
+    ) -> RequestClient<GatedTransport> {
+        RequestClient::new(
+            transport,
+            registry,
+            Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
+            default_timeout,
+            CancellationToken::new(),
+            None,
+        )
     }
 
     /// Read the request identity the client stamped on its published envelope.
@@ -839,6 +915,149 @@ mod tests {
         assert!(
             registry.is_empty(),
             "the pre-publication failure must release its pending slot"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_bounds_a_publication_that_never_completes() {
+        let timeout = Duration::from_millis(30);
+        let transport = Arc::new(GatedTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = gated_client(Arc::clone(&transport), Arc::clone(&registry), timeout);
+        let started_at = tokio::time::Instant::now();
+
+        let request = client.request(Ping { seq: 1 });
+        tokio::pin!(request);
+        tokio::select! {
+            () = transport.wait_until_publish_started() => {}
+            result = &mut request => panic!("publication unexpectedly completed: {result:?}"),
+        }
+        tokio::time::advance(timeout).await;
+
+        let error = request
+            .await
+            .expect_err("the publication must share the request timeout");
+
+        assert!(matches!(error, RequestError::Timeout(elapsed) if elapsed == timeout));
+        assert_eq!(tokio::time::Instant::now() - started_at, timeout);
+        assert!(
+            transport.last_published().is_none(),
+            "the gated transport never crossed its acceptance boundary"
+        );
+        assert!(
+            registry.is_empty(),
+            "timing out publication must release the pending slot"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn publication_latency_consumes_the_reply_wait_budget_and_late_replies_are_orphaned() {
+        let timeout = Duration::from_millis(30);
+        let publish_latency = Duration::from_millis(20);
+        let transport = Arc::new(GatedTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = gated_client(Arc::clone(&transport), Arc::clone(&registry), timeout);
+        let started_at = tokio::time::Instant::now();
+
+        let request = client.request(Ping { seq: 1 });
+        tokio::pin!(request);
+        tokio::select! {
+            () = transport.wait_until_publish_started() => {}
+            result = &mut request => panic!("publication unexpectedly completed: {result:?}"),
+        }
+        tokio::time::advance(publish_latency).await;
+        transport.release_publish();
+        tokio::select! {
+            biased;
+            result = &mut request => panic!("request unexpectedly completed: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        let published = transport
+            .last_published()
+            .expect("the transport crossed its acceptance boundary");
+
+        tokio::time::advance(timeout - publish_latency).await;
+        let error = request
+            .await
+            .expect_err("the reply wait receives only the remaining budget");
+
+        assert!(matches!(error, RequestError::Timeout(elapsed) if elapsed == timeout));
+        assert_eq!(tokio::time::Instant::now() - started_at, timeout);
+        assert!(registry.is_empty(), "the timed-out slot must be released");
+
+        registry.resolve(ok_reply(published_request_id(&published), 1));
+        assert_eq!(
+            registry.counters().orphaned,
+            1,
+            "a reply after the absolute deadline must remain orphaned"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_inside_the_single_absolute_deadline_still_succeeds() {
+        let timeout = Duration::from_millis(30);
+        let publish_latency = Duration::from_millis(20);
+        let transport = Arc::new(GatedTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = gated_client(Arc::clone(&transport), Arc::clone(&registry), timeout);
+        let started_at = tokio::time::Instant::now();
+
+        let request = client.request(Ping { seq: 7 });
+        tokio::pin!(request);
+        tokio::select! {
+            () = transport.wait_until_publish_started() => {}
+            result = &mut request => panic!("publication unexpectedly completed: {result:?}"),
+        }
+        tokio::time::advance(publish_latency).await;
+        transport.release_publish();
+        tokio::select! {
+            biased;
+            result = &mut request => panic!("request unexpectedly completed: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        let published = transport
+            .last_published()
+            .expect("the transport crossed its acceptance boundary");
+
+        tokio::time::advance(Duration::from_millis(9)).await;
+        registry.resolve(ok_reply(published_request_id(&published), 7));
+
+        assert_eq!(
+            request.await.expect("reply is inside the deadline"),
+            Pong { seq: 7 }
+        );
+        assert_eq!(
+            tokio::time::Instant::now() - started_at,
+            Duration::from_millis(29)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_during_publication_releases_the_pending_slot() {
+        let transport = Arc::new(GatedTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = gated_client(
+            Arc::clone(&transport),
+            Arc::clone(&registry),
+            Duration::from_secs(30),
+        );
+
+        let mut request = Box::pin(client.request(Ping { seq: 1 }));
+        tokio::select! {
+            () = transport.wait_until_publish_started() => {}
+            result = &mut request => panic!("publication unexpectedly completed: {result:?}"),
+        }
+        assert_eq!(registry.len(), 1, "the request must hold one pending slot");
+
+        drop(request);
+
+        assert!(
+            registry.is_empty(),
+            "cancelling the request future must release its pending slot"
+        );
+        assert!(
+            transport.last_published().is_none(),
+            "the cancelled publication never crossed the test transport gate"
         );
     }
 

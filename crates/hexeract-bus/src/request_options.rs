@@ -30,7 +30,10 @@ use hexeract_core::CorrelationId;
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct RequestOptions {
-    /// Overrides the client's default call timeout.
+    /// Overrides the client's default end-to-end local call timeout.
+    ///
+    /// The budget covers both publishing the request and waiting for its
+    /// reply; publication latency does not start a fresh reply-wait budget.
     pub timeout: Option<Duration>,
     /// Overrides `Request::DESTINATION` for this call only.
     pub destination: Option<String>,
@@ -48,7 +51,7 @@ impl RequestOptions {
         Self::default()
     }
 
-    /// Override the client's default call timeout for this call only.
+    /// Override the client's default end-to-end local timeout for this call.
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
