@@ -4,8 +4,12 @@ use hexeract_core::RequestId;
 
 use crate::BusError;
 use crate::remote_error::RemoteErrorType;
+use crate::request_registry::RegisterRejection;
 
-/// A reply that does not honor the request-reply protocol.
+/// A violation of the request-reply protocol, observed by the caller
+/// either on the wire (a malformed or unexpected reply) or at
+/// registration (a defect on the caller's own side, before anything is
+/// published).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ProtocolViolation {
@@ -29,6 +33,18 @@ pub enum ProtocolViolation {
         /// Message type actually received.
         actual: String,
     },
+    /// The freshly minted request identity collided with one already in
+    /// flight in the registry.
+    ///
+    /// This is a defect on the caller's own side, not a wire fault from the
+    /// peer: it is raised at registration time, before any envelope is
+    /// published. It is grouped here rather than given its own
+    /// [`RequestError`] variant because it is, at bottom, the same kind of
+    /// failure as the other variants of this enum: a violation of an
+    /// invariant the request-reply protocol depends on, here that request
+    /// identities are unique for the lifetime of a call.
+    #[error("request identity is already in flight")]
+    IdentityCollision,
 }
 
 /// Failure of a request-reply round trip observed by the caller.
@@ -38,6 +54,17 @@ pub enum RequestError {
     /// No reply arrived within the deadline.
     #[error("request timed out after {0:?}")]
     Timeout(Duration),
+    /// The client reached its in-flight capacity.
+    ///
+    /// The registry refuses the call immediately rather than waiting for a
+    /// slot to free up: back-pressure must be visible to the caller, not
+    /// disguised as extra latency.
+    #[error("client reached its in-flight request capacity")]
+    AtCapacity,
+    /// The client was closed while the call was pending, or before it
+    /// started.
+    #[error("client is closed")]
+    Closed,
     /// The responder reported a failure.
     ///
     /// The category is deliberately coarse and carries no detail: the full
@@ -49,7 +76,8 @@ pub enum RequestError {
         /// Identity of the call, to correlate with the responder trace.
         request_id: RequestId,
     },
-    /// The reply does not honor the protocol.
+    /// A violation of the request-reply protocol, observed on the wire or
+    /// at registration. See [`ProtocolViolation`] for which.
     #[error("protocol violation")]
     Protocol(#[source] ProtocolViolation),
     /// The request could not be published or the reply channel was lost.
@@ -59,6 +87,18 @@ pub enum RequestError {
     /// decoded into the expected type.
     #[error("failed to decode reply")]
     Decode(#[source] BusError),
+}
+
+impl From<RegisterRejection> for RequestError {
+    fn from(rejection: RegisterRejection) -> Self {
+        match rejection {
+            RegisterRejection::AtCapacity => RequestError::AtCapacity,
+            RegisterRejection::Closed => RequestError::Closed,
+            RegisterRejection::SlotOccupied => {
+                RequestError::Protocol(ProtocolViolation::IdentityCollision)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -115,5 +155,38 @@ mod tests {
             source.to_string(),
             "failed to (de)serialize message payload as JSON"
         );
+    }
+
+    #[test]
+    fn at_capacity_renders_a_message() {
+        let err = RequestError::AtCapacity;
+        assert!(err.to_string().contains("capacity"));
+    }
+
+    #[test]
+    fn closed_renders_a_message() {
+        let err = RequestError::Closed;
+        assert!(err.to_string().contains("closed"));
+    }
+
+    #[test]
+    fn register_rejection_at_capacity_maps_to_request_error_at_capacity() {
+        let err: RequestError = RegisterRejection::AtCapacity.into();
+        assert!(matches!(err, RequestError::AtCapacity));
+    }
+
+    #[test]
+    fn register_rejection_closed_maps_to_request_error_closed() {
+        let err: RequestError = RegisterRejection::Closed.into();
+        assert!(matches!(err, RequestError::Closed));
+    }
+
+    #[test]
+    fn register_rejection_slot_occupied_maps_to_protocol_identity_collision() {
+        let err: RequestError = RegisterRejection::SlotOccupied.into();
+        assert!(matches!(
+            err,
+            RequestError::Protocol(ProtocolViolation::IdentityCollision)
+        ));
     }
 }

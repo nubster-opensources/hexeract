@@ -1,11 +1,15 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use hexeract_core::{CorrelationId, HandlerContext, RequestId};
+use hexeract_core::{CorrelationId, RequestId};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::remote_error::RemoteErrorPayload;
 use crate::reply_acceptance::ReplyExpectation;
+use crate::reply_inbox_state::ReplyInboxState;
 use crate::request_error::ProtocolViolation;
+use crate::request_options::RequestOptions;
 use crate::request_registry::RequestRegistry;
 use crate::rpc_protocol::{
     PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, REPLY_ERROR_MESSAGE_TYPE, REPLY_STATUS_ERROR,
@@ -14,125 +18,364 @@ use crate::rpc_protocol::{
 use crate::{BusEnvelope, Message, Request, RequestError, Transport};
 
 /// Synchronous-over-async RPC client: send a [`Request`], await its reply.
+///
+/// Cheap to clone: every clone shares the same `RequestClientInner`
+/// through an [`Arc`], so cloning is how a caller hands out further handles
+/// to the same registry, reply consumer and lifecycle. The last handle to
+/// drop signals shutdown; see [`Self::close`] for the stronger, awaited
+/// alternative.
 pub struct RequestClient<T: Transport> {
+    inner: Arc<RequestClientInner<T>>,
+}
+
+impl<T: Transport> Clone for RequestClient<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+/// Shared state behind every [`RequestClient`] handle.
+///
+/// Never constructed or named directly by a caller: it exists so the
+/// client's lifecycle (the shutdown [`CancellationToken`] and the reply
+/// consumer's [`JoinHandle`]) is tied to the last handle disappearing,
+/// through its [`Drop`] implementation, rather than to any single clone.
+/// `pub(crate)` rather than `pub`: nothing outside this crate can name it,
+/// since it has no public constructor or method of its own.
+pub(crate) struct RequestClientInner<T: Transport> {
     transport: Arc<T>,
     registry: Arc<RequestRegistry>,
-    reply_inbox: Arc<Mutex<String>>,
+    reply_inbox: Arc<Mutex<ReplyInboxState>>,
     default_timeout: Duration,
+    cancel: CancellationToken,
+    supervisor: Mutex<Option<JoinHandle<()>>>,
+    /// Cancelled by the reply consumer task itself, right before it
+    /// returns, on every exit path. This is what lets a concurrent
+    /// [`RequestClient::close`] caller, one that finds the supervisor
+    /// handle already taken, observe genuine termination instead of
+    /// racing ahead of it: see [`RequestClient::close`] for why a `take`
+    /// alone is not enough once the client is cloned.
+    ///
+    /// `None` exactly when this client was built with no supervisor at
+    /// all (`supervisor: None` at construction): there is then nothing
+    /// for [`RequestClient::close`] to wait for, on any branch, and no
+    /// token anyone would ever cancel. `Some` and the `supervisor` field
+    /// above are set together, from the same constructor parameter (see
+    /// [`RequestClient::new`]), so the two can never disagree about
+    /// whether a real consumer exists.
+    finished: Option<CancellationToken>,
+}
+
+impl<T: Transport> Drop for RequestClientInner<T> {
+    /// Signal shutdown when the last handle disappears: close the registry
+    /// and cancel the token.
+    ///
+    /// This is the weak half of the client's shutdown contract: it can only
+    /// signal, never wait, since a `drop` that blocks a tokio worker is a
+    /// deadlock under load. It does not join the reply consumer task, which
+    /// may still be mid-teardown when this returns. A caller that needs the
+    /// stronger guarantee, that the consumer has actually stopped, must call
+    /// [`RequestClient::close`] explicitly before dropping its last handle.
+    fn drop(&mut self) {
+        self.registry.close();
+        self.cancel.cancel();
+    }
 }
 
 impl<T: Transport> RequestClient<T> {
     /// Assemble a client from its collaborators. The `reply_inbox` is shared
     /// so a transport supervisor can update it across reconnects.
+    ///
+    /// [`Self::request_with`] reads `reply_inbox` only after it has
+    /// registered with `registry`, never before: that order is what lets
+    /// [`ReplyInboxState`] close the reconnect race instead of leaving a
+    /// window inside it. See [`ReplyInboxState`] for the exact guarantee
+    /// this gives a caller.
+    ///
+    /// `cancel` is the shutdown signal this client's reply consumer, if any,
+    /// observes to stop. `supervisor` pairs that consumer's join handle
+    /// with the token that consumer cancels right before it returns, on
+    /// every exit path: the two travel together, as one `Option`, so a
+    /// client cannot be built with a consumer but no way to learn when it
+    /// truly stops.
+    ///
+    /// That closes the shape, not the pairing. This constructor is public
+    /// and cannot check that the token it is handed is the one the
+    /// supervisor task actually cancels; a caller that passes an unrelated
+    /// token leaves every [`Self::close`] past the first waiting forever on
+    /// a signal that will never be raised. Outside this crate, take both
+    /// values from the same transport that spawned the consumer rather than
+    /// assembling the pair by hand. Pass `None`
+    /// for a client with no real consumer, such as one built for a unit
+    /// test: [`Self::close`] then has nothing to wait for and returns as
+    /// soon as it has closed the registry and cancelled `cancel`.
     #[must_use]
     pub fn new(
         transport: Arc<T>,
         registry: Arc<RequestRegistry>,
-        reply_inbox: Arc<Mutex<String>>,
+        reply_inbox: Arc<Mutex<ReplyInboxState>>,
         default_timeout: Duration,
+        cancel: CancellationToken,
+        supervisor: Option<(JoinHandle<()>, CancellationToken)>,
     ) -> Self {
+        let (supervisor, finished) = match supervisor {
+            Some((handle, finished)) => (Some(handle), Some(finished)),
+            None => (None, None),
+        };
         Self {
-            transport,
-            registry,
-            reply_inbox,
-            default_timeout,
+            inner: Arc::new(RequestClientInner {
+                transport,
+                registry,
+                reply_inbox,
+                default_timeout,
+                cancel,
+                supervisor: Mutex::new(supervisor),
+                finished,
+            }),
         }
     }
 
-    /// Send `request` on a fresh causal chain, within the default timeout.
+    /// Reject new calls, fail every pending call with [`RequestError::Closed`],
+    /// then wait for the reply consumer to actually stop.
     ///
-    /// Use this at the root of a flow, where no handler context exists: a
-    /// command-line entry point, an HTTP edge, a scheduled task.
+    /// This is the strong half of the client's shutdown contract: when this
+    /// method returns, the registry is closed and empty, and the reply
+    /// consumer task, if this client was built with one, has genuinely
+    /// finished. That guarantee holds for every caller and every clone,
+    /// including one that calls `close` concurrently with another: the
+    /// caller that finds the supervisor handle already taken does not
+    /// return early, it waits for the same termination signal the
+    /// consumer itself raises right before it exits. Compare with the
+    /// [`Drop`] impl on `RequestClientInner`, which fires when the last
+    /// handle disappears without an explicit `close`: it can only signal
+    /// (close the registry, cancel the token) and never await the
+    /// consumer.
     ///
-    /// # Errors
+    /// This also cancels the [`CancellationToken`] this client was built
+    /// with. That token is owned by the caller, not private to this
+    /// client, and may be shared with other tasks, such as responder
+    /// workers a caller wants to wind down together with the client; see
+    /// the crate's request-reply example for that pattern.
     ///
-    /// See [`RequestClient::request_in_with_timeout`].
-    pub async fn request<R: Request>(&self, request: &R) -> Result<R::Reply, RequestError> {
-        self.request_inner(CorrelationId::new(), request, self.default_timeout)
-            .await
+    /// Idempotent: the first call takes the supervisor handle and awaits it
+    /// directly; every later call, sequential or concurrent, finds `None`
+    /// and awaits the same termination signal instead, without changing
+    /// registry or token state again. If this client was built with no
+    /// supervisor at all, there is no termination signal to wait for on
+    /// either branch, and every call, first or later, returns as soon as
+    /// it has closed the registry and cancelled `cancel`.
+    ///
+    /// Calling this from the supervisor task itself deadlocks, on either
+    /// branch: on the handle-holding branch, a task can never observe its
+    /// own completion by joining its own [`JoinHandle`]; on the other
+    /// branch, waiting on `finished` is no better, since nothing else will
+    /// ever cancel that token while the task that alone can cancel it is
+    /// the one blocked waiting on it. The second case is worse than the
+    /// first: because the other closers are all waiting either on that
+    /// same `finished` token or on the join handle of the very task that
+    /// is blocked, a single misplaced call from the supervisor task
+    /// freezes every other, legitimate caller of `close` along with
+    /// itself, not just the caller at fault. Nothing in this crate does
+    /// that today, since the supervisor is only ever handed the registry,
+    /// the inbox and the token, never a [`RequestClient`], but the client
+    /// is clonable and nothing stops a caller from handing a clone to a
+    /// task it spawns itself.
+    pub async fn close(&self) {
+        self.inner.registry.close();
+        self.inner.cancel.cancel();
+        let handle = self
+            .inner
+            .supervisor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        match handle {
+            Some(handle) => {
+                let _ = handle.await;
+            }
+            None => {
+                if let Some(finished) = &self.inner.finished {
+                    finished.cancelled().await;
+                }
+            }
+        }
     }
 
-    /// Send `request` on the causal chain of `ctx`, within the default timeout.
+    /// Send `request` on a fresh causal chain, using this client's default
+    /// timeout and `R::DESTINATION`.
+    ///
+    /// Equivalent to `self.request_with(request, RequestOptions::default())`.
+    /// Use [`Self::request_with`] to override the timeout or the
+    /// destination for a single call.
     ///
     /// # Errors
     ///
-    /// See [`RequestClient::request_in_with_timeout`].
-    pub async fn request_in<R: Request>(
-        &self,
-        ctx: &HandlerContext,
-        request: &R,
-    ) -> Result<R::Reply, RequestError> {
-        self.request_inner(ctx.correlation_id, request, self.default_timeout)
-            .await
+    /// See [`Self::request_with`].
+    pub async fn request<R: Request>(&self, request: R) -> Result<R::Reply, RequestError> {
+        self.request_with(request, RequestOptions::default()).await
     }
 
-    /// Send `request` on a fresh causal chain, within `timeout`.
+    /// Send `request`, applying `options` on top of this client's own
+    /// defaults.
+    ///
+    /// Resolution order:
+    /// - timeout: `options.timeout` if set, otherwise this client's default
+    ///   timeout;
+    /// - destination: `options.destination` if set, otherwise
+    ///   `R::DESTINATION`;
+    /// - causal chain: `options.correlation_id` if set, joining the chain it
+    ///   identifies, otherwise a fresh one minted for this call.
     ///
     /// # Errors
     ///
-    /// See [`RequestClient::request_in_with_timeout`].
-    pub async fn request_with_timeout<R: Request>(
-        &self,
-        request: &R,
-        timeout: Duration,
-    ) -> Result<R::Reply, RequestError> {
-        self.request_inner(CorrelationId::new(), request, timeout)
-            .await
-    }
-
-    /// Send `request` on the causal chain of `ctx`, within `timeout`.
+    /// The first three are refused by this client before anything is
+    /// published: the responder never saw the request, and the call left no
+    /// trace anywhere. They are grouped because that shared property, not
+    /// their cause, is what decides whether retrying is safe.
     ///
-    /// # Errors
+    /// - [`RequestError::AtCapacity`] if the client already holds
+    ///   `max_in_flight` calls. Back-pressure is reported as an immediate
+    ///   failure rather than queued behind a free slot, so a saturated
+    ///   client stays distinguishable from a slow responder. Retrying at
+    ///   once cannot succeed, since nothing has been released in the
+    ///   meantime.
+    /// - [`RequestError::Closed`] if [`Self::close`] was called, whether
+    ///   before this call started or while it was pending. Unlike the other
+    ///   two, this is not a symptom of load: the client will never serve
+    ///   another call, so the response is to stop issuing them rather than
+    ///   to retry.
+    /// - [`RequestError::Protocol`] carrying
+    ///   [`ProtocolViolation::IdentityCollision`] if the request identity
+    ///   minted for this call is already registered. Retrying is safe, and
+    ///   is the intended response.
+    ///
+    /// The rest are reported while publishing the request, or after it has
+    /// been published, so the responder may already have acted on it.
     ///
     /// - [`RequestError::Transport`] if publishing fails or the reply channel
     ///   is lost (connection dropped).
-    /// - [`RequestError::Timeout`] if no reply arrives within `timeout`. This
-    ///   is also what a legitimate call observes when every delivery bearing
-    ///   its request identity violates the request-reply protocol: an
-    ///   unsupported or missing protocol version, a missing or unrecognized
-    ///   reply status, or a reply message type other than the one expected.
-    ///   The registry ignores such deliveries without waking the caller, so
-    ///   the slot stays open for the real reply; if none arrives before
-    ///   `timeout`, the call times out rather than surfacing the violation
-    ///   that caused the delivery to be ignored.
-    /// - [`RequestError::Protocol`] if a delivery still reaches this decoding
-    ///   step while failing one of those same checks: an unsupported or
-    ///   missing protocol version, a missing or unrecognized reply status, or
-    ///   a reply message type other than the one expected. This remains a
-    ///   reachable defense-in-depth path, not one exercised by a well-behaved
-    ///   registry today.
+    /// - [`RequestError::Timeout`] if no reply arrives within the resolved
+    ///   timeout. This is also what a legitimate call observes when every
+    ///   delivery bearing its request identity violates the request-reply
+    ///   protocol: an unsupported or missing protocol version, a missing or
+    ///   unrecognized reply status, or a reply message type other than the
+    ///   one expected. The registry ignores such deliveries without waking
+    ///   the caller, so the slot stays open for the real reply; if none
+    ///   arrives before the timeout, the call times out rather than
+    ///   surfacing the violation that caused the delivery to be ignored.
+    /// - [`RequestError::Protocol`] again, this time carrying one of the
+    ///   other [`ProtocolViolation`] variants, if a delivery reaches this
+    ///   decoding step while failing one of those same checks. Unlike the
+    ///   collision above, this one arrives after publication, so retrying
+    ///   may reach a responder that already served the call. It is a
+    ///   reachable defense-in-depth path, not one a well-behaved registry
+    ///   exercises today.
     /// - [`RequestError::Remote`] if the responder reported a failure.
     /// - [`RequestError::Decode`] if the request cannot be serialized, or if
     ///   a reply that already passed protocol and status validation cannot be
     ///   decoded: either an ok reply whose payload does not decode into the
     ///   expected reply type, or an error reply whose `message_type` matches
     ///   but whose payload does not decode into a [`RemoteErrorPayload`].
-    pub async fn request_in_with_timeout<R: Request>(
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// use hexeract_bus::{Message, Request, RequestClient, RequestOptions, Transport};
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// #[derive(Debug, Serialize, Deserialize)]
+    /// struct GetBalance {
+    ///     account_id: uuid::Uuid,
+    /// }
+    /// impl Message for GetBalance {
+    ///     const MESSAGE_TYPE: &'static str = "accounts.get_balance";
+    /// }
+    ///
+    /// #[derive(Debug, Serialize, Deserialize)]
+    /// struct Balance {
+    ///     cents: u64,
+    /// }
+    /// impl Message for Balance {
+    ///     const MESSAGE_TYPE: &'static str = "accounts.balance";
+    /// }
+    ///
+    /// impl Request for GetBalance {
+    ///     type Reply = Balance;
+    /// }
+    ///
+    /// async fn priority_lookup<T: Transport>(
+    ///     client: &RequestClient<T>,
+    ///     account_id: uuid::Uuid,
+    /// ) -> Balance {
+    ///     let options = RequestOptions::new()
+    ///         .with_timeout(Duration::from_millis(200))
+    ///         .with_destination("accounts.priority");
+    ///     client
+    ///         .request_with(GetBalance { account_id }, options)
+    ///         .await
+    ///         .unwrap()
+    /// }
+    ///
+    /// // A handler forwards `GetBalance` on the caller's own causal chain
+    /// // instead of opening a new one, by passing the `correlation_id` its
+    /// // `HandlerContext` carried.
+    /// async fn forward_on_the_same_chain<T: Transport>(
+    ///     client: &RequestClient<T>,
+    ///     ctx: &hexeract_core::HandlerContext,
+    ///     account_id: uuid::Uuid,
+    /// ) -> Balance {
+    ///     let options = RequestOptions::new().with_correlation_id(ctx.correlation_id);
+    ///     client
+    ///         .request_with(GetBalance { account_id }, options)
+    ///         .await
+    ///         .unwrap()
+    /// }
+    /// ```
+    pub async fn request_with<R: Request>(
         &self,
-        ctx: &HandlerContext,
-        request: &R,
-        timeout: Duration,
+        request: R,
+        options: RequestOptions,
     ) -> Result<R::Reply, RequestError> {
-        self.request_inner(ctx.correlation_id, request, timeout)
+        let timeout = options.timeout.unwrap_or(self.inner.default_timeout);
+        let destination = options.destination.as_deref().unwrap_or(R::DESTINATION);
+        let correlation_id = options.correlation_id.unwrap_or_default();
+        self.request_inner(&request, destination, timeout, correlation_id)
             .await
     }
 
     async fn request_inner<R: Request>(
         &self,
-        correlation_id: CorrelationId,
         request: &R,
+        destination: &str,
         timeout: Duration,
+        correlation_id: CorrelationId,
     ) -> Result<R::Reply, RequestError> {
+        let request_id = RequestId::new();
+        // Registering first, and only then reading the inbox state, is
+        // what closes the reconnect race: see the `reply_inbox` doc on
+        // `Self::new` and `ReplyInboxState` for why this order, not the
+        // reverse, is load-bearing rather than incidental.
         let mut pending = self
+            .inner
             .registry
-            .register(ReplyExpectation::new(R::Reply::MESSAGE_TYPE));
-        let request_id = pending.request_id();
+            .register(request_id, ReplyExpectation::new(R::Reply::MESSAGE_TYPE))?;
         let correlation_id = *correlation_id.as_uuid();
-        let inbox = self
+        let inbox = match &*self
+            .inner
             .reply_inbox
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone();
+        {
+            ReplyInboxState::Ready(inbox) => inbox.clone(),
+            ReplyInboxState::Reconnecting => {
+                return Err(RequestError::Transport(reply_inbox_reconnecting()));
+            }
+        };
         let mut envelope = BusEnvelope::with_reply_to(correlation_id, inbox, request)
             .map_err(RequestError::Decode)?;
         envelope
@@ -142,15 +385,28 @@ impl<T: Transport> RequestClient<T> {
             PROTOCOL_VERSION_HEADER.to_owned(),
             PROTOCOL_VERSION.to_string(),
         );
-        self.transport
-            .publish_envelope(R::DESTINATION, &envelope)
+        self.inner
+            .transport
+            .publish_envelope(destination, &envelope)
             .await
             .map_err(RequestError::Transport)?;
 
         let reply = match tokio::time::timeout(timeout, pending.wait()).await {
             Err(_elapsed) => return Err(RequestError::Timeout(timeout)),
             Ok(Err(_closed)) => {
-                return Err(RequestError::Transport(reply_channel_lost()));
+                // The registry drops every sender on both `close` (permanent)
+                // and `drain` (transient, on broker loss). `is_closed` is
+                // what tells the two apart for the caller, outside of a
+                // concurrent close: a caller woken by a `drain` that reads
+                // `is_closed` after a `close` has since landed sees
+                // `Closed` instead of `Transport`, losing the retryable
+                // signal. Consequence is weak, since a closed client
+                // accepts no further calls anyway.
+                return Err(if self.inner.registry.is_closed() {
+                    RequestError::Closed
+                } else {
+                    RequestError::Transport(reply_channel_lost())
+                });
             }
             Ok(Ok(envelope)) => envelope,
         };
@@ -161,6 +417,15 @@ impl<T: Transport> RequestClient<T> {
 
 fn reply_channel_lost() -> crate::BusError {
     crate::BusError::connection("reply inbox channel closed before a reply arrived", true)
+}
+
+/// Built when [`ReplyInboxState::Reconnecting`] is observed, refusing to
+/// publish toward an inbox that no longer exists.
+fn reply_inbox_reconnecting() -> crate::BusError {
+    crate::BusError::connection(
+        "reply inbox is reconnecting: no fresh inbox exists yet after a broker drop",
+        true,
+    )
 }
 
 /// Validate a reply against the protocol, then decode it.
@@ -221,16 +486,18 @@ fn decode_reply<R: Request>(reply: BusEnvelope) -> Result<R::Reply, RequestError
 mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
+    use tokio_util::sync::CancellationToken;
 
-    use hexeract_core::MessageId;
     use uuid::Uuid;
 
     use super::*;
     use crate::BusError;
     use crate::remote_error::RemoteErrorType;
+    use crate::request_options::RequestOptions;
     use crate::request_registry::ReplyCountersSnapshot;
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -328,6 +595,11 @@ mod tests {
         env
     }
 
+    /// A client with no real reply consumer. None of the tests using this
+    /// helper call `close`, but a client built this way must still behave
+    /// sanely if one did: with `supervisor: None`, `close` has nothing to
+    /// wait for on either branch and returns as soon as it has closed the
+    /// registry and cancelled `cancel`.
     fn client(
         transport: Arc<CapturingTransport>,
         registry: Arc<RequestRegistry>,
@@ -335,18 +607,193 @@ mod tests {
         RequestClient::new(
             transport,
             registry,
-            Arc::new(Mutex::new("reply.inbox".to_owned())),
+            Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
             Duration::from_millis(200),
+            CancellationToken::new(),
+            None,
         )
+    }
+
+    /// Build a client whose `cancel` token and supervisor (join handle
+    /// paired with its `finished` token) are both under the caller's
+    /// control, for the lifecycle tests below.
+    fn client_with_lifecycle(
+        transport: Arc<CapturingTransport>,
+        registry: Arc<RequestRegistry>,
+        cancel: CancellationToken,
+        supervisor: Option<(tokio::task::JoinHandle<()>, CancellationToken)>,
+    ) -> RequestClient<CapturingTransport> {
+        RequestClient::new(
+            transport,
+            registry,
+            Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
+            Duration::from_millis(200),
+            cancel,
+            supervisor,
+        )
+    }
+
+    /// A call that reads `Reconnecting` must fail before it ever reaches
+    /// the transport, and before any timeout elapses: it is refused at
+    /// the door, not by the timer.
+    ///
+    /// "Sans publier" is proven by the transport itself, via
+    /// `CapturingTransport::last_published`, not deduced from the error
+    /// variant alone. The paused clock proves "sans attendre le timeout":
+    /// under `start_paused = true`, any real wait on the 30 second
+    /// timeout would need tokio's virtual clock to advance, which only
+    /// happens if every task is parked on a timer; a call that returns
+    /// without ever registering a timer leaves the clock exactly where it
+    /// started.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_during_reconnecting_fails_fast_without_publishing() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let reply_inbox = Arc::new(Mutex::new(ReplyInboxState::Reconnecting));
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            registry,
+            reply_inbox,
+            Duration::from_secs(30),
+            CancellationToken::new(),
+            None,
+        );
+
+        let started = tokio::time::Instant::now();
+        let error = client
+            .request(Ping { seq: 1 })
+            .await
+            .expect_err("a reconnecting inbox must be refused");
+
+        assert!(matches!(error, RequestError::Transport(_)));
+        assert!(
+            tokio::time::Instant::now() - started < Duration::from_millis(1),
+            "a reconnecting inbox must fail before any timeout elapses"
+        );
+        assert!(
+            transport.last_published().is_none(),
+            "a reconnecting inbox must never be published to"
+        );
+    }
+
+    /// The narrow half of resolution 4: a closed client must be rejected
+    /// as `Closed`, not `Transport`, even while the inbox is
+    /// `Reconnecting`. `register()` runs before the inbox state is ever
+    /// read, so a closed registry short-circuits the call before it gets
+    /// the chance to observe `Reconnecting` at all; this test checks that
+    /// property directly rather than assuming it holds because the code
+    /// happens to be written in that order today.
+    #[tokio::test]
+    async fn a_closed_client_is_rejected_as_closed_even_when_the_inbox_is_reconnecting() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        registry.close();
+        let reply_inbox = Arc::new(Mutex::new(ReplyInboxState::Reconnecting));
+        let client = RequestClient::new(
+            transport,
+            registry,
+            reply_inbox,
+            Duration::from_millis(30),
+            CancellationToken::new(),
+            None,
+        );
+
+        let error = client
+            .request(Ping { seq: 1 })
+            .await
+            .expect_err("a closed client refuses new calls");
+        assert!(matches!(error, RequestError::Closed));
+    }
+
+    /// After the shared state is updated with a fresh inbox name, exactly
+    /// what the supervisor does on reconnect, a subsequent call must
+    /// publish to the new address, never the one it replaces.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_uses_the_new_inbox_never_the_old_once_the_supervisor_marks_it_ready() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let reply_inbox = Arc::new(Mutex::new(ReplyInboxState::Ready("old.inbox".to_owned())));
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            Arc::clone(&registry),
+            Arc::clone(&reply_inbox),
+            Duration::from_secs(5),
+            CancellationToken::new(),
+            None,
+        );
+
+        let first_fut = client.request(Ping { seq: 1 });
+        tokio::pin!(first_fut);
+        tokio::select! {
+            _ = &mut first_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let first = transport.last_published().expect("first request published");
+        assert_eq!(first.reply_to.as_deref(), Some("old.inbox"));
+
+        *reply_inbox.lock().unwrap_or_else(PoisonError::into_inner) =
+            ReplyInboxState::Ready("new.inbox".to_owned());
+
+        let second_fut = client.request(Ping { seq: 2 });
+        tokio::pin!(second_fut);
+        tokio::select! {
+            _ = &mut second_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let second = transport
+            .last_published()
+            .expect("second request published");
+        assert_eq!(second.reply_to.as_deref(), Some("new.inbox"));
+        assert_ne!(second.reply_to, first.reply_to);
+    }
+
+    /// Non-regression: a call already in flight when the connection drops
+    /// must still fail fast, exactly as it did before this state existed.
+    /// Mirrors what the supervisor does, in the mandated order: mark
+    /// `Reconnecting`, then drain.
+    #[tokio::test(start_paused = true)]
+    async fn an_in_flight_call_fails_fast_when_the_supervisor_marks_and_drains() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let reply_inbox = Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned())));
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            Arc::clone(&registry),
+            Arc::clone(&reply_inbox),
+            Duration::from_secs(30),
+            CancellationToken::new(),
+            None,
+        );
+
+        let request_fut = client.request(Ping { seq: 1 });
+        tokio::pin!(request_fut);
+        tokio::select! {
+            _ = &mut request_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        assert_eq!(
+            registry.len(),
+            1,
+            "the call must be registered before the drop"
+        );
+
+        *reply_inbox.lock().unwrap_or_else(PoisonError::into_inner) = ReplyInboxState::Reconnecting;
+        registry.drain();
+
+        let error = tokio::time::timeout(Duration::from_millis(1), request_fut)
+            .await
+            .expect("a drained slot must resolve well before the 30s timeout")
+            .expect_err("connection loss must surface as an error");
+        assert!(matches!(error, RequestError::Transport(_)));
     }
 
     #[tokio::test(start_paused = true)]
     async fn nominal_round_trip_returns_typed_reply() {
         let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
+        let registry = Arc::new(RequestRegistry::default());
         let client = client(Arc::clone(&transport), Arc::clone(&registry));
 
-        let request_fut = client.request(&Ping { seq: 3 });
+        let request_fut = client.request(Ping { seq: 3 });
         tokio::pin!(request_fut);
         // drive the request until it has published and registered the slot
         tokio::select! {
@@ -363,23 +810,59 @@ mod tests {
     #[tokio::test]
     async fn silent_responder_times_out() {
         let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
-        let client = client(transport, Arc::clone(&registry));
-        let err = client
-            .request_with_timeout(&Ping { seq: 1 }, Duration::from_millis(30))
-            .await
-            .expect_err("no reply");
+        let registry = Arc::new(RequestRegistry::default());
+        let client = RequestClient::new(
+            transport,
+            Arc::clone(&registry),
+            Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
+            Duration::from_millis(30),
+            CancellationToken::new(),
+            None,
+        );
+        let err = client.request(Ping { seq: 1 }).await.expect_err("no reply");
         assert!(matches!(err, RequestError::Timeout(_)));
         assert_eq!(registry.len(), 0);
+    }
+
+    /// The `RegisterRejection::AtCapacity -> RequestError::AtCapacity`
+    /// mapping is tested directly in `request_error`, but that alone does
+    /// not prove a caller of `RequestClient::request` ever observes it: the
+    /// `?` in `request_inner` is the only path by which a full registry
+    /// becomes visible to a user of this crate. This test drives a first
+    /// call far enough to occupy the registry's only slot, then leaves it
+    /// pending (never resolved) so a second call finds no room.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_when_the_registry_is_at_capacity_surfaces_at_capacity() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::new(1));
+        let client = client(Arc::clone(&transport), Arc::clone(&registry));
+
+        let first_fut = client.request(Ping { seq: 1 });
+        tokio::pin!(first_fut);
+        tokio::select! {
+            _ = &mut first_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        assert_eq!(
+            registry.len(),
+            1,
+            "the first call must occupy the registry's only slot"
+        );
+
+        let error = client
+            .request(Ping { seq: 2 })
+            .await
+            .expect_err("the registry has no free slot for a second call");
+        assert!(matches!(error, RequestError::AtCapacity));
     }
 
     #[tokio::test(start_paused = true)]
     async fn remote_error_reply_maps_to_remote() {
         let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
+        let registry = Arc::new(RequestRegistry::default());
         let client = client(Arc::clone(&transport), Arc::clone(&registry));
 
-        let request_fut = client.request(&Ping { seq: 9 });
+        let request_fut = client.request(Ping { seq: 9 });
         tokio::pin!(request_fut);
         tokio::select! {
             _ = &mut request_fut => panic!("pending"),
@@ -658,77 +1141,26 @@ mod tests {
         ));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn request_in_inherits_the_caller_causal_chain() {
-        let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
-        let client = RequestClient::new(
-            Arc::clone(&transport),
-            registry,
-            Arc::new(Mutex::new("caller.inbox".to_owned())),
-            Duration::from_secs(5),
-        );
-        let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
-        let expected = *ctx.correlation_id.as_uuid();
-
-        let request_fut = client.request_in(&ctx, &Ping { seq: 1 });
-        tokio::pin!(request_fut);
-        tokio::select! {
-            _ = &mut request_fut => panic!("should still be pending"),
-            () = tokio::time::sleep(Duration::from_millis(20)) => {}
-        }
-
-        let published = transport.last_published().expect("a request was published");
-        assert_eq!(published.correlation_id, expected);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn two_calls_in_one_chain_share_correlation_and_differ_in_request_id() {
-        let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
-        let client = RequestClient::new(
-            Arc::clone(&transport),
-            registry,
-            Arc::new(Mutex::new("caller.inbox".to_owned())),
-            Duration::from_secs(5),
-        );
-        let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
-
-        let first_fut = client.request_in(&ctx, &Ping { seq: 1 });
-        tokio::pin!(first_fut);
-        tokio::select! {
-            _ = &mut first_fut => panic!("should still be pending"),
-            () = tokio::time::sleep(Duration::from_millis(20)) => {}
-        }
-        let first = transport.last_published().expect("first request");
-
-        let second_fut = client.request_in(&ctx, &Ping { seq: 2 });
-        tokio::pin!(second_fut);
-        tokio::select! {
-            _ = &mut second_fut => panic!("should still be pending"),
-            () = tokio::time::sleep(Duration::from_millis(20)) => {}
-        }
-        let second = transport.last_published().expect("second request");
-
-        assert_eq!(first.correlation_id, second.correlation_id);
-        assert_ne!(
-            first.headers.get(REQUEST_ID_HEADER),
-            second.headers.get(REQUEST_ID_HEADER)
-        );
-    }
-
+    /// Every call mints its own fresh causal chain: `RequestClient` no longer
+    /// carries a `HandlerContext` to inherit a `correlation_id` from (see
+    /// `request_with`'s doc comment); two calls in a row must therefore
+    /// never share one.
     #[tokio::test(start_paused = true)]
     async fn request_starts_a_fresh_chain() {
         let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
+        let registry = Arc::new(RequestRegistry::default());
         let client = RequestClient::new(
             Arc::clone(&transport),
             registry,
-            Arc::new(Mutex::new("caller.inbox".to_owned())),
+            Arc::new(Mutex::new(ReplyInboxState::Ready(
+                "caller.inbox".to_owned(),
+            ))),
             Duration::from_secs(5),
+            CancellationToken::new(),
+            None,
         );
 
-        let first_fut = client.request(&Ping { seq: 1 });
+        let first_fut = client.request(Ping { seq: 1 });
         tokio::pin!(first_fut);
         tokio::select! {
             _ = &mut first_fut => panic!("should still be pending"),
@@ -736,7 +1168,7 @@ mod tests {
         }
         let first = transport.last_published().expect("first request");
 
-        let second_fut = client.request(&Ping { seq: 2 });
+        let second_fut = client.request(Ping { seq: 2 });
         tokio::pin!(second_fut);
         tokio::select! {
             _ = &mut second_fut => panic!("should still be pending"),
@@ -750,15 +1182,19 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn request_publishes_to_the_declared_destination_not_the_message_type() {
         let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
+        let registry = Arc::new(RequestRegistry::default());
         let client = RequestClient::new(
             Arc::clone(&transport),
             registry,
-            Arc::new(Mutex::new("caller.inbox".to_owned())),
+            Arc::new(Mutex::new(ReplyInboxState::Ready(
+                "caller.inbox".to_owned(),
+            ))),
             Duration::from_secs(5),
+            CancellationToken::new(),
+            None,
         );
 
-        let request_fut = client.request(&PingToDedicatedQueue { seq: 1 });
+        let request_fut = client.request(PingToDedicatedQueue { seq: 1 });
         tokio::pin!(request_fut);
         tokio::select! {
             _ = &mut request_fut => panic!("should still be pending"),
@@ -770,6 +1206,219 @@ mod tests {
             .expect("a request was published");
         assert_eq!(routing_key, PingToDedicatedQueue::DESTINATION);
         assert_ne!(routing_key, PingToDedicatedQueue::MESSAGE_TYPE);
+    }
+
+    /// Without any [`RequestOptions`], `request` must resolve both the
+    /// destination and the timeout from the client's own defaults: the
+    /// request's declared [`Request::DESTINATION`], never overridden here,
+    /// and the client's `default_timeout`, distinguishable from any other
+    /// duration because nothing ever replies.
+    #[tokio::test]
+    async fn request_without_options_uses_request_destination_and_client_default_timeout() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            registry,
+            Arc::new(Mutex::new(ReplyInboxState::Ready(
+                "caller.inbox".to_owned(),
+            ))),
+            Duration::from_millis(30),
+            CancellationToken::new(),
+            None,
+        );
+
+        let error = client
+            .request(PingToDedicatedQueue { seq: 1 })
+            .await
+            .expect_err("no responder ever answers");
+
+        match error {
+            RequestError::Timeout(elapsed) => assert_eq!(elapsed, Duration::from_millis(30)),
+            other => panic!("expected RequestError::Timeout, got {other:?}"),
+        }
+        let routing_key = transport
+            .last_routing_key()
+            .expect("a request was published");
+        assert_eq!(routing_key, PingToDedicatedQueue::DESTINATION);
+    }
+
+    /// `options.destination` takes precedence over `R::DESTINATION`.
+    #[tokio::test]
+    async fn options_destination_overrides_the_request_declared_destination() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            registry,
+            Arc::new(Mutex::new(ReplyInboxState::Ready(
+                "caller.inbox".to_owned(),
+            ))),
+            Duration::from_millis(30),
+            CancellationToken::new(),
+            None,
+        );
+
+        let options = RequestOptions::new().with_destination("tests.overridden.queue");
+        let _ = client
+            .request_with(PingToDedicatedQueue { seq: 1 }, options)
+            .await;
+
+        let routing_key = transport
+            .last_routing_key()
+            .expect("a request was published");
+        assert_eq!(routing_key, "tests.overridden.queue");
+        assert_ne!(routing_key, PingToDedicatedQueue::DESTINATION);
+    }
+
+    /// `options.timeout` takes precedence over the client's default timeout.
+    #[tokio::test]
+    async fn options_timeout_overrides_the_client_default_timeout() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            registry,
+            Arc::new(Mutex::new(ReplyInboxState::Ready(
+                "caller.inbox".to_owned(),
+            ))),
+            Duration::from_secs(30),
+            CancellationToken::new(),
+            None,
+        );
+
+        let options = RequestOptions::new().with_timeout(Duration::from_millis(30));
+        let error = client
+            .request_with(Ping { seq: 1 }, options)
+            .await
+            .expect_err("no responder ever answers");
+
+        match error {
+            RequestError::Timeout(elapsed) => assert_eq!(elapsed, Duration::from_millis(30)),
+            other => panic!("expected RequestError::Timeout, got {other:?}"),
+        }
+    }
+
+    /// `options.correlation_id` joins an existing causal chain: the supplied
+    /// identifier, not a freshly minted one, must travel on the wire.
+    #[tokio::test]
+    async fn options_correlation_id_is_carried_on_the_wire() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            registry,
+            Arc::new(Mutex::new(ReplyInboxState::Ready(
+                "caller.inbox".to_owned(),
+            ))),
+            Duration::from_millis(30),
+            CancellationToken::new(),
+            None,
+        );
+
+        let correlation_id = CorrelationId::new();
+        let options = RequestOptions::new().with_correlation_id(correlation_id);
+        let _ = client.request_with(Ping { seq: 1 }, options).await;
+
+        let published = transport.last_published().expect("a request was published");
+        assert_eq!(published.correlation_id, *correlation_id.as_uuid());
+    }
+
+    /// Without a `correlation_id` override, `request_with` opens a fresh
+    /// causal chain, exactly like `request` (see `request_starts_a_fresh_chain`):
+    /// two calls under `RequestOptions::default()` never share theirs.
+    #[tokio::test]
+    async fn request_with_default_options_opens_a_fresh_correlation_each_call() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            registry,
+            Arc::new(Mutex::new(ReplyInboxState::Ready(
+                "caller.inbox".to_owned(),
+            ))),
+            Duration::from_millis(30),
+            CancellationToken::new(),
+            None,
+        );
+
+        let _ = client
+            .request_with(Ping { seq: 1 }, RequestOptions::default())
+            .await;
+        let first = transport
+            .last_published()
+            .expect("first request")
+            .correlation_id;
+
+        let _ = client
+            .request_with(Ping { seq: 2 }, RequestOptions::default())
+            .await;
+        let second = transport
+            .last_published()
+            .expect("second request")
+            .correlation_id;
+
+        assert_ne!(first, second);
+    }
+
+    /// Two calls sharing a `correlation_id` (the causal chain) still mint
+    /// distinct `RequestId`s (the per-call identity) and each resolves to
+    /// its own reply rather than crossing over: the shared correlation must
+    /// never be usable to key a pending slot.
+    #[tokio::test]
+    async fn two_calls_sharing_a_correlation_mint_distinct_request_ids_and_do_not_cross_replies() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            Arc::clone(&registry),
+            Arc::new(Mutex::new(ReplyInboxState::Ready(
+                "caller.inbox".to_owned(),
+            ))),
+            Duration::from_secs(5),
+            CancellationToken::new(),
+            None,
+        );
+        let correlation_id = CorrelationId::new();
+
+        let first_fut = client.request_with(
+            Ping { seq: 1 },
+            RequestOptions::new().with_correlation_id(correlation_id),
+        );
+        tokio::pin!(first_fut);
+        tokio::select! {
+            _ = &mut first_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let first = transport.last_published().expect("first request");
+
+        let second_fut = client.request_with(
+            Ping { seq: 2 },
+            RequestOptions::new().with_correlation_id(correlation_id),
+        );
+        tokio::pin!(second_fut);
+        tokio::select! {
+            _ = &mut second_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let second = transport.last_published().expect("second request");
+
+        assert_eq!(first.correlation_id, *correlation_id.as_uuid());
+        assert_eq!(second.correlation_id, *correlation_id.as_uuid());
+        let first_request_id = published_request_id(&first);
+        let second_request_id = published_request_id(&second);
+        assert_ne!(first_request_id, second_request_id);
+
+        // Resolve the second call's reply before the first call's, so a slot
+        // keyed on the shared correlation_id (rather than on request_id)
+        // would deliver the wrong Pong to the wrong caller.
+        registry.resolve(ok_reply(second_request_id, 2));
+        registry.resolve(ok_reply(first_request_id, 1));
+
+        let first_reply = first_fut.await.expect("first reply");
+        let second_reply = second_fut.await.expect("second reply");
+        assert_eq!(first_reply, Pong { seq: 1 });
+        assert_eq!(second_reply, Pong { seq: 2 });
     }
 
     /// The request id of the single call currently in flight on `registry`.
@@ -826,10 +1475,10 @@ mod tests {
     #[tokio::test]
     async fn a_forged_reply_of_the_wrong_type_does_not_end_the_call() {
         let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
+        let registry = Arc::new(RequestRegistry::default());
         let client = client(Arc::clone(&transport), Arc::clone(&registry));
 
-        let call = tokio::spawn(async move { client.request(&Ping { seq: 7 }).await });
+        let call = tokio::spawn(async move { client.request(Ping { seq: 7 }).await });
         tokio::task::yield_now().await;
 
         let request_id = registry_single_request_id(&registry);
@@ -863,15 +1512,19 @@ mod tests {
         mutate: impl FnOnce(RequestId, &mut BusEnvelope),
     ) -> (RequestError, ReplyCountersSnapshot) {
         let transport = Arc::new(CapturingTransport::default());
-        let registry = Arc::new(RequestRegistry::new());
+        let registry = Arc::new(RequestRegistry::default());
         let client = RequestClient::new(
             Arc::clone(&transport),
             Arc::clone(&registry),
-            Arc::new(Mutex::new("caller.inbox".to_owned())),
+            Arc::new(Mutex::new(ReplyInboxState::Ready(
+                "caller.inbox".to_owned(),
+            ))),
             Duration::from_millis(100),
+            CancellationToken::new(),
+            None,
         );
 
-        let request_fut = client.request(&Ping { seq: 1 });
+        let request_fut = client.request(Ping { seq: 1 });
         tokio::pin!(request_fut);
         tokio::select! {
             _ = &mut request_fut => panic!("should still be pending"),
@@ -907,5 +1560,340 @@ mod tests {
             .await
             .expect_err("the tampered reply must be rejected");
         (error, registry.counters())
+    }
+
+    #[tokio::test]
+    async fn close_fails_every_pending_call_with_closed() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = client_with_lifecycle(
+            Arc::clone(&transport),
+            Arc::clone(&registry),
+            CancellationToken::new(),
+            None,
+        );
+
+        let call = {
+            let client = client.clone();
+            tokio::spawn(async move { client.request(Ping { seq: 1 }).await })
+        };
+        tokio::task::yield_now().await;
+
+        // Without this, both interleavings of the spawned call against
+        // `close` produce the same `Err(RequestError::Closed)`: whether the
+        // call was genuinely in flight when `close` ran, or never got the
+        // chance to register at all. This assertion is what tells the two
+        // apart and keeps this test distinct from
+        // `request_after_close_is_rejected_with_closed` below.
+        assert_eq!(registry.len(), 1, "the call must be in flight before close");
+
+        client.close().await;
+
+        let result = call.await.expect("the spawned call must not panic");
+        assert!(
+            matches!(result, Err(RequestError::Closed)),
+            "expected RequestError::Closed, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_after_close_is_rejected_with_closed() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = client_with_lifecycle(
+            Arc::clone(&transport),
+            Arc::clone(&registry),
+            CancellationToken::new(),
+            None,
+        );
+
+        client.close().await;
+
+        let error = client
+            .request(Ping { seq: 1 })
+            .await
+            .expect_err("a closed client refuses new calls");
+        assert!(matches!(error, RequestError::Closed));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_called_twice_does_not_panic_and_the_second_call_returns_promptly() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let cancel = CancellationToken::new();
+        let finished_signal = CancellationToken::new();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let supervisor = tokio::spawn({
+            let cancel = cancel.clone();
+            let finished_signal = finished_signal.clone();
+            let stopped = Arc::clone(&stopped);
+            async move {
+                cancel.cancelled().await;
+                stopped.store(true, Ordering::SeqCst);
+                finished_signal.cancel();
+            }
+        });
+        let client = client_with_lifecycle(
+            transport,
+            Arc::clone(&registry),
+            cancel,
+            Some((supervisor, finished_signal)),
+        );
+
+        client.close().await;
+        assert!(stopped.load(Ordering::SeqCst));
+        assert!(registry.is_closed());
+
+        // Second call: no supervisor handle is left to await, so it falls
+        // through to waiting on the already-cancelled `finished` token
+        // instead of the join handle. It must not panic, must not change
+        // any observable state again, and above all must not block: under
+        // `start_paused = true`, the timeout below is a deterministic
+        // two-valued discriminator rather than a wall-clock bound. A
+        // `close` that regressed to waiting on the wrong token, one
+        // nothing will ever cancel again, would leave every task parked,
+        // which is exactly the condition that makes tokio's virtual clock
+        // advance on its own, so `Elapsed` would still fire without a
+        // single real millisecond passing; this test does not depend on
+        // `SystemTime`, so pausing tokio's clock cannot mislead it.
+        tokio::time::timeout(Duration::from_millis(200), client.close())
+            .await
+            .expect("a second close must not block");
+        assert!(registry.is_closed(), "a second close must change nothing");
+    }
+
+    /// Proves `close` actually awaits the supervisor task rather than only
+    /// cancelling its token and returning. The supervisor sets `finished`
+    /// only right before it returns, after observing cancellation and
+    /// yielding once more: if `close` did not await the handle, this
+    /// assertion, which runs immediately after `close` returns, would
+    /// observe `finished` still `false`.
+    ///
+    /// This proof is exact under the default `current_thread` flavor
+    /// `#[tokio::test]` uses here: with a single scheduler thread, the
+    /// extra `yield_now` below forces a second scheduler turn the
+    /// supervisor cannot skip, so a `close` that only yielded once instead
+    /// of genuinely awaiting the handle could not observe `finished` as
+    /// `true` yet. Under `flavor = "multi_thread"` the same ordering is
+    /// only overwhelmingly likely, not guaranteed: a second OS thread could
+    /// in principle race the supervisor to completion ahead of the
+    /// assertion regardless of what `close` awaited.
+    #[tokio::test]
+    async fn close_only_returns_after_the_supervisor_task_has_actually_finished() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let cancel = CancellationToken::new();
+        let finished_signal = CancellationToken::new();
+        let finished = Arc::new(AtomicBool::new(false));
+        let supervisor = tokio::spawn({
+            let cancel = cancel.clone();
+            let finished_signal = finished_signal.clone();
+            let finished = Arc::clone(&finished);
+            async move {
+                cancel.cancelled().await;
+                tokio::task::yield_now().await;
+                finished.store(true, Ordering::SeqCst);
+                finished_signal.cancel();
+            }
+        });
+        let client = client_with_lifecycle(
+            transport,
+            registry,
+            cancel,
+            Some((supervisor, finished_signal)),
+        );
+
+        client.close().await;
+
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "close returned before the supervisor task actually finished"
+        );
+    }
+
+    /// A `close()` call from a second clone, made while a first clone's
+    /// `close()` already holds the supervisor's `JoinHandle`, must wait for
+    /// the supervisor to actually finish rather than returning as soon as
+    /// it finds the handle already taken. Before the `finished` token
+    /// existed, the `None` branch of `close` had nothing to wait on and
+    /// returned immediately, so this second, concurrent caller could
+    /// observe `close` returning before the reply consumer had genuinely
+    /// stopped: exactly the defect this test pins down. Compare with
+    /// `close_only_returns_after_the_supervisor_task_has_actually_finished`
+    /// above, which proves the equivalent property for the first,
+    /// handle-holding caller.
+    ///
+    /// This proof is exact under the default `current_thread` flavor
+    /// `#[tokio::test]` uses here, for the same reason given on the sibling
+    /// test above: with a single scheduler thread, the `yield_now` below
+    /// forces a scheduler turn the spawned `first_close` cannot skip before
+    /// it reaches its own `handle.await`, so by the time `second.close()`
+    /// starts, the supervisor handle is deterministically already taken.
+    /// The `assert!` right before `second.close()` checks that directly,
+    /// rather than assuming it: without it, a flavor change to
+    /// `multi_thread` could let `second.close()` win the race and take the
+    /// handle itself, and the assertion below would still pass, since
+    /// `finished` becomes `true` on either branch, so this test would
+    /// silently stop covering the `None` branch it exists to pin down.
+    /// Under `flavor = "multi_thread"` the ordering this test relies on is
+    /// only overwhelmingly likely, not guaranteed.
+    #[tokio::test]
+    async fn concurrent_close_from_a_second_clone_also_waits_for_the_supervisor_task() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let cancel = CancellationToken::new();
+        let finished_signal = CancellationToken::new();
+        let finished = Arc::new(AtomicBool::new(false));
+        let supervisor = tokio::spawn({
+            let cancel = cancel.clone();
+            let finished_signal = finished_signal.clone();
+            let finished = Arc::clone(&finished);
+            async move {
+                cancel.cancelled().await;
+                tokio::task::yield_now().await;
+                finished.store(true, Ordering::SeqCst);
+                finished_signal.cancel();
+            }
+        });
+        let client = client_with_lifecycle(
+            transport,
+            registry,
+            cancel,
+            Some((supervisor, finished_signal)),
+        );
+        let second = client.clone();
+
+        // Drive the first close() far enough to take the supervisor's
+        // `JoinHandle`, a synchronous step performed before any await
+        // inside `close`, and park it on `handle.await`, before the second
+        // clone starts its own close(). One `yield_now` is the same idiom
+        // already used elsewhere in this module, for example in
+        // `close_fails_every_pending_call_with_closed`, to let a spawned
+        // task run up to its first await point.
+        let first_close = tokio::spawn(async move { client.close().await });
+        tokio::task::yield_now().await;
+
+        // Pin the branch: the second, concurrent close() below must find
+        // the supervisor handle already taken by the first close(), so it
+        // is genuinely exercising the `None` branch and not, say, racing
+        // ahead of it under a scheduler that behaves differently.
+        assert!(
+            second
+                .inner
+                .supervisor
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none(),
+            "the first close() must have already taken the supervisor handle before the \
+             second starts, or this test would silently exercise the Some branch instead \
+             of the None branch it exists to pin down"
+        );
+
+        second.close().await;
+
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the second, concurrent close() must not return before the supervisor task actually finished"
+        );
+
+        first_close.await.expect("first close task must not panic");
+    }
+
+    /// The limit case of the `None` branch: a `close()` on a client built
+    /// with no supervisor at all has nothing to take from the supervisor
+    /// mutex and no `finished` token to wait on, and must still return
+    /// promptly rather than block forever.
+    ///
+    /// `start_paused = true` turns the timeout below into a deterministic
+    /// two-valued discriminator rather than a wall-clock bound, the same
+    /// reasoning as on `close_called_twice_does_not_panic_and_the_second_call_returns_promptly`
+    /// above: this test reads no `SystemTime`, so tokio's virtual clock
+    /// cannot mislead it.
+    #[tokio::test(start_paused = true)]
+    async fn close_on_a_client_built_without_a_supervisor_does_not_block() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = client_with_lifecycle(transport, registry, CancellationToken::new(), None);
+
+        tokio::time::timeout(Duration::from_millis(200), client.close())
+            .await
+            .expect("close on a client built without a supervisor must not block");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_handle_closes_the_registry_and_signals_the_consumer() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let cancel = CancellationToken::new();
+        let external_cancel = cancel.clone();
+        let finished_signal = CancellationToken::new();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let supervisor = tokio::spawn({
+            let cancel = cancel.clone();
+            let finished_signal = finished_signal.clone();
+            let stopped = Arc::clone(&stopped);
+            async move {
+                cancel.cancelled().await;
+                stopped.store(true, Ordering::SeqCst);
+                finished_signal.cancel();
+            }
+        });
+
+        let client = client_with_lifecycle(
+            transport,
+            Arc::clone(&registry),
+            cancel,
+            Some((supervisor, finished_signal)),
+        );
+        let _pending = registry
+            .register(RequestId::new(), ReplyExpectation::new(Pong::MESSAGE_TYPE))
+            .expect("registration succeeds");
+
+        drop(client);
+
+        assert!(
+            registry.is_closed(),
+            "dropping the last handle must close the registry"
+        );
+        assert!(
+            registry.is_empty(),
+            "dropping the last handle must empty the registry"
+        );
+        assert!(
+            external_cancel.is_cancelled(),
+            "dropping the last handle must cancel the token"
+        );
+
+        // Drop can only signal, never await: give the already-cancelled
+        // supervisor task a chance to actually run to completion.
+        tokio::task::yield_now().await;
+        assert!(stopped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn dropping_a_clone_while_another_handle_lives_closes_nothing() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let cancel = CancellationToken::new();
+        let external_cancel = cancel.clone();
+        let client = client_with_lifecycle(transport, Arc::clone(&registry), cancel, None);
+        let clone = client.clone();
+
+        drop(clone);
+
+        assert!(
+            !registry.is_closed(),
+            "a still-live handle must keep the registry open"
+        );
+        assert!(
+            !external_cancel.is_cancelled(),
+            "a still-live handle must keep the token uncancelled"
+        );
+
+        drop(client);
+        assert!(
+            registry.is_closed(),
+            "dropping the last remaining handle must close the registry"
+        );
     }
 }

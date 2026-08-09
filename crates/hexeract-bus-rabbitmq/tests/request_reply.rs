@@ -30,10 +30,13 @@ use hexeract_bus::REPLY_STATUS_OK;
 use hexeract_bus::REQUEST_ID_HEADER;
 use hexeract_bus::RemoteErrorType;
 use hexeract_bus::ReplyExpectation;
+use hexeract_bus::ReplyInboxState;
 use hexeract_bus::Request;
 use hexeract_bus::RequestClient;
+use hexeract_bus::RequestContext;
 use hexeract_bus::RequestError;
 use hexeract_bus::RequestHandler;
+use hexeract_bus::RequestOptions;
 use hexeract_bus::RequestRegistry;
 use hexeract_bus::Transport;
 use hexeract_bus_rabbitmq::RabbitMqConnection;
@@ -42,7 +45,6 @@ use hexeract_bus_rabbitmq::RabbitMqWorkerBuilder;
 use hexeract_bus_rabbitmq::connect_request_client;
 use hexeract_bus_rabbitmq::declare_reply_inbox_for_test;
 use hexeract_bus_rabbitmq::run_reply_inbox_for_test;
-use hexeract_core::HandlerContext;
 use lapin::BasicProperties;
 use lapin::Channel;
 use lapin::Confirmation;
@@ -93,7 +95,7 @@ async fn reply_published_to_inbox_is_resolved() {
         .await
         .unwrap();
 
-    let registry = Arc::new(RequestRegistry::new());
+    let registry = Arc::new(RequestRegistry::default());
     let cancel = CancellationToken::new();
     let handle = {
         let registry = Arc::clone(&registry);
@@ -104,8 +106,10 @@ async fn reply_published_to_inbox_is_resolved() {
         })
     };
 
-    let mut pending = registry.register(ReplyExpectation::new(Pong::MESSAGE_TYPE));
-    let request_id = pending.request_id();
+    let request_id = hexeract_core::RequestId::new();
+    let mut pending = registry
+        .register(request_id, ReplyExpectation::new(Pong::MESSAGE_TYPE))
+        .expect("registration succeeds");
 
     // publish a reply envelope straight to the inbox via a fresh channel
     let publish_channel = connection.create_channel().await.unwrap();
@@ -153,7 +157,7 @@ async fn connection_drop_fails_in_flight_fast() {
     .unwrap();
 
     // no responder consumes it; kill the broker while a request is in flight
-    let request = client.request(&Ping { seq: 1 });
+    let request = client.request(Ping { seq: 1 });
     tokio::pin!(request);
     tokio::select! {
         _ = &mut request => panic!("should still be pending before the drop"),
@@ -174,7 +178,7 @@ async fn connection_drop_fails_in_flight_fast() {
 struct Echo;
 impl RequestHandler<Ping> for Echo {
     type Error = BusError;
-    async fn handle(&self, request: Ping, _ctx: &HandlerContext) -> Result<Pong, BusError> {
+    async fn handle(&self, request: Ping, _ctx: &RequestContext<'_>) -> Result<Pong, BusError> {
         Ok(Pong { seq: request.seq })
     }
 }
@@ -184,7 +188,7 @@ impl RequestHandler<Ping> for Echo {
 struct Failing;
 impl RequestHandler<Ping> for Failing {
     type Error = BusError;
-    async fn handle(&self, _request: Ping, _ctx: &HandlerContext) -> Result<Pong, BusError> {
+    async fn handle(&self, _request: Ping, _ctx: &RequestContext<'_>) -> Result<Pong, BusError> {
         Err(BusError::Internal("deliberate handler failure".to_owned()))
     }
 }
@@ -244,7 +248,7 @@ async fn end_to_end_request_reply_round_trip() {
         .await
         .unwrap();
 
-    let pong = client.request(&Ping { seq: 21 }).await.unwrap();
+    let pong = client.request(Ping { seq: 21 }).await.unwrap();
     assert_eq!(pong.seq, 21);
 
     cancel.cancel();
@@ -273,7 +277,10 @@ async fn a_round_trip_carries_the_protocol_headers_over_the_wire() {
     // available for a direct basic_get, timing out client-side instead of
     // waiting for a reply that will never come.
     let _ = client
-        .request_with_timeout(&Ping { seq: 1 }, Duration::from_millis(500))
+        .request_with(
+            Ping { seq: 1 },
+            RequestOptions::new().with_timeout(Duration::from_millis(500)),
+        )
         .await;
 
     let inspect_connection = RabbitMqConnection::connect(broker.uri()).await.unwrap();
@@ -351,7 +358,7 @@ async fn remote_error_reaches_caller_fast() {
 
     let started = Instant::now();
     let err = client
-        .request(&Ping { seq: 1 })
+        .request(Ping { seq: 1 })
         .await
         .expect_err("a failing handler must surface as an error");
     let elapsed = started.elapsed();
@@ -433,7 +440,7 @@ async fn request_without_reply_to_is_non_fatal() {
     let client = connect_request_client(broker.uri(), Duration::from_secs(10), cancel.clone())
         .await
         .unwrap();
-    let pong = client.request(&Ping { seq: 7 }).await.unwrap();
+    let pong = client.request(Ping { seq: 7 }).await.unwrap();
     assert_eq!(pong.seq, 7);
 
     cancel.cancel();
@@ -452,7 +459,7 @@ struct SlowEcho {
 }
 impl RequestHandler<Ping> for SlowEcho {
     type Error = BusError;
-    async fn handle(&self, request: Ping, _ctx: &HandlerContext) -> Result<Pong, BusError> {
+    async fn handle(&self, request: Ping, _ctx: &RequestContext<'_>) -> Result<Pong, BusError> {
         tokio::time::sleep(self.delay).await;
         Ok(Pong { seq: request.seq })
     }
@@ -587,14 +594,14 @@ async fn a_forged_reply_published_into_the_inbox_does_not_end_the_call() {
 
     declare_ping_queue(broker.uri(), "tests.ping").await;
 
-    let registry = Arc::new(RequestRegistry::new());
+    let registry = Arc::new(RequestRegistry::default());
     let inbox_connection =
         RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
             .await
             .unwrap();
     let inbox_channel = inbox_connection.create_channel().await.unwrap();
     let inbox = declare_reply_inbox_for_test(&inbox_channel).await.unwrap();
-    let reply_inbox = Arc::new(Mutex::new(inbox.clone()));
+    let reply_inbox = Arc::new(Mutex::new(ReplyInboxState::Ready(inbox.clone())));
     let inbox_cancel = cancel.clone();
     let inbox_registry = Arc::clone(&registry);
     let inbox_name = inbox.clone();
@@ -611,9 +618,11 @@ async fn a_forged_reply_published_into_the_inbox_does_not_end_the_call() {
         Arc::clone(&registry),
         reply_inbox,
         Duration::from_secs(10),
+        cancel.clone(),
+        None,
     );
 
-    let call = tokio::spawn(async move { client.request(&Ping { seq: 1 }).await });
+    let call = tokio::spawn(async move { client.request(Ping { seq: 1 }).await });
 
     let request_id = wait_for_recorded_request_id(&publisher_transport).await;
 
@@ -731,7 +740,7 @@ async fn a_responder_on_an_application_exchange_still_replies_through_the_defaul
     // The round trip succeeding is half the proof: the reply reached the
     // caller's server-named inbox, which only the default exchange routes
     // to.
-    let pong = client.request(&Ping { seq: 7 }).await.unwrap();
+    let pong = client.request(Ping { seq: 7 }).await.unwrap();
     assert_eq!(
         pong.seq, 7,
         "the reply must be delivered through the default exchange"

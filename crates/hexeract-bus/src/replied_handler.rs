@@ -4,12 +4,14 @@ use std::sync::Arc;
 use hexeract_core::{HandlerContext, RequestId};
 
 use crate::remote_error::{RemoteErrorPayload, RemoteErrorType};
+use crate::request_context::RequestContext;
 use crate::rpc_protocol::{
     PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, REPLY_ERROR_MESSAGE_TYPE, REPLY_STATUS_ERROR,
     REPLY_STATUS_HEADER, REPLY_STATUS_OK, REQUEST_ID_HEADER, read_protocol_version,
 };
 use crate::{
-    BoxFuture, BusEnvelope, BusError, ErasedHandler, ReplyPublisher, Request, RequestHandler,
+    BoxFuture, BusEnvelope, BusError, ErasedHandler, ReplyDestination, ReplyPublisher, Request,
+    RequestHandler,
 };
 
 /// Adapts a [`RequestHandler<R>`] into an [`ErasedHandler`] that decodes the
@@ -42,6 +44,61 @@ where
             _phantom: PhantomData,
         }
     }
+
+    /// Parse and validate `envelope.reply_to` against
+    /// [`ReplyPublisher::accept_destination`], logging and returning `None`
+    /// for either an absent or a rejected destination. Called first, before
+    /// any other guard: see [`RepliedHandler::handle`] for why.
+    fn validated_reply_to(&self, envelope: &BusEnvelope) -> Option<ReplyDestination> {
+        let Some(raw_reply_to) = envelope.reply_to.as_deref() else {
+            tracing::warn!(
+                message_type = R::MESSAGE_TYPE,
+                correlation_id = %envelope.correlation_id,
+                "request without reply_to, dropping without running the handler"
+            );
+            return None;
+        };
+        match self.replies.accept_destination(raw_reply_to) {
+            Ok(reply_to) => Some(reply_to),
+            Err(rejection) => {
+                tracing::warn!(
+                    message_type = R::MESSAGE_TYPE,
+                    correlation_id = %envelope.correlation_id,
+                    ?rejection,
+                    "request carries an unusable reply_to, dropping without running the handler"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// Outcome of reading the inbound `x-hexeract-request-id` header.
+///
+/// Kept as two distinct rejection cases, rather than collapsed into a
+/// single `None`, because they call for different diagnoses: a missing
+/// header points at a non-conforming client library or version, an
+/// unreadable one points at an encoding bug in a peer that otherwise
+/// believes it speaks the protocol.
+enum RequestIdHeader {
+    /// The header parsed into a request identity.
+    Present(RequestId),
+    /// The envelope carries no `x-hexeract-request-id` header at all.
+    Missing,
+    /// The header is present but does not parse as a UUID.
+    Unreadable,
+}
+
+/// Parse the inbound `x-hexeract-request-id` header into a [`RequestIdHeader`].
+fn parse_request_id(envelope: &BusEnvelope) -> RequestIdHeader {
+    match envelope.headers.get(REQUEST_ID_HEADER) {
+        None => RequestIdHeader::Missing,
+        Some(raw) => raw
+            .parse::<uuid::Uuid>()
+            .map_or(RequestIdHeader::Unreadable, |uuid| {
+                RequestIdHeader::Present(RequestId::from(uuid))
+            }),
+    }
 }
 
 impl<R, H, P> ErasedHandler for RepliedHandler<R, H, P>
@@ -56,28 +113,38 @@ where
 
     /// Decode the inbound request, run the handler, and publish the reply.
     ///
-    /// The inbound `x-hexeract-request-id` header is parsed into a
-    /// [`RequestId`] exactly once, up front, and that single value feeds
-    /// every branch below: the ok-reply header, the error-reply header, and
-    /// the error-reply payload all share the same identity rather than
-    /// risking divergent views of it: a header echoing the raw inbound string
-    /// while the payload fell back to a nil identity would describe the same
-    /// call two different ways.
+    /// Four guards run in a fixed order before the handler is ever invoked,
+    /// each one stopping the request before the handler runs, two of them
+    /// silently and two of them with a categorized error reply, rather than
+    /// running the handler on incomplete input:
     ///
-    /// `reply_to` is parsed and validated against [`ReplyPublisher::accept_destination`]
-    /// FIRST, before any other guard. An absent or rejected `reply_to` drops
-    /// the request without running the handler and without publishing
-    /// anything. This order was inverted from an earlier revision that ran
-    /// the protocol-version check before the `reply_to` guard: a guard
-    /// placed after an early return can never protect that path, so once
-    /// the version-mismatch branch publishes an error reply, that publish
-    /// must not be reachable with an unvalidated destination. Otherwise the
-    /// version check is a publication relay: a third party could have a
-    /// trusted responder emit a message to an arbitrary destination without
-    /// a decodable payload and without ever reaching the handler. Only once
-    /// `reply_to` is validated does the version check run, publishing (when
-    /// needed) to the already-validated destination, followed by decode and
-    /// the handler.
+    /// 1. `reply_to` is parsed and validated against
+    ///    [`ReplyPublisher::accept_destination`] FIRST, before any other
+    ///    guard. This order was inverted from an earlier revision that ran
+    ///    the protocol-version check before the `reply_to` guard: a guard
+    ///    placed after an early return can never protect that path, so once
+    ///    a later branch publishes an error reply, that publish must not be
+    ///    reachable with an unvalidated destination. Otherwise the version
+    ///    check is a publication relay: a third party could have a trusted
+    ///    responder emit a message to an arbitrary destination without a
+    ///    decodable payload and without ever reaching the handler.
+    /// 2. The `x-hexeract-request-id` header is parsed into a [`RequestId`]
+    ///    second, right after `reply_to`. A request carrying no readable
+    ///    identity is dropped here rather than answered: the caller matches
+    ///    its replies by this same identifier
+    ///    (`RequestClient`'s pending-reply registry), so a reply built
+    ///    without one could never be matched to any in-flight call and
+    ///    would only be counted orphaned. Placing this guard here, ahead of
+    ///    the version and decode checks, also means every later branch that
+    ///    builds a reply can carry `request_id` as a plain [`RequestId`]
+    ///    rather than an `Option<RequestId>`: there is no "unknown
+    ///    identity" case left for it to represent past this point.
+    /// 3. The protocol version is checked third, once both `reply_to` and
+    ///    `request_id` are known good: its own rejection branch is the
+    ///    first one in this method that publishes, and it now has both a
+    ///    validated destination and a definite identity to publish with.
+    /// 4. The payload is decoded fourth, and its own rejection reuses the
+    ///    same guarantees.
     ///
     /// A nominal reply the framework fails to serialize is treated the same
     /// as an undecodable request: an opaque internal error is published
@@ -88,41 +155,45 @@ where
         ctx: &'a HandlerContext,
     ) -> BoxFuture<'a, Result<(), BusError>> {
         Box::pin(async move {
-            let request_id: Option<RequestId> = envelope
-                .headers
-                .get(REQUEST_ID_HEADER)
-                .and_then(|raw| raw.parse::<uuid::Uuid>().ok())
-                .map(RequestId::from);
             let correlation_id = envelope.correlation_id;
 
-            let Some(raw_reply_to) = envelope.reply_to.as_deref() else {
-                tracing::warn!(
-                    message_type = R::MESSAGE_TYPE,
-                    "request without reply_to, dropping without running the handler"
-                );
+            let Some(reply_to) = self.validated_reply_to(envelope) else {
                 return Ok(());
             };
-            let reply_to = match self.replies.accept_destination(raw_reply_to) {
-                Ok(reply_to) => reply_to,
-                Err(rejection) => {
+
+            let request_id = match parse_request_id(envelope) {
+                RequestIdHeader::Present(request_id) => request_id,
+                RequestIdHeader::Missing => {
                     tracing::warn!(
                         message_type = R::MESSAGE_TYPE,
-                        ?rejection,
-                        "request carries an unusable reply_to, dropping without running the handler"
+                        %correlation_id,
+                        "request without a request id header, dropping without running the handler"
+                    );
+                    return Ok(());
+                }
+                RequestIdHeader::Unreadable => {
+                    tracing::warn!(
+                        message_type = R::MESSAGE_TYPE,
+                        %correlation_id,
+                        "request with an unparsable request id header, dropping without running the handler"
                     );
                     return Ok(());
                 }
             };
 
-            if read_protocol_version(&envelope.headers) != Some(PROTOCOL_VERSION) {
-                tracing::warn!(
-                    message_type = R::MESSAGE_TYPE,
-                    "request announces an unsupported protocol version, rejecting"
-                );
-                let reply = error_reply(RemoteErrorType::Unsupported, correlation_id, request_id)?;
-                self.replies.publish_reply(&reply_to, &reply).await?;
-                return Ok(());
-            }
+            let protocol_version = match read_protocol_version(&envelope.headers) {
+                Some(version) if version == PROTOCOL_VERSION => version,
+                _ => {
+                    tracing::warn!(
+                        message_type = R::MESSAGE_TYPE,
+                        "request announces an unsupported protocol version, rejecting"
+                    );
+                    let reply =
+                        error_reply(RemoteErrorType::Unsupported, correlation_id, request_id)?;
+                    self.replies.publish_reply(&reply_to, &reply).await?;
+                    return Ok(());
+                }
+            };
 
             let request: R = match envelope.decode() {
                 Ok(request) => request,
@@ -139,15 +210,14 @@ where
                 }
             };
 
-            let reply_envelope = match self.handler.handle(request, ctx).await {
+            let request_context = RequestContext::new(request_id, protocol_version, ctx);
+            let reply_envelope = match self.handler.handle(request, &request_context).await {
                 Ok(reply) => match BusEnvelope::new(correlation_id, &reply) {
                     Ok(mut env) => {
                         env.headers
                             .insert(REPLY_STATUS_HEADER.to_owned(), REPLY_STATUS_OK.to_owned());
-                        if let Some(request_id) = request_id {
-                            env.headers
-                                .insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
-                        }
+                        env.headers
+                            .insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
                         env.headers.insert(
                             PROTOCOL_VERSION_HEADER.to_owned(),
                             PROTOCOL_VERSION.to_string(),
@@ -156,7 +226,7 @@ where
                     }
                     Err(error) => {
                         tracing::error!(
-                            request_id = %request_id.map(|id| id.to_string()).unwrap_or_default(),
+                            %request_id,
                             message_type = R::MESSAGE_TYPE,
                             %error,
                             "reply serialization failed, replying with an opaque category"
@@ -167,7 +237,7 @@ where
                 Err(error) => {
                     let error: BusError = error.into();
                     tracing::error!(
-                        request_id = %request_id.map(|id| id.to_string()).unwrap_or_default(),
+                        %request_id,
                         message_type = R::MESSAGE_TYPE,
                         %error,
                         "request handler failed, replying with an opaque category"
@@ -192,24 +262,22 @@ where
 /// The failure detail is deliberately absent from the wire: it has already
 /// been recorded on the responder side, indexed by the request identity.
 ///
-/// `request_id` is parsed exactly once by the caller into a single
-/// [`RequestId`], and that same value feeds both the header and the
-/// payload below: the two can no longer disagree about the request
-/// identity the way a header copied verbatim and a payload silently
-/// defaulting to nil once could. The chosen convention for "no known
-/// identity" (the inbound header was absent or did not parse as a UUID)
-/// is to agree on absence everywhere: the header is omitted from the
-/// reply and the payload carries `Uuid::nil()`.
+/// `request_id` is guaranteed present by the caller: [`RepliedHandler::handle`]
+/// rejects a request with no readable identity before any code path that
+/// could reach this function runs, so there is no "no known identity" case
+/// left to represent here. That same value feeds both the header and the
+/// payload below, so the two can never disagree about which request an
+/// error reply is for.
 fn error_reply(
     category: RemoteErrorType,
     correlation_id: uuid::Uuid,
-    request_id: Option<RequestId>,
+    request_id: RequestId,
 ) -> Result<BusEnvelope, BusError> {
     let payload = RemoteErrorPayload {
         error_type: category,
-        request_id: request_id.map_or_else(uuid::Uuid::nil, |id| *id.as_uuid()),
+        request_id: *request_id.as_uuid(),
     };
-    let mut headers = std::collections::HashMap::from([
+    let headers = std::collections::HashMap::from([
         (
             REPLY_STATUS_HEADER.to_owned(),
             REPLY_STATUS_ERROR.to_owned(),
@@ -218,10 +286,8 @@ fn error_reply(
             PROTOCOL_VERSION_HEADER.to_owned(),
             PROTOCOL_VERSION.to_string(),
         ),
+        (REQUEST_ID_HEADER.to_owned(), request_id.to_string()),
     ]);
-    if let Some(request_id) = request_id {
-        headers.insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
-    }
     Ok(BusEnvelope::restore(
         uuid::Uuid::now_v7(),
         REPLY_ERROR_MESSAGE_TYPE.to_owned(),
@@ -243,6 +309,7 @@ mod tests {
 
     use super::*;
     use crate::Message;
+    use crate::RequestContext;
     use crate::{ReplyDestination, ReplyDestinationError, ReplyPublisher};
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -266,14 +333,18 @@ mod tests {
     struct Echo;
     impl RequestHandler<Ping> for Echo {
         type Error = BusError;
-        async fn handle(&self, request: Ping, _ctx: &HandlerContext) -> Result<Pong, BusError> {
+        async fn handle(&self, request: Ping, _ctx: &RequestContext<'_>) -> Result<Pong, BusError> {
             Ok(Pong { seq: request.seq })
         }
     }
     struct Boom;
     impl RequestHandler<Ping> for Boom {
         type Error = BusError;
-        async fn handle(&self, _request: Ping, _ctx: &HandlerContext) -> Result<Pong, BusError> {
+        async fn handle(
+            &self,
+            _request: Ping,
+            _ctx: &RequestContext<'_>,
+        ) -> Result<Pong, BusError> {
             Err(BusError::Internal("kaboom".to_owned()))
         }
     }
@@ -410,7 +481,7 @@ mod tests {
             async fn handle(
                 &self,
                 _request: Ping,
-                _ctx: &HandlerContext,
+                _ctx: &RequestContext<'_>,
             ) -> Result<Pong, BusError> {
                 Err(BusError::Internal(SECRET.to_owned()))
             }
@@ -466,7 +537,11 @@ mod tests {
 
     impl RequestHandler<Ping> for RecordingHandler {
         type Error = BusError;
-        async fn handle(&self, _request: Ping, _ctx: &HandlerContext) -> Result<Pong, BusError> {
+        async fn handle(
+            &self,
+            _request: Ping,
+            _ctx: &RequestContext<'_>,
+        ) -> Result<Pong, BusError> {
             self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(Pong { seq: 1 })
         }
@@ -488,6 +563,9 @@ mod tests {
             &Ping { seq: 1 },
         )
         .expect("ping must serialize");
+        request
+            .headers
+            .insert(REQUEST_ID_HEADER.to_owned(), RequestId::new().to_string());
         request
             .headers
             .insert(PROTOCOL_VERSION_HEADER.to_owned(), "99".to_owned());
@@ -562,6 +640,9 @@ mod tests {
         )
         .expect("ping must serialize");
         request.payload = b"{ not json".to_vec();
+        request
+            .headers
+            .insert(REQUEST_ID_HEADER.to_owned(), RequestId::new().to_string());
         request.headers.insert(
             PROTOCOL_VERSION_HEADER.to_owned(),
             PROTOCOL_VERSION.to_string(),
@@ -625,7 +706,7 @@ mod tests {
         async fn handle(
             &self,
             _request: WeirdPing,
-            _ctx: &HandlerContext,
+            _ctx: &RequestContext<'_>,
         ) -> Result<UnserializableReply, BusError> {
             Ok(UnserializableReply)
         }
@@ -675,15 +756,25 @@ mod tests {
         assert_eq!(payload.error_type, RemoteErrorType::Internal);
     }
 
-    /// An inbound `x-hexeract-request-id` header that does not parse as a
-    /// UUID must not leak into the reply as a divergent identity: the header
-    /// is omitted and the payload falls back to `Uuid::nil()`, so the two
-    /// channels agree on "no known identity" rather than disagreeing about
-    /// it.
+    /// Resolution 3: `request_id` is obligatory. An inbound
+    /// `x-hexeract-request-id` header that does not parse as a UUID carries
+    /// no readable identity, so the request is dropped before the handler
+    /// runs, exactly like the neighboring `reply_to` guards (resolution 4).
+    /// This reuses the `"not-a-uuid"` value the previous revision of this
+    /// test already documented, updated from its old outcome (a published
+    /// reply with a nil payload id) to the new one (a silent drop): a
+    /// response keyed on an identity the client never sent could not be
+    /// matched to any pending call and would only be counted orphaned.
     #[tokio::test]
-    async fn an_unparsable_request_id_header_yields_a_reply_with_no_header_and_a_nil_payload_id() {
+    async fn an_unreadable_request_id_header_is_dropped_without_running_the_handler() {
         let publisher = Arc::new(RecordingReplyPublisher::default());
-        let handler = RepliedHandler::new(Boom, Arc::clone(&publisher));
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler = RepliedHandler::new(
+            RecordingHandler {
+                ran: Arc::clone(&ran),
+            },
+            Arc::clone(&publisher),
+        );
         let mut request = BusEnvelope::with_reply_to(
             Uuid::now_v7(),
             "amq.gen-inbox".to_owned(),
@@ -702,19 +793,228 @@ mod tests {
         handler
             .handle(&request, &ctx)
             .await
+            .expect("dropping must not surface as a framework error");
+
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the handler must not run without a readable request id"
+        );
+        assert!(
+            publisher.published.lock().unwrap().is_empty(),
+            "nothing may be published for a request with no readable identity"
+        );
+    }
+
+    /// Symmetric to the unreadable-header case above: an absent
+    /// `x-hexeract-request-id` header carries no identity at all, and is
+    /// dropped the same way, before the handler ever runs.
+    #[tokio::test]
+    async fn a_request_without_a_request_id_header_is_dropped_without_running_the_handler() {
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler = RepliedHandler::new(
+            RecordingHandler {
+                ran: Arc::clone(&ran),
+            },
+            Arc::clone(&publisher),
+        );
+        let mut request = BusEnvelope::with_reply_to(
+            Uuid::now_v7(),
+            "amq.gen-inbox".to_owned(),
+            &Ping { seq: 1 },
+        )
+        .expect("ping must serialize");
+        // Deliberately no REQUEST_ID_HEADER.
+        request.headers.insert(
+            PROTOCOL_VERSION_HEADER.to_owned(),
+            PROTOCOL_VERSION.to_string(),
+        );
+
+        let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
+        handler
+            .handle(&request, &ctx)
+            .await
+            .expect("dropping must not surface as a framework error");
+
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the handler must not run without a request id header"
+        );
+        assert!(
+            publisher.published.lock().unwrap().is_empty(),
+            "nothing may be published for a request with no request id header"
+        );
+    }
+
+    /// Combination that the identity guard's placement before the version
+    /// check is meant to close off: a request with neither a readable
+    /// identity nor a supported version must still be dropped silently by
+    /// the identity guard, never answered by the version guard's
+    /// `RemoteErrorType::Unsupported` reply. Pins the guard order so that a
+    /// future refactor making `error_reply` tolerant of a missing identity
+    /// would surface here rather than only in production.
+    #[tokio::test]
+    async fn a_request_with_no_identity_and_an_unsupported_version_is_dropped_by_identity_first() {
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler = RepliedHandler::new(
+            RecordingHandler {
+                ran: Arc::clone(&ran),
+            },
+            Arc::clone(&publisher),
+        );
+        let mut request = BusEnvelope::with_reply_to(
+            Uuid::now_v7(),
+            "amq.gen-inbox".to_owned(),
+            &Ping { seq: 1 },
+        )
+        .expect("ping must serialize");
+        request
+            .headers
+            .insert(PROTOCOL_VERSION_HEADER.to_owned(), "99".to_owned());
+        // Deliberately no REQUEST_ID_HEADER, combined with an unsupported version.
+
+        let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
+        handler
+            .handle(&request, &ctx)
+            .await
+            .expect("dropping must not surface as a framework error");
+
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the handler must not run when neither identity nor version is usable"
+        );
+        assert!(
+            publisher.published.lock().unwrap().is_empty(),
+            "the identity guard must drop the request before the version guard could reply"
+        );
+    }
+
+    /// Handler that records the [`RequestContext`] it was invoked with, so
+    /// tests can inspect exactly what the framework threads through to a
+    /// responder.
+    struct CapturingHandler {
+        captured: Arc<StdMutex<Option<(RequestId, u32, CorrelationId)>>>,
+    }
+    impl RequestHandler<Ping> for CapturingHandler {
+        type Error = BusError;
+        async fn handle(&self, request: Ping, ctx: &RequestContext<'_>) -> Result<Pong, BusError> {
+            *self.captured.lock().unwrap() = Some((
+                ctx.request_id,
+                ctx.protocol_version,
+                ctx.handler.correlation_id,
+            ));
+            Ok(Pong { seq: request.seq })
+        }
+    }
+
+    /// Build a request envelope carrying exactly `request_id` as its
+    /// `x-hexeract-request-id` header, overriding the one [`request_envelope`]
+    /// mints on its own, so a test can assert on the precise value a handler
+    /// observes.
+    fn request_envelope_with_id(reply_to: Option<&str>, request_id: RequestId) -> BusEnvelope {
+        let mut env = request_envelope(reply_to);
+        env.headers
+            .insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
+        env
+    }
+
+    #[tokio::test]
+    async fn the_handler_receives_the_exact_inbound_request_id() {
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let captured = Arc::new(StdMutex::new(None));
+        let handler = RepliedHandler::new(
+            CapturingHandler {
+                captured: Arc::clone(&captured),
+            },
+            Arc::clone(&publisher),
+        );
+        let request_id = RequestId::new();
+        let request = request_envelope_with_id(Some("amq.gen-inbox"), request_id);
+
+        handler
+            .handle(&request, &ctx())
+            .await
             .expect("reply must publish");
 
-        let recorded = publisher.last_published().expect("a reply was published");
-        assert!(
-            !recorded.headers.contains_key(REQUEST_ID_HEADER),
-            "the reply must omit the request id header when the inbound one did not parse"
+        let (seen_request_id, _, _) = captured.lock().unwrap().expect("handler must have run");
+        assert_eq!(seen_request_id, request_id);
+    }
+
+    #[tokio::test]
+    async fn the_handler_receives_the_negotiated_protocol_version() {
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let captured = Arc::new(StdMutex::new(None));
+        let handler = RepliedHandler::new(
+            CapturingHandler {
+                captured: Arc::clone(&captured),
+            },
+            Arc::clone(&publisher),
         );
-        let payload: RemoteErrorPayload =
-            serde_json::from_slice(&recorded.payload).expect("payload must decode");
-        assert_eq!(
-            payload.request_id,
-            Uuid::nil(),
-            "the payload must fall back to nil, agreeing with the omitted header"
+        let request = request_envelope_with_id(Some("amq.gen-inbox"), RequestId::new());
+
+        handler
+            .handle(&request, &ctx())
+            .await
+            .expect("reply must publish");
+
+        let (_, seen_version, _) = captured.lock().unwrap().expect("handler must have run");
+        assert_eq!(seen_version, PROTOCOL_VERSION);
+    }
+
+    #[tokio::test]
+    async fn the_correlation_id_stays_reachable_through_ctx_handler_and_matches_the_causal_chain() {
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let captured = Arc::new(StdMutex::new(None));
+        let handler = RepliedHandler::new(
+            CapturingHandler {
+                captured: Arc::clone(&captured),
+            },
+            Arc::clone(&publisher),
+        );
+        let request = request_envelope_with_id(Some("amq.gen-inbox"), RequestId::new());
+        let handler_ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
+
+        handler
+            .handle(&request, &handler_ctx)
+            .await
+            .expect("reply must publish");
+
+        let (_, _, seen_correlation_id) = captured.lock().unwrap().expect("handler must have run");
+        assert_eq!(seen_correlation_id, handler_ctx.correlation_id);
+    }
+
+    /// The most important of the four positive tests: it stops a future
+    /// refactor from collapsing the per-call request identity into the
+    /// causal correlation identity, which would break every caller relying
+    /// on `RequestId` to key exactly one in-flight call.
+    #[tokio::test]
+    async fn request_id_and_correlation_id_are_distinct_values_for_the_same_call() {
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let captured = Arc::new(StdMutex::new(None));
+        let handler = RepliedHandler::new(
+            CapturingHandler {
+                captured: Arc::clone(&captured),
+            },
+            Arc::clone(&publisher),
+        );
+        let request_id = RequestId::new();
+        let request = request_envelope_with_id(Some("amq.gen-inbox"), request_id);
+        let handler_ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
+
+        handler
+            .handle(&request, &handler_ctx)
+            .await
+            .expect("reply must publish");
+
+        let (seen_request_id, _, seen_correlation_id) =
+            captured.lock().unwrap().expect("handler must have run");
+        assert_eq!(seen_request_id, request_id);
+        assert_eq!(seen_correlation_id, handler_ctx.correlation_id);
+        assert_ne!(
+            seen_request_id.as_uuid(),
+            seen_correlation_id.as_uuid(),
+            "request_id and correlation_id must never collapse into the same identity"
         );
     }
 

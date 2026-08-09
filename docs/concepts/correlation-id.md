@@ -67,10 +67,10 @@ The `correlation_id` rides through the AMQP property of the same name. The bus s
 
 Request-reply layers a second identifier on top of `correlation_id`: the reserved header `x-hexeract-request-id`, minted fresh by `RequestClient` on every call. The two answer different questions and must never be confused:
 
-- `correlation_id` labels a causal chain and is shared by every message that chain contains, request-reply calls included. `RequestClient::request_in` deliberately inherits the `correlation_id` of the `HandlerContext` it is given, exactly like `publish_with_correlation_id`.
-- `request_id` identifies exactly one request-reply call and is never shared, not even by two calls on the same causal chain. `RequestRegistry` keys its in-flight slots on `request_id` for precisely this reason: keying on `correlation_id` would let two concurrent replies on the same chain cross into the wrong caller.
+- `correlation_id` labels a causal chain and is shared by every message that chain contains, request-reply calls included. `RequestClient::request` mints a fresh `correlation_id` for its request, the same way `publish` does for a plain message; `RequestClient::request_with` continues an existing chain instead when passed `RequestOptions::new().with_correlation_id(ctx.correlation_id)`, exactly like `publish_with_correlation_id`.
+- `request_id` identifies exactly one request-reply call and is never shared, not even by two concurrent calls on the same `correlation_id`. `RequestRegistry` keys its in-flight slots on `request_id` for precisely this reason: keying on `correlation_id` would let two concurrent replies on the same chain cross into the wrong caller.
 
-Two concurrent `request_in` calls issued from the same handler, on the same `HandlerContext`, therefore share their `correlation_id` and always mint distinct `request_id`s. Each call is routed to its own waiting slot regardless of which reply arrives first.
+Two concurrent calls sharing a `correlation_id` therefore still mint distinct `request_id`s. Each is routed to its own waiting slot regardless of which reply arrives first, and two calls issued with no `correlation_id` override never share one.
 
 See [RPC protocol](../architecture/rpc-protocol.md) for the full wire contract, and [Request-reply](request-reply.md) for the pattern this identifier pair supports.
 

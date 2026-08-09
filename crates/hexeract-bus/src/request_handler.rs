@@ -1,6 +1,4 @@
-use hexeract_core::HandlerContext;
-
-use crate::{BusError, Request};
+use crate::{BusError, Request, RequestContext};
 
 /// Responder-side handler that produces a typed reply for a [`Request`].
 ///
@@ -13,16 +11,17 @@ pub trait RequestHandler<R: Request>: Send + Sync + 'static {
     type Error: Into<BusError> + Send + Sync + 'static;
 
     /// Handle `request` and produce its reply.
-    async fn handle(&self, request: R, ctx: &HandlerContext) -> Result<R::Reply, Self::Error>;
+    async fn handle(&self, request: R, ctx: &RequestContext<'_>) -> Result<R::Reply, Self::Error>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hexeract_core::{CorrelationId, MessageId};
+    use hexeract_core::{CorrelationId, HandlerContext, MessageId, RequestId};
     use serde::{Deserialize, Serialize};
 
-    use crate::Message;
+    use crate::rpc_protocol::PROTOCOL_VERSION;
+    use crate::{Message, RequestContext};
 
     #[derive(Debug, Serialize, Deserialize)]
     struct Ping {
@@ -45,14 +44,15 @@ mod tests {
     struct Echo;
     impl RequestHandler<Ping> for Echo {
         type Error = BusError;
-        async fn handle(&self, request: Ping, _ctx: &HandlerContext) -> Result<Pong, BusError> {
+        async fn handle(&self, request: Ping, _ctx: &RequestContext<'_>) -> Result<Pong, BusError> {
             Ok(Pong { seq: request.seq })
         }
     }
 
     #[tokio::test]
     async fn handler_returns_typed_reply() {
-        let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
+        let handler_ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
+        let ctx = RequestContext::new(RequestId::new(), PROTOCOL_VERSION, &handler_ctx);
         let pong = Echo.handle(Ping { seq: 5 }, &ctx).await.unwrap();
         assert_eq!(pong, Pong { seq: 5 });
     }

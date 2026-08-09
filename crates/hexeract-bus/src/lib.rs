@@ -10,9 +10,10 @@
 //! [`TypedHandler`]).
 //!
 //! It also ships the backend-agnostic request-reply primitives: the
-//! [`Request`] trait naming a typed reply, [`RequestClient`] and
-//! [`RequestError`] (with its [`ProtocolViolation`] source) on the caller
-//! side, [`RequestHandler`] and [`RepliedHandler`] on the responder side,
+//! [`Request`] trait naming a typed reply, [`RequestClient`] (configured
+//! per call through [`RequestOptions`]) and [`RequestError`] (with its
+//! [`ProtocolViolation`] source) on the caller side, [`RequestHandler`],
+//! [`RequestContext`] and [`RepliedHandler`] on the responder side,
 //! and the [`RequestRegistry`] (with its RAII [`PendingReply`] guard)
 //! routing a reply back to its in-flight request by request identity. A
 //! failed reply carries only a closed-set [`RemoteErrorType`] category plus
@@ -43,16 +44,23 @@ pub mod replied_handler;
 pub mod reply_acceptance;
 /// The destination a reply is published to, validated at construction.
 pub mod reply_destination;
+/// Shared state of the reply inbox a [`RequestClient`] publishes its
+/// return address into.
+pub mod reply_inbox_state;
 /// Contract for publishing a reply, isolated from application routing.
 pub mod reply_publisher;
 /// Trait for messages that expect a single typed reply.
 pub mod request;
 /// Generic request-reply client built on top of a [`Transport`].
 pub mod request_client;
+/// What a request handler knows about the call it is serving.
+pub mod request_context;
 /// Errors observed by the caller of a request-reply round trip.
 pub mod request_error;
 /// Responder-side handler that produces a typed reply for a [`Request`].
 pub mod request_handler;
+/// Per-call overrides for a request issued through a [`RequestClient`].
+pub mod request_options;
 /// Rendezvous point between request callers and reply deliveries, keyed by
 /// request identity.
 pub mod request_registry;
@@ -78,13 +86,18 @@ pub use reply_acceptance::ReplyExpectation;
 pub use reply_acceptance::ReplyRejection;
 pub use reply_destination::ReplyDestination;
 pub use reply_destination::ReplyDestinationError;
+pub use reply_inbox_state::ReplyInboxState;
 pub use reply_publisher::ReplyPublisher;
 pub use request::Request;
 pub use request_client::RequestClient;
+pub use request_context::RequestContext;
 pub use request_error::ProtocolViolation;
 pub use request_error::RequestError;
 pub use request_handler::RequestHandler;
+pub use request_options::RequestOptions;
+pub use request_registry::DEFAULT_MAX_IN_FLIGHT;
 pub use request_registry::PendingReply;
+pub use request_registry::RegisterRejection;
 pub use request_registry::ReplyCountersSnapshot;
 pub use request_registry::RequestRegistry;
 pub use rpc_protocol::PROTOCOL_VERSION;

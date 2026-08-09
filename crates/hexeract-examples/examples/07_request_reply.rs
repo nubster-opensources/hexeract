@@ -7,8 +7,8 @@
 //!   [`Ping`] with a [`Pong`] carrying the same sequence number.
 //! - Act 2: a timeout. [`Silence`] requests are published to a queue
 //!   that exists (so the publish is routable) but that no worker ever
-//!   consumes from: a mute responder. The client's `request_with_timeout`
-//!   gives up well before its deadline would starve the example.
+//!   consumes from: a mute responder. A per-call [`RequestOptions`]
+//!   timeout gives up well before its deadline would starve the example.
 //! - Act 3: a genuine remote fault. The `Faulty` responder always fails
 //!   [`Explode`] with an internal error, and the failure reaches the
 //!   caller as [`RequestError::Remote`]: the protocol's error channel is
@@ -17,11 +17,11 @@
 //!   [`Divide`] request: a zero denominator is an expected, named
 //!   outcome carried by the [`DivisionOutcome`] reply, not a protocol
 //!   failure.
-//! - Act 5: causal propagation through `request_in`. The `Relay`
-//!   responder receives a [`RelayedPing`] and forwards it to `Echo` as a
-//!   second request-reply hop, on the same causal chain: the two calls
-//!   share their `correlation_id` and get distinct, unrelated
-//!   `request_id`s.
+//! - Act 5: causal propagation through `RequestOptions::with_correlation_id`.
+//!   The `Relay` responder receives a [`RelayedPing`] and forwards it to
+//!   `Echo` as a second request-reply hop, joining the same causal chain it
+//!   was called on: the two calls share their `correlation_id` and get
+//!   distinct, unrelated `request_id`s.
 //!
 //! Run with (requires a running Docker daemon):
 //!
@@ -38,14 +38,15 @@ use hexeract::bus::Message;
 use hexeract::bus::Queue;
 use hexeract::bus::Request;
 use hexeract::bus::RequestClient;
+use hexeract::bus::RequestContext;
 use hexeract::bus::RequestError;
 use hexeract::bus::RequestHandler;
+use hexeract::bus::RequestOptions;
 use hexeract::bus_rabbitmq::RabbitMqConnection;
 use hexeract::bus_rabbitmq::RabbitMqTransport;
 use hexeract::bus_rabbitmq::RabbitMqWorkerBuilder;
 use hexeract::bus_rabbitmq::connect_request_client;
 use hexeract::bus_rabbitmq::declare_queue;
-use hexeract::core::HandlerContext;
 use serde::Deserialize;
 use serde::Serialize;
 use testcontainers::ContainerAsync;
@@ -91,19 +92,25 @@ impl Message for Pong {
 }
 
 /// Responder that echoes the request's `seq` back in the reply, and
-/// records the `correlation_id` of the last request it handled so the
-/// relay act below can prove the causal chain survived the extra hop.
+/// records both the `correlation_id` and the `request_id` of the last
+/// request it handled, so the relay act below can prove the causal chain
+/// survived the extra hop while the per-call request identity did not.
 struct Echo {
     last_correlation: Arc<StdMutex<Option<Uuid>>>,
+    last_request_id: Arc<StdMutex<Option<Uuid>>>,
 }
 impl RequestHandler<Ping> for Echo {
     type Error = BusError;
 
-    async fn handle(&self, request: Ping, ctx: &HandlerContext) -> Result<Pong, BusError> {
+    async fn handle(&self, request: Ping, ctx: &RequestContext<'_>) -> Result<Pong, BusError> {
         *self
             .last_correlation
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(*ctx.correlation_id.as_uuid());
+            .unwrap_or_else(PoisonError::into_inner) = Some(*ctx.handler.correlation_id.as_uuid());
+        *self
+            .last_request_id
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(*ctx.request_id.as_uuid());
         Ok(Pong { seq: request.seq })
     }
 }
@@ -161,7 +168,7 @@ struct Faulty;
 impl RequestHandler<Explode> for Faulty {
     type Error = BusError;
 
-    async fn handle(&self, _request: Explode, _ctx: &HandlerContext) -> Result<Ack, BusError> {
+    async fn handle(&self, _request: Explode, _ctx: &RequestContext<'_>) -> Result<Ack, BusError> {
         Err(BusError::Internal(
             "downstream dependency unreachable".to_owned(),
         ))
@@ -203,7 +210,7 @@ impl RequestHandler<Divide> for Divider {
     async fn handle(
         &self,
         request: Divide,
-        _ctx: &HandlerContext,
+        _ctx: &RequestContext<'_>,
     ) -> Result<DivisionOutcome, BusError> {
         if request.denominator == 0 {
             return Ok(DivisionOutcome::DivisionByZero);
@@ -214,9 +221,10 @@ impl RequestHandler<Divide> for Divider {
     }
 }
 
-/// Request whose handler forwards to `Echo` via `request_in`, to
-/// demonstrate a handler continuing the caller's causal chain into a
-/// second request-reply hop rather than starting a fresh one.
+/// Request whose handler forwards to `Echo` via `RequestOptions`'s
+/// `correlation_id` override, to demonstrate a handler continuing the
+/// caller's causal chain into a second request-reply hop rather than
+/// starting a fresh one.
 #[derive(Debug, Serialize, Deserialize)]
 struct RelayedPing {
     seq: u64,
@@ -229,23 +237,35 @@ impl Request for RelayedPing {
 }
 
 /// Responder whose handler issues its own request on the caller's
-/// `correlation_id`, via `request_in(ctx, &request)`, and records that
-/// `correlation_id` so the example can prove `Echo` observed the same
-/// one on the forwarded call.
+/// `correlation_id`, via
+/// `RequestOptions::new().with_correlation_id(ctx.handler.correlation_id)`,
+/// and records that `correlation_id` plus its own `request_id`, so the
+/// example can prove `Echo` observed the same correlation but a distinct
+/// request identity on the forwarded call.
 struct Relay {
     client: Arc<RequestClient<RabbitMqTransport>>,
     last_correlation: Arc<StdMutex<Option<Uuid>>>,
+    last_request_id: Arc<StdMutex<Option<Uuid>>>,
 }
 impl RequestHandler<RelayedPing> for Relay {
     type Error = BusError;
 
-    async fn handle(&self, request: RelayedPing, ctx: &HandlerContext) -> Result<Pong, BusError> {
+    async fn handle(
+        &self,
+        request: RelayedPing,
+        ctx: &RequestContext<'_>,
+    ) -> Result<Pong, BusError> {
         *self
             .last_correlation
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(*ctx.correlation_id.as_uuid());
+            .unwrap_or_else(PoisonError::into_inner) = Some(*ctx.handler.correlation_id.as_uuid());
+        *self
+            .last_request_id
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(*ctx.request_id.as_uuid());
+        let options = RequestOptions::new().with_correlation_id(ctx.handler.correlation_id);
         self.client
-            .request_in(ctx, &Ping { seq: request.seq })
+            .request_with(Ping { seq: request.seq }, options)
             .await
             .map_err(|error| BusError::Internal(error.to_string()))
     }
@@ -305,11 +325,14 @@ impl ResponderHandles {
     }
 }
 
-/// Correlation ids captured mid-flight by `Echo` and `Relay`, so act 5
-/// can prove the causal chain survived the relay hop.
-struct CorrelationCaptures {
-    echo: Arc<StdMutex<Option<Uuid>>>,
-    relay: Arc<StdMutex<Option<Uuid>>>,
+/// Correlation and request ids captured mid-flight by `Echo` and `Relay`,
+/// so act 5 can prove the causal chain survived the relay hop while the
+/// per-call request identity did not.
+struct HandlerCaptures {
+    echo_correlation: Arc<StdMutex<Option<Uuid>>>,
+    echo_request_id: Arc<StdMutex<Option<Uuid>>>,
+    relay_correlation: Arc<StdMutex<Option<Uuid>>>,
+    relay_request_id: Arc<StdMutex<Option<Uuid>>>,
 }
 
 /// Spawn every responder worker this example needs: `Echo`, `Divider`,
@@ -317,8 +340,9 @@ struct CorrelationCaptures {
 async fn spawn_responders(
     uri: &str,
     cancel: &CancellationToken,
-) -> Result<(ResponderHandles, CorrelationCaptures), Box<dyn Error>> {
+) -> Result<(ResponderHandles, HandlerCaptures), Box<dyn Error>> {
     let echo_correlation = Arc::new(StdMutex::new(None));
+    let echo_request_id = Arc::new(StdMutex::new(None));
     let echo_transport = Arc::new(RabbitMqTransport::new(uri).await?);
     let echo_worker = RabbitMqWorkerBuilder::new(
         RabbitMqConnection::connect_with_retry(uri, RETRY_ATTEMPTS, RETRY_BASE_DELAY).await?,
@@ -327,6 +351,7 @@ async fn spawn_responders(
     .register_request_handler::<Ping, _>(
         Echo {
             last_correlation: Arc::clone(&echo_correlation),
+            last_request_id: Arc::clone(&echo_request_id),
         },
         Arc::clone(&echo_transport),
     )
@@ -359,6 +384,7 @@ async fn spawn_responders(
     // inside its handler, distinct from the transport it uses to publish
     // its own reply to `RelayedPing`.
     let relay_correlation = Arc::new(StdMutex::new(None));
+    let relay_request_id = Arc::new(StdMutex::new(None));
     // Shorter than the outer client's timeout (below), so on a slow broker
     // the inner hop times out first: a relay timeout is then unambiguously
     // attributable to the forwarded call, never to the outer one.
@@ -373,6 +399,7 @@ async fn spawn_responders(
         Relay {
             client: relay_client,
             last_correlation: Arc::clone(&relay_correlation),
+            last_request_id: Arc::clone(&relay_request_id),
         },
         Arc::clone(&relay_reply_transport),
     )
@@ -387,9 +414,11 @@ async fn spawn_responders(
             explode,
             relay,
         },
-        CorrelationCaptures {
-            echo: echo_correlation,
-            relay: relay_correlation,
+        HandlerCaptures {
+            echo_correlation,
+            echo_request_id,
+            relay_correlation,
+            relay_request_id,
         },
     ))
 }
@@ -400,7 +429,7 @@ async fn run_nominal_round_trip(
     client: &RequestClient<RabbitMqTransport>,
 ) -> Result<(), Box<dyn Error>> {
     tracing::info!("act 1: nominal round trip");
-    let pong = client.request(&Ping { seq: 7 }).await?;
+    let pong = client.request(Ping { seq: 7 }).await?;
     if pong.seq != 7 {
         return Err(format!("expected echo of 7, got {}", pong.seq).into());
     }
@@ -412,12 +441,13 @@ async fn run_nominal_round_trip(
 /// the call times out rather than hangs forever.
 async fn run_timeout(client: &RequestClient<RabbitMqTransport>) -> Result<(), Box<dyn Error>> {
     tracing::info!("act 2: mute responder times out");
+    let options = RequestOptions::new().with_timeout(Duration::from_secs(2));
     let outcome = client
-        .request_with_timeout(
-            &Silence {
+        .request_with(
+            Silence {
                 note: "is anybody listening".to_owned(),
             },
-            Duration::from_secs(2),
+            options,
         )
         .await;
     match outcome {
@@ -437,7 +467,7 @@ async fn run_timeout(client: &RequestClient<RabbitMqTransport>) -> Result<(), Bo
 async fn run_remote_fault(client: &RequestClient<RabbitMqTransport>) -> Result<(), Box<dyn Error>> {
     tracing::info!("act 3: a genuine remote fault reaches the caller");
     let outcome = client
-        .request(&Explode {
+        .request(Explode {
             reason: "simulated dependency outage".to_owned(),
         })
         .await;
@@ -462,7 +492,7 @@ async fn run_business_rejection(
 ) -> Result<(), Box<dyn Error>> {
     tracing::info!("act 4: a business rejection travels as a Reply value");
     let outcome = client
-        .request(&Divide {
+        .request(Divide {
             numerator: 10,
             denominator: 2,
         })
@@ -473,7 +503,7 @@ async fn run_business_rejection(
     tracing::info!("division succeeded");
 
     let outcome = client
-        .request(&Divide {
+        .request(Divide {
             numerator: 10,
             denominator: 0,
         })
@@ -485,38 +515,66 @@ async fn run_business_rejection(
     Ok(())
 }
 
-/// Act 5: `request_in` propagates the causal chain through a relay hop.
-/// `Relay` forwards the inbound [`RelayedPing`] to `Echo` on the same
-/// `correlation_id` it received, minting its own, unrelated
-/// `request_id` for that second call.
+/// Act 5: `RequestOptions::with_correlation_id` propagates the causal
+/// chain through a relay hop. `Relay` forwards the inbound
+/// [`RelayedPing`] to `Echo` on the same `correlation_id` it received,
+/// minting its own, unrelated `request_id` for that second call: the two
+/// handlers must observe the same `correlation_id` and two distinct
+/// `request_id`s.
 async fn run_causal_propagation(
     client: &RequestClient<RabbitMqTransport>,
-    correlations: &CorrelationCaptures,
+    captures: &HandlerCaptures,
 ) -> Result<(), Box<dyn Error>> {
-    tracing::info!("act 5: request_in propagates the causal chain through a relay hop");
-    let relayed = client.request(&RelayedPing { seq: 21 }).await?;
+    tracing::info!(
+        "act 5: RequestOptions::with_correlation_id propagates the causal chain through a relay hop"
+    );
+    let relayed = client.request(RelayedPing { seq: 21 }).await?;
     if relayed.seq != 21 {
         return Err(format!("expected echo of 21, got {}", relayed.seq).into());
     }
 
-    let relay_seen = *correlations
-        .relay
+    let relay_correlation = *captures
+        .relay_correlation
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    let echo_seen = *correlations
-        .echo
+    let echo_correlation = *captures
+        .echo_correlation
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    if relay_seen.is_none() || relay_seen != echo_seen {
+    if relay_correlation.is_none() || relay_correlation != echo_correlation {
         return Err(format!(
             "expected the relayed call and the forwarded ping to share their correlation_id, \
-             got relay={relay_seen:?} echo={echo_seen:?}"
+             got relay={relay_correlation:?} echo={echo_correlation:?}"
         )
         .into());
     }
     tracing::info!(
-        correlation_id = ?relay_seen,
+        correlation_id = ?relay_correlation,
         "the relay hop kept the caller's causal chain"
+    );
+
+    let relay_request_id = *captures
+        .relay_request_id
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let echo_request_id = *captures
+        .echo_request_id
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if relay_request_id.is_none()
+        || echo_request_id.is_none()
+        || relay_request_id == echo_request_id
+    {
+        return Err(format!(
+            "expected the relayed call and the forwarded ping to carry distinct request_ids, \
+             got relay={relay_request_id:?} echo={echo_request_id:?}"
+        )
+        .into());
+    }
+    tracing::info!(
+        relay_request_id = ?relay_request_id,
+        echo_request_id = ?echo_request_id,
+        "the relay hop, unlike the correlation_id, did not carry its own request_id forward"
     );
     Ok(())
 }
@@ -533,7 +591,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     declare_all_request_queues(&uri).await?;
 
     let cancel = CancellationToken::new();
-    let (responders, correlations) = spawn_responders(&uri, &cancel).await?;
+    let (responders, captures) = spawn_responders(&uri, &cancel).await?;
 
     let client = connect_request_client(&uri, Duration::from_secs(10), cancel.clone()).await?;
     tracing::info!("request client and all responders ready");
@@ -542,9 +600,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     run_timeout(&client).await?;
     run_remote_fault(&client).await?;
     run_business_rejection(&client).await?;
-    run_causal_propagation(&client, &correlations).await?;
+    run_causal_propagation(&client, &captures).await?;
 
-    cancel.cancel();
+    // Closing the client rejects further calls, fails any still-pending
+    // one with `RequestError::Closed`, and cancels the shared token: since
+    // every responder worker above was spawned on a clone of that same
+    // token, this single call is also what winds them all down. Unlike
+    // simply dropping the client, `close` waits for its own reply consumer
+    // task to have actually stopped before returning.
+    client.close().await;
     responders.join_all().await?;
     tracing::info!("request-reply example completed");
     Ok(())
