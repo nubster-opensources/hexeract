@@ -80,6 +80,13 @@ pub enum RequestError {
     /// at registration. See [`ProtocolViolation`] for which.
     #[error("protocol violation")]
     Protocol(#[source] ProtocolViolation),
+    /// The outbound request could not be encoded.
+    ///
+    /// This failure is guaranteed to occur before the transport is called,
+    /// so nothing has been published and the responder cannot have acted on
+    /// this request.
+    #[error("failed to encode request")]
+    Encode(#[source] BusError),
     /// The request could not be published or the reply channel was lost.
     #[error("transport failure")]
     Transport(#[source] BusError),
@@ -141,6 +148,23 @@ mod tests {
         assert_eq!(source.to_string(), "transport error");
         let inner_source = source.source().expect("inner source must be set");
         assert_eq!(inner_source.to_string(), "broker exploded");
+    }
+
+    #[test]
+    fn encode_preserves_source_chain_without_exposing_details_in_its_message() {
+        let invalid_json = b"not json";
+        let serde_error: serde_json::Error =
+            serde_json::from_slice::<serde_json::Value>(invalid_json).unwrap_err();
+        let bus_error: BusError = serde_error.into();
+        let err = RequestError::Encode(bus_error);
+
+        assert_eq!(err.to_string(), "failed to encode request");
+        let source = err.source().expect("source must be set");
+        assert_eq!(
+            source.to_string(),
+            "failed to (de)serialize message payload as JSON"
+        );
+        assert!(source.source().is_some(), "serde source must be preserved");
     }
 
     #[test]

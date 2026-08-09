@@ -251,6 +251,10 @@ impl<T: Transport> RequestClient<T> {
     ///   minted for this call is already registered. Retrying is safe, and
     ///   is the intended response.
     ///
+    /// - [`RequestError::Encode`] if the outbound request cannot be serialized.
+    ///   This is guaranteed to happen before the transport is called, so
+    ///   nothing was published and the responder cannot have acted on it.
+    ///
     /// The rest are reported while publishing the request, or after it has
     /// been published, so the responder may already have acted on it.
     ///
@@ -273,11 +277,12 @@ impl<T: Transport> RequestClient<T> {
     ///   reachable defense-in-depth path, not one a well-behaved registry
     ///   exercises today.
     /// - [`RequestError::Remote`] if the responder reported a failure.
-    /// - [`RequestError::Decode`] if the request cannot be serialized, or if
-    ///   a reply that already passed protocol and status validation cannot be
-    ///   decoded: either an ok reply whose payload does not decode into the
-    ///   expected reply type, or an error reply whose `message_type` matches
-    ///   but whose payload does not decode into a [`RemoteErrorPayload`].
+    /// - [`RequestError::Decode`] if a reply that already passed protocol and
+    ///   status validation cannot be decoded: either an ok reply whose payload
+    ///   does not decode into the expected reply type, or an error reply whose
+    ///   `message_type` matches but whose payload does not decode into a
+    ///   [`RemoteErrorPayload`]. Since a reply exists, the request was already
+    ///   published and the responder may have acted on it.
     ///
     /// # Example
     ///
@@ -377,7 +382,7 @@ impl<T: Transport> RequestClient<T> {
             }
         };
         let mut envelope = BusEnvelope::with_reply_to(correlation_id, inbox, request)
-            .map_err(RequestError::Decode)?;
+            .map_err(RequestError::Encode)?;
         envelope
             .headers
             .insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
@@ -515,6 +520,31 @@ mod tests {
         const MESSAGE_TYPE: &'static str = "tests.pong";
     }
     impl Request for Ping {
+        type Reply = Pong;
+    }
+
+    /// A request fixture that always fails JSON serialization, used to prove
+    /// that request encoding is still on the pre-publication side of the RPC
+    /// boundary.
+    #[derive(Debug, Deserialize)]
+    struct UnserializableRequest;
+
+    impl Serialize for UnserializableRequest {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom(
+                "deliberate request encoding failure",
+            ))
+        }
+    }
+
+    impl Message for UnserializableRequest {
+        const MESSAGE_TYPE: &'static str = "tests.unserializable_request";
+    }
+
+    impl Request for UnserializableRequest {
         type Reply = Pong;
     }
 
@@ -787,6 +817,31 @@ mod tests {
         assert!(matches!(error, RequestError::Transport(_)));
     }
 
+    #[tokio::test]
+    async fn an_unencodable_request_fails_before_the_transport_is_called() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = client(Arc::clone(&transport), Arc::clone(&registry));
+
+        let error = client
+            .request(UnserializableRequest)
+            .await
+            .expect_err("the request cannot be encoded");
+
+        assert!(matches!(
+            error,
+            RequestError::Encode(BusError::Serialization(_))
+        ));
+        assert!(
+            transport.last_published().is_none(),
+            "encoding must fail before the transport is called"
+        );
+        assert!(
+            registry.is_empty(),
+            "the pre-publication failure must release its pending slot"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn nominal_round_trip_returns_typed_reply() {
         let transport = Arc::new(CapturingTransport::default());
@@ -1036,6 +1091,32 @@ mod tests {
             ]),
             std::time::SystemTime::UNIX_EPOCH,
         )
+    }
+
+    #[test]
+    fn a_malformed_nominal_reply_payload_surfaces_as_decode() {
+        let mut reply = ok_reply(RequestId::new(), 1);
+        reply.payload = b"not json".to_vec();
+
+        let error = decode_reply::<Ping>(reply).expect_err("reply payload is malformed");
+
+        assert!(matches!(
+            error,
+            RequestError::Decode(BusError::Serialization(_))
+        ));
+    }
+
+    #[test]
+    fn a_malformed_remote_error_payload_surfaces_as_decode() {
+        let mut reply = error_reply(RequestId::new());
+        reply.payload = b"not json".to_vec();
+
+        let error = decode_reply::<Ping>(reply).expect_err("remote error payload is malformed");
+
+        assert!(matches!(
+            error,
+            RequestError::Decode(BusError::Serialization(_))
+        ));
     }
 
     /// `accepts` (the registry's gate) and `decode_reply` (the client's
