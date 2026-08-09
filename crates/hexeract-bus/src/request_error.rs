@@ -51,7 +51,11 @@ pub enum ProtocolViolation {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RequestError {
-    /// No reply arrived within the deadline.
+    /// Publication and reply waiting did not complete within the call's one
+    /// end-to-end local deadline.
+    ///
+    /// If the deadline raced publication, the broker may already have
+    /// accepted the request even though its transport future was cancelled.
     #[error("request timed out after {0:?}")]
     Timeout(Duration),
     /// The client reached its in-flight capacity.
