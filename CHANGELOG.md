@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 
 ## [Unreleased]
 
+### Changed
+
+- Raise the MSRV from Rust 1.88 to 1.89 for the August 2026 fleet baseline and prefer MSRV-compatible dependency versions during Cargo updates.
+
 ### Added
 
 - `hexeract-bus`: `Transport::publish_envelope`, the single primitive every backend implements. `publish`, `publish_with_headers` and `publish_with_correlation_id` are now default methods built on top of it, with no change of behavior. (#430)

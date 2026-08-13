@@ -1,23 +1,23 @@
 # Minimum Supported Rust Version (MSRV) policy
 
-The current MSRV is **Rust 1.88** (stable channel).
+The current MSRV is **Rust 1.89** (stable channel).
 
-The MSRV is pinned in `rust-toolchain.toml` at the repository root and declared in every workspace crate via `rust-version = "1.88"` (or `rust-version.workspace = true`). The `hexeract-umbrella-tests` integration-test crate inherits the MSRV through the workspace table.
+The MSRV is pinned in `rust-toolchain.toml` at the repository root and declared in every workspace crate via `rust-version = "1.89"` (or `rust-version.workspace = true`). The `hexeract-umbrella-tests` integration-test crate inherits the MSRV through the workspace table.
 
 ## How the MSRV evolves
 
-- Hexeract does not commit to supporting Rust versions older than 1.88.
-- An MSRV bump is treated as a **minor** version bump per the [semver policy](SEMVER_POLICY.md). For example, raising the MSRV from 1.88 to 1.92 ships in a `0.X.0` release (or `X.0.0` once at 1.0).
+- Hexeract does not commit to supporting Rust versions older than 1.89.
+- An MSRV bump is treated as a **minor** version bump per the [semver policy](SEMVER_POLICY.md). For example, raising the MSRV from 1.89 to 1.92 ships in a `0.X.0` release (or `X.0.0` once at 1.0).
 - The current MSRV is documented in CHANGELOG.md under the `Changed` section of the release that bumps it.
 
 ## Why we pick the floor we pick
 
-- **1.88** is required because Hexeract uses Rust edition 2024 features and the stabilised `async fn` in traits (via `trait_variant::make(Send)`).
-- Future bumps will be driven by concrete features the framework needs (e.g. an upcoming GAT stabilisation, an `async closure` improvement), not by chasing the latest stable.
+- **1.89** is the August 2026 [Nubster open source fleet baseline](https://github.com/nubster-opensources/.github/blob/main/docs/MSRV_POLICY.md).
+- The baseline is reviewed in February and August. Hexeract may move ahead of it only for a concrete language, dependency, correctness, or security requirement.
 
 ## How we verify the MSRV in CI
 
-The repository CI pins `rust-toolchain.toml` to `1.88.0`. The `Format`, `Clippy` and `Build and test` jobs all run on this exact toolchain, which guarantees that nothing newer slips in. A dedicated MSRV job in `ci.yml` runs `cargo build --workspace` on the pinned toolchain to catch regressions introduced by dependency updates.
+The repository CI pins `rust-toolchain.toml` to `1.89.0`. The `Format`, `Clippy` and `Build and test` jobs all run on this exact toolchain, which guarantees that nothing newer slips in. A dedicated MSRV job in `ci.yml` runs `cargo build --workspace` on the pinned toolchain to catch regressions introduced by dependency updates.
 
 ## Downstream impact
 

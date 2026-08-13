@@ -812,9 +812,9 @@ mod tests {
     }
 
     /// Mirrors `many_concurrent_calls_each_receive_their_own_reply` at a
-    /// larger scale, 1_000 slots instead of 64, and additionally asserts
+    /// larger scale, `1_000` slots instead of 64, and additionally asserts
     /// the registry returns to zero once every call has completed: the
-    /// property #471 exists to guarantee under sustained concurrent load,
+    /// property `#471` exists to guarantee under sustained concurrent load,
     /// not just for one call at a time.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn one_thousand_concurrent_calls_never_cross_replies_and_the_registry_returns_to_zero() {

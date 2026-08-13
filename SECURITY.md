@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Hexeract follows the [semver policy](docs/SEMVER_POLICY.md). During the 0.x phase, only the latest minor release receives security fixes. The current supported release line is **0.6.x** (MSRV: Rust 1.88).
+Hexeract follows the [semver policy](docs/SEMVER_POLICY.md). During the 0.x phase, only the latest minor release receives security fixes. The current supported release line is **0.6.x** (MSRV: Rust 1.89).
 
 | Version | Supported          |
 | ------- | ------------------ |

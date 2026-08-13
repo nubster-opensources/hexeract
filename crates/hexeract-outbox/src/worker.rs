@@ -26,7 +26,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// idiomatic: the connection guard is owned by the worker's polling
 /// cycle, and the transaction borrows from it for the duration of the
 /// cycle. Backends that follow the `Pool` + `Transaction` pattern
-/// (deadpool_postgres, sqlx, ...) map onto this trait directly.
+/// (`deadpool_postgres`, `sqlx`, ...) map onto this trait directly.
 ///
 /// Implemented via `async_trait` (boxed futures) to work around the
 /// current Rust limitation around HRTB inference on GATs (see

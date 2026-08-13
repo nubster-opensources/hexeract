@@ -4,7 +4,7 @@ This page walks you through publishing and consuming a typed message on a Rabbit
 
 ## Prerequisites
 
-- Rust 1.88 or later (`rustup toolchain install 1.88.0`).
+- Rust 1.89 or later (`rustup toolchain install 1.89.0`).
 - A RabbitMQ broker reachable from your machine. For local development, the easiest is `docker run -d --rm --name rabbit -p 5672:5672 rabbitmq:3-management`.
 
 ## Step 1: add the dependencies

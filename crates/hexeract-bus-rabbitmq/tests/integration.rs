@@ -781,11 +781,10 @@ async fn worker_routes_to_dead_letter_after_exhausting_attempts() {
         if let Ok(candidate) = probe_channel
             .basic_get(dlr_queue.into(), BasicGetOptions::default())
             .await
+            && candidate.is_some()
         {
-            if candidate.is_some() {
-                parked = candidate;
-                break;
-            }
+            parked = candidate;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -860,11 +859,10 @@ async fn worker_routes_oversize_delivery_to_dead_letter_queue() {
         if let Ok(candidate) = probe_channel
             .basic_get(dlr_queue.into(), BasicGetOptions::default())
             .await
+            && candidate.is_some()
         {
-            if candidate.is_some() {
-                parked = candidate;
-                break;
-            }
+            parked = candidate;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -938,11 +936,10 @@ async fn worker_routes_undecodable_delivery_to_dead_letter_queue() {
         if let Ok(candidate) = probe_channel
             .basic_get(dlr_queue.into(), BasicGetOptions::default())
             .await
+            && candidate.is_some()
         {
-            if candidate.is_some() {
-                parked = candidate;
-                break;
-            }
+            parked = candidate;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

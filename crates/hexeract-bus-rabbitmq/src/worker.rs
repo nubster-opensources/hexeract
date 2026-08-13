@@ -1264,13 +1264,13 @@ impl RabbitMqWorker {
         A: FnOnce() -> AF,
         AF: Future<Output = Result<(), BusError>>,
     {
-        if let Some(publish) = dead_letter {
-            if let Err(err) = publish().await {
-                let requeue = Self::requeue_on_publish_failure(&err);
-                return DeliveryDisposition::from_settle_result(
-                    &settle_on_publish_failure(requeue).await,
-                );
-            }
+        if let Some(publish) = dead_letter
+            && let Err(err) = publish().await
+        {
+            let requeue = Self::requeue_on_publish_failure(&err);
+            return DeliveryDisposition::from_settle_result(
+                &settle_on_publish_failure(requeue).await,
+            );
         }
         DeliveryDisposition::from_settle_result(&ack().await)
     }
@@ -1390,14 +1390,15 @@ pub(crate) fn death_count(props: &BasicProperties, wait_queue: &str) -> u32 {
             fields.get("reason"),
             Some(AMQPValue::LongString(r)) if r.as_bytes() == b"expired"
         );
-        if queue_matches && reason_matches {
-            if let Some(AMQPValue::LongLongInt(count)) = fields.get("count") {
-                // `x-death` is an ordinary header any producer can forge:
-                // a negative or huge count must not poison the retry
-                // counter. Clamp negatives to 0 before the conversion so
-                // `try_from` never maps a forged negative to `u32::MAX`.
-                return u32::try_from(count.max(&0).to_owned()).unwrap_or(u32::MAX);
-            }
+        if queue_matches
+            && reason_matches
+            && let Some(AMQPValue::LongLongInt(count)) = fields.get("count")
+        {
+            // `x-death` is an ordinary header any producer can forge:
+            // a negative or huge count must not poison the retry
+            // counter. Clamp negatives to 0 before the conversion so
+            // `try_from` never maps a forged negative to `u32::MAX`.
+            return u32::try_from(count.max(&0).to_owned()).unwrap_or(u32::MAX);
         }
     }
     0
@@ -1446,10 +1447,10 @@ pub(crate) fn delivery_to_envelope(
     let mut headers = StdHashMap::new();
     if let Some(table) = props.headers().as_ref() {
         for (key, value) in table.inner() {
-            if let lapin::types::AMQPValue::LongString(s) = value {
-                if let Ok(text) = std::str::from_utf8(s.as_bytes()) {
-                    headers.insert(key.as_str().to_owned(), text.to_owned());
-                }
+            if let lapin::types::AMQPValue::LongString(s) = value
+                && let Ok(text) = std::str::from_utf8(s.as_bytes())
+            {
+                headers.insert(key.as_str().to_owned(), text.to_owned());
             }
         }
     }
