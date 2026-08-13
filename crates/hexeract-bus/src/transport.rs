@@ -91,7 +91,7 @@ pub trait Transport: Send + Sync + 'static {
     /// hints exposed verbatim to the broker. The `correlation_id`
     /// is minted by the transport; combine with
     /// [`Self::publish_with_correlation_id`] semantics when both a
-    /// caller-supplied correlation_id and custom headers are needed.
+    /// caller-supplied `correlation_id` and custom headers are needed.
     ///
     /// # Errors
     ///

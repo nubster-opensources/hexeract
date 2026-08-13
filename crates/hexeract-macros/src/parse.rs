@@ -380,23 +380,21 @@ fn is_std_arc_path(path: &syn::Path) -> bool {
 /// signature takes the context by shared reference.
 fn validate_ctx_arg(arg: &FnArg) -> syn::Result<()> {
     let ty = typed_arg_type(arg, "ctx: &HandlerContext")?;
-    if let Type::Reference(reference) = &ty {
-        if let Type::Path(path) = &*reference.elem {
-            if path
-                .path
-                .segments
-                .last()
-                .is_some_and(|seg| seg.ident == "HandlerContext")
-            {
-                if reference.mutability.is_some() {
-                    return Err(syn::Error::new_spanned(
-                        &ty,
-                        "the context must be taken by shared reference `&HandlerContext`, not `&mut`",
-                    ));
-                }
-                return Ok(());
-            }
+    if let Type::Reference(reference) = &ty
+        && let Type::Path(path) = &*reference.elem
+        && path
+            .path
+            .segments
+            .last()
+            .is_some_and(|seg| seg.ident == "HandlerContext")
+    {
+        if reference.mutability.is_some() {
+            return Err(syn::Error::new_spanned(
+                &ty,
+                "the context must be taken by shared reference `&HandlerContext`, not `&mut`",
+            ));
         }
+        return Ok(());
     }
     Err(syn::Error::new_spanned(
         &ty,

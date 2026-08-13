@@ -96,7 +96,7 @@ pub trait OutboxPublisher: Send + Sync + 'static {
     /// Use this variant when downstream handlers need to observe events
     /// sharing the same aggregate identifier in a best-effort order.
     /// Events with the same `subject_id` are polled by ascending `event_id`
-    /// (UUIDv7, millisecond timestamp granularity), so the ordering is
+    /// (`UUIDv7`, millisecond timestamp granularity), so the ordering is
     /// best-effort: two events inserted within the same millisecond can
     /// appear in any order relative to each other. Nothing in the framework
     /// enforces strict subject-keyed serialization.
