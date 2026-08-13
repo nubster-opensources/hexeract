@@ -18,6 +18,7 @@ jobs:
   integration:
     name: Integration tests on Linux with Docker
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     permissions:
       contents: read
     steps:
@@ -34,8 +35,17 @@ jobs:
       - name: Verify Docker daemon is available
         run: docker version
 
-      - name: Run #[ignore]-d integration tests
-        run: cargo test --workspace --all-features --no-fail-fast -- --ignored --test-threads=1
+      - name: Run #[ignore]-d integration tests concurrently
+        run: |
+          started_at=$(date +%s)
+          cargo test --workspace --all-features --no-fail-fast -- --ignored
+          elapsed_seconds=$(( $(date +%s) - started_at ))
+          {
+            echo "### Docker integration duration"
+            echo
+            echo "- Ignored integration suite: ${elapsed_seconds}s"
+            echo "- Baseline before parallel execution: 13m41s (821s)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run self-asserting examples
         run: |
