@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use hexeract_core::{CorrelationId, RequestId};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -50,6 +51,7 @@ pub(crate) struct RequestClientInner<T: Transport> {
     reply_inbox: Arc<Mutex<ReplyInboxState>>,
     default_timeout: Duration,
     cancel: CancellationToken,
+    publication_lifecycle: PublicationLifecycle,
     supervisor: Mutex<Option<JoinHandle<()>>>,
     /// Cancelled by the reply consumer task itself, right before it
     /// returns, on every exit path. This is what lets a concurrent
@@ -66,6 +68,97 @@ pub(crate) struct RequestClientInner<T: Transport> {
     /// [`RequestClient::new`]), so the two can never disagree about
     /// whether a real consumer exists.
     finished: Option<CancellationToken>,
+}
+
+/// Coordinates the boundary between admitting a request publication and
+/// starting shutdown. Once shutdown begins, no new publication can be
+/// admitted; shutdown then waits for the already-admitted publications to
+/// return from their transport call.
+struct PublicationLifecycle {
+    state: Mutex<PublicationState>,
+    drained: watch::Sender<bool>,
+}
+
+struct PublicationState {
+    closing: bool,
+    in_flight: usize,
+}
+
+impl Default for PublicationLifecycle {
+    fn default() -> Self {
+        let (drained, _receiver) = watch::channel(true);
+        Self {
+            state: Mutex::new(PublicationState {
+                closing: false,
+                in_flight: 0,
+            }),
+            drained,
+        }
+    }
+}
+
+impl PublicationLifecycle {
+    /// Admit one publication, unless shutdown has already started.
+    fn admit(&self) -> Result<PublicationPermit<'_>, RequestError> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.closing {
+            return Err(RequestError::Closed);
+        }
+        if state.in_flight == 0 {
+            self.drained.send_replace(false);
+        }
+        state.in_flight += 1;
+        Ok(PublicationPermit { lifecycle: self })
+    }
+
+    /// Mark shutdown as started and return a receiver when publication work
+    /// remains. The caller must create this receiver before closing the
+    /// registry, because closing the registry wakes the corresponding calls.
+    fn begin_close(&self) -> Option<watch::Receiver<bool>> {
+        let receiver = self.drained.subscribe();
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.closing = true;
+        (state.in_flight != 0).then_some(receiver)
+    }
+
+    fn is_closing(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .closing
+    }
+
+    async fn wait_for_drain(mut receiver: watch::Receiver<bool>) {
+        while !*receiver.borrow() {
+            // `RequestClientInner` owns `drained` for the lifetime of every
+            // close call, so this branch is unreachable in normal operation.
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+struct PublicationPermit<'a> {
+    lifecycle: &'a PublicationLifecycle,
+}
+
+impl Drop for PublicationPermit<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .lifecycle
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        debug_assert!(
+            state.in_flight > 0,
+            "every publication permit is dropped exactly once"
+        );
+        state.in_flight = state.in_flight.saturating_sub(1);
+        if state.in_flight == 0 {
+            self.lifecycle.drained.send_replace(true);
+        }
+    }
 }
 
 impl<T: Transport> Drop for RequestClientInner<T> {
@@ -131,14 +224,15 @@ impl<T: Transport> RequestClient<T> {
                 reply_inbox,
                 default_timeout,
                 cancel,
+                publication_lifecycle: PublicationLifecycle::default(),
                 supervisor: Mutex::new(supervisor),
                 finished,
             }),
         }
     }
 
-    /// Reject new calls, fail every pending call with [`RequestError::Closed`],
-    /// then wait for the reply consumer to actually stop.
+    /// Reject new calls, wait for already-admitted publications to return from
+    /// the transport, then wait for the reply consumer to actually stop.
     ///
     /// This is the strong half of the client's shutdown contract: when this
     /// method returns, the registry is closed and empty, and the reply
@@ -164,8 +258,9 @@ impl<T: Transport> RequestClient<T> {
     /// and awaits the same termination signal instead, without changing
     /// registry or token state again. If this client was built with no
     /// supervisor at all, there is no termination signal to wait for on
-    /// either branch, and every call, first or later, returns as soon as
-    /// it has closed the registry and cancelled `cancel`.
+    /// either branch. Every call, first or later, still waits for any
+    /// publication admitted before shutdown, then returns as soon as it has
+    /// closed the registry and cancelled `cancel`.
     ///
     /// Calling this from the supervisor task itself deadlocks, on either
     /// branch: on the handle-holding branch, a task can never observe its
@@ -182,8 +277,21 @@ impl<T: Transport> RequestClient<T> {
     /// the inbox and the token, never a [`RequestClient`], but the client
     /// is clonable and nothing stops a caller from handing a clone to a
     /// task it spawns itself.
+    ///
+    /// If publication is already admitted when `close` begins, this method
+    /// waits until that transport call returns before cancelling the shared
+    /// token. Each admitted call is bounded by its own resolved request
+    /// timeout, so shutdown can wait up to the longest such remaining
+    /// deadline. This preserves the responder while a publication is still
+    /// travelling to the broker; a call whose reply slot is then drained
+    /// reports [`RequestError::PublicationUnknown`] rather than the safe
+    /// pre-publication [`RequestError::Closed`] outcome.
     pub async fn close(&self) {
+        let publication_drain = self.inner.publication_lifecycle.begin_close();
         self.inner.registry.close();
+        if let Some(receiver) = publication_drain {
+            PublicationLifecycle::wait_for_drain(receiver).await;
+        }
         self.inner.cancel.cancel();
         let handle = self
             .inner
@@ -241,11 +349,9 @@ impl<T: Transport> RequestClient<T> {
     ///   client stays distinguishable from a slow responder. Retrying at
     ///   once cannot succeed, since nothing has been released in the
     ///   meantime.
-    /// - [`RequestError::Closed`] if [`Self::close`] was called, whether
-    ///   before this call started or while it was pending. Unlike the other
-    ///   two, this is not a symptom of load: the client will never serve
-    ///   another call, so the response is to stop issuing them rather than
-    ///   to retry.
+    /// - [`RequestError::Closed`] if [`Self::close`] started before this call
+    ///   was admitted for publication. The responder never saw the request,
+    ///   so this error is safe to treat as pre-publication.
     /// - [`RequestError::Protocol`] carrying
     ///   [`ProtocolViolation::IdentityCollision`] if the request identity
     ///   minted for this call is already registered. Retrying is safe, and
@@ -260,6 +366,10 @@ impl<T: Transport> RequestClient<T> {
     ///
     /// - [`RequestError::Transport`] if publishing fails or the reply channel
     ///   is lost (connection dropped).
+    /// - [`RequestError::PublicationUnknown`] if shutdown began after the
+    ///   transport accepted the request but before a reply established its
+    ///   outcome. The responder may have acted, so retrying can duplicate
+    ///   side effects.
     /// - [`RequestError::Timeout`] if publishing and waiting for a reply do
     ///   not both complete within the single resolved timeout. A timeout
     ///   racing publication is ambiguous: the transport future is cancelled,
@@ -394,6 +504,7 @@ impl<T: Transport> RequestClient<T> {
             PROTOCOL_VERSION_HEADER.to_owned(),
             PROTOCOL_VERSION.to_string(),
         );
+        let publication = self.inner.publication_lifecycle.admit()?;
         match tokio::time::timeout_at(
             deadline,
             self.inner
@@ -406,23 +517,25 @@ impl<T: Transport> RequestClient<T> {
             Ok(Err(error)) => return Err(RequestError::Transport(error)),
             Ok(Ok(_message_id)) => {}
         }
+        drop(publication);
 
         let reply = match tokio::time::timeout_at(deadline, pending.wait()).await {
             Err(_elapsed) => return Err(RequestError::Timeout(timeout)),
             Ok(Err(_closed)) => {
                 // The registry drops every sender on both `close` (permanent)
-                // and `drain` (transient, on broker loss). `is_closed` is
-                // what tells the two apart for the caller, outside of a
-                // concurrent close: a caller woken by a `drain` that reads
-                // `is_closed` after a `close` has since landed sees
-                // `Closed` instead of `Transport`, losing the retryable
-                // signal. Consequence is weak, since a closed client
-                // accepts no further calls anyway.
-                return Err(if self.inner.registry.is_closed() {
-                    RequestError::Closed
-                } else {
-                    RequestError::Transport(reply_channel_lost())
-                });
+                // and `drain` (transient, on broker loss). A close, including
+                // a manual registry close supplied through the public
+                // constructor, cannot establish that a successfully published
+                // request had no side effects, so it stays conservative.
+                return Err(
+                    if self.inner.publication_lifecycle.is_closing()
+                        || self.inner.registry.is_closed()
+                    {
+                        RequestError::PublicationUnknown
+                    } else {
+                        RequestError::Transport(reply_channel_lost())
+                    },
+                );
             }
             Ok(Ok(envelope)) => envelope,
         };
@@ -1863,7 +1976,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_fails_every_pending_call_with_closed() {
+    async fn close_marks_an_already_published_pending_call_unknown() {
         let transport = Arc::new(CapturingTransport::default());
         let registry = Arc::new(RequestRegistry::default());
         let client = client_with_lifecycle(
@@ -1879,21 +1992,160 @@ mod tests {
         };
         tokio::task::yield_now().await;
 
-        // Without this, both interleavings of the spawned call against
-        // `close` produce the same `Err(RequestError::Closed)`: whether the
-        // call was genuinely in flight when `close` ran, or never got the
-        // chance to register at all. This assertion is what tells the two
-        // apart and keeps this test distinct from
-        // `request_after_close_is_rejected_with_closed` below.
+        // This assertion distinguishes a call that already published from one
+        // rejected before it registered, which still returns `Closed` below.
         assert_eq!(registry.len(), 1, "the call must be in flight before close");
 
         client.close().await;
 
         let result = call.await.expect("the spawned call must not panic");
         assert!(
-            matches!(result, Err(RequestError::Closed)),
-            "expected RequestError::Closed, got {result:?}"
+            matches!(result, Err(RequestError::PublicationUnknown)),
+            "expected RequestError::PublicationUnknown, got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_an_admitted_publication_and_marks_its_result_unknown() {
+        let transport = Arc::new(GatedTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = gated_client(
+            Arc::clone(&transport),
+            Arc::clone(&registry),
+            Duration::from_secs(30),
+        );
+
+        let request = {
+            let client = client.clone();
+            tokio::spawn(async move { client.request(Ping { seq: 1 }).await })
+        };
+        transport.wait_until_publish_started().await;
+
+        let close = {
+            let client = client.clone();
+            tokio::spawn(async move { client.close().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !close.is_finished(),
+            "close must wait for a publication admitted before shutdown"
+        );
+
+        transport.release_publish();
+
+        let result = request.await.expect("request task must not panic");
+        assert!(
+            matches!(result, Err(RequestError::PublicationUnknown)),
+            "a request published during shutdown must not report the safe Closed error: {result:?}"
+        );
+        assert!(
+            transport.last_published().is_some(),
+            "the transport accepted the request before shutdown completed"
+        );
+        close.await.expect("close task must not panic");
+    }
+
+    #[tokio::test]
+    async fn close_delays_shared_cancellation_until_admitted_publication_drains() {
+        let transport = Arc::new(GatedTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let cancel = CancellationToken::new();
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            registry,
+            Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
+            Duration::from_secs(30),
+            cancel.clone(),
+            None,
+        );
+
+        let request = {
+            let client = client.clone();
+            tokio::spawn(async move { client.request(Ping { seq: 1 }).await })
+        };
+        transport.wait_until_publish_started().await;
+
+        let close = {
+            let client = client.clone();
+            tokio::spawn(async move { client.close().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !cancel.is_cancelled(),
+            "shared cancellation must not stop responders while publication is in flight"
+        );
+
+        transport.release_publish();
+        let _ = request.await.expect("request task must not panic");
+        close.await.expect("close task must not panic");
+        assert!(
+            cancel.is_cancelled(),
+            "close must eventually cancel the caller-owned token"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_between_registration_and_publication_refuses_the_publication() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = client(Arc::clone(&transport), Arc::clone(&registry));
+        let reply_inbox = Arc::clone(&client.inner.reply_inbox);
+        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let inbox_locker = std::thread::spawn(move || {
+            let inbox_lock = reply_inbox.lock().unwrap_or_else(PoisonError::into_inner);
+            locked_tx
+                .send(())
+                .expect("test must observe the inbox lock before starting the request");
+            release_rx
+                .recv()
+                .expect("test must release the inbox lock after shutdown begins");
+            drop(inbox_lock);
+        });
+        locked_rx
+            .recv()
+            .expect("inbox-locking thread must report that it holds the lock");
+
+        let request = {
+            let client = client.clone();
+            tokio::spawn(async move { client.request(Ping { seq: 1 }).await })
+        };
+        tokio::time::timeout(Duration::from_millis(200), async {
+            while registry.len() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request must register before attempting to read the inbox");
+
+        let close = {
+            let client = client.clone();
+            tokio::spawn(async move { client.close().await })
+        };
+        tokio::time::timeout(Duration::from_millis(200), async {
+            while !registry.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("close must begin before the request can reach publication");
+        release_tx
+            .send(())
+            .expect("inbox-locking thread must still await release");
+        inbox_locker
+            .join()
+            .expect("inbox-locking thread must not panic");
+
+        let error = request
+            .await
+            .expect("request task must not panic")
+            .expect_err("shutdown must refuse a publication not yet admitted");
+        assert!(matches!(error, RequestError::Closed));
+        assert!(
+            transport.last_published().is_none(),
+            "the request must not reach the transport after shutdown begins"
+        );
+        close.await.expect("close task must not panic");
     }
 
     #[tokio::test]

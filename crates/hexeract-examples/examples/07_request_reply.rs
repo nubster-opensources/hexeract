@@ -602,12 +602,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     run_business_rejection(&client).await?;
     run_causal_propagation(&client, &captures).await?;
 
-    // Closing the client rejects further calls, fails any still-pending
-    // one with `RequestError::Closed`, and cancels the shared token: since
-    // every responder worker above was spawned on a clone of that same
-    // token, this single call is also what winds them all down. Unlike
-    // simply dropping the client, `close` waits for its own reply consumer
-    // task to have actually stopped before returning.
+    // Closing the client rejects calls that have not reached publication with
+    // `RequestError::Closed`. A request already accepted by the transport
+    // reports `RequestError::PublicationUnknown`, because retrying it could
+    // duplicate side effects. The shared token is cancelled after admitted
+    // publications drain, which then winds down every responder worker above.
+    // Unlike simply dropping the client, `close` also waits for its own reply
+    // consumer task to have actually stopped before returning.
     client.close().await;
     responders.join_all().await?;
     tracing::info!("request-reply example completed");
