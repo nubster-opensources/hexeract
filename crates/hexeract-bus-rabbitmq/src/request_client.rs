@@ -82,7 +82,7 @@ pub async fn connect_request_client(
         inbox_name,
         Arc::clone(&registry),
         Arc::clone(&reply_inbox),
-        cancel.clone(),
+        cancel,
     );
 
     Ok(RequestClient::new(
@@ -90,8 +90,7 @@ pub async fn connect_request_client(
         registry,
         reply_inbox,
         default_timeout,
-        cancel,
-        Some(supervisor),
+        supervisor,
     ))
 }
 
@@ -114,7 +113,7 @@ fn spawn_reply_inbox_supervisor(
     reply_inbox: Arc<Mutex<ReplyInboxState>>,
     cancel: CancellationToken,
 ) -> RequestClientSupervisor {
-    RequestClientSupervisor::spawn(async move {
+    RequestClientSupervisor::spawn(cancel, move |cancel| async move {
         let mut channel = channel;
         let mut inbox = inbox;
         loop {

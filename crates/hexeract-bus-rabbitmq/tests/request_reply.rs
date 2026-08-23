@@ -33,6 +33,7 @@ use hexeract_bus::ReplyExpectation;
 use hexeract_bus::ReplyInboxState;
 use hexeract_bus::Request;
 use hexeract_bus::RequestClient;
+use hexeract_bus::RequestClientSupervisor;
 use hexeract_bus::RequestContext;
 use hexeract_bus::RequestError;
 use hexeract_bus::RequestHandler;
@@ -618,8 +619,7 @@ async fn a_forged_reply_published_into_the_inbox_does_not_end_the_call() {
         Arc::clone(&registry),
         reply_inbox,
         Duration::from_secs(10),
-        cancel.clone(),
-        None,
+        RequestClientSupervisor::detached(cancel.clone()),
     );
 
     let call = tokio::spawn(async move { client.request(Ping { seq: 1 }).await });
