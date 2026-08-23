@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -29,6 +30,66 @@ pub struct RequestClient<T: Transport> {
     inner: Arc<RequestClientInner<T>>,
 }
 
+/// Opaque ownership of a request client's reply-inbox supervisor.
+///
+/// Construct this value with [`Self::spawn`]. The constructor pairs the
+/// supervisor task with its completion signal internally, so a
+/// [`RequestClient`] cannot be assembled with a task and an unrelated signal
+/// that would leave concurrent [`RequestClient::close`] calls waiting forever.
+///
+/// ```compile_fail
+/// use hexeract_bus::RequestClientSupervisor;
+///
+/// let _ = RequestClientSupervisor {
+///     handle: todo!(),
+///     finished: todo!(),
+/// };
+/// ```
+pub struct RequestClientSupervisor {
+    handle: JoinHandle<()>,
+    task_id: tokio::task::Id,
+    finished: CancellationToken,
+}
+
+impl RequestClientSupervisor {
+    /// Spawn `task` and bind its actual termination to the returned handle.
+    ///
+    /// The completion signal fires when the task unwinds, including after a
+    /// panic or task cancellation. It is intentionally not supplied by the
+    /// caller: the task and the signal can therefore never be mispaired.
+    #[must_use]
+    pub fn spawn<F>(task: F) -> Self
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let finished = CancellationToken::new();
+        let signal = finished.clone();
+        let handle = tokio::task::spawn(async move {
+            let _completion = SupervisorCompletionGuard(signal);
+            task.await;
+        });
+        let task_id = handle.id();
+        Self {
+            handle,
+            task_id,
+            finished,
+        }
+    }
+
+    fn into_parts(self) -> (JoinHandle<()>, tokio::task::Id, CancellationToken) {
+        (self.handle, self.task_id, self.finished)
+    }
+}
+
+/// Signals supervisor completion whenever its wrapper task unwinds.
+struct SupervisorCompletionGuard(CancellationToken);
+
+impl Drop for SupervisorCompletionGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 impl<T: Transport> Clone for RequestClient<T> {
     fn clone(&self) -> Self {
         Self {
@@ -53,6 +114,7 @@ pub(crate) struct RequestClientInner<T: Transport> {
     cancel: CancellationToken,
     publication_lifecycle: PublicationLifecycle,
     supervisor: Mutex<Option<JoinHandle<()>>>,
+    supervisor_task_id: Option<tokio::task::Id>,
     /// Cancelled by the reply consumer task itself, right before it
     /// returns, on every exit path. This is what lets a concurrent
     /// [`RequestClient::close`] caller, one that finds the supervisor
@@ -188,19 +250,9 @@ impl<T: Transport> RequestClient<T> {
     /// this gives a caller.
     ///
     /// `cancel` is the shutdown signal this client's reply consumer, if any,
-    /// observes to stop. `supervisor` pairs that consumer's join handle
-    /// with the token that consumer cancels right before it returns, on
-    /// every exit path: the two travel together, as one `Option`, so a
-    /// client cannot be built with a consumer but no way to learn when it
-    /// truly stops.
-    ///
-    /// That closes the shape, not the pairing. This constructor is public
-    /// and cannot check that the token it is handed is the one the
-    /// supervisor task actually cancels; a caller that passes an unrelated
-    /// token leaves every [`Self::close`] past the first waiting forever on
-    /// a signal that will never be raised. Outside this crate, take both
-    /// values from the same transport that spawned the consumer rather than
-    /// assembling the pair by hand. Pass `None`
+    /// observes to stop. `supervisor`, when present, is an opaque handle made
+    /// by [`RequestClientSupervisor::spawn`], which binds the consumer task
+    /// to its completion signal. Pass `None`
     /// for a client with no real consumer, such as one built for a unit
     /// test: [`Self::close`] then has nothing to wait for and returns as
     /// soon as it has closed the registry and cancelled `cancel`.
@@ -211,11 +263,14 @@ impl<T: Transport> RequestClient<T> {
         reply_inbox: Arc<Mutex<ReplyInboxState>>,
         default_timeout: Duration,
         cancel: CancellationToken,
-        supervisor: Option<(JoinHandle<()>, CancellationToken)>,
+        supervisor: Option<RequestClientSupervisor>,
     ) -> Self {
-        let (supervisor, finished) = match supervisor {
-            Some((handle, finished)) => (Some(handle), Some(finished)),
-            None => (None, None),
+        let (supervisor, supervisor_task_id, finished) = match supervisor {
+            Some(supervisor) => {
+                let (handle, task_id, finished) = supervisor.into_parts();
+                (Some(handle), Some(task_id), Some(finished))
+            }
+            None => (None, None, None),
         };
         Self {
             inner: Arc::new(RequestClientInner {
@@ -226,6 +281,7 @@ impl<T: Transport> RequestClient<T> {
                 cancel,
                 publication_lifecycle: PublicationLifecycle::default(),
                 supervisor: Mutex::new(supervisor),
+                supervisor_task_id,
                 finished,
             }),
         }
@@ -262,21 +318,10 @@ impl<T: Transport> RequestClient<T> {
     /// publication admitted before shutdown, then returns as soon as it has
     /// closed the registry and cancelled `cancel`.
     ///
-    /// Calling this from the supervisor task itself deadlocks, on either
-    /// branch: on the handle-holding branch, a task can never observe its
-    /// own completion by joining its own [`JoinHandle`]; on the other
-    /// branch, waiting on `finished` is no better, since nothing else will
-    /// ever cancel that token while the task that alone can cancel it is
-    /// the one blocked waiting on it. The second case is worse than the
-    /// first: because the other closers are all waiting either on that
-    /// same `finished` token or on the join handle of the very task that
-    /// is blocked, a single misplaced call from the supervisor task
-    /// freezes every other, legitimate caller of `close` along with
-    /// itself, not just the caller at fault. Nothing in this crate does
-    /// that today, since the supervisor is only ever handed the registry,
-    /// the inbox and the token, never a [`RequestClient`], but the client
-    /// is clonable and nothing stops a caller from handing a clone to a
-    /// task it spawns itself.
+    /// A call made by the supervisor task itself performs the shutdown signal
+    /// but does not await its own join handle. Awaiting itself would deadlock;
+    /// another caller still observes actual completion through the shared
+    /// termination signal.
     ///
     /// If publication is already admitted when `close` begins, this method
     /// waits until that transport call returns before cancelling the shared
@@ -293,6 +338,13 @@ impl<T: Transport> RequestClient<T> {
             PublicationLifecycle::wait_for_drain(receiver).await;
         }
         self.inner.cancel.cancel();
+        if self
+            .inner
+            .supervisor_task_id
+            .is_some_and(|id| tokio::task::try_id() == Some(id))
+        {
+            return;
+        }
         let handle = self
             .inner
             .supervisor
@@ -833,14 +885,13 @@ mod tests {
         )
     }
 
-    /// Build a client whose `cancel` token and supervisor (join handle
-    /// paired with its `finished` token) are both under the caller's
-    /// control, for the lifecycle tests below.
+    /// Build a client whose `cancel` token and opaque supervisor are both
+    /// under the caller's control, for the lifecycle tests below.
     fn client_with_lifecycle(
         transport: Arc<CapturingTransport>,
         registry: Arc<RequestRegistry>,
         cancel: CancellationToken,
-        supervisor: Option<(tokio::task::JoinHandle<()>, CancellationToken)>,
+        supervisor: Option<RequestClientSupervisor>,
     ) -> RequestClient<CapturingTransport> {
         RequestClient::new(
             transport,
@@ -850,6 +901,18 @@ mod tests {
             cancel,
             supervisor,
         )
+    }
+
+    fn test_supervisor(
+        handle: tokio::task::JoinHandle<()>,
+        finished: CancellationToken,
+    ) -> RequestClientSupervisor {
+        let task_id = handle.id();
+        RequestClientSupervisor {
+            handle,
+            task_id,
+            finished,
+        }
     }
 
     /// A call that reads `Reconnecting` must fail before it ever reaches
@@ -2189,7 +2252,7 @@ mod tests {
             transport,
             Arc::clone(&registry),
             cancel,
-            Some((supervisor, finished_signal)),
+            Some(test_supervisor(supervisor, finished_signal)),
         );
 
         client.close().await;
@@ -2252,7 +2315,7 @@ mod tests {
             transport,
             registry,
             cancel,
-            Some((supervisor, finished_signal)),
+            Some(test_supervisor(supervisor, finished_signal)),
         );
 
         client.close().await;
@@ -2311,7 +2374,7 @@ mod tests {
             transport,
             registry,
             cancel,
-            Some((supervisor, finished_signal)),
+            Some(test_supervisor(supervisor, finished_signal)),
         );
         let second = client.clone();
 
@@ -2372,6 +2435,83 @@ mod tests {
             .expect("close on a client built without a supervisor must not block");
     }
 
+    /// The public supervisor constructor owns both the task and its
+    /// completion signal, so concurrent closers cannot accidentally wait on
+    /// an unrelated token supplied by the caller.
+    #[tokio::test]
+    async fn opaque_supervisor_wakes_every_concurrent_closer_on_task_completion() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let cancel = CancellationToken::new();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let supervisor = RequestClientSupervisor::spawn({
+            let cancel = cancel.clone();
+            let stopped = Arc::clone(&stopped);
+            async move {
+                cancel.cancelled().await;
+                stopped.store(true, Ordering::SeqCst);
+            }
+        });
+        let client = RequestClient::new(
+            transport,
+            registry,
+            Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
+            Duration::from_millis(200),
+            cancel,
+            Some(supervisor),
+        );
+
+        let other = client.clone();
+        let first = tokio::spawn(async move { client.close().await });
+        other.close().await;
+
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "each closer must observe the supervisor task's real termination"
+        );
+        first.await.expect("first close task must not panic");
+    }
+
+    #[tokio::test]
+    async fn close_called_from_the_supervisor_task_does_not_deadlock() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let cancel = CancellationToken::new();
+        let returned = Arc::new(AtomicBool::new(false));
+        let (client_tx, client_rx) = tokio::sync::oneshot::channel();
+        let supervisor = RequestClientSupervisor::spawn({
+            let returned = Arc::clone(&returned);
+            async move {
+                let client = client_rx
+                    .await
+                    .expect("client must be handed to the supervisor task");
+                client.close().await;
+                returned.store(true, Ordering::SeqCst);
+            }
+        });
+        let client = RequestClient::new(
+            transport,
+            registry,
+            Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
+            Duration::from_millis(200),
+            cancel,
+            Some(supervisor),
+        );
+
+        client_tx
+            .send(client.clone())
+            .expect("supervisor must still wait for its client");
+        tokio::time::timeout(Duration::from_millis(200), async {
+            while !returned.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("self-close must return instead of deadlocking");
+
+        client.close().await;
+    }
+
     #[tokio::test]
     async fn dropping_the_last_handle_closes_the_registry_and_signals_the_consumer() {
         let transport = Arc::new(CapturingTransport::default());
@@ -2395,7 +2535,7 @@ mod tests {
             transport,
             Arc::clone(&registry),
             cancel,
-            Some((supervisor, finished_signal)),
+            Some(test_supervisor(supervisor, finished_signal)),
         );
         let _pending = registry
             .register(RequestId::new(), ReplyExpectation::new(Pong::MESSAGE_TYPE))

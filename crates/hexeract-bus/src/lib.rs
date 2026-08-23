@@ -90,6 +90,7 @@ pub use reply_inbox_state::ReplyInboxState;
 pub use reply_publisher::ReplyPublisher;
 pub use request::Request;
 pub use request_client::RequestClient;
+pub use request_client::RequestClientSupervisor;
 pub use request_context::RequestContext;
 pub use request_error::ProtocolViolation;
 pub use request_error::RequestError;

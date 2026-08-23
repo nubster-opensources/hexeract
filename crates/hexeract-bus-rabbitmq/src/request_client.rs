@@ -32,7 +32,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use hexeract_bus::{
-    BusError, DEFAULT_MAX_IN_FLIGHT, ReplyInboxState, RequestClient, RequestRegistry,
+    BusError, DEFAULT_MAX_IN_FLIGHT, ReplyInboxState, RequestClient, RequestClientSupervisor,
+    RequestRegistry,
 };
 use lapin::Channel;
 use tokio_util::sync::CancellationToken;
@@ -75,8 +76,6 @@ pub async fn connect_request_client(
     let inbox_name = declare_reply_inbox(&channel).await?;
     let reply_inbox = Arc::new(Mutex::new(ReplyInboxState::Ready(inbox_name.clone())));
 
-    let finished = CancellationToken::new();
-
     let supervisor = spawn_reply_inbox_supervisor(
         uri.to_owned(),
         channel,
@@ -84,7 +83,6 @@ pub async fn connect_request_client(
         Arc::clone(&registry),
         Arc::clone(&reply_inbox),
         cancel.clone(),
-        finished.clone(),
     );
 
     Ok(RequestClient::new(
@@ -93,28 +91,8 @@ pub async fn connect_request_client(
         reply_inbox,
         default_timeout,
         cancel,
-        Some((supervisor, finished)),
+        Some(supervisor),
     ))
-}
-
-/// Cancels its token on drop: the last thing that happens to this guard,
-/// on every exit path of the task that owns it, panic included.
-///
-/// [`spawn_reply_inbox_supervisor`]'s task body has three `return` points
-/// (cancellation observed at the top of the loop, a plain `Ok(())` or an
-/// already-observed cancellation after [`run_reply_inbox`], and a failed
-/// reconnect). Cancelling `finished` by hand at each of them would work
-/// today, but silently stops working the moment a fourth exit point is
-/// added and its author forgets the cancellation. Tying the cancellation
-/// to this guard's `Drop` instead makes forgetting it impossible: the
-/// token is cancelled exactly when the task's stack unwinds, regardless
-/// of which `return` triggered it.
-struct FinishedGuard(CancellationToken);
-
-impl Drop for FinishedGuard {
-    fn drop(&mut self) {
-        self.0.cancel();
-    }
 }
 
 /// Drive the reply inbox consumer, rebuilding it across a broker drop.
@@ -124,16 +102,10 @@ impl Drop for FinishedGuard {
 /// fail fast, then hands off to [`reconnect_reply_inbox`] for a fresh
 /// connection and inbox before resuming.
 ///
-/// Returns the spawned task's [`tokio::task::JoinHandle`] rather than
-/// detaching it: [`connect_request_client`] hands that handle to the
+/// Returns an opaque [`RequestClientSupervisor`] rather than detaching the
+/// task: [`connect_request_client`] hands that handle to the
 /// [`RequestClient`] it assembles, so `RequestClient::close` can await
 /// this task's actual termination instead of merely cancelling it.
-///
-/// `finished` is cancelled, through a [`FinishedGuard`], right before the
-/// task actually returns, on every exit path: this is the signal a
-/// `RequestClient::close` caller that finds the join handle already taken
-/// by a concurrent caller waits on instead, so it too observes genuine
-/// termination rather than returning early.
 fn spawn_reply_inbox_supervisor(
     uri: String,
     channel: Channel,
@@ -141,10 +113,8 @@ fn spawn_reply_inbox_supervisor(
     registry: Arc<RequestRegistry>,
     reply_inbox: Arc<Mutex<ReplyInboxState>>,
     cancel: CancellationToken,
-    finished: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::task::spawn(async move {
-        let _finished_guard = FinishedGuard(finished);
+) -> RequestClientSupervisor {
+    RequestClientSupervisor::spawn(async move {
         let mut channel = channel;
         let mut inbox = inbox;
         loop {
