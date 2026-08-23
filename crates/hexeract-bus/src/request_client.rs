@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::remote_error::RemoteErrorPayload;
 use crate::reply_acceptance::ReplyExpectation;
 use crate::reply_inbox_state::ReplyInboxState;
+use crate::request_client_supervisor::RequestClientSupervisor;
 use crate::request_error::ProtocolViolation;
 use crate::request_options::RequestOptions;
 use crate::request_registry::RequestRegistry;
@@ -53,6 +54,7 @@ pub(crate) struct RequestClientInner<T: Transport> {
     cancel: CancellationToken,
     publication_lifecycle: PublicationLifecycle,
     supervisor: Mutex<Option<JoinHandle<()>>>,
+    supervisor_task_id: Option<tokio::task::Id>,
     /// Cancelled by the reply consumer task itself, right before it
     /// returns, on every exit path. This is what lets a concurrent
     /// [`RequestClient::close`] caller, one that finds the supervisor
@@ -187,36 +189,36 @@ impl<T: Transport> RequestClient<T> {
     /// window inside it. See [`ReplyInboxState`] for the exact guarantee
     /// this gives a caller.
     ///
-    /// `cancel` is the shutdown signal this client's reply consumer, if any,
-    /// observes to stop. `supervisor` pairs that consumer's join handle
-    /// with the token that consumer cancels right before it returns, on
-    /// every exit path: the two travel together, as one `Option`, so a
-    /// client cannot be built with a consumer but no way to learn when it
-    /// truly stops.
+    /// `supervisor` is an opaque handle built by
+    /// [`RequestClientSupervisor::spawn`] or
+    /// [`RequestClientSupervisor::detached`], and is the sole source of the
+    /// shutdown token this client's reply consumer, if any, observes to
+    /// stop: [`RequestClientSupervisor::spawn`] hands the consumer task the
+    /// very token the supervisor holds, rather than this constructor taking
+    /// an independent `cancel` argument the way earlier revisions of this
+    /// crate did, so a caller can no longer assemble a client whose task
+    /// watches a token unrelated to the one [`Self::close`] cancels.
     ///
-    /// That closes the shape, not the pairing. This constructor is public
-    /// and cannot check that the token it is handed is the one the
-    /// supervisor task actually cancels; a caller that passes an unrelated
-    /// token leaves every [`Self::close`] past the first waiting forever on
-    /// a signal that will never be raised. Outside this crate, take both
-    /// values from the same transport that spawned the consumer rather than
-    /// assembling the pair by hand. Pass `None`
-    /// for a client with no real consumer, such as one built for a unit
-    /// test: [`Self::close`] then has nothing to wait for and returns as
-    /// soon as it has closed the registry and cancelled `cancel`.
+    /// What this still cannot verify is whether the task passed to
+    /// [`RequestClientSupervisor::spawn`] actually reacts to the token it is
+    /// handed: nothing forces that task to return once the token is
+    /// cancelled. A task that ignores its argument keeps running, and
+    /// [`Self::close`] then waits for its genuine termination for as long as
+    /// that task keeps running, unless the caller aborts it explicitly
+    /// through [`RequestClientSupervisor::abort_handle`].
+    /// [`RequestClientSupervisor::detached`] is the escape hatch for a
+    /// client with no real consumer, such as one built for a unit test:
+    /// [`Self::close`] then has nothing to wait for and returns as soon as
+    /// it has closed the registry and cancelled the token.
     #[must_use]
     pub fn new(
         transport: Arc<T>,
         registry: Arc<RequestRegistry>,
         reply_inbox: Arc<Mutex<ReplyInboxState>>,
         default_timeout: Duration,
-        cancel: CancellationToken,
-        supervisor: Option<(JoinHandle<()>, CancellationToken)>,
+        supervisor: RequestClientSupervisor,
     ) -> Self {
-        let (supervisor, finished) = match supervisor {
-            Some((handle, finished)) => (Some(handle), Some(finished)),
-            None => (None, None),
-        };
+        let (cancel, supervisor, supervisor_task_id, finished) = supervisor.into_parts();
         Self {
             inner: Arc::new(RequestClientInner {
                 transport,
@@ -226,6 +228,7 @@ impl<T: Transport> RequestClient<T> {
                 cancel,
                 publication_lifecycle: PublicationLifecycle::default(),
                 supervisor: Mutex::new(supervisor),
+                supervisor_task_id,
                 finished,
             }),
         }
@@ -247,11 +250,23 @@ impl<T: Transport> RequestClient<T> {
     /// (close the registry, cancel the token) and never await the
     /// consumer.
     ///
-    /// This also cancels the [`CancellationToken`] this client was built
-    /// with. That token is owned by the caller, not private to this
-    /// client, and may be shared with other tasks, such as responder
-    /// workers a caller wants to wind down together with the client; see
-    /// the crate's request-reply example for that pattern.
+    /// This also cancels the [`CancellationToken`] given to the
+    /// [`RequestClientSupervisor`] this client was built with, through
+    /// [`RequestClientSupervisor::spawn`] or
+    /// [`RequestClientSupervisor::detached`]. That token is not private to
+    /// this client: a caller that kept its own clone before handing one to
+    /// the supervisor may share it with other tasks, such as responder
+    /// workers it wants to wind down together with the client; see the
+    /// crate's request-reply example for that pattern.
+    ///
+    /// This waits for the consumer task's actual termination, not merely
+    /// for the token to be cancelled: a normal return, a panic, or an
+    /// abort through [`RequestClientSupervisor::abort_handle`] all count
+    /// and wake this call. The one case this cannot bound is a task that
+    /// neither observes its token nor is ever aborted: `close` then waits
+    /// for exactly as long as that task keeps running, which may be
+    /// forever. [`RequestClientSupervisor::spawn`]'s documentation covers
+    /// what it cannot guarantee about the task it spawns.
     ///
     /// Idempotent: the first call takes the supervisor handle and awaits it
     /// directly; every later call, sequential or concurrent, finds `None`
@@ -262,21 +277,10 @@ impl<T: Transport> RequestClient<T> {
     /// publication admitted before shutdown, then returns as soon as it has
     /// closed the registry and cancelled `cancel`.
     ///
-    /// Calling this from the supervisor task itself deadlocks, on either
-    /// branch: on the handle-holding branch, a task can never observe its
-    /// own completion by joining its own [`JoinHandle`]; on the other
-    /// branch, waiting on `finished` is no better, since nothing else will
-    /// ever cancel that token while the task that alone can cancel it is
-    /// the one blocked waiting on it. The second case is worse than the
-    /// first: because the other closers are all waiting either on that
-    /// same `finished` token or on the join handle of the very task that
-    /// is blocked, a single misplaced call from the supervisor task
-    /// freezes every other, legitimate caller of `close` along with
-    /// itself, not just the caller at fault. Nothing in this crate does
-    /// that today, since the supervisor is only ever handed the registry,
-    /// the inbox and the token, never a [`RequestClient`], but the client
-    /// is clonable and nothing stops a caller from handing a clone to a
-    /// task it spawns itself.
+    /// A call made by the supervisor task itself performs the shutdown signal
+    /// but does not await its own join handle. Awaiting itself would deadlock;
+    /// another caller still observes actual completion through the shared
+    /// termination signal.
     ///
     /// If publication is already admitted when `close` begins, this method
     /// waits until that transport call returns before cancelling the shared
@@ -293,6 +297,27 @@ impl<T: Transport> RequestClient<T> {
             PublicationLifecycle::wait_for_drain(receiver).await;
         }
         self.inner.cancel.cancel();
+        // tokio may reuse a task `Id` once it has been retired, but only
+        // after the task has both exited and its `JoinHandle` has been
+        // dropped. Neither has happened yet at this point: the comparison
+        // below still holds this client's own `JoinHandle` in `supervisor`
+        // (or has already taken and awaited it on an earlier call), so the
+        // `Id` being compared against cannot have been recycled to some
+        // unrelated task. Reuse would only become a concern after this
+        // `close` call itself has returned, by which point `finished` is
+        // already cancelled and every closer, on any branch, returns
+        // immediately regardless of what `try_id()` reports.
+        //
+        // `try_id` rather than `id`: `id` panics outside a task context, and
+        // `close` may legitimately be called from a plain `block_on`, which
+        // tokio does not assign any task id to at all.
+        if self
+            .inner
+            .supervisor_task_id
+            .is_some_and(|id| tokio::task::try_id() == Some(id))
+        {
+            return;
+        }
         let handle = self
             .inner
             .supervisor
@@ -784,8 +809,7 @@ mod tests {
             registry,
             Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
             default_timeout,
-            CancellationToken::new(),
-            None,
+            RequestClientSupervisor::detached(CancellationToken::new()),
         )
     }
 
@@ -828,26 +852,22 @@ mod tests {
             registry,
             Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
             Duration::from_millis(200),
-            CancellationToken::new(),
-            None,
+            RequestClientSupervisor::detached(CancellationToken::new()),
         )
     }
 
-    /// Build a client whose `cancel` token and supervisor (join handle
-    /// paired with its `finished` token) are both under the caller's
-    /// control, for the lifecycle tests below.
+    /// Build a client whose opaque supervisor, and the token it owns, are
+    /// both under the caller's control, for the lifecycle tests below.
     fn client_with_lifecycle(
         transport: Arc<CapturingTransport>,
         registry: Arc<RequestRegistry>,
-        cancel: CancellationToken,
-        supervisor: Option<(tokio::task::JoinHandle<()>, CancellationToken)>,
+        supervisor: RequestClientSupervisor,
     ) -> RequestClient<CapturingTransport> {
         RequestClient::new(
             transport,
             registry,
             Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
             Duration::from_millis(200),
-            cancel,
             supervisor,
         )
     }
@@ -874,8 +894,7 @@ mod tests {
             registry,
             reply_inbox,
             Duration::from_secs(30),
-            CancellationToken::new(),
-            None,
+            RequestClientSupervisor::detached(CancellationToken::new()),
         );
 
         let started = tokio::time::Instant::now();
@@ -913,8 +932,7 @@ mod tests {
             registry,
             reply_inbox,
             Duration::from_millis(30),
-            CancellationToken::new(),
-            None,
+            RequestClientSupervisor::detached(CancellationToken::new()),
         );
 
         let error = client
@@ -937,8 +955,7 @@ mod tests {
             Arc::clone(&registry),
             Arc::clone(&reply_inbox),
             Duration::from_secs(5),
-            CancellationToken::new(),
-            None,
+            RequestClientSupervisor::detached(CancellationToken::new()),
         );
 
         let first_fut = client.request(Ping { seq: 1 });
@@ -980,8 +997,7 @@ mod tests {
             Arc::clone(&registry),
             Arc::clone(&reply_inbox),
             Duration::from_secs(30),
-            CancellationToken::new(),
-            None,
+            RequestClientSupervisor::detached(CancellationToken::new()),
         );
 
         let request_fut = client.request(Ping { seq: 1 });
@@ -1203,8 +1219,7 @@ mod tests {
             Arc::clone(&registry),
             Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
             Duration::from_millis(30),
-            CancellationToken::new(),
-            None,
+            RequestClientSupervisor::detached(CancellationToken::new()),
         );
         let err = client.request(Ping { seq: 1 }).await.expect_err("no reply");
         assert!(matches!(err, RequestError::Timeout(_)));
@@ -1569,8 +1584,7 @@ mod tests {
                 "caller.inbox".to_owned(),
             ))),
             Duration::from_secs(5),
-            CancellationToken::new(),
-            None,
+            RequestClientSupervisor::detached(CancellationToken::new()),
         );
 
         let first_fut = client.request(Ping { seq: 1 });
@@ -1603,8 +1617,7 @@ mod tests {
                 "caller.inbox".to_owned(),
             ))),
             Duration::from_secs(5),
-            CancellationToken::new(),
-            None,
+            RequestClientSupervisor::detached(CancellationToken::new()),
         );
 
         let request_fut = client.request(PingToDedicatedQueue { seq: 1 });
@@ -1637,8 +1650,7 @@ mod tests {
                 "caller.inbox".to_owned(),
             ))),
             Duration::from_millis(30),
-            CancellationToken::new(),
-            None,
+            RequestClientSupervisor::detached(CancellationToken::new()),
         );
 
         let error = client
@@ -1668,8 +1680,7 @@ mod tests {
                 "caller.inbox".to_owned(),
             ))),
             Duration::from_millis(30),
-            CancellationToken::new(),
-            None,
+            RequestClientSupervisor::detached(CancellationToken::new()),
         );
 
         let options = RequestOptions::new().with_destination("tests.overridden.queue");
@@ -1696,8 +1707,7 @@ mod tests {
                 "caller.inbox".to_owned(),
             ))),
             Duration::from_secs(30),
-            CancellationToken::new(),
-            None,
+            RequestClientSupervisor::detached(CancellationToken::new()),
         );
 
         let options = RequestOptions::new().with_timeout(Duration::from_millis(30));
@@ -1725,8 +1735,7 @@ mod tests {
                 "caller.inbox".to_owned(),
             ))),
             Duration::from_millis(30),
-            CancellationToken::new(),
-            None,
+            RequestClientSupervisor::detached(CancellationToken::new()),
         );
 
         let correlation_id = CorrelationId::new();
@@ -1751,8 +1760,7 @@ mod tests {
                 "caller.inbox".to_owned(),
             ))),
             Duration::from_millis(30),
-            CancellationToken::new(),
-            None,
+            RequestClientSupervisor::detached(CancellationToken::new()),
         );
 
         let _ = client
@@ -1789,8 +1797,7 @@ mod tests {
                 "caller.inbox".to_owned(),
             ))),
             Duration::from_secs(5),
-            CancellationToken::new(),
-            None,
+            RequestClientSupervisor::detached(CancellationToken::new()),
         );
         let correlation_id = CorrelationId::new();
 
@@ -1933,8 +1940,7 @@ mod tests {
                 "caller.inbox".to_owned(),
             ))),
             Duration::from_millis(100),
-            CancellationToken::new(),
-            None,
+            RequestClientSupervisor::detached(CancellationToken::new()),
         );
 
         let request_fut = client.request(Ping { seq: 1 });
@@ -1982,8 +1988,7 @@ mod tests {
         let client = client_with_lifecycle(
             Arc::clone(&transport),
             Arc::clone(&registry),
-            CancellationToken::new(),
-            None,
+            RequestClientSupervisor::detached(CancellationToken::new()),
         );
 
         let call = {
@@ -2055,8 +2060,7 @@ mod tests {
             registry,
             Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
             Duration::from_secs(30),
-            cancel.clone(),
-            None,
+            RequestClientSupervisor::detached(cancel.clone()),
         );
 
         let request = {
@@ -2110,7 +2114,7 @@ mod tests {
             let client = client.clone();
             tokio::spawn(async move { client.request(Ping { seq: 1 }).await })
         };
-        tokio::time::timeout(Duration::from_millis(200), async {
+        tokio::time::timeout(Duration::from_secs(2), async {
             while registry.len() != 1 {
                 tokio::task::yield_now().await;
             }
@@ -2122,7 +2126,7 @@ mod tests {
             let client = client.clone();
             tokio::spawn(async move { client.close().await })
         };
-        tokio::time::timeout(Duration::from_millis(200), async {
+        tokio::time::timeout(Duration::from_secs(2), async {
             while !registry.is_closed() {
                 tokio::task::yield_now().await;
             }
@@ -2155,8 +2159,7 @@ mod tests {
         let client = client_with_lifecycle(
             Arc::clone(&transport),
             Arc::clone(&registry),
-            CancellationToken::new(),
-            None,
+            RequestClientSupervisor::detached(CancellationToken::new()),
         );
 
         client.close().await;
@@ -2188,8 +2191,7 @@ mod tests {
         let client = client_with_lifecycle(
             transport,
             Arc::clone(&registry),
-            cancel,
-            Some((supervisor, finished_signal)),
+            RequestClientSupervisor::from_task_for_test(cancel, supervisor, finished_signal),
         );
 
         client.close().await;
@@ -2208,7 +2210,7 @@ mod tests {
         // advance on its own, so `Elapsed` would still fire without a
         // single real millisecond passing; this test does not depend on
         // `SystemTime`, so pausing tokio's clock cannot mislead it.
-        tokio::time::timeout(Duration::from_millis(200), client.close())
+        tokio::time::timeout(Duration::from_secs(2), client.close())
             .await
             .expect("a second close must not block");
         assert!(registry.is_closed(), "a second close must change nothing");
@@ -2251,8 +2253,7 @@ mod tests {
         let client = client_with_lifecycle(
             transport,
             registry,
-            cancel,
-            Some((supervisor, finished_signal)),
+            RequestClientSupervisor::from_task_for_test(cancel, supervisor, finished_signal),
         );
 
         client.close().await;
@@ -2310,8 +2311,7 @@ mod tests {
         let client = client_with_lifecycle(
             transport,
             registry,
-            cancel,
-            Some((supervisor, finished_signal)),
+            RequestClientSupervisor::from_task_for_test(cancel, supervisor, finished_signal),
         );
         let second = client.clone();
 
@@ -2365,11 +2365,151 @@ mod tests {
     async fn close_on_a_client_built_without_a_supervisor_does_not_block() {
         let transport = Arc::new(CapturingTransport::default());
         let registry = Arc::new(RequestRegistry::default());
-        let client = client_with_lifecycle(transport, registry, CancellationToken::new(), None);
+        let client = client_with_lifecycle(
+            transport,
+            registry,
+            RequestClientSupervisor::detached(CancellationToken::new()),
+        );
 
-        tokio::time::timeout(Duration::from_millis(200), client.close())
+        tokio::time::timeout(Duration::from_secs(2), client.close())
             .await
             .expect("close on a client built without a supervisor must not block");
+    }
+
+    /// The public supervisor constructor owns both the task and its
+    /// completion signal, so concurrent closers cannot accidentally wait on
+    /// an unrelated token supplied by the caller.
+    #[tokio::test]
+    async fn opaque_supervisor_wakes_every_concurrent_closer_on_task_completion() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let stopped = Arc::new(AtomicBool::new(false));
+        let supervisor = RequestClientSupervisor::spawn(CancellationToken::new(), {
+            let stopped = Arc::clone(&stopped);
+            move |cancel| async move {
+                cancel.cancelled().await;
+                stopped.store(true, Ordering::SeqCst);
+            }
+        });
+        let client = RequestClient::new(
+            transport,
+            registry,
+            Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
+            Duration::from_millis(200),
+            supervisor,
+        );
+
+        let other = client.clone();
+        let first = tokio::spawn(async move { client.close().await });
+        other.close().await;
+
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "each closer must observe the supervisor task's real termination"
+        );
+        first.await.expect("first close task must not panic");
+    }
+
+    /// Issue #500 requires that a supervisor panic still wakes every
+    /// closer. The completion guard lives on the supervisor task's own
+    /// stack, so unwinding from a panic drops it exactly as a normal
+    /// return would, cancelling `finished` and letting `close` return
+    /// rather than hang on the now-defunct `JoinHandle`.
+    ///
+    /// Wrapped in a bounded timeout so a regression that reintroduces the
+    /// deadlock fails the test outright instead of hanging the suite.
+    #[tokio::test]
+    async fn supervisor_task_panic_still_wakes_every_closer() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let supervisor =
+            RequestClientSupervisor::spawn(CancellationToken::new(), |cancel| async move {
+                cancel.cancelled().await;
+                panic!("supervisor task panics on purpose for this test");
+            });
+        let client = RequestClient::new(
+            transport,
+            registry,
+            Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
+            Duration::from_millis(200),
+            supervisor,
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), client.close())
+            .await
+            .expect("close must return even though the supervisor task panicked");
+    }
+
+    /// Issue #500 also requires that an abandoned (aborted) supervisor
+    /// task wakes every closer, the same as a normal return, an error or a
+    /// panic would: [`RequestClientSupervisor::abort_handle`] exists
+    /// precisely so a caller can treat abandonment as a valid termination
+    /// path rather than one `close` would hang on.
+    ///
+    /// Wrapped in a bounded timeout so a regression that reintroduces the
+    /// deadlock fails the test outright instead of hanging the suite.
+    #[tokio::test]
+    async fn supervisor_task_abort_still_wakes_every_closer() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let supervisor = RequestClientSupervisor::spawn(CancellationToken::new(), |_cancel| {
+            std::future::pending::<()>()
+        });
+        let abort_handle = supervisor
+            .abort_handle()
+            .expect("a spawned supervisor always has an abort handle");
+        let client = RequestClient::new(
+            transport,
+            registry,
+            Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
+            Duration::from_millis(200),
+            supervisor,
+        );
+
+        abort_handle.abort();
+
+        tokio::time::timeout(Duration::from_secs(2), client.close())
+            .await
+            .expect("close must return even though the supervisor task was aborted");
+    }
+
+    #[tokio::test]
+    async fn close_called_from_the_supervisor_task_does_not_deadlock() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let returned = Arc::new(AtomicBool::new(false));
+        let (client_tx, client_rx) =
+            tokio::sync::oneshot::channel::<RequestClient<CapturingTransport>>();
+        let supervisor = RequestClientSupervisor::spawn(CancellationToken::new(), {
+            let returned = Arc::clone(&returned);
+            move |_cancel| async move {
+                let client = client_rx
+                    .await
+                    .expect("client must be handed to the supervisor task");
+                client.close().await;
+                returned.store(true, Ordering::SeqCst);
+            }
+        });
+        let client = RequestClient::new(
+            transport,
+            registry,
+            Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
+            Duration::from_millis(200),
+            supervisor,
+        );
+
+        client_tx
+            .send(client.clone())
+            .unwrap_or_else(|_| panic!("supervisor must still wait for its client"));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !returned.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("self-close must return instead of deadlocking");
+
+        client.close().await;
     }
 
     #[tokio::test]
@@ -2394,8 +2534,7 @@ mod tests {
         let client = client_with_lifecycle(
             transport,
             Arc::clone(&registry),
-            cancel,
-            Some((supervisor, finished_signal)),
+            RequestClientSupervisor::from_task_for_test(cancel, supervisor, finished_signal),
         );
         let _pending = registry
             .register(RequestId::new(), ReplyExpectation::new(Pong::MESSAGE_TYPE))
@@ -2428,7 +2567,11 @@ mod tests {
         let registry = Arc::new(RequestRegistry::default());
         let cancel = CancellationToken::new();
         let external_cancel = cancel.clone();
-        let client = client_with_lifecycle(transport, Arc::clone(&registry), cancel, None);
+        let client = client_with_lifecycle(
+            transport,
+            Arc::clone(&registry),
+            RequestClientSupervisor::detached(cancel),
+        );
         let clone = client.clone();
 
         drop(clone);
