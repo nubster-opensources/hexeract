@@ -28,6 +28,7 @@
 //!   `Arc<Mutex<ReplyInboxState>>` the [`hexeract_bus::RequestClient`]
 //!   reads on every request, and resumes consuming.
 
+use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -77,7 +78,7 @@ pub async fn connect_request_client(
     let reply_inbox = Arc::new(Mutex::new(ReplyInboxState::Ready(inbox_name.clone())));
 
     let supervisor = spawn_reply_inbox_supervisor(
-        uri.to_owned(),
+        uri,
         channel,
         inbox_name,
         Arc::clone(&registry),
@@ -106,41 +107,89 @@ pub async fn connect_request_client(
 /// [`RequestClient`] it assembles, so `RequestClient::close` can await
 /// this task's actual termination instead of merely cancelling it.
 fn spawn_reply_inbox_supervisor(
-    uri: String,
+    uri: &str,
     channel: Channel,
     inbox: String,
     registry: Arc<RequestRegistry>,
     reply_inbox: Arc<Mutex<ReplyInboxState>>,
     cancel: CancellationToken,
 ) -> RequestClientSupervisor {
+    let active_inbox = Arc::new(Mutex::new(Some((channel, inbox))));
+    let run_inbox = Arc::clone(&active_inbox);
+    let reconnect_inbox = Arc::clone(&active_inbox);
+    let reconnect_uri = uri.to_owned();
+    let reconnect_state = Arc::clone(&reply_inbox);
+    let run_registry = Arc::clone(&registry);
+
     RequestClientSupervisor::spawn(cancel, move |cancel| async move {
-        let mut channel = channel;
-        let mut inbox = inbox;
-        loop {
-            if cancel.is_cancelled() {
-                return;
-            }
-            let outcome =
-                run_reply_inbox(channel, inbox, Arc::clone(&registry), cancel.clone()).await;
-            if cancel.is_cancelled() || outcome.is_ok() {
-                return;
-            }
-
-            // Connection lost: fail every in-flight request fast rather
-            // than let it run out its timeout against a dead inbox, and
-            // refuse any new call that has not registered yet. The order
-            // is non-negotiable: see `on_connection_lost`.
-            on_connection_lost(&reply_inbox, &registry);
-
-            match reconnect_reply_inbox(&uri, &reply_inbox, &cancel).await {
-                Some((new_channel, new_inbox)) => {
-                    channel = new_channel;
-                    inbox = new_inbox;
+        supervise_reply_inbox(
+            registry,
+            reply_inbox,
+            cancel,
+            move |cancel| {
+                let (channel, inbox) = run_inbox
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take()
+                    .expect("every reply-inbox run has an active channel and inbox");
+                run_reply_inbox(channel, inbox, Arc::clone(&run_registry), cancel)
+            },
+            move |cancel| {
+                let reconnect_inbox = Arc::clone(&reconnect_inbox);
+                let reconnect_uri = reconnect_uri.clone();
+                let reconnect_state = Arc::clone(&reconnect_state);
+                async move {
+                    let Some((channel, inbox)) =
+                        reconnect_reply_inbox(&reconnect_uri, &reconnect_state, &cancel).await
+                    else {
+                        return false;
+                    };
+                    *reconnect_inbox
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = Some((channel, inbox));
+                    true
                 }
-                None => return,
-            }
-        }
+            },
+        )
+        .await;
     })
+}
+
+/// Run the reply-inbox lifecycle independently from its RabbitMQ plumbing.
+///
+/// Keeping the loop here makes the lifecycle contract testable with a failed
+/// receive and a blocked reconnect, while production supplies the concrete
+/// channel operations at the call site above.
+async fn supervise_reply_inbox<Run, RunFuture, Reconnect, ReconnectFuture>(
+    registry: Arc<RequestRegistry>,
+    reply_inbox: Arc<Mutex<ReplyInboxState>>,
+    cancel: CancellationToken,
+    mut run_once: Run,
+    mut reconnect: Reconnect,
+) where
+    Run: FnMut(CancellationToken) -> RunFuture,
+    RunFuture: Future<Output = Result<(), BusError>>,
+    Reconnect: FnMut(CancellationToken) -> ReconnectFuture,
+    ReconnectFuture: Future<Output = bool>,
+{
+    loop {
+        if cancel.is_cancelled() {
+            return;
+        }
+        let outcome = run_once(cancel.clone()).await;
+        if cancel.is_cancelled() || outcome.is_ok() {
+            return;
+        }
+
+        // Connection lost: fail every in-flight request fast rather than let
+        // it run out its timeout against a dead inbox, and refuse calls that
+        // have not registered yet. The order is non-negotiable.
+        on_connection_lost(&reply_inbox, &registry);
+
+        if !reconnect(cancel.clone()).await {
+            return;
+        }
+    }
 }
 
 /// Handle connection loss: mark `reply_inbox` [`ReplyInboxState::Reconnecting`]
@@ -218,11 +267,15 @@ async fn reconnect_reply_inbox(
 #[cfg(test)]
 mod tests {
     use std::future::Future;
+    use std::io;
     use std::pin::pin;
+    use std::sync::Arc;
     use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
 
     use hexeract_bus::ReplyExpectation;
     use hexeract_core::RequestId;
+    use tokio::sync::Notify;
 
     use super::*;
 
@@ -313,5 +366,62 @@ mod tests {
             matches!(future.as_mut().poll(&mut context), Poll::Ready(Err(_))),
             "the caller still waiting on its PendingReply must observe a closed channel"
         );
+    }
+
+    #[tokio::test]
+    async fn supervisor_marks_and_drains_before_it_starts_reconnecting() {
+        let registry = Arc::new(RequestRegistry::default());
+        let reply_inbox = Arc::new(Mutex::new(ReplyInboxState::Ready("inbox-1".to_owned())));
+        let mut pending = registry
+            .register(RequestId::new(), ReplyExpectation::new("test.reply"))
+            .expect("registration succeeds");
+        let cancel = CancellationToken::new();
+        let reconnect_started = Arc::new(Notify::new());
+        let supervisor_finished = Arc::new(Notify::new());
+
+        let _supervisor = RequestClientSupervisor::spawn(cancel.clone(), {
+            let registry = Arc::clone(&registry);
+            let reply_inbox = Arc::clone(&reply_inbox);
+            let reconnect_started = Arc::clone(&reconnect_started);
+            let supervisor_finished = Arc::clone(&supervisor_finished);
+            move |cancel| async move {
+                supervise_reply_inbox(
+                    registry,
+                    reply_inbox,
+                    cancel,
+                    |_| async { Err(BusError::connection(io::Error::other("lost"), true)) },
+                    move |cancel| {
+                        let reconnect_started = Arc::clone(&reconnect_started);
+                        async move {
+                            reconnect_started.notify_one();
+                            cancel.cancelled().await;
+                            false
+                        }
+                    },
+                )
+                .await;
+                supervisor_finished.notify_one();
+            }
+        });
+
+        reconnect_started.notified().await;
+        assert_eq!(
+            *reply_inbox.lock().unwrap_or_else(PoisonError::into_inner),
+            ReplyInboxState::Reconnecting,
+            "the real supervisor must mark Reconnecting before reconnecting"
+        );
+        assert!(
+            registry.is_empty(),
+            "the real supervisor must drain pending calls before reconnecting"
+        );
+        assert!(
+            pending.wait().await.is_err(),
+            "the pending caller must be released before reconnecting starts"
+        );
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), supervisor_finished.notified())
+            .await
+            .expect("supervisor must stop once cancellation reaches reconnecting");
     }
 }
