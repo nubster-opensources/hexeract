@@ -205,6 +205,12 @@ mod tests {
     }
 
     #[test]
+    fn publication_unknown_renders_retry_warning() {
+        let err = RequestError::PublicationUnknown;
+        assert!(err.to_string().contains("may have succeeded"));
+    }
+
+    #[test]
     fn register_rejection_at_capacity_maps_to_request_error_at_capacity() {
         let err: RequestError = RegisterRejection::AtCapacity.into();
         assert!(matches!(err, RequestError::AtCapacity));
