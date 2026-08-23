@@ -2478,7 +2478,8 @@ mod tests {
         let registry = Arc::new(RequestRegistry::default());
         let cancel = CancellationToken::new();
         let returned = Arc::new(AtomicBool::new(false));
-        let (client_tx, client_rx) = tokio::sync::oneshot::channel();
+        let (client_tx, client_rx) =
+            tokio::sync::oneshot::channel::<RequestClient<CapturingTransport>>();
         let supervisor = RequestClientSupervisor::spawn({
             let returned = Arc::clone(&returned);
             async move {
