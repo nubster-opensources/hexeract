@@ -53,6 +53,9 @@ pub mod reply_publisher;
 pub mod request;
 /// Generic request-reply client built on top of a [`Transport`].
 pub mod request_client;
+/// Opaque handle binding a request client's reply-inbox consumer task to its
+/// completion signal.
+pub mod request_client_supervisor;
 /// What a request handler knows about the call it is serving.
 pub mod request_context;
 /// Errors observed by the caller of a request-reply round trip.
@@ -90,7 +93,7 @@ pub use reply_inbox_state::ReplyInboxState;
 pub use reply_publisher::ReplyPublisher;
 pub use request::Request;
 pub use request_client::RequestClient;
-pub use request_client::RequestClientSupervisor;
+pub use request_client_supervisor::RequestClientSupervisor;
 pub use request_context::RequestContext;
 pub use request_error::ProtocolViolation;
 pub use request_error::RequestError;
