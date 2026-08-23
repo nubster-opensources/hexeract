@@ -65,10 +65,17 @@ pub enum RequestError {
     /// disguised as extra latency.
     #[error("client reached its in-flight request capacity")]
     AtCapacity,
-    /// The client was closed while the call was pending, or before it
-    /// started.
+    /// The client was closed before this request was admitted for
+    /// publication.
     #[error("client is closed")]
     Closed,
+    /// Shutdown began after the request was admitted for publication.
+    ///
+    /// The transport reported that it accepted the envelope, but the client
+    /// closed before a reply could establish the outcome. The responder may
+    /// therefore have acted; retrying the request can duplicate side effects.
+    #[error("request publication may have succeeded before the client closed")]
+    PublicationUnknown,
     /// The responder reported a failure.
     ///
     /// The category is deliberately coarse and carries no detail: the full
