@@ -1,6 +1,6 @@
 //! Opaque handle binding a request client's reply-inbox consumer task to its
-//! completion signal, and owning the [`CancellationToken`] that task
-//! observes.
+//! completion signal, and owning the
+//! [`tokio_util::sync::CancellationToken`] that task observes.
 
 use std::future::Future;
 
