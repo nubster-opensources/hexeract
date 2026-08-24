@@ -114,40 +114,24 @@ fn spawn_reply_inbox_supervisor(
     reply_inbox: Arc<Mutex<ReplyInboxState>>,
     cancel: CancellationToken,
 ) -> RequestClientSupervisor {
-    let active_inbox = Arc::new(Mutex::new(Some((channel, inbox))));
-    let run_inbox = Arc::clone(&active_inbox);
-    let reconnect_inbox = Arc::clone(&active_inbox);
     let reconnect_uri = uri.to_owned();
     let reconnect_state = Arc::clone(&reply_inbox);
     let run_registry = Arc::clone(&registry);
 
     RequestClientSupervisor::spawn(cancel, move |cancel| async move {
         supervise_reply_inbox(
+            (channel, inbox),
             registry,
             reply_inbox,
             cancel,
-            move |cancel| {
-                let (channel, inbox) = run_inbox
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take()
-                    .expect("every reply-inbox run has an active channel and inbox");
+            move |(channel, inbox), cancel| {
                 run_reply_inbox(channel, inbox, Arc::clone(&run_registry), cancel)
             },
             move |cancel| {
-                let reconnect_inbox = Arc::clone(&reconnect_inbox);
                 let reconnect_uri = reconnect_uri.clone();
                 let reconnect_state = Arc::clone(&reconnect_state);
                 async move {
-                    let Some((channel, inbox)) =
-                        reconnect_reply_inbox(&reconnect_uri, &reconnect_state, &cancel).await
-                    else {
-                        return false;
-                    };
-                    *reconnect_inbox
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner) = Some((channel, inbox));
-                    true
+                    reconnect_reply_inbox(&reconnect_uri, &reconnect_state, &cancel).await
                 }
             },
         )
@@ -160,23 +144,30 @@ fn spawn_reply_inbox_supervisor(
 /// Keeping the loop here makes the lifecycle contract testable with a failed
 /// receive and a blocked reconnect, while production supplies the concrete
 /// channel operations at the call site above.
-async fn supervise_reply_inbox<Run, RunFuture, Reconnect, ReconnectFuture>(
+///
+/// `ActiveInbox` is whatever a run consumes and a reconnect replaces:
+/// production pairs a `Channel` with the exclusive inbox it declared, and a
+/// test supplies a unit so the loop runs without a broker. Owning that value
+/// outright keeps "a run always has an inbox to consume" a fact the compiler
+/// checks, rather than a convention two closures have to agree to keep.
+async fn supervise_reply_inbox<ActiveInbox, Run, RunFuture, Reconnect, ReconnectFuture>(
+    mut active_inbox: ActiveInbox,
     registry: Arc<RequestRegistry>,
     reply_inbox: Arc<Mutex<ReplyInboxState>>,
     cancel: CancellationToken,
     mut run_once: Run,
     mut reconnect: Reconnect,
 ) where
-    Run: FnMut(CancellationToken) -> RunFuture,
+    Run: FnMut(ActiveInbox, CancellationToken) -> RunFuture,
     RunFuture: Future<Output = Result<(), BusError>>,
     Reconnect: FnMut(CancellationToken) -> ReconnectFuture,
-    ReconnectFuture: Future<Output = bool>,
+    ReconnectFuture: Future<Output = Option<ActiveInbox>>,
 {
     loop {
         if cancel.is_cancelled() {
             return;
         }
-        let outcome = run_once(cancel.clone()).await;
+        let outcome = run_once(active_inbox, cancel.clone()).await;
         if cancel.is_cancelled() || outcome.is_ok() {
             return;
         }
@@ -186,8 +177,9 @@ async fn supervise_reply_inbox<Run, RunFuture, Reconnect, ReconnectFuture>(
         // have not registered yet. The order is non-negotiable.
         on_connection_lost(&reply_inbox, &registry);
 
-        if !reconnect(cancel.clone()).await {
-            return;
+        match reconnect(cancel.clone()).await {
+            Some(next_inbox) => active_inbox = next_inbox,
+            None => return,
         }
     }
 }
@@ -386,16 +378,17 @@ mod tests {
             let supervisor_finished = Arc::clone(&supervisor_finished);
             move |cancel| async move {
                 supervise_reply_inbox(
+                    (),
                     registry,
                     reply_inbox,
                     cancel,
-                    |_| async { Err(BusError::connection(io::Error::other("lost"), true)) },
+                    |(), _| async { Err(BusError::connection(io::Error::other("lost"), true)) },
                     move |cancel| {
                         let reconnect_started = Arc::clone(&reconnect_started);
                         async move {
                             reconnect_started.notify_one();
                             cancel.cancelled().await;
-                            false
+                            None
                         }
                     },
                 )
