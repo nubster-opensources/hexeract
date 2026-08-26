@@ -222,37 +222,115 @@ fn mark_reconnecting_then_drain(reply_inbox: &Mutex<ReplyInboxState>, drain: imp
 /// exclusive reply inbox, retrying until it succeeds or `cancel` fires.
 ///
 /// Publishes the new inbox name into `reply_inbox` (read by the
-/// [`RequestClient`] on every request) before returning it. Each
-/// reconnect attempt is bounded by
-/// [`RabbitMqConnection::connect_with_retry`]'s own attempt budget; a
-/// failed attempt loops back for another rather than giving up.
+/// [`RequestClient`] on every request) before returning it. Every failure
+/// that cost no wall-clock delay waits [`DEFAULT_RETRY_BASE_DELAY`] before
+/// the next attempt: failed channel or inbox setup, and a connect that gave
+/// up without sleeping. Only a connect that actually spent its own attempt
+/// budget skips that wait, since it has already waited. Both the attempt and
+/// that wait stop as soon as `cancel` fires.
 async fn reconnect_reply_inbox(
     uri: &str,
     reply_inbox: &Mutex<ReplyInboxState>,
     cancel: &CancellationToken,
 ) -> Option<(Channel, String)> {
-    loop {
-        if cancel.is_cancelled() {
-            return None;
-        }
-        let Ok(connection) = RabbitMqConnection::connect_with_retry(
+    let next_inbox = retry_reply_inbox_after_failures(cancel, DEFAULT_RETRY_BASE_DELAY, || async {
+        let connection = RabbitMqConnection::connect_with_retry(
             uri,
             DEFAULT_RETRY_ATTEMPTS,
             DEFAULT_RETRY_BASE_DELAY,
         )
         .await
-        else {
-            continue;
+        .map_err(|error| {
+            tracing::warn!(
+                phase = "connect",
+                retryable = ?error.is_retryable_connection(),
+                "rpc reply inbox reconnect failed"
+            );
+            classify_connect_failure(&error)
+        })?;
+        let channel = connection.create_channel().await.map_err(|error| {
+            tracing::warn!(phase = "channel", error = %error, "rpc reply inbox reconnect failed");
+            ReconnectFailure::NeedsBackoff
+        })?;
+        let inbox = declare_reply_inbox(&channel).await.map_err(|error| {
+            tracing::warn!(phase = "inbox", error = %error, "rpc reply inbox reconnect failed");
+            ReconnectFailure::NeedsBackoff
+        })?;
+        Ok((channel, inbox))
+    })
+    .await?;
+
+    *reply_inbox.lock().unwrap_or_else(PoisonError::into_inner) =
+        ReplyInboxState::Ready(next_inbox.1.clone());
+    Some(next_inbox)
+}
+
+/// Retry a reply-inbox setup attempt until it succeeds or cancellation fires.
+///
+/// Failures that did not already consume a connection backoff are followed by
+/// exactly one cancellable delay. The attempt itself is also cancellable, so
+/// dropping a blocked broker operation cannot hold [`RequestClient::close`]
+/// past the caller's cancellation.
+async fn retry_reply_inbox_after_failures<Inbox, Attempt, AttemptFuture>(
+    cancel: &CancellationToken,
+    retry_delay: Duration,
+    mut attempt: Attempt,
+) -> Option<Inbox>
+where
+    Attempt: FnMut() -> AttemptFuture,
+    AttemptFuture: Future<Output = Result<Inbox, ReconnectFailure>>,
+{
+    loop {
+        // `biased` so an already-cancelled token wins deterministically:
+        // the attempt future is built but never polled, which is what keeps
+        // "no attempt starts after cancellation" a guarantee rather than a
+        // coin flip on `select!`'s random poll order.
+        let result = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return None,
+            result = attempt() => result,
         };
-        let Ok(channel) = connection.create_channel().await else {
-            continue;
-        };
-        let Ok(inbox) = declare_reply_inbox(&channel).await else {
-            continue;
-        };
-        *reply_inbox.lock().unwrap_or_else(PoisonError::into_inner) =
-            ReplyInboxState::Ready(inbox.clone());
-        return Some((channel, inbox));
+
+        match result {
+            Ok(inbox) => return Some(inbox),
+            Err(ReconnectFailure::AlreadyBackedOff) => continue,
+            Err(ReconnectFailure::NeedsBackoff) => {}
+        }
+
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return None,
+            () = tokio::time::sleep(retry_delay) => {}
+        }
+    }
+}
+
+/// Records whether a failed reconnect setup already consumed a backoff.
+#[derive(Debug, PartialEq, Eq)]
+enum ReconnectFailure {
+    /// [`RabbitMqConnection::connect_with_retry`] spent its attempt budget,
+    /// so the wait it applied stands in for this loop's own.
+    AlreadyBackedOff,
+    /// The failure cost no wall-clock delay: channel setup or inbox
+    /// declaration after a successful connect, or a connect that gave up
+    /// without ever sleeping.
+    NeedsBackoff,
+}
+
+/// Decide whether a failed connect already paid for a delay.
+///
+/// [`RabbitMqConnection::connect_with_retry`] only spends its attempt budget
+/// while the failure looks transient. A permanent one (refused credentials,
+/// an unsupported protocol version) breaks out on the first attempt without
+/// sleeping at all, which is deliberate: burning the budget against a broker
+/// that has already refused the handshake helps nobody (#340). Reading that
+/// early exit as "a delay was applied" is what would let this loop retry with
+/// no delay whatsoever, so only an explicitly retryable connection failure
+/// gets the benefit of the doubt. Anything else earns a wait.
+fn classify_connect_failure(error: &BusError) -> ReconnectFailure {
+    match error.is_retryable_connection() {
+        Some(true) => ReconnectFailure::AlreadyBackedOff,
+        _ => ReconnectFailure::NeedsBackoff,
     }
 }
 
@@ -262,6 +340,7 @@ mod tests {
     use std::io;
     use std::pin::pin;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
@@ -416,5 +495,163 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), supervisor_finished.notified())
             .await
             .expect("supervisor must stop once cancellation reaches reconnecting");
+    }
+
+    #[tokio::test]
+    async fn reconnect_policy_delays_after_a_failure_and_cancellation_interrupts_the_wait() {
+        let cancel = CancellationToken::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let first_attempt = Arc::new(Notify::new());
+        let second_attempt = Arc::new(Notify::new());
+
+        let reconnect = tokio::spawn({
+            let cancel = cancel.clone();
+            let attempts = Arc::clone(&attempts);
+            let first_attempt = Arc::clone(&first_attempt);
+            let second_attempt = Arc::clone(&second_attempt);
+            async move {
+                retry_reply_inbox_after_failures(&cancel, Duration::from_secs(60), move || {
+                    let attempts = Arc::clone(&attempts);
+                    let first_attempt = Arc::clone(&first_attempt);
+                    let second_attempt = Arc::clone(&second_attempt);
+                    async move {
+                        match attempts.fetch_add(1, Ordering::SeqCst) {
+                            0 => first_attempt.notify_one(),
+                            _ => second_attempt.notify_one(),
+                        }
+                        Err::<(), _>(ReconnectFailure::NeedsBackoff)
+                    }
+                })
+                .await
+            }
+        });
+
+        first_attempt.notified().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), second_attempt.notified())
+                .await
+                .is_err(),
+            "a failed reconnect must wait before starting another attempt"
+        );
+
+        cancel.cancel();
+        assert_eq!(
+            reconnect.await.expect("reconnect task must not panic"),
+            None,
+            "cancellation must interrupt the reconnect backoff"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "cancellation during the delay must not start a new attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_policy_cancellation_interrupts_an_attempt_in_progress() {
+        let cancel = CancellationToken::new();
+        let attempt_started = Arc::new(Notify::new());
+
+        let reconnect = tokio::spawn({
+            let cancel = cancel.clone();
+            let attempt_started = Arc::clone(&attempt_started);
+            async move {
+                retry_reply_inbox_after_failures(&cancel, Duration::from_secs(60), move || {
+                    let attempt_started = Arc::clone(&attempt_started);
+                    async move {
+                        attempt_started.notify_one();
+                        std::future::pending::<Result<(), ReconnectFailure>>().await
+                    }
+                })
+                .await
+            }
+        });
+
+        attempt_started.notified().await;
+        cancel.cancel();
+        assert_eq!(
+            reconnect.await.expect("reconnect task must not panic"),
+            None,
+            "cancellation must interrupt a broker operation that has not returned"
+        );
+    }
+
+    /// [`RabbitMqConnection::connect_with_retry`] only spends its attempt
+    /// budget on a transient failure. A permanent one breaks out of that
+    /// budget on the first attempt without sleeping at all (#340), so
+    /// reading every connect failure as "already delayed" leaves the
+    /// reconnect loop hammering a broker that has already refused the
+    /// handshake (#495), which is exactly what a rotated credential or a
+    /// revoked vhost permission produces.
+    #[test]
+    fn a_permanent_connect_failure_still_earns_a_backoff() {
+        assert_eq!(
+            classify_connect_failure(&BusError::connection("ACCESS_REFUSED", false)),
+            ReconnectFailure::NeedsBackoff
+        );
+    }
+
+    #[test]
+    fn a_transient_connect_failure_has_already_spent_its_budget() {
+        assert_eq!(
+            classify_connect_failure(&BusError::connection("broker unreachable", true)),
+            ReconnectFailure::AlreadyBackedOff
+        );
+    }
+
+    /// Only [`BusError::Connection`] carries the transience flag. Any other
+    /// variant proves nothing about a delay having been spent, so it earns
+    /// one rather than being given the benefit of the doubt.
+    #[test]
+    fn a_failure_that_is_not_a_connection_error_earns_a_backoff() {
+        assert_eq!(
+            classify_connect_failure(&BusError::Internal("unexpected".to_owned())),
+            ReconnectFailure::NeedsBackoff
+        );
+    }
+
+    /// The other half of the contract: a failure that did consume a backoff
+    /// must not be delayed a second time, or every broker blip would be
+    /// waited out twice over.
+    ///
+    /// The attempt yields before failing, the way a real connect yields on
+    /// its socket. Without that, a loop with no delay would starve the
+    /// current-thread runtime instead of reaching the third attempt.
+    #[tokio::test]
+    async fn an_already_backed_off_failure_retries_without_a_further_delay() {
+        let cancel = CancellationToken::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let third_attempt = Arc::new(Notify::new());
+
+        let reconnect = tokio::spawn({
+            let cancel = cancel.clone();
+            let attempts = Arc::clone(&attempts);
+            let third_attempt = Arc::clone(&third_attempt);
+            async move {
+                retry_reply_inbox_after_failures(&cancel, Duration::from_secs(60), move || {
+                    let attempts = Arc::clone(&attempts);
+                    let third_attempt = Arc::clone(&third_attempt);
+                    async move {
+                        tokio::task::yield_now().await;
+                        if attempts.fetch_add(1, Ordering::SeqCst) >= 2 {
+                            third_attempt.notify_one();
+                        }
+                        Err::<(), _>(ReconnectFailure::AlreadyBackedOff)
+                    }
+                })
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), third_attempt.notified())
+            .await
+            .expect("a failure that already backed off must retry without waiting again");
+
+        cancel.cancel();
+        assert_eq!(
+            reconnect.await.expect("reconnect task must not panic"),
+            None,
+            "cancellation must still stop the loop"
+        );
     }
 }
