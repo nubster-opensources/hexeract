@@ -50,6 +50,7 @@ pub use pool::ChannelPool;
 pub use pool::PooledChannel;
 pub use reply_publisher::RabbitMqReplyPublisher;
 pub use request_client::RabbitMqRequestClientConfig;
+pub use request_client::RabbitMqRequestClientConfigBuilder;
 pub use request_client::connect_request_client;
 pub use request_client::connect_request_client_with_config;
 pub use topology::bind_queue;

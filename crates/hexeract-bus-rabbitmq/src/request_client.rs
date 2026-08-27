@@ -46,7 +46,8 @@ use crate::transport::RabbitMqTransport;
 /// Tuning parameters for a RabbitMQ request client.
 ///
 /// Marked `#[non_exhaustive]` so new tuning fields can be added in a minor
-/// version: construct it with [`Self::default`] rather than a struct literal.
+/// version: construct it through [`RabbitMqRequestClientConfigBuilder`]
+/// rather than a struct literal.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct RabbitMqRequestClientConfig {
@@ -55,7 +56,14 @@ pub struct RabbitMqRequestClientConfig {
     /// Reaching this limit returns [`hexeract_bus::RequestError::AtCapacity`]
     /// immediately. It is caller-side backpressure, never an added queue or
     /// latency: callers can shed, retry, or route the rejected request using
-    /// their own policy.
+    /// their own policy. Rejecting is preferable to waiting for a free slot
+    /// because it keeps a saturated client distinguishable from a slow
+    /// responder: queuing would report both as latency, and the caller would
+    /// lose the one signal that tells it to shed load rather than wait.
+    ///
+    /// Zero is a legitimate setting, not a misconfiguration guard: it admits
+    /// no request at all, which turns request-reply off without stopping the
+    /// process. See [`hexeract_bus::RequestRegistry::new`].
     pub max_in_flight: usize,
 }
 
@@ -67,6 +75,43 @@ impl Default for RabbitMqRequestClientConfig {
     }
 }
 
+/// Builder for [`RabbitMqRequestClientConfig`].
+///
+/// Mirrors the construction style of [`crate::RabbitMqWorkerBuilder`]: every
+/// setter consumes and returns the builder, and [`Self::build`] yields the
+/// configuration. An untouched builder produces exactly
+/// [`RabbitMqRequestClientConfig::default`], so naming only the settings that
+/// matter is always safe.
+#[derive(Debug, Clone, Default)]
+pub struct RabbitMqRequestClientConfigBuilder {
+    config: RabbitMqRequestClientConfig,
+}
+
+impl RabbitMqRequestClientConfigBuilder {
+    /// Build a fresh builder carrying the default tuning.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Override the maximum number of concurrent requests awaiting a reply
+    /// (default [`DEFAULT_MAX_IN_FLIGHT`]).
+    ///
+    /// See [`RabbitMqRequestClientConfig::max_in_flight`] for what reaching
+    /// the bound does, and why zero is a meaningful value.
+    #[must_use]
+    pub fn max_in_flight(mut self, max_in_flight: usize) -> Self {
+        self.config.max_in_flight = max_in_flight;
+        self
+    }
+
+    /// Finish the builder into a [`RabbitMqRequestClientConfig`].
+    #[must_use]
+    pub fn build(self) -> RabbitMqRequestClientConfig {
+        self.config
+    }
+}
+
 /// Assemble a ready RabbitMQ request client.
 ///
 /// Requests are published through a recovering publisher connection
@@ -75,6 +120,9 @@ impl Default for RabbitMqRequestClientConfig {
 /// supervised connection that detects broker loss; a background
 /// supervisor drains the in-flight registry and re-declares the inbox
 /// on reconnect. See the [module docs](self) for the full contract.
+///
+/// The client admits [`DEFAULT_MAX_IN_FLIGHT`] concurrent requests. Use
+/// [`connect_request_client_with_config`] to select another bound.
 ///
 /// # Errors
 ///
@@ -404,6 +452,41 @@ mod tests {
         assert_eq!(
             RabbitMqRequestClientConfig::default().max_in_flight,
             DEFAULT_MAX_IN_FLIGHT
+        );
+    }
+
+    #[test]
+    fn an_untouched_builder_yields_the_default_bound() {
+        assert_eq!(
+            RabbitMqRequestClientConfigBuilder::new()
+                .build()
+                .max_in_flight,
+            DEFAULT_MAX_IN_FLIGHT
+        );
+    }
+
+    #[test]
+    fn the_builder_carries_the_selected_bound_into_the_config() {
+        assert_eq!(
+            RabbitMqRequestClientConfigBuilder::new()
+                .max_in_flight(7)
+                .build()
+                .max_in_flight,
+            7
+        );
+    }
+
+    /// A bound of zero is a documented way to refuse every request without
+    /// stopping the process, so the builder must carry it through untouched
+    /// rather than treating it as "unset" and silently restoring the default.
+    #[test]
+    fn the_builder_carries_a_zero_bound_rather_than_restoring_the_default() {
+        assert_eq!(
+            RabbitMqRequestClientConfigBuilder::new()
+                .max_in_flight(0)
+                .build()
+                .max_in_flight,
+            0
         );
     }
 

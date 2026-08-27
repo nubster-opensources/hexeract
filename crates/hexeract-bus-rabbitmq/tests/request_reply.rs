@@ -41,7 +41,7 @@ use hexeract_bus::RequestOptions;
 use hexeract_bus::RequestRegistry;
 use hexeract_bus::Transport;
 use hexeract_bus_rabbitmq::RabbitMqConnection;
-use hexeract_bus_rabbitmq::RabbitMqRequestClientConfig;
+use hexeract_bus_rabbitmq::RabbitMqRequestClientConfigBuilder;
 use hexeract_bus_rabbitmq::RabbitMqTransport;
 use hexeract_bus_rabbitmq::RabbitMqWorkerBuilder;
 use hexeract_bus_rabbitmq::connect_request_client;
@@ -184,8 +184,9 @@ async fn request_client_config_rejects_a_second_concurrent_request_at_its_bound(
     let cancel = CancellationToken::new();
     declare_ping_queue(broker.uri(), "tests.ping").await;
 
-    let mut config = RabbitMqRequestClientConfig::default();
-    config.max_in_flight = 1;
+    let config = RabbitMqRequestClientConfigBuilder::new()
+        .max_in_flight(1)
+        .build();
     let client = connect_request_client_with_config(
         broker.uri(),
         Duration::from_secs(30),
