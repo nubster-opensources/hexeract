@@ -43,6 +43,30 @@ use crate::connection::{DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BASE_DELAY, Rabbit
 use crate::reply_inbox::{declare_reply_inbox, run_reply_inbox};
 use crate::transport::RabbitMqTransport;
 
+/// Tuning parameters for a RabbitMQ request client.
+///
+/// Marked `#[non_exhaustive]` so new tuning fields can be added in a minor
+/// version: construct it with [`Self::default`] rather than a struct literal.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct RabbitMqRequestClientConfig {
+    /// Maximum number of concurrent requests awaiting a reply.
+    ///
+    /// Reaching this limit returns [`hexeract_bus::RequestError::AtCapacity`]
+    /// immediately. It is caller-side backpressure, never an added queue or
+    /// latency: callers can shed, retry, or route the rejected request using
+    /// their own policy.
+    pub max_in_flight: usize,
+}
+
+impl Default for RabbitMqRequestClientConfig {
+    fn default() -> Self {
+        Self {
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+        }
+    }
+}
+
 /// Assemble a ready RabbitMQ request client.
 ///
 /// Requests are published through a recovering publisher connection
@@ -62,8 +86,33 @@ pub async fn connect_request_client(
     default_timeout: Duration,
     cancel: CancellationToken,
 ) -> Result<RequestClient<RabbitMqTransport>, BusError> {
+    connect_request_client_with_config(
+        uri,
+        default_timeout,
+        cancel,
+        RabbitMqRequestClientConfig::default(),
+    )
+    .await
+}
+
+/// Assemble a ready RabbitMQ request client with caller-selected limits.
+///
+/// See [`RabbitMqRequestClientConfig::max_in_flight`] for the immediate
+/// backpressure applied when too many requests are already awaiting replies.
+///
+/// # Errors
+///
+/// Returns [`BusError::Connection`] if either the recovering publisher
+/// connection or the initial supervised inbox connection cannot be
+/// established.
+pub async fn connect_request_client_with_config(
+    uri: &str,
+    default_timeout: Duration,
+    cancel: CancellationToken,
+    config: RabbitMqRequestClientConfig,
+) -> Result<RequestClient<RabbitMqTransport>, BusError> {
     let transport = Arc::new(RabbitMqTransport::new(uri).await?);
-    let registry = Arc::new(RequestRegistry::new(DEFAULT_MAX_IN_FLIGHT));
+    let registry = Arc::new(RequestRegistry::new(config.max_in_flight));
 
     // Supervised connection for the inbox consumer: NOT the recovering
     // connection used by the publisher above.
@@ -349,6 +398,14 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
+
+    #[test]
+    fn request_client_config_preserves_the_default_in_flight_bound() {
+        assert_eq!(
+            RabbitMqRequestClientConfig::default().max_in_flight,
+            DEFAULT_MAX_IN_FLIGHT
+        );
+    }
 
     /// The invariant of resolution 2, attested rather than merely
     /// documented: `mark_reconnecting_then_drain` must have already
