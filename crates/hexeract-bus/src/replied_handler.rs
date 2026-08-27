@@ -1153,4 +1153,41 @@ mod tests {
         assert_eq!(handler.counters(), expected);
         assert_eq!(counters.snapshot(), expected);
     }
+
+    /// The complement of
+    /// `responder_counters_categorize_every_pre_dispatch_rejection`: a
+    /// monotonic counter is worthless as a rate signal if it also moves on
+    /// requests the responder accepted, so the accepting paths are asserted
+    /// to leave it alone. The undecodable request is the one rejection that
+    /// is deliberately out of scope (see [`ResponderCounters`]): it is
+    /// answered with `Malformed` and must not be folded into any of the
+    /// three envelope-contract totals.
+    #[tokio::test]
+    async fn accepted_and_undecodable_requests_leave_the_counters_untouched() {
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let counters = ResponderCounters::default();
+        let handler = RepliedHandler::with_counters(Echo, Arc::clone(&publisher), counters.clone());
+
+        let accepted = request_envelope(Some("amq.gen-inbox"));
+        handler.handle(&accepted, &ctx()).await.unwrap();
+
+        let mut undecodable = request_envelope(Some("amq.gen-inbox"));
+        undecodable.payload = b"{ not json".to_vec();
+        handler.handle(&undecodable, &ctx()).await.unwrap();
+
+        assert_eq!(
+            publisher.published.lock().unwrap().len(),
+            2,
+            "both requests must have been answered, so neither was dropped by a guard"
+        );
+        assert_eq!(
+            counters.snapshot(),
+            ResponderCountersSnapshot {
+                invalid_reply_to: 0,
+                invalid_request_id: 0,
+                unsupported_protocol_version: 0,
+            },
+            "a rejection counter must not move on a request the responder accepted"
+        );
+    }
 }

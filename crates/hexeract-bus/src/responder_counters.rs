@@ -88,3 +88,68 @@ impl ResponderCounters {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fresh_handle_counts_nothing() {
+        assert_eq!(
+            ResponderCounters::default().snapshot(),
+            ResponderCountersSnapshot {
+                invalid_reply_to: 0,
+                invalid_request_id: 0,
+                unsupported_protocol_version: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn clones_share_one_set_of_counters() {
+        let counters = ResponderCounters::default();
+        let retained = counters.clone();
+
+        counters.count_invalid_reply_to();
+        retained.count_invalid_request_id();
+
+        let expected = ResponderCountersSnapshot {
+            invalid_reply_to: 1,
+            invalid_request_id: 1,
+            unsupported_protocol_version: 0,
+        };
+        assert_eq!(
+            counters.snapshot(),
+            expected,
+            "the handle handed to a responder must see what its clone counted"
+        );
+        assert_eq!(
+            retained.snapshot(),
+            expected,
+            "the clone an operator retains must see what the responder counted"
+        );
+    }
+
+    /// Guards the one defect the categorizing test in `replied_handler`
+    /// cannot see on its own: a `count_*` method wired to the wrong field
+    /// would still move a counter on every rejection, and only a per-kind
+    /// assertion tells the three apart.
+    #[test]
+    fn each_kind_increments_only_its_own_counter() {
+        let counters = ResponderCounters::default();
+        counters.count_invalid_reply_to();
+        counters.count_invalid_request_id();
+        counters.count_invalid_request_id();
+        counters.count_unsupported_protocol_version();
+        counters.count_unsupported_protocol_version();
+        counters.count_unsupported_protocol_version();
+
+        assert_eq!(
+            counters.snapshot(),
+            ResponderCountersSnapshot {
+                invalid_reply_to: 1,
+                invalid_request_id: 2,
+                unsupported_protocol_version: 3,
+            }
+        );
+    }
+}
