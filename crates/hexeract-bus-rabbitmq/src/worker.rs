@@ -397,11 +397,6 @@ impl RabbitMqWorkerBuilder {
     /// Registering twice for the same `R::MESSAGE_TYPE` silently replaces
     /// the previous entry, same as [`Self::register_handler`].
     #[must_use]
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "the Arc<RabbitMqTransport> parameter is a stable public signature shared by \
-                  every existing call site; only its connection and pool size are read here"
-    )]
     pub fn register_request_handler<R, H>(
         self,
         handler: H,
