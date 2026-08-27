@@ -67,6 +67,8 @@ pub mod request_options;
 /// Rendezvous point between request callers and reply deliveries, keyed by
 /// request identity.
 pub mod request_registry;
+/// Shared counters for requests rejected before responder dispatch.
+pub mod responder_counters;
 /// Wire constants of the request-reply protocol.
 pub mod rpc_protocol;
 /// Strongly-typed topology declarations shared by transports.
@@ -104,6 +106,8 @@ pub use request_registry::PendingReply;
 pub use request_registry::RegisterRejection;
 pub use request_registry::ReplyCountersSnapshot;
 pub use request_registry::RequestRegistry;
+pub use responder_counters::ResponderCounters;
+pub use responder_counters::ResponderCountersSnapshot;
 pub use rpc_protocol::PROTOCOL_VERSION;
 pub use rpc_protocol::PROTOCOL_VERSION_HEADER;
 pub use rpc_protocol::REPLY_ERROR_MESSAGE_TYPE;
