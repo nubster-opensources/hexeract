@@ -1596,6 +1596,7 @@ async fn publish_recovers_after_a_broker_blip() {
 
 #[derive(Debug)]
 struct SlowCountingHandler {
+    started: Arc<AtomicUsize>,
     done: Arc<AtomicUsize>,
 }
 
@@ -1607,6 +1608,7 @@ impl Handler<OrderPlaced> for SlowCountingHandler {
         _message: OrderPlaced,
         _ctx: &HandlerContext,
     ) -> Result<(), Self::Error> {
+        self.started.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(300)).await;
         self.done.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -1620,6 +1622,7 @@ async fn no_ack_shutdown_drains_in_flight_handlers() {
     let queue_name = "noack.drain";
     declare_temporary_queue(&uri, queue_name).await;
 
+    let started = Arc::new(AtomicUsize::new(0));
     let done = Arc::new(AtomicUsize::new(0));
     let transport = RabbitMqTransport::new(&uri)
         .await
@@ -1645,6 +1648,7 @@ async fn no_ack_shutdown_drains_in_flight_handlers() {
         .ack_mode(AckMode::Unacknowledged)
         .max_buffered(batch)
         .register_handler::<OrderPlaced, _>(SlowCountingHandler {
+            started: Arc::clone(&started),
             done: Arc::clone(&done),
         })
         .build()
@@ -1654,8 +1658,25 @@ async fn no_ack_shutdown_drains_in_flight_handlers() {
     let cancel_for_task = cancel.clone();
     let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
 
-    // Let all deliveries enter their (slow) handlers, then cancel mid-flight.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Cancel only once every delivery is actually inside its (slow)
+    // handler. A fixed sleep here was a bet on how fast the broker
+    // delivers `batch` messages: lose that bet on a loaded runner and the
+    // worker stops consuming with a delivery never dispatched, leaving
+    // fewer handlers in flight than the assertion below expects. The test
+    // then fails on its own race rather than on a defect in the drain.
+    // Scrutinizing `started` makes the precondition this test claims, a
+    // full batch in flight, one it actually establishes.
+    let mut attempts = 0;
+    while started.load(Ordering::SeqCst) < batch {
+        attempts += 1;
+        assert!(
+            attempts < 250,
+            "only {} of {batch} deliveries reached a handler within 5s, so the worker \
+             never had a full in-flight batch to drain",
+            started.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     cancel.cancel();
 
     tokio::time::timeout(Duration::from_secs(10), handle)
