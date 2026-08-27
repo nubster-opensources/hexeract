@@ -42,9 +42,11 @@ use hexeract_bus::RequestRegistry;
 use hexeract_bus::ResponderCounters;
 use hexeract_bus::Transport;
 use hexeract_bus_rabbitmq::RabbitMqConnection;
+use hexeract_bus_rabbitmq::RabbitMqRequestClientConfigBuilder;
 use hexeract_bus_rabbitmq::RabbitMqTransport;
 use hexeract_bus_rabbitmq::RabbitMqWorkerBuilder;
 use hexeract_bus_rabbitmq::connect_request_client;
+use hexeract_bus_rabbitmq::connect_request_client_with_config;
 use hexeract_bus_rabbitmq::declare_reply_inbox_for_test;
 use hexeract_bus_rabbitmq::run_reply_inbox_for_test;
 use lapin::BasicProperties;
@@ -174,6 +176,47 @@ async fn connection_drop_fails_in_flight_fast() {
         Err(hexeract_bus::RequestError::Transport(_))
     ));
     cancel.cancel();
+}
+
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn request_client_config_rejects_a_second_concurrent_request_at_its_bound() {
+    let broker = harness::start_rabbitmq().await;
+    let cancel = CancellationToken::new();
+    declare_ping_queue(broker.uri(), "tests.ping").await;
+
+    let config = RabbitMqRequestClientConfigBuilder::new()
+        .max_in_flight(1)
+        .build();
+    let client = connect_request_client_with_config(
+        broker.uri(),
+        Duration::from_secs(30),
+        cancel.clone(),
+        config,
+    )
+    .await
+    .expect("the request client must connect");
+
+    let first_request = client.request(Ping { seq: 1 });
+    tokio::pin!(first_request);
+    tokio::select! {
+        _ = &mut first_request => panic!("the first request must still be awaiting a reply"),
+        () = tokio::time::sleep(Duration::from_millis(200)) => {}
+    }
+
+    assert!(
+        matches!(
+            client.request(Ping { seq: 2 }).await,
+            Err(RequestError::AtCapacity)
+        ),
+        "the configured bound must reject immediately instead of queuing the second request"
+    );
+
+    cancel.cancel();
+    assert!(
+        first_request.await.is_err(),
+        "cancelling the client must release the first pending request"
+    );
 }
 
 /// Responder that echoes the request's `seq` back in the reply.
