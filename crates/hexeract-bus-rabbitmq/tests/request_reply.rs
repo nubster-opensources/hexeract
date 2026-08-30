@@ -39,6 +39,7 @@ use hexeract_bus::RequestError;
 use hexeract_bus::RequestHandler;
 use hexeract_bus::RequestOptions;
 use hexeract_bus::RequestRegistry;
+use hexeract_bus::ResponderCounters;
 use hexeract_bus::Transport;
 use hexeract_bus_rabbitmq::RabbitMqConnection;
 use hexeract_bus_rabbitmq::RabbitMqRequestClientConfigBuilder;
@@ -837,6 +838,138 @@ async fn a_responder_on_an_application_exchange_still_replies_through_the_defaul
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     assert_eq!(probe.data.as_slice(), b"probe");
+
+    cancel.cancel();
+    let _ = worker_handle.await;
+}
+
+/// Publish a request straight to `queue` on the default exchange, stamping
+/// the AMQP `reply_to` property from the envelope.
+///
+/// The crate's shared harness helper does not carry `reply_to`, and that is
+/// the very property this test needs on the wire: `delivery_to_envelope`
+/// rebuilds `BusEnvelope::reply_to` from the AMQP property, not from a
+/// header, so a request forged without it would exercise the wrong guard.
+async fn publish_request_to_queue(channel: &Channel, queue: &str, envelope: &BusEnvelope) {
+    channel
+        .confirm_select(ConfirmSelectOptions::default())
+        .await
+        .expect("confirm select must succeed");
+
+    let mut headers = FieldTable::default();
+    for (key, value) in &envelope.headers {
+        headers.insert(
+            ShortString::from(key.as_str()),
+            AMQPValue::LongString(value.as_str().into()),
+        );
+    }
+    let mut properties = BasicProperties::default()
+        .with_message_id(envelope.message_id.to_string().into())
+        .with_correlation_id(envelope.correlation_id.to_string().into())
+        .with_type(envelope.message_type.as_str().into())
+        .with_headers(headers);
+    if let Some(reply_to) = envelope.reply_to.as_deref() {
+        properties = properties.with_reply_to(reply_to.into());
+    }
+
+    let confirmation = channel
+        .basic_publish(
+            ShortString::from(""),
+            ShortString::from(queue),
+            BasicPublishOptions {
+                mandatory: true,
+                ..BasicPublishOptions::default()
+            },
+            &envelope.payload,
+            properties,
+        )
+        .await
+        .expect("request publish must be accepted")
+        .await
+        .expect("request publish confirmation must resolve");
+    assert!(
+        matches!(confirmation, Confirmation::Ack(None)),
+        "the request must be routed to the queue before the test proceeds, got {confirmation:?}"
+    );
+}
+
+/// The wiring #491 hangs on, proven end to end.
+///
+/// Every counting decision itself is unit-tested in `hexeract-bus`, but no
+/// unit test in this workspace can see `register_request_handler_with_counters`
+/// installing a default handle instead of the caller's: the responder would
+/// still reject the request, still emit its warning, and the operator's own
+/// snapshot would sit at zero forever while the drops kept happening. That
+/// is exactly the failure the issue exists to make visible, so it is
+/// asserted against a real broker.
+///
+/// The forged request names `tests.replies` as its `reply_to`: a legitimate
+/// application queue, but not the server-named inbox
+/// [`hexeract_bus_rabbitmq::RabbitMqReplyPublisher`] confines a reply to, so
+/// the destination guard refuses it before `Echo` ever runs.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn a_registered_responder_counts_into_the_handle_the_caller_kept() {
+    let broker = harness::start_rabbitmq().await;
+    let cancel = CancellationToken::new();
+
+    declare_ping_queue(broker.uri(), "tests.ping").await;
+
+    let counters = ResponderCounters::default();
+    let responder_transport = Arc::new(RabbitMqTransport::new(broker.uri()).await.unwrap());
+    let worker = RabbitMqWorkerBuilder::new(
+        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+            .await
+            .unwrap(),
+    )
+    .queue("tests.ping")
+    .register_request_handler_with_counters::<Ping, _>(
+        Echo,
+        Arc::clone(&responder_transport),
+        counters.clone(),
+    )
+    .build()
+    .unwrap();
+    let worker_cancel = cancel.clone();
+    let worker_handle = tokio::spawn(async move { worker.run(worker_cancel).await });
+
+    let publisher_connection = RabbitMqConnection::connect(broker.uri()).await.unwrap();
+    let publisher_channel = publisher_connection.create_channel().await.unwrap();
+    let mut request =
+        BusEnvelope::with_reply_to(Uuid::now_v7(), "tests.replies".to_owned(), &Ping { seq: 1 })
+            .expect("ping must serialize");
+    request.headers.insert(
+        REQUEST_ID_HEADER.to_owned(),
+        hexeract_core::RequestId::new().to_string(),
+    );
+    request.headers.insert(
+        PROTOCOL_VERSION_HEADER.to_owned(),
+        PROTOCOL_VERSION.to_string(),
+    );
+    publish_request_to_queue(&publisher_channel, "tests.ping", &request).await;
+
+    let mut attempts = 0;
+    let snapshot = loop {
+        let snapshot = counters.snapshot();
+        if snapshot.invalid_reply_to > 0 {
+            break snapshot;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 100,
+            "the handle the caller kept never saw the rejection the responder made"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(snapshot.invalid_reply_to, 1);
+    assert_eq!(
+        snapshot.invalid_request_id, 0,
+        "the request carried a readable identity"
+    );
+    assert_eq!(
+        snapshot.unsupported_protocol_version, 0,
+        "the request announced the current protocol version"
+    );
 
     cancel.cancel();
     let _ = worker_handle.await;

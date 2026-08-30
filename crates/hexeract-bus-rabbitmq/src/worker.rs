@@ -23,6 +23,7 @@ use hexeract_bus::Message;
 use hexeract_bus::RepliedHandler;
 use hexeract_bus::Request;
 use hexeract_bus::RequestHandler;
+use hexeract_bus::ResponderCounters;
 use hexeract_bus::TypedHandler;
 use hexeract_core::CorrelationId;
 use hexeract_core::HandlerContext;
@@ -396,15 +397,48 @@ impl RabbitMqWorkerBuilder {
     /// Registering twice for the same `R::MESSAGE_TYPE` silently replaces
     /// the previous entry, same as [`Self::register_handler`].
     #[must_use]
+    pub fn register_request_handler<R, H>(
+        self,
+        handler: H,
+        transport: Arc<RabbitMqTransport>,
+    ) -> Self
+    where
+        R: Request,
+        H: RequestHandler<R>,
+    {
+        self.register_request_handler_with_counters(
+            handler,
+            transport,
+            ResponderCounters::default(),
+        )
+    }
+
+    /// Register a request handler and expose its responder rejection totals.
+    ///
+    /// Retain a clone of `counters` to observe requests rejected for an
+    /// invalid `reply_to`, request identity, or protocol version before the
+    /// domain handler runs.
+    ///
+    /// The reply is published through a dedicated [`RabbitMqReplyPublisher`],
+    /// built internally from `transport`'s connection, which ALWAYS targets
+    /// the AMQP default exchange. `transport`'s own exchange is not used for
+    /// replies; it only sources the connection and pool size. This confines
+    /// a caller-supplied `reply_to` to the default exchange regardless of
+    /// how the responder's application transport is configured.
+    ///
+    /// Registering twice for the same `R::MESSAGE_TYPE` silently replaces
+    /// the previous entry, same as [`Self::register_handler`].
+    #[must_use]
     #[allow(
         clippy::needless_pass_by_value,
-        reason = "the Arc<RabbitMqTransport> parameter is a stable public signature shared by \
-                  every existing call site; only its connection and pool size are read here"
+        reason = "the Arc<RabbitMqTransport> mirrors register_request_handler and only its \
+                  connection and pool size are read here"
     )]
-    pub fn register_request_handler<R, H>(
+    pub fn register_request_handler_with_counters<R, H>(
         mut self,
         handler: H,
         transport: Arc<RabbitMqTransport>,
+        counters: ResponderCounters,
     ) -> Self
     where
         R: Request,
@@ -415,7 +449,9 @@ impl RabbitMqWorkerBuilder {
             transport.pool().max_size(),
         ));
         let erased: Arc<dyn ErasedHandler> = Arc::new(
-            RepliedHandler::<R, H, RabbitMqReplyPublisher>::new(handler, replies),
+            RepliedHandler::<R, H, RabbitMqReplyPublisher>::with_counters(
+                handler, replies, counters,
+            ),
         );
         self.handlers.insert(R::MESSAGE_TYPE, erased);
         self

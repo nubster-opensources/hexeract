@@ -55,6 +55,51 @@ Hexeract does not export Prometheus metrics natively (planned for a future relea
 | `bus.retry.counter` | Increment on `tracing::warn` parsing or via a custom field visitor | `message_type` |
 | `bus.dlr.counter` | Increment when the worker publishes to the dead-letter routing key | `message_type` |
 
+### Counters Hexeract exposes directly
+
+Request-reply is the exception to the section above: both ends of a call keep
+in-process counters, so the failures each end cannot see from the other need no
+instrumentation of your own, only a periodic read.
+
+| Snapshot field | Read from | Counts |
+| --- | --- | --- |
+| `ReplyCountersSnapshot.invalid` | `RequestRegistry::counters()` | Replies whose request identity was known but which failed validation before the registry consumed the pending slot |
+| `ReplyCountersSnapshot.orphaned` | `RequestRegistry::counters()` | Replies with an absent, unparsable or unknown identity, a second reply to an already resolved call included |
+| `ResponderCountersSnapshot.invalid_reply_to` | a retained `ResponderCounters` handle | Requests refused for an absent or policy-rejected reply destination |
+| `ResponderCountersSnapshot.invalid_request_id` | idem | Requests with an absent or unparsable `x-hexeract-request-id` |
+| `ResponderCountersSnapshot.unsupported_protocol_version` | idem | Requests announcing a missing or unsupported protocol version |
+
+The caller-side snapshot comes from the registry the client already owns. The
+responder-side handle is supplied at registration instead, because the worker
+erases the handler it wraps, so keep a clone of it:
+
+```rust
+let counters = ResponderCounters::default();
+let worker = RabbitMqWorkerBuilder::new(connection)
+    .queue("orders.requests")
+    .register_request_handler_with_counters::<PlaceOrder, _>(
+        handler,
+        Arc::clone(&transport),
+        counters.clone(),
+    )
+    .build()?;
+
+// from your metrics loop, on the clone you kept
+let snapshot = counters.snapshot();
+report_counter("rpc.responder.invalid_reply_to", snapshot.invalid_reply_to);
+```
+
+Read them as rates rather than as totals. They are monotonic for the life of
+the process, and they count rejections rather than distinct requests: a
+delivery the transport redelivers is counted again. They also merge
+sub-reasons that share one remedy, so when you need to tell a missing header
+from an unreadable one, the `warn` event on the same path names the sub-reason
+and the message type.
+
+These are the drops nothing else reports. A request refused on its envelope
+never reaches a handler and never produces a reply, so the caller observes
+nothing but a timeout, and a reply refused on arrival resolves no call at all.
+
 ## Correlation across services
 
 `OutboxEnvelope.event_id`, `BusEnvelope.message_id` and `BusEnvelope.correlation_id` are UUIDv7 by construction (lexically sortable by mint timestamp). Log every one of them at every hop:

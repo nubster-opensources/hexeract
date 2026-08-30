@@ -5,6 +5,7 @@ use hexeract_core::{HandlerContext, RequestId};
 
 use crate::remote_error::{RemoteErrorPayload, RemoteErrorType};
 use crate::request_context::RequestContext;
+use crate::responder_counters::{ResponderCounters, ResponderCountersSnapshot};
 use crate::rpc_protocol::{
     PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, REPLY_ERROR_MESSAGE_TYPE, REPLY_STATUS_ERROR,
     REPLY_STATUS_HEADER, REPLY_STATUS_OK, REQUEST_ID_HEADER, read_protocol_version,
@@ -27,6 +28,7 @@ use crate::{
 pub struct RepliedHandler<R, H, P> {
     handler: Arc<H>,
     replies: Arc<P>,
+    counters: ResponderCounters,
     _phantom: PhantomData<fn() -> R>,
 }
 
@@ -38,11 +40,26 @@ where
 {
     /// Wrap a handler and the reply publisher used to publish replies.
     pub fn new(handler: H, replies: Arc<P>) -> Self {
+        Self::with_counters(handler, replies, ResponderCounters::default())
+    }
+
+    /// Wrap a handler with a shared responder rejection counter handle.
+    ///
+    /// Retain a clone of `counters` to inspect requests rejected before the
+    /// domain handler runs.
+    pub fn with_counters(handler: H, replies: Arc<P>, counters: ResponderCounters) -> Self {
         Self {
             handler: Arc::new(handler),
             replies,
+            counters,
             _phantom: PhantomData,
         }
+    }
+
+    /// Return a point-in-time snapshot of responder-side rejection totals.
+    #[must_use]
+    pub fn counters(&self) -> ResponderCountersSnapshot {
+        self.counters.snapshot()
     }
 
     /// Parse and validate `envelope.reply_to` against
@@ -51,6 +68,7 @@ where
     /// any other guard: see [`RepliedHandler::handle`] for why.
     fn validated_reply_to(&self, envelope: &BusEnvelope) -> Option<ReplyDestination> {
         let Some(raw_reply_to) = envelope.reply_to.as_deref() else {
+            self.counters.count_invalid_reply_to();
             tracing::warn!(
                 message_type = R::MESSAGE_TYPE,
                 correlation_id = %envelope.correlation_id,
@@ -61,6 +79,7 @@ where
         match self.replies.accept_destination(raw_reply_to) {
             Ok(reply_to) => Some(reply_to),
             Err(rejection) => {
+                self.counters.count_invalid_reply_to();
                 tracing::warn!(
                     message_type = R::MESSAGE_TYPE,
                     correlation_id = %envelope.correlation_id,
@@ -164,6 +183,7 @@ where
             let request_id = match parse_request_id(envelope) {
                 RequestIdHeader::Present(request_id) => request_id,
                 RequestIdHeader::Missing => {
+                    self.counters.count_invalid_request_id();
                     tracing::warn!(
                         message_type = R::MESSAGE_TYPE,
                         %correlation_id,
@@ -172,6 +192,7 @@ where
                     return Ok(());
                 }
                 RequestIdHeader::Unreadable => {
+                    self.counters.count_invalid_request_id();
                     tracing::warn!(
                         message_type = R::MESSAGE_TYPE,
                         %correlation_id,
@@ -184,6 +205,7 @@ where
             let protocol_version = match read_protocol_version(&envelope.headers) {
                 Some(version) if version == PROTOCOL_VERSION => version,
                 _ => {
+                    self.counters.count_unsupported_protocol_version();
                     tracing::warn!(
                         message_type = R::MESSAGE_TYPE,
                         "request announces an unsupported protocol version, rejecting"
@@ -1089,6 +1111,83 @@ mod tests {
         assert!(
             publisher.published.lock().unwrap().is_empty(),
             "the version path must not be usable as a publication relay: reply_to was invalid"
+        );
+    }
+
+    #[tokio::test]
+    async fn responder_counters_categorize_every_pre_dispatch_rejection() {
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let counters = ResponderCounters::default();
+        let handler = RepliedHandler::with_counters(Echo, Arc::clone(&publisher), counters.clone());
+
+        let missing_reply_to = request_envelope(None);
+        handler.handle(&missing_reply_to, &ctx()).await.unwrap();
+
+        let rejected_reply_to = request_envelope(Some("orders.inbox"));
+        handler.handle(&rejected_reply_to, &ctx()).await.unwrap();
+
+        let mut missing_request_id = request_envelope(Some("amq.gen-inbox"));
+        missing_request_id.headers.remove(REQUEST_ID_HEADER);
+        handler.handle(&missing_request_id, &ctx()).await.unwrap();
+
+        let mut unreadable_request_id = request_envelope(Some("amq.gen-inbox"));
+        unreadable_request_id
+            .headers
+            .insert(REQUEST_ID_HEADER.to_owned(), "not-a-uuid".to_owned());
+        handler
+            .handle(&unreadable_request_id, &ctx())
+            .await
+            .unwrap();
+
+        let mut unsupported_version = request_envelope(Some("amq.gen-inbox"));
+        unsupported_version
+            .headers
+            .insert(PROTOCOL_VERSION_HEADER.to_owned(), "99".to_owned());
+        handler.handle(&unsupported_version, &ctx()).await.unwrap();
+
+        let expected = ResponderCountersSnapshot {
+            invalid_reply_to: 2,
+            invalid_request_id: 2,
+            unsupported_protocol_version: 1,
+        };
+        assert_eq!(handler.counters(), expected);
+        assert_eq!(counters.snapshot(), expected);
+    }
+
+    /// The complement of
+    /// `responder_counters_categorize_every_pre_dispatch_rejection`: a
+    /// monotonic counter is worthless as a rate signal if it also moves on
+    /// requests the responder accepted, so the accepting paths are asserted
+    /// to leave it alone. The undecodable request is the one rejection that
+    /// is deliberately out of scope (see [`ResponderCounters`]): it is
+    /// answered with `Malformed` and must not be folded into any of the
+    /// three envelope-contract totals.
+    #[tokio::test]
+    async fn accepted_and_undecodable_requests_leave_the_counters_untouched() {
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let counters = ResponderCounters::default();
+        let handler = RepliedHandler::with_counters(Echo, Arc::clone(&publisher), counters.clone());
+
+        let accepted = request_envelope(Some("amq.gen-inbox"));
+        handler.handle(&accepted, &ctx()).await.unwrap();
+
+        let mut undecodable = request_envelope(Some("amq.gen-inbox"));
+        undecodable.payload = b"{ not json".to_vec();
+        handler.handle(&undecodable, &ctx()).await.unwrap();
+
+        assert_eq!(
+            publisher.published.lock().unwrap().len(),
+            2,
+            "both requests must have been answered, so neither was dropped by a guard"
+        );
+        assert_eq!(
+            counters.snapshot(),
+            ResponderCountersSnapshot {
+                invalid_reply_to: 0,
+                invalid_request_id: 0,
+                unsupported_protocol_version: 0,
+            },
+            "a rejection counter must not move on a request the responder accepted"
         );
     }
 }
