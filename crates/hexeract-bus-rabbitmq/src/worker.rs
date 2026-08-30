@@ -418,6 +418,16 @@ impl RabbitMqWorkerBuilder {
     /// Retain a clone of `counters` to observe requests rejected for an
     /// invalid `reply_to`, request identity, or protocol version before the
     /// domain handler runs.
+    ///
+    /// The reply is published through a dedicated [`RabbitMqReplyPublisher`],
+    /// built internally from `transport`'s connection, which ALWAYS targets
+    /// the AMQP default exchange. `transport`'s own exchange is not used for
+    /// replies; it only sources the connection and pool size. This confines
+    /// a caller-supplied `reply_to` to the default exchange regardless of
+    /// how the responder's application transport is configured.
+    ///
+    /// Registering twice for the same `R::MESSAGE_TYPE` silently replaces
+    /// the previous entry, same as [`Self::register_handler`].
     #[must_use]
     #[allow(
         clippy::needless_pass_by_value,

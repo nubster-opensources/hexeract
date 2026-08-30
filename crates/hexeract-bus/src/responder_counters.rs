@@ -8,14 +8,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// to inspect the responder-side rejection totals later. The counters are
 /// monotonic and shared by every clone.
 ///
-/// The scope is the envelope contract itself, not every rejection
-/// [`RepliedHandler`](crate::RepliedHandler) can make before dispatch: its
-/// reply destination, its request identity, its protocol version. A request
-/// whose *payload* fails to decode is deliberately absent, and is reported
-/// to the caller as [`RemoteErrorType::Malformed`](crate::RemoteErrorType):
-/// that is a schema mismatch on one message type between two peers, not a
-/// signal about the responder's inbound protocol health, which is what
-/// these three measure.
+/// The scope is the envelope contract itself: its reply destination, its
+/// request identity, its protocol version. It is not every rejection
+/// [`RepliedHandler`](crate::RepliedHandler) can make before dispatch. A
+/// request whose *payload* fails to decode is deliberately absent, and is
+/// reported to the caller as
+/// [`RemoteErrorType::Malformed`](crate::RemoteErrorType): that is a schema
+/// mismatch on one message type between two peers, not a signal about the
+/// responder's inbound protocol health, which is what these three measure.
 #[derive(Debug, Clone, Default)]
 pub struct ResponderCounters {
     inner: Arc<ResponderCountersInner>,

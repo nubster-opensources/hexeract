@@ -86,7 +86,7 @@ let worker = RabbitMqWorkerBuilder::new(connection)
 
 // from your metrics loop, on the clone you kept
 let snapshot = counters.snapshot();
-report_gauge("rpc.responder.invalid_reply_to", snapshot.invalid_reply_to);
+report_counter("rpc.responder.invalid_reply_to", snapshot.invalid_reply_to);
 ```
 
 Read them as rates rather than as totals. They are monotonic for the life of
