@@ -876,7 +876,10 @@ async fn publish_request_to_queue(channel: &Channel, queue: &str, envelope: &Bus
         .basic_publish(
             ShortString::from(""),
             ShortString::from(queue),
-            BasicPublishOptions::default(),
+            BasicPublishOptions {
+                mandatory: true,
+                ..BasicPublishOptions::default()
+            },
             &envelope.payload,
             properties,
         )
@@ -886,7 +889,7 @@ async fn publish_request_to_queue(channel: &Channel, queue: &str, envelope: &Bus
         .expect("request publish confirmation must resolve");
     assert!(
         matches!(confirmation, Confirmation::Ack(None)),
-        "the request must be durably queued before the test proceeds, got {confirmation:?}"
+        "the request must be routed to the queue before the test proceeds, got {confirmation:?}"
     );
 }
 
