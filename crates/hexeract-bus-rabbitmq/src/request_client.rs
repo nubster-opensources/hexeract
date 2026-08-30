@@ -43,6 +43,12 @@ use crate::connection::{DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BASE_DELAY, Rabbit
 use crate::reply_inbox::{declare_reply_inbox, run_reply_inbox};
 use crate::transport::RabbitMqTransport;
 
+/// Maximum time spent closing a connection from a failed reply-inbox setup.
+///
+/// This close is best-effort cleanup: it must never turn a broker that has
+/// stopped responding into an unbounded pause in the reconnect loop.
+const FAILED_REPLY_INBOX_SETUP_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Tuning parameters for a RabbitMQ request client.
 ///
 /// Marked `#[non_exhaustive]` so new tuning fields can be added in a minor
@@ -345,14 +351,33 @@ async fn reconnect_reply_inbox(
             );
             classify_connect_failure(&error)
         })?;
-        let channel = connection.create_channel().await.map_err(|error| {
-            tracing::warn!(phase = "channel", error = %error, "rpc reply inbox reconnect failed");
-            ReconnectFailure::NeedsBackoff
-        })?;
-        let inbox = declare_reply_inbox(&channel).await.map_err(|error| {
-            tracing::warn!(phase = "inbox", error = %error, "rpc reply inbox reconnect failed");
-            ReconnectFailure::NeedsBackoff
-        })?;
+        let channel = match connection.create_channel().await {
+            Ok(channel) => channel,
+            Err(error) => {
+                close_failed_reply_inbox_connection(
+                    cancel,
+                    FAILED_REPLY_INBOX_SETUP_CLOSE_TIMEOUT,
+                    close_reply_inbox_connection(&connection),
+                )
+                .await;
+                tracing::warn!(phase = "channel", error = %error, "rpc reply inbox reconnect failed");
+                return Err(ReconnectFailure::NeedsBackoff);
+            }
+        };
+        let inbox = match declare_reply_inbox(&channel).await {
+            Ok(inbox) => inbox,
+            Err(error) => {
+                drop(channel);
+                close_failed_reply_inbox_connection(
+                    cancel,
+                    FAILED_REPLY_INBOX_SETUP_CLOSE_TIMEOUT,
+                    close_reply_inbox_connection(&connection),
+                )
+                .await;
+                tracing::warn!(phase = "inbox", error = %error, "rpc reply inbox reconnect failed");
+                return Err(ReconnectFailure::NeedsBackoff);
+            }
+        };
         Ok((channel, inbox))
     })
     .await?;
@@ -360,6 +385,36 @@ async fn reconnect_reply_inbox(
     *reply_inbox.lock().unwrap_or_else(PoisonError::into_inner) =
         ReplyInboxState::Ready(next_inbox.1.clone());
     Some(next_inbox)
+}
+
+/// Close a connection that successfully opened but could not finish reply
+/// inbox setup. Failure is deliberately diagnostic-only: setup's original
+/// error remains the one that drives the reconnect policy.
+async fn close_reply_inbox_connection(connection: &RabbitMqConnection) {
+    if let Err(error) = connection.inner().close(200, "OK".into()).await {
+        tracing::debug!(%error, "failed reply inbox connection close did not complete");
+    }
+}
+
+/// Await a best-effort connection close without letting it hold cancellation
+/// or reconnect forever.
+///
+/// Returns `true` when the close future completed, including a broker-side
+/// error that [`close_reply_inbox_connection`] recorded. `false` means
+/// cancellation or the supplied deadline won first.
+async fn close_failed_reply_inbox_connection<Close>(
+    cancel: &CancellationToken,
+    timeout: Duration,
+    close: Close,
+) -> bool
+where
+    Close: Future<Output = ()>,
+{
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => false,
+        result = tokio::time::timeout(timeout, close) => result.is_ok(),
+    }
 }
 
 /// Retry a reply-inbox setup attempt until it succeeds or cancellation fires.
@@ -437,7 +492,7 @@ mod tests {
     use std::io;
     use std::pin::pin;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
@@ -792,6 +847,82 @@ mod tests {
             reconnect.await.expect("reconnect task must not panic"),
             None,
             "cancellation must still stop the loop"
+        );
+    }
+
+    /// A setup failure after a successful connect owns a live AMQP session.
+    /// Dropping that handle leaks the session, its I/O loop and the broker-side
+    /// connection; a retry must start the best-effort close before it proceeds.
+    #[tokio::test]
+    async fn failed_reply_inbox_setup_starts_closing_its_connection() {
+        let cancel = CancellationToken::new();
+        let close_started = Arc::new(AtomicBool::new(false));
+
+        let closed = close_failed_reply_inbox_connection(&cancel, Duration::from_secs(1), {
+            let close_started = Arc::clone(&close_started);
+            async move {
+                close_started.store(true, Ordering::SeqCst);
+            }
+        })
+        .await;
+
+        assert!(closed, "the failed setup must await its close attempt");
+        assert!(
+            close_started.load(Ordering::SeqCst),
+            "the connection close future must be polled"
+        );
+    }
+
+    /// The close handshake uses the broker, so it may itself stop making
+    /// progress during an outage. Cancellation must win over that handshake:
+    /// otherwise `RequestClient::close` inherits an unbounded wait from a
+    /// failed reconnect setup.
+    #[tokio::test]
+    async fn cancellation_interrupts_a_failed_setup_connection_close() {
+        let cancel = CancellationToken::new();
+        let close_started = Arc::new(Notify::new());
+
+        let close = tokio::spawn({
+            let cancel = cancel.clone();
+            let close_started = Arc::clone(&close_started);
+            async move {
+                close_failed_reply_inbox_connection(&cancel, Duration::from_secs(1), async move {
+                    close_started.notify_one();
+                    std::future::pending::<()>().await;
+                })
+                .await
+            }
+        });
+
+        close_started.notified().await;
+        cancel.cancel();
+
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(2), close)
+                .await
+                .expect("cancellation must interrupt the close handshake")
+                .expect("close task must not panic"),
+            "an interrupted close must report that it did not finish"
+        );
+    }
+
+    /// A healthy but unresponsive peer can accept the connection then never
+    /// answer `Connection.Close-Ok`. The cleanup is best-effort, so its own
+    /// bound must release the reconnect loop even without cancellation.
+    #[tokio::test]
+    async fn failed_reply_inbox_setup_close_stops_at_its_deadline() {
+        let cancel = CancellationToken::new();
+
+        let closed = close_failed_reply_inbox_connection(
+            &cancel,
+            Duration::from_millis(50),
+            std::future::pending(),
+        )
+        .await;
+
+        assert!(
+            !closed,
+            "an unresponsive close must give up at its configured bound"
         );
     }
 }
