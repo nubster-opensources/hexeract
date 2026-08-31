@@ -45,7 +45,10 @@ pub mod transport;
 pub mod worker;
 
 pub use connection::RabbitMqConnection;
+pub use connection::RabbitMqConnectionConfig;
 pub use connection::redact_uri;
+pub use lapin::tcp::OwnedIdentity;
+pub use lapin::tcp::OwnedTLSConfig;
 pub use pool::ChannelPool;
 pub use pool::PooledChannel;
 pub use reply_publisher::RabbitMqReplyPublisher;

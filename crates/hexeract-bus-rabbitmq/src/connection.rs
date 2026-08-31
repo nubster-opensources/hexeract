@@ -1,3 +1,4 @@
+use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,6 +8,7 @@ use lapin::Channel;
 use lapin::Connection;
 use lapin::ConnectionProperties;
 use lapin::ErrorKind;
+use lapin::tcp::OwnedTLSConfig;
 
 /// Redact the credentials of a connection URI for safe logging.
 ///
@@ -190,6 +192,43 @@ pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 // completes the AMQP handshake and then stalls, which a local listener
 // cannot simulate. The Docker integration suites exercise the success path.
 pub const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// TLS settings shared by every connection created for one RabbitMQ client.
+///
+/// The default delegates server-certificate verification to lapin's platform
+/// trust store. Use [`Self::with_tls_config`] to provide a private CA and,
+/// when required by the broker, a client identity. The URI still selects the
+/// transport: use `amqps://` for TLS.
+#[derive(Clone, Default)]
+pub struct RabbitMqConnectionConfig {
+    tls_config: Option<OwnedTLSConfig>,
+}
+
+impl RabbitMqConnectionConfig {
+    /// Replace the default platform-trust-store TLS configuration.
+    #[must_use]
+    pub fn with_tls_config(mut self, tls_config: OwnedTLSConfig) -> Self {
+        self.tls_config = Some(tls_config);
+        self
+    }
+
+    pub(crate) fn tls_config(&self) -> OwnedTLSConfig {
+        self.tls_config.clone().unwrap_or_default()
+    }
+
+    pub(crate) fn has_custom_tls_config(&self) -> bool {
+        self.tls_config.is_some()
+    }
+}
+
+impl fmt::Debug for RabbitMqConnectionConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RabbitMqConnectionConfig")
+            .field("custom_tls_configured", &self.has_custom_tls_config())
+            .finish()
+    }
+}
 
 /// Thin wrapper over a shared [`lapin::Connection`].
 ///
@@ -475,8 +514,23 @@ impl RabbitMqConnection {
 #[cfg(test)]
 mod tests {
     use lapin::protocol::{AMQPError, AMQPErrorKind, AMQPSoftError};
+    use lapin::tcp::OwnedTLSConfig;
 
     use super::*;
+
+    #[test]
+    fn custom_tls_config_is_retained_without_debugging_its_secret() {
+        let config = RabbitMqConnectionConfig::default().with_tls_config(OwnedTLSConfig {
+            cert_chain: Some("private-ca-pem".to_owned()),
+            identity: None,
+        });
+
+        assert_eq!(
+            config.tls_config().cert_chain.as_deref(),
+            Some("private-ca-pem")
+        );
+        assert!(!format!("{config:?}").contains("private-ca-pem"));
+    }
 
     #[tokio::test]
     async fn connect_with_retry_returns_connection_error_after_max_attempts() {
