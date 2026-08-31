@@ -7,6 +7,7 @@ use hexeract_bus::BusError;
 use lapin::Channel;
 use lapin::Connection;
 use lapin::ConnectionProperties;
+use lapin::DefaultConnectionBuilder;
 use lapin::ErrorKind;
 use lapin::tcp::OwnedTLSConfig;
 
@@ -230,6 +231,24 @@ impl fmt::Debug for RabbitMqConnectionConfig {
     }
 }
 
+/// Open one AMQP connection with the supplied role properties and TLS setup.
+///
+/// The builder owns its runtime and clones the configuration before the call,
+/// which lets a retry reuse private trust or client-identity material without
+/// exposing either to diagnostics.
+async fn connect_once(
+    uri: &str,
+    properties: ConnectionProperties,
+    config: &RabbitMqConnectionConfig,
+) -> lapin::Result<Connection> {
+    DefaultConnectionBuilder::new()?
+        .with_uri_str(uri.to_owned())
+        .with_properties(properties)
+        .with_tls_config(config.tls_config())
+        .connect()
+        .await
+}
+
 /// Thin wrapper over a shared [`lapin::Connection`].
 ///
 /// The wrapper centralises connection establishment so the rest of the
@@ -297,7 +316,25 @@ impl RabbitMqConnection {
     /// credentials: the raw `lapin` error (which can echo a malformed
     /// URI back) is dropped in favour of a credential-redacted message.
     pub async fn connect(uri: &str) -> Result<Self, BusError> {
-        let inner = Connection::connect(uri, supervised_properties())
+        Self::connect_with_config(uri, &RabbitMqConnectionConfig::default()).await
+    }
+
+    /// Connect to the broker once with caller-selected TLS settings.
+    ///
+    /// `config` changes the trust and client-identity material used when
+    /// `uri` selects TLS through `amqps://`; it never enables a plaintext
+    /// fallback. See [`RabbitMqConnectionConfig`] for the default trust-store
+    /// behaviour and private-CA configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a credential-redacted [`BusError::Connection`] when the AMQP
+    /// or TLS handshake fails.
+    pub async fn connect_with_config(
+        uri: &str,
+        config: &RabbitMqConnectionConfig,
+    ) -> Result<Self, BusError> {
+        let inner = connect_once(uri, supervised_properties(), config)
             .await
             .map_err(|err| connection_error(uri, is_transient(&err)))?;
         Ok(Self {
@@ -336,7 +373,31 @@ impl RabbitMqConnection {
         attempts: u32,
         base_delay: Duration,
     ) -> Result<Self, BusError> {
-        Self::connect_with_retry_inner(uri, attempts, base_delay, false).await
+        Self::connect_with_retry_with_config(
+            uri,
+            attempts,
+            base_delay,
+            &RabbitMqConnectionConfig::default(),
+        )
+        .await
+    }
+
+    /// Connect to the broker with retries and caller-selected TLS settings.
+    ///
+    /// The selected configuration is cloned for every attempt so a private CA
+    /// and client identity remain in force until the retry budget is spent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a credential-redacted [`BusError::Connection`] after the final
+    /// attempt or on a permanent handshake failure.
+    pub async fn connect_with_retry_with_config(
+        uri: &str,
+        attempts: u32,
+        base_delay: Duration,
+        config: &RabbitMqConnectionConfig,
+    ) -> Result<Self, BusError> {
+        Self::connect_with_retry_inner(uri, attempts, base_delay, false, config).await
     }
 
     /// Like [`Self::connect_with_retry`] but enables lapin auto-recovery on
@@ -354,12 +415,30 @@ impl RabbitMqConnection {
         attempts: u32,
         base_delay: Duration,
     ) -> Result<Self, BusError> {
+        Self::connect_with_retry_recovering_with_config(
+            uri,
+            attempts,
+            base_delay,
+            &RabbitMqConnectionConfig::default(),
+        )
+        .await
+    }
+
+    /// Like [`Self::connect_with_retry_recovering`] with caller-selected TLS
+    /// settings, used by the publisher constructors.
+    pub(crate) async fn connect_with_retry_recovering_with_config(
+        uri: &str,
+        attempts: u32,
+        base_delay: Duration,
+        config: &RabbitMqConnectionConfig,
+    ) -> Result<Self, BusError> {
         Self::connect_recovering_within(
             uri,
             attempts,
             base_delay,
             DEFAULT_PROBE_TIMEOUT,
             DEFAULT_SESSION_TIMEOUT,
+            config,
         )
         .await
     }
@@ -397,12 +476,13 @@ impl RabbitMqConnection {
         base_delay: Duration,
         probe_timeout: Duration,
         session_timeout: Duration,
+        config: &RabbitMqConnectionConfig,
     ) -> Result<Self, BusError> {
         // An expired bound carries no classification of its own; an
         // unreachable broker may heal, so it is reported as transient.
         let probe = tokio::time::timeout(
             probe_timeout,
-            Self::connect_with_retry_inner(uri, attempts, base_delay, false),
+            Self::connect_with_retry_inner(uri, attempts, base_delay, false, config),
         )
         .await
         .map_err(|_elapsed| connection_error(uri, true))??;
@@ -410,7 +490,7 @@ impl RabbitMqConnection {
 
         let inner = tokio::time::timeout(
             session_timeout,
-            Self::connect_with_retry_inner(uri, attempts, base_delay, true),
+            Self::connect_with_retry_inner(uri, attempts, base_delay, true, config),
         )
         .await
         .map_err(|_elapsed| connection_error(uri, true))??;
@@ -429,6 +509,7 @@ impl RabbitMqConnection {
         attempts: u32,
         base_delay: Duration,
         recovering: bool,
+        config: &RabbitMqConnectionConfig,
     ) -> Result<Self, BusError> {
         let attempts = attempts.max(1);
         let mut retryable = true;
@@ -438,7 +519,7 @@ impl RabbitMqConnection {
             } else {
                 supervised_properties()
             };
-            match Connection::connect(uri, properties).await {
+            match connect_once(uri, properties, config).await {
                 Ok(conn) => {
                     return Ok(Self {
                         inner: Arc::new(conn),
@@ -530,6 +611,25 @@ mod tests {
             Some("private-ca-pem")
         );
         assert!(!format!("{config:?}").contains("private-ca-pem"));
+    }
+
+    #[tokio::test]
+    async fn connect_with_custom_tls_config_never_leaks_password_in_error() {
+        let config = RabbitMqConnectionConfig::default().with_tls_config(OwnedTLSConfig {
+            cert_chain: Some("private-ca-pem".to_owned()),
+            identity: None,
+        });
+
+        let error = RabbitMqConnection::connect_with_config(
+            "amqps://user:super-secret@127.0.0.1:1",
+            &config,
+        )
+        .await
+        .expect_err("a closed local port must fail to connect");
+
+        let rendered = error.to_string();
+        assert!(!rendered.contains("super-secret"));
+        assert!(!rendered.contains("private-ca-pem"));
     }
 
     #[tokio::test]
@@ -646,6 +746,7 @@ mod tests {
             DEFAULT_RETRY_BASE_DELAY,
             probe_timeout,
             DEFAULT_SESSION_TIMEOUT,
+            &RabbitMqConnectionConfig::default(),
         )
         .await
         .expect_err("a closed port must not yield a connection");
@@ -668,6 +769,7 @@ mod tests {
             DEFAULT_RETRY_BASE_DELAY,
             Duration::from_millis(50),
             DEFAULT_SESSION_TIMEOUT,
+            &RabbitMqConnectionConfig::default(),
         )
         .await
         .expect_err("a closed port must not yield a connection");
