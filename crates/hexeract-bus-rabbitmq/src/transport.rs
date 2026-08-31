@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::connection::DEFAULT_RETRY_ATTEMPTS;
 use crate::connection::DEFAULT_RETRY_BASE_DELAY;
-use crate::connection::RabbitMqConnection;
+use crate::connection::{RabbitMqConnection, RabbitMqConnectionConfig};
 use crate::pool::ChannelPool;
 use crate::pool::DEFAULT_POOL_MAX_SIZE;
 
@@ -105,10 +105,20 @@ impl RabbitMqTransport {
     /// [`crate::connection::DEFAULT_SESSION_TIMEOUT`]. No path blocks
     /// forever.
     pub async fn new(connection_string: &str) -> Result<Self, BusError> {
-        let connection = RabbitMqConnection::connect_with_retry_recovering(
+        Self::new_with_config(connection_string, &RabbitMqConnectionConfig::default()).await
+    }
+
+    /// Connect to `connection_string` with caller-selected TLS settings and
+    /// target the AMQP default exchange.
+    pub async fn new_with_config(
+        connection_string: &str,
+        config: &RabbitMqConnectionConfig,
+    ) -> Result<Self, BusError> {
+        let connection = RabbitMqConnection::connect_with_retry_recovering_with_config(
             connection_string,
             DEFAULT_RETRY_ATTEMPTS,
             DEFAULT_RETRY_BASE_DELAY,
+            config,
         )
         .await?;
         let pool = Arc::new(ChannelPool::new(connection, DEFAULT_POOL_MAX_SIZE));
@@ -146,10 +156,26 @@ impl RabbitMqTransport {
         connection_string: &str,
         exchange: Exchange,
     ) -> Result<Self, BusError> {
-        let connection = RabbitMqConnection::connect_with_retry_recovering(
+        Self::with_exchange_with_config(
+            connection_string,
+            exchange,
+            &RabbitMqConnectionConfig::default(),
+        )
+        .await
+    }
+
+    /// Connect with caller-selected TLS settings, declare `exchange`, and use
+    /// it for subsequent publishes.
+    pub async fn with_exchange_with_config(
+        connection_string: &str,
+        exchange: Exchange,
+        config: &RabbitMqConnectionConfig,
+    ) -> Result<Self, BusError> {
+        let connection = RabbitMqConnection::connect_with_retry_recovering_with_config(
             connection_string,
             DEFAULT_RETRY_ATTEMPTS,
             DEFAULT_RETRY_BASE_DELAY,
+            config,
         )
         .await?;
         let exchange_kind = exchange_kind_to_lapin(exchange.kind)?;

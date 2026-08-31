@@ -410,21 +410,7 @@ impl RabbitMqConnection {
     /// and would stop [`crate::RabbitMqWorker::run`] from ever detecting a
     /// dead broker (the run loop would block forever instead of returning a
     /// connection error for the supervisor to act on).
-    pub(crate) async fn connect_with_retry_recovering(
-        uri: &str,
-        attempts: u32,
-        base_delay: Duration,
-    ) -> Result<Self, BusError> {
-        Self::connect_with_retry_recovering_with_config(
-            uri,
-            attempts,
-            base_delay,
-            &RabbitMqConnectionConfig::default(),
-        )
-        .await
-    }
-
-    /// Like [`Self::connect_with_retry_recovering`] with caller-selected TLS
+    /// Open a recovering publisher connection with caller-selected TLS
     /// settings, used by the publisher constructors.
     pub(crate) async fn connect_with_retry_recovering_with_config(
         uri: &str,
