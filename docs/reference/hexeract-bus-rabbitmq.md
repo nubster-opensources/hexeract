@@ -56,6 +56,29 @@ do not place private keys or PKCS#12 passwords in source control. The same
 and `RabbitMqRequestClientConfigBuilder::connection_config`, the latter applying
 it to both the publisher and reply-inbox connections.
 
+A private CA is an **additional** trust anchor, not a replacement: it is
+appended to the platform trust store, so a certificate issued by any publicly
+trusted authority for the broker hostname stays acceptable. Supplying an
+internal CA therefore widens what is accepted rather than pinning trust to your
+own authority, and lapin exposes no way to restrict verification further.
+Treat broker authentication as resting on mutual TLS and on the credentials in
+the URI, not on the private CA alone.
+
+TLS material only takes effect on an `amqps://` URI. Pairing it with a
+plaintext `amqp://` URI is refused with a permanent connection error rather
+than silently ignored, so a mis-templated scheme cannot downgrade a session to
+cleartext while the deployment believes it runs mutual TLS. A test harness that
+deliberately reuses one configuration across both transports opts out with
+`RabbitMqConnectionConfig::allow_plaintext_transport`.
+
+A rejected certificate (unknown authority, hostname outside the SAN, expired
+certificate, refused client certificate) is classified as a permanent
+connection failure, so a supervisor stops instead of rebuilding the connection
+against a trust chain that can never succeed. The failure is named in the
+error's source and in the `failure` field of the `warn` log line, which
+distinguishes a certificate fault from an unreachable broker without ever
+rendering the credential-bearing URI.
+
 ### Channel pool
 
 | Item | Role |
