@@ -110,6 +110,12 @@ impl RabbitMqTransport {
 
     /// Connect to `connection_string` with caller-selected TLS settings and
     /// target the AMQP default exchange.
+    ///
+    /// # Errors
+    ///
+    /// Returns a credential-redacted [`BusError::Connection`] when the broker
+    /// cannot be reached within the connect bounds, or a permanent one when
+    /// `config` carries TLS material that `connection_string` would discard.
     pub async fn new_with_config(
         connection_string: &str,
         config: &RabbitMqConnectionConfig,
@@ -166,6 +172,13 @@ impl RabbitMqTransport {
 
     /// Connect with caller-selected TLS settings, declare `exchange`, and use
     /// it for subsequent publishes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a credential-redacted [`BusError::Connection`] when the broker
+    /// cannot be reached within the connect bounds, or a permanent one when
+    /// `config` carries TLS material that `connection_string` would discard.
+    /// Returns [`BusError`] when the exchange cannot be declared.
     pub async fn with_exchange_with_config(
         connection_string: &str,
         exchange: Exchange,
@@ -549,8 +562,8 @@ mod tests {
     // The connect-failure path of `new` and `with_exchange` is covered by
     // `connection::tests::connect_with_retry_returns_connection_error_after_max_attempts`
     // and by `connection::tests::connect_recovering_gives_up_once_its_bound_elapses`.
-    // Both constructors only forward `connect_with_retry_recovering` through
-    // `?`, so exercising them here would re-test the same mapping.
+    // Both constructors only forward `connect_with_retry_recovering_with_config`
+    // through `?`, so exercising them here would re-test the same mapping.
 
     #[test]
     fn default_constants_are_sane() {

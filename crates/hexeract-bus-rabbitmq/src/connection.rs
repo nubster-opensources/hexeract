@@ -1,5 +1,6 @@
 use std::fmt;
 use std::future::Future;
+use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -83,9 +84,9 @@ fn supervised_properties() -> ConnectionProperties {
 /// connect, where it multiplies every attempt by four.
 ///
 /// These properties are therefore no longer used for the initial connect.
-/// [`RabbitMqConnection::connect_with_retry_recovering`] probes the broker
-/// first with [`supervised_properties`], under a bound, and only opens an
-/// auto-recovering session once the broker has answered.
+/// [`RabbitMqConnection::connect_with_retry_recovering_with_config`] probes
+/// the broker first with [`supervised_properties`], under a bound, and only
+/// opens an auto-recovering session once the broker has answered.
 ///
 /// `with_max_times(3)` also bounds something outside our own control: if the
 /// session bound expires while a connect built from these properties is
@@ -123,6 +124,63 @@ fn connection_error(uri: &str, retryable: bool) -> BusError {
     )
 }
 
+/// Build a credential-safe [`BusError::Connection`] naming why the connect
+/// failed.
+///
+/// `failure` is a fixed discriminant from [`failure_kind`], never formatted
+/// error content, so the same guarantee as [`connection_error`] holds: no
+/// credential can reach the message. Without it every TLS fault (unknown CA,
+/// hostname outside the SAN, client certificate refused) renders identically
+/// to a refused TCP connect, leaving an operator no way to tell a certificate
+/// problem from an unreachable broker.
+fn connection_error_with_kind(uri: &str, retryable: bool, failure: &str) -> BusError {
+    BusError::connection(
+        format!(
+            "failed to connect to rabbitmq broker at {}: {failure}",
+            redact_uri(uri)
+        ),
+        retryable,
+    )
+}
+
+/// Build a credential-safe [`BusError::Connection`] from a `lapin` failure,
+/// classifying and naming it in one step.
+fn connection_error_from(uri: &str, error: &lapin::Error) -> BusError {
+    connection_error_with_kind(uri, is_transient(error), failure_kind(error))
+}
+
+/// Name a `lapin` failure with a fixed, credential-free discriminant.
+///
+/// Reads only the error *shape*, never its formatted content, for the same
+/// reason [`is_transient`] does: on the connect path the content can echo the
+/// password-bearing URI.
+fn failure_kind(error: &lapin::Error) -> &'static str {
+    match error.kind() {
+        ErrorKind::IOError(io_error) => io_failure_kind(io_error),
+        ErrorKind::ProtocolError(_) => "broker refused the amqp handshake",
+        ErrorKind::InvalidProtocolVersion(_) => "unsupported amqp protocol version",
+        ErrorKind::AuthProviderError(_) => "authentication provider error",
+        ErrorKind::RuntimeShutdownError(_) => "runtime shutdown",
+        _ => "transport failure",
+    }
+}
+
+/// Name the transport-level shape of an IO failure.
+///
+/// `InvalidData` is the kind `rustls` produces when certificate verification
+/// fails, so it is reported as a TLS validation failure. It is phrased to stay
+/// truthful: the AMQP frame decoder can surface the same kind, and neither can
+/// be distinguished without reading error content this crate refuses to read.
+fn io_failure_kind(error: &io::Error) -> &'static str {
+    match error.kind() {
+        io::ErrorKind::InvalidData => "tls or protocol validation failure",
+        io::ErrorKind::ConnectionRefused => "connection refused",
+        io::ErrorKind::ConnectionReset => "connection reset",
+        io::ErrorKind::TimedOut => "connection timed out",
+        _ => "io failure",
+    }
+}
+
 /// Classify a lapin failure as transient (worth retrying) or permanent.
 ///
 /// Reads only the error *shape* through [`lapin::Error::kind`], never its
@@ -136,14 +194,31 @@ fn connection_error(uri: &str, retryable: bool) -> BusError {
 /// lapin's own `Error::can_be_recovered` is deliberately not used: it
 /// classifies every `ProtocolError` as recoverable, so it would retry an
 /// `ACCESS_REFUSED`, which is exactly the bug this classifier prevents.
+///
+/// A rejected TLS certificate is permanent for the same reason. It reaches us
+/// as an `IOError`, because `tcp-stream` surfaces a failed handshake as an
+/// `io::Error` and `rustls` converts a certificate fault (unknown authority,
+/// hostname outside the SAN, expired certificate, refused client certificate)
+/// into `io::ErrorKind::InvalidData`. Without singling that kind out, an
+/// unusable trust chain would burn the whole retry budget and still report
+/// itself as retryable, so a supervisor would rebuild the connection forever.
 pub(crate) fn is_transient(error: &lapin::Error) -> bool {
-    // Permanent kinds are enumerated; everything else (transport-level
-    // IOError, and any future `#[non_exhaustive]` variant such as a
-    // channel/connection state during a recovery gap or a missing
-    // heartbeat) is transient, so a retry or auto-recovery is given a
-    // chance to heal it, bounded by the caller's attempt budget. Expressed
-    // as a negated match so the shared `true` outcomes do not trip
-    // clippy::match_same_arms (pedantic, denied at the workspace level).
+    // An IO failure is transport level and normally transient, with one
+    // exception: `InvalidData` is how a certificate rejection arrives. The
+    // AMQP frame decoder can raise the same kind, and telling the two apart
+    // would mean reading error *content*, which this function refuses to do
+    // on a credential-bearing path. Both are permanent faults in practice, so
+    // the conflation is safe in the direction that matters.
+    if let ErrorKind::IOError(io_error) = error.kind() {
+        return io_error.kind() != io::ErrorKind::InvalidData;
+    }
+    // Permanent kinds are enumerated; everything else (any future
+    // `#[non_exhaustive]` variant such as a channel/connection state during a
+    // recovery gap or a missing heartbeat) is transient, so a retry or
+    // auto-recovery is given a chance to heal it, bounded by the caller's
+    // attempt budget. Expressed as a negated match so the shared `true`
+    // outcomes do not trip clippy::match_same_arms (pedantic, denied at the
+    // workspace level).
     !matches!(
         error.kind(),
         ErrorKind::InvalidProtocolVersion(_)
@@ -197,19 +272,61 @@ pub const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 /// TLS settings shared by every connection created for one RabbitMQ client.
 ///
 /// The default delegates server-certificate verification to lapin's platform
-/// trust store. Use [`Self::with_tls_config`] to provide a private CA and,
-/// when required by the broker, a client identity. The URI still selects the
+/// trust store. Use [`Self::with_tls_config`] to add a private CA and, when
+/// required by the broker, a client identity. The URI still selects the
 /// transport: use `amqps://` for TLS.
+///
+/// # Security
+///
+/// A configuration carrying TLS material is only honoured by an `amqps://`
+/// URI. Pairing it with a plaintext `amqp://` URI is refused rather than
+/// ignored, so a mistyped or mis-templated scheme cannot silently downgrade a
+/// session to cleartext while the deployment believes it is running mutual
+/// TLS. [`Self::allow_plaintext_transport`] opts out of that refusal.
 #[derive(Clone, Default)]
 pub struct RabbitMqConnectionConfig {
     tls_config: Option<OwnedTLSConfig>,
+    allows_plaintext_transport: bool,
 }
 
 impl RabbitMqConnectionConfig {
-    /// Replace the default platform-trust-store TLS configuration.
+    /// Add a private certificate authority, and optionally a client identity,
+    /// to the trust material used when the URI selects TLS.
+    ///
+    /// # Security
+    ///
+    /// The supplied `cert_chain` is an **additional** trust anchor: it is
+    /// appended to the platform trust store rather than replacing it. A
+    /// certificate issued by any publicly trusted authority for the broker's
+    /// hostname therefore remains acceptable, so this method does not pin
+    /// trust to a private CA. lapin exposes no way to restrict verification to
+    /// the supplied anchors, so restricting trust further is not currently
+    /// possible through this crate.
+    ///
+    /// Supplying an [`OwnedIdentity`] enables mutual TLS when the broker is
+    /// configured with `ssl_options.fail_if_no_peer_cert`.
+    ///
+    /// [`OwnedIdentity`]: lapin::tcp::OwnedIdentity
     #[must_use]
     pub fn with_tls_config(mut self, tls_config: OwnedTLSConfig) -> Self {
         self.tls_config = Some(tls_config);
+        self
+    }
+
+    /// Accept a plaintext `amqp://` URI even though TLS material is
+    /// configured, acknowledging that the material will be ignored.
+    ///
+    /// # Security
+    ///
+    /// Calling this re-enables the silent downgrade the default refusal
+    /// exists to prevent: the session runs in cleartext and the broker
+    /// credentials travel unencrypted. It is meant for a test harness that
+    /// reuses one configuration across a plaintext and a TLS broker, never
+    /// for a deployment. Prefer building a separate configuration for the
+    /// plaintext path.
+    #[must_use]
+    pub fn allow_plaintext_transport(mut self) -> Self {
+        self.allows_plaintext_transport = true;
         self
     }
 
@@ -220,15 +337,73 @@ impl RabbitMqConnectionConfig {
     pub(crate) fn has_custom_tls_config(&self) -> bool {
         self.tls_config.is_some()
     }
+
+    pub(crate) fn allows_plaintext_transport(&self) -> bool {
+        self.allows_plaintext_transport
+    }
 }
 
+/// Renders whether TLS material is configured, never the material itself.
+///
+/// `tls_config` is deliberately omitted: an [`OwnedIdentity`] carries the
+/// PKCS#12 bytes and the passphrase that decrypts them, both of which a
+/// derived `Debug` would print in clear. The omission is declared through
+/// `finish_non_exhaustive` so it reads as intentional rather than forgotten.
+///
+/// [`OwnedIdentity`]: lapin::tcp::OwnedIdentity
 impl fmt::Debug for RabbitMqConnectionConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RabbitMqConnectionConfig")
             .field("custom_tls_configured", &self.has_custom_tls_config())
-            .finish()
+            .field(
+                "allows_plaintext_transport",
+                &self.allows_plaintext_transport,
+            )
+            .finish_non_exhaustive()
     }
+}
+
+/// Whether the URI scheme selects an encrypted transport.
+///
+/// lapin only consults the TLS configuration for a scheme that selects TLS,
+/// which for AMQP is `amqps`. The comparison is case-insensitive because URI
+/// schemes are, and it deliberately looks at the scheme alone: a URI that
+/// carries no `://` at all cannot select TLS.
+fn uri_selects_tls(uri: &str) -> bool {
+    uri.split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("amqps"))
+}
+
+/// Refuse a configuration whose TLS material the URI would silently discard.
+///
+/// lapin ignores [`OwnedTLSConfig`] unless the scheme selects TLS, so a
+/// private CA and a client identity paired with `amqp://` produce a cleartext
+/// session with no error and no log line. That is a downgrade in the unsafe
+/// direction and it is refused here, at every connect path, unless the caller
+/// opted in through
+/// [`RabbitMqConnectionConfig::allow_plaintext_transport`].
+///
+/// # Errors
+///
+/// Returns a permanent (non-retryable) [`BusError::Connection`]: a scheme
+/// mismatch is a configuration fault that every retry would reproduce.
+fn ensure_tls_material_is_honoured(
+    uri: &str,
+    config: &RabbitMqConnectionConfig,
+) -> Result<(), BusError> {
+    if !config.has_custom_tls_config()
+        || config.allows_plaintext_transport()
+        || uri_selects_tls(uri)
+    {
+        return Ok(());
+    }
+    Err(connection_error_with_kind(
+        uri,
+        false,
+        "tls material was configured but the uri scheme is not amqps, which \
+         would discard it and connect in cleartext",
+    ))
 }
 
 /// Open one AMQP connection with the supplied role properties and TLS setup.
@@ -267,7 +442,15 @@ async fn connect_once(
 ///   use `amqps://` so credentials and message payloads are encrypted
 ///   in transit. Server certificate validation is performed by the
 ///   platform trust store; point the broker at a certificate chain that
-///   the host already trusts.
+///   the host already trusts, or add a private authority through
+///   [`RabbitMqConnectionConfig::with_tls_config`]. A private authority is
+///   an *additional* trust anchor, so it widens what is accepted rather
+///   than narrowing it.
+///
+/// TLS material configured for an `amqp://` URI would be discarded by
+/// lapin, so the connect paths refuse that pairing instead of downgrading
+/// the session silently. See
+/// [`RabbitMqConnectionConfig::allow_plaintext_transport`].
 ///
 /// # Security
 ///
@@ -329,14 +512,16 @@ impl RabbitMqConnection {
     /// # Errors
     ///
     /// Returns a credential-redacted [`BusError::Connection`] when the AMQP
-    /// or TLS handshake fails.
+    /// or TLS handshake fails, or a permanent one when `config` carries TLS
+    /// material that `uri` would silently discard.
     pub async fn connect_with_config(
         uri: &str,
         config: &RabbitMqConnectionConfig,
     ) -> Result<Self, BusError> {
+        ensure_tls_material_is_honoured(uri, config)?;
         let inner = connect_once(uri, supervised_properties(), config)
             .await
-            .map_err(|err| connection_error(uri, is_transient(&err)))?;
+            .map_err(|err| connection_error_from(uri, &err))?;
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -400,6 +585,9 @@ impl RabbitMqConnection {
         Self::connect_with_retry_inner(uri, attempts, base_delay, false, config).await
     }
 
+    /// Open a recovering publisher connection with caller-selected TLS
+    /// settings, used by the publisher constructors.
+    ///
     /// Like [`Self::connect_with_retry`] but enables lapin auto-recovery on
     /// the resulting connection, for the long-lived publisher path that must
     /// heal itself across a broker blip (#334).
@@ -410,8 +598,6 @@ impl RabbitMqConnection {
     /// and would stop [`crate::RabbitMqWorker::run`] from ever detecting a
     /// dead broker (the run loop would block forever instead of returning a
     /// connection error for the supervisor to act on).
-    /// Open a recovering publisher connection with caller-selected TLS
-    /// settings, used by the publisher constructors.
     pub(crate) async fn connect_with_retry_recovering_with_config(
         uri: &str,
         attempts: u32,
@@ -497,8 +683,10 @@ impl RabbitMqConnection {
         recovering: bool,
         config: &RabbitMqConnectionConfig,
     ) -> Result<Self, BusError> {
+        ensure_tls_material_is_honoured(uri, config)?;
         let attempts = attempts.max(1);
         let mut retryable = true;
+        let mut failure = "no connect attempt completed";
         for attempt in 1..=attempts {
             let properties = if recovering {
                 recovering_properties()
@@ -513,9 +701,11 @@ impl RabbitMqConnection {
                 }
                 Err(err) => {
                     retryable = is_transient(&err);
+                    failure = failure_kind(&err);
                     tracing::warn!(
                         attempt,
                         retryable,
+                        failure,
                         uri = %redact_uri(uri),
                         "rabbitmq connect failed"
                     );
@@ -534,7 +724,7 @@ impl RabbitMqConnection {
                 }
             }
         }
-        Err(connection_error(uri, retryable))
+        Err(connection_error_with_kind(uri, retryable, failure))
     }
 
     /// Open a fresh AMQP channel on the underlying connection.
@@ -581,41 +771,189 @@ impl RabbitMqConnection {
 #[cfg(test)]
 mod tests {
     use lapin::protocol::{AMQPError, AMQPErrorKind, AMQPSoftError};
-    use lapin::tcp::OwnedTLSConfig;
+    use lapin::tcp::{OwnedIdentity, OwnedTLSConfig};
 
     use super::*;
 
+    /// TLS material carrying a client identity, whose PKCS#12 password is the
+    /// only genuine secret in the configuration.
+    fn mutual_tls_config() -> OwnedTLSConfig {
+        OwnedTLSConfig {
+            cert_chain: Some("private-ca-pem".to_owned()),
+            identity: Some(OwnedIdentity::PKCS12 {
+                der: vec![0x30, 0x82, 0x00, 0x01],
+                password: "pkcs12-passphrase".to_owned(),
+            }),
+        }
+    }
+
     #[test]
     fn custom_tls_config_is_retained_without_debugging_its_secret() {
-        let config = RabbitMqConnectionConfig::default().with_tls_config(OwnedTLSConfig {
-            cert_chain: Some("private-ca-pem".to_owned()),
-            identity: None,
-        });
+        let config = RabbitMqConnectionConfig::default().with_tls_config(mutual_tls_config());
 
         assert_eq!(
             config.tls_config().cert_chain.as_deref(),
             Some("private-ca-pem")
         );
-        assert!(!format!("{config:?}").contains("private-ca-pem"));
+        // The CA is public material; the identity password is not. The Debug
+        // rendering must not carry the password, nor the raw PKCS#12 bytes.
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains("pkcs12-passphrase"),
+            "the client identity password must never be rendered, got {rendered}"
+        );
+        assert!(
+            !rendered.contains("PKCS12"),
+            "the identity material must not be rendered at all, got {rendered}"
+        );
     }
 
+    /// A configuration whose TLS material an `amqp://` URI would discard is a
+    /// silent downgrade to cleartext: the session carries the broker password
+    /// unencrypted while the deployment believes it runs mutual TLS. Every
+    /// connect path must refuse it rather than connect.
     #[tokio::test]
-    async fn connect_with_custom_tls_config_never_leaks_password_in_error() {
-        let config = RabbitMqConnectionConfig::default().with_tls_config(OwnedTLSConfig {
-            cert_chain: Some("private-ca-pem".to_owned()),
-            identity: None,
-        });
+    async fn tls_material_on_a_plaintext_uri_is_refused() {
+        let config = RabbitMqConnectionConfig::default().with_tls_config(mutual_tls_config());
 
         let error = RabbitMqConnection::connect_with_config(
-            "amqps://user:super-secret@127.0.0.1:1",
+            "amqp://user:s3cr3t@127.0.0.1:1/vhost",
             &config,
         )
         .await
-        .expect_err("a closed local port must fail to connect");
+        .expect_err("tls material paired with a plaintext uri must be refused");
 
+        assert_eq!(
+            error.is_retryable_connection(),
+            Some(false),
+            "a scheme mismatch is a configuration fault every retry reproduces"
+        );
         let rendered = error.to_string();
-        assert!(!rendered.contains("super-secret"));
-        assert!(!rendered.contains("private-ca-pem"));
+        assert!(
+            !rendered.contains("s3cr3t") && !rendered.contains("pkcs12-passphrase"),
+            "the refusal must stay credential-free, got {rendered}"
+        );
+    }
+
+    /// The retrying and recovering paths share the same guard. Without this,
+    /// only the single-shot path would be covered and the publisher and reply
+    /// inbox could still downgrade silently.
+    #[tokio::test]
+    async fn every_retrying_connect_path_refuses_ignored_tls_material() {
+        let config = RabbitMqConnectionConfig::default().with_tls_config(mutual_tls_config());
+
+        let retrying = RabbitMqConnection::connect_with_retry_with_config(
+            "amqp://127.0.0.1:1",
+            DEFAULT_RETRY_ATTEMPTS,
+            Duration::from_millis(1),
+            &config,
+        )
+        .await
+        .expect_err("the retry path must refuse ignored tls material");
+        assert_eq!(retrying.is_retryable_connection(), Some(false));
+
+        let recovering = RabbitMqConnection::connect_with_retry_recovering_with_config(
+            "amqp://127.0.0.1:1",
+            DEFAULT_RETRY_ATTEMPTS,
+            Duration::from_millis(1),
+            &config,
+        )
+        .await
+        .expect_err("the recovering path must refuse ignored tls material");
+        assert_eq!(recovering.is_retryable_connection(), Some(false));
+    }
+
+    /// The opt-out exists for a harness that reuses one configuration across a
+    /// plaintext and a TLS broker. Once taken, the connect proceeds and fails
+    /// on the dead port like any other plaintext connect.
+    #[tokio::test]
+    async fn an_explicit_opt_in_allows_a_plaintext_uri_to_carry_tls_material() {
+        let config = RabbitMqConnectionConfig::default()
+            .with_tls_config(mutual_tls_config())
+            .allow_plaintext_transport();
+
+        let error = RabbitMqConnection::connect_with_config("amqp://127.0.0.1:1", &config)
+            .await
+            .expect_err("a closed local port must still fail to connect");
+
+        assert_eq!(
+            error.is_retryable_connection(),
+            Some(true),
+            "an unreachable broker may heal, so this must not be the permanent config refusal"
+        );
+    }
+
+    /// A rejected certificate fails identically on every retry, so it must
+    /// break the retry loop instead of burning the budget (#340). `rustls`
+    /// surfaces an unknown CA, a hostname outside the SAN, an expired
+    /// certificate and a refused client certificate as `InvalidData`.
+    #[test]
+    fn tls_validation_failures_classify_as_permanent() {
+        let error: lapin::Error =
+            io::Error::new(io::ErrorKind::InvalidData, "invalid peer certificate").into();
+
+        assert!(
+            !is_transient(&error),
+            "a rejected certificate must not be retried"
+        );
+        assert_eq!(failure_kind(&error), "tls or protocol validation failure");
+    }
+
+    /// The complement: a transport hiccup on a TLS session must stay
+    /// retryable, otherwise hardening the classifier would trade a hammering
+    /// bug for an availability one.
+    #[test]
+    fn transport_failures_stay_transient_on_a_tls_session() {
+        for (label, error) in [
+            (
+                "connection refused",
+                lapin::Error::from(io::Error::from(io::ErrorKind::ConnectionRefused)),
+            ),
+            (
+                "connection reset",
+                lapin::Error::from(io::Error::from(io::ErrorKind::ConnectionReset)),
+            ),
+            (
+                "timed out",
+                lapin::Error::from(io::Error::from(io::ErrorKind::TimedOut)),
+            ),
+            (
+                "an unclassified io failure",
+                lapin::Error::from(io::Error::other("something else")),
+            ),
+        ] {
+            assert!(
+                is_transient(&error),
+                "{label} may heal, so it must stay retryable"
+            );
+        }
+    }
+
+    /// An operator must be able to tell a certificate problem from an
+    /// unreachable broker without the raw error, which can echo the URI.
+    ///
+    /// `BusError::Connection` renders as the fixed string `connection error`
+    /// and keeps the detail in its boxed source, so the message is asserted
+    /// there, which is the surface an operator actually reaches.
+    #[test]
+    fn connection_errors_name_the_failure_without_leaking_credentials() {
+        let error = connection_error_from(
+            "amqps://user:s3cr3t@broker.example.com:5671/vhost",
+            &io::Error::new(io::ErrorKind::InvalidData, "invalid peer certificate").into(),
+        );
+
+        let source = std::error::Error::source(&error)
+            .expect("a connection error carries its detail as a source")
+            .to_string();
+        assert!(
+            source.contains("tls or protocol validation failure"),
+            "the failure must be named, got {source}"
+        );
+        assert!(
+            !source.contains("s3cr3t"),
+            "credentials must not survive, got {source}"
+        );
+        assert!(source.contains("broker.example.com:5671"));
     }
 
     #[tokio::test]
