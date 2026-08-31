@@ -11,10 +11,50 @@ The full rustdoc lives at <https://docs.rs/hexeract-bus-rabbitmq>.
 | Item | Role |
 | --- | --- |
 | `RabbitMqConnection::connect(uri)` | Single-shot connect. Returns `BusError::Connection` on failure. |
+| `RabbitMqConnection::connect_with_config(uri, config)` | Single-shot connect with a private-CA or client-certificate TLS configuration. |
 | `RabbitMqConnection::connect_with_retry(uri, attempts, base_delay)` | Bounded exponential-backoff retry loop. Logs each failure at `warn`. |
+| `RabbitMqConnection::connect_with_retry_with_config(uri, attempts, base_delay, config)` | Same retry loop while retaining the TLS settings for every attempt. |
 | `RabbitMqConnection::create_channel()` | Open a fresh AMQP channel. |
 | `RabbitMqConnection::with_channel(|ch| async { ... })` | Open a short-lived channel, hand it to the closure, drop on return. Used by every topology helper. |
 | `DEFAULT_RETRY_ATTEMPTS = 5`, `DEFAULT_RETRY_BASE_DELAY = 250 ms` | Defaults used by `RabbitMqTransport::new`. |
+
+### TLS with a private CA or mTLS
+
+Use an `amqps://` URI to select TLS. The default connection configuration uses
+the platform trust store. For a broker using an internal CA, build a
+`RabbitMqConnectionConfig` with the re-exported TLS types; adding a client
+identity enables mutual TLS when the broker requires it.
+
+```rust,no_run
+use hexeract_bus_rabbitmq::{
+    OwnedIdentity, OwnedTLSConfig, RabbitMqConnectionConfig, RabbitMqTransport,
+};
+
+# async fn connect() -> Result<(), Box<dyn std::error::Error>> {
+let tls_config = OwnedTLSConfig {
+    cert_chain: Some(std::fs::read_to_string("/run/secrets/rabbitmq-ca.pem")?),
+    identity: Some(OwnedIdentity::PKCS12 {
+        der: std::fs::read("/run/secrets/rabbitmq-client.p12")?,
+        password: std::env::var("RABBITMQ_CLIENT_CERT_PASSWORD")?,
+    }),
+};
+let connection_config = RabbitMqConnectionConfig::default().with_tls_config(tls_config);
+
+let transport = RabbitMqTransport::new_with_config(
+    "amqps://rabbitmq.internal:5671/%2f",
+    &connection_config,
+)
+.await?;
+# drop(transport);
+# Ok(())
+# }
+```
+
+Load certificate material through the application's secret-management system;
+do not place private keys or PKCS#12 passwords in source control. The same
+`connection_config` is accepted by `RabbitMqTransport::with_exchange_with_config`
+and `RabbitMqRequestClientConfigBuilder::connection_config`, the latter applying
+it to both the publisher and reply-inbox connections.
 
 ### Channel pool
 
@@ -30,7 +70,9 @@ The full rustdoc lives at <https://docs.rs/hexeract-bus-rabbitmq>.
 | Item | Role |
 | --- | --- |
 | `RabbitMqTransport::new(uri)` | Connect with retry and target the AMQP default exchange. |
+| `RabbitMqTransport::new_with_config(uri, config)` | Connect with retry and caller-selected TLS settings. |
 | `RabbitMqTransport::with_exchange(uri, exchange)` | Connect, declare a typed `Exchange`, target it. |
+| `RabbitMqTransport::with_exchange_with_config(uri, exchange, config)` | Declare and target an exchange with caller-selected TLS settings. |
 | `RabbitMqTransport::from_connection(connection, pool_size)` | Reuse an existing connection (useful when several transports share a broker session). |
 | `RabbitMqTransport::fire_and_forget()` | Switch to fire-and-forget publishing: no publisher confirm, no `mandatory` flag, `Ok` no longer proves delivery. Messages stay persistent. |
 | Implements `Transport` from `hexeract-bus` (three publish methods). | Mints `BusEnvelope`, encodes JSON, sends through `lapin::Channel::basic_publish` with `mandatory` set, awaits the publisher confirm. An unroutable routing key surfaces as `BusError::Unroutable` instead of silently dropping the message. |

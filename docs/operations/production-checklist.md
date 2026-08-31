@@ -45,7 +45,7 @@ Run through this list before letting a Hexeract-powered service answer a real wo
 ## Security
 
 - [ ] **Connection string out of source control.** Use environment variables (`DATABASE_URL`, `HEXERACT_BUS_URL`) or a secret manager.
-- [ ] **TLS enabled on broker connections.** `amqps://` instead of `amqp://`; the lapin connection picks the right scheme automatically.
+- [ ] **TLS enabled on broker connections.** Use `amqps://` instead of `amqp://`; the default configuration validates against the platform trust store. For an internal CA or mutual TLS, pass a `RabbitMqConnectionConfig` containing `OwnedTLSConfig` to every connection constructor, or through `RabbitMqRequestClientConfigBuilder::connection_config`; load the CA, client certificate, and its password from the service's secret manager.
 - [ ] **`outbox apply` and `outbox check` use TLS by default; scheduler admin commands do not.** `outbox apply`/`outbox check` upgrade any `sslmode` other than an explicit `disable` to `require` and connect via `rustls` against the operating-system trust store; only `sslmode=disable` in the connection string opts into plaintext, and a warning is logged when it does. `scheduler list`/`inspect`/`dead-letter` open their PostgreSQL pool through `sqlx` directly, which defaults to `sslmode=prefer` and silently falls back to cleartext if the server declines TLS. For those commands, set `sslmode=require` explicitly in `DATABASE_URL`.
 - [ ] **Credentials scoped per service.** A consumer service does not need publish permissions on every exchange; tighten the broker authorisation rules.
 - [ ] **Database role least-privileged.** The outbox publisher needs `INSERT` on the outbox table; the worker needs `SELECT FOR UPDATE` and `UPDATE`. No `DROP`, no `TRUNCATE`.
