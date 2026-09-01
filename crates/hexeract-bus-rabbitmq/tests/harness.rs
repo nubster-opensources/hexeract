@@ -12,6 +12,9 @@
     reason = "not every test binary in this crate uses every helper"
 )]
 
+use std::time::Duration;
+use std::time::Instant;
+
 use hexeract_bus::BusEnvelope;
 use hexeract_bus_rabbitmq::{OwnedIdentity, OwnedTLSConfig};
 use lapin::BasicProperties;
@@ -28,6 +31,7 @@ use testcontainers::core::IntoContainerPort;
 use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::rabbitmq::RabbitMq;
+use tokio::net::TcpStream;
 
 /// A running RabbitMQ test container, kept alive for the container's
 /// AMQP URI to stay reachable.
@@ -98,11 +102,15 @@ ssl_options.verify = verify_peer
 ssl_options.fail_if_no_peer_cert = true
 ";
 
+    // The readiness probe is deliberately NOT `WaitFor::message_on_stdout`.
+    // Waiting on a startup banner couples the test to a log line, and a broker
+    // that refuses its own configuration never prints one: the wait then blocks
+    // until the CI job is killed, with no error and no container to inspect.
+    // Handing back the container immediately and probing the port ourselves
+    // means a broker that never comes up is reported with its own logs instead.
     let container = GenericImage::new("rabbitmq", "3.8.22-management")
         .with_exposed_port(5671.tcp())
-        .with_wait_for(WaitFor::message_on_stdout(
-            "Server startup complete; 4 plugins started.",
-        ))
+        .with_wait_for(WaitFor::seconds(1))
         .with_copy_to(
             "/etc/rabbitmq/rabbitmq.conf",
             RABBITMQ_TLS_CONFIG.as_bytes().to_vec(),
@@ -130,11 +138,49 @@ ssl_options.fail_if_no_peer_cert = true
         .get_host_port_ipv4(5671)
         .await
         .expect("TLS RabbitMQ container must expose AMQPS port");
+
+    await_tls_listener(&container, &format!("{host}:{port}")).await;
+
     let uri = format!("amqps://guest:guest@{host}:{port}/%2f");
 
     RunningTlsBroker {
         _container: container,
         uri,
+    }
+}
+
+/// How long a TLS broker is given to open its AMQPS listener.
+///
+/// Generous enough for a cold image on a loaded CI runner, and short enough
+/// that a broker which will never come up fails with a diagnosis rather than
+/// hanging until the job is cancelled.
+const TLS_LISTENER_BUDGET: Duration = Duration::from_secs(120);
+
+/// Block until the broker accepts TCP on `address`, or fail with its logs.
+///
+/// A TLS listener that never opens means RabbitMQ rejected its own
+/// configuration (unreadable key, malformed `rabbitmq.conf`, refused cipher
+/// setup) and exited or stalled during boot. That reason is only ever written
+/// to the container's own output, so it is surfaced here: without it the test
+/// reports nothing but a timeout, which is what made the first CI failure
+/// impossible to diagnose.
+async fn await_tls_listener(container: &ContainerAsync<GenericImage>, address: &str) {
+    let deadline = Instant::now() + TLS_LISTENER_BUDGET;
+    loop {
+        if TcpStream::connect(address).await.is_ok() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let stdout = container.stdout_to_vec().await.unwrap_or_default();
+            let stderr = container.stderr_to_vec().await.unwrap_or_default();
+            panic!(
+                "the TLS broker never opened {address} within {TLS_LISTENER_BUDGET:?}.\n\
+                 --- container stdout ---\n{}\n--- container stderr ---\n{}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
