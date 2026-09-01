@@ -123,9 +123,93 @@ rendering the credential-bearing URI.
 | `RabbitMqTransport::with_exchange_with_config(uri, exchange, config)` | Declare and target an exchange with caller-selected TLS settings. |
 | `RabbitMqTransport::from_connection(connection, pool_size)` | Reuse an existing connection (useful when several transports share a broker session). |
 | `RabbitMqTransport::fire_and_forget()` | Switch to fire-and-forget publishing: no publisher confirm, no `mandatory` flag, `Ok` no longer proves delivery. Messages stay persistent. |
+| `RabbitMqTransport::with_metadata_limits(limits)` | Bound the metadata every subsequent publish may carry. Validation runs before a channel is acquired, so a rejected envelope never reaches the broker. |
 | Implements `Transport` from `hexeract-bus` (three publish methods). | Mints `BusEnvelope`, encodes JSON, sends through `lapin::Channel::basic_publish` with `mandatory` set, awaits the publisher confirm. An unroutable routing key surfaces as `BusError::Unroutable` instead of silently dropping the message. |
 
 AMQP `BasicProperties` set on every publish: `message_id`, `correlation_id`, `content_type = "application/json"`, `type = MESSAGE_TYPE`, `delivery_mode = 2` (persistent), `timestamp` (the envelope's `published_at` in epoch seconds), optional `reply_to`, free-form `headers` (each as `LongString`).
+
+### Metadata limits
+
+AMQP metadata is untrusted input the payload cap does not cover: a message well
+under `max_payload_bytes` can still carry a large field table, and `lapin` has
+already decoded it by the time Hexeract sees it. `AmqpMetadataLimits` bounds the
+work that happens after that decode, in both directions.
+
+| Limit | Default | Meaning |
+| --- | ---: | --- |
+| `max_headers` | 64 | Maximum top-level AMQP header entries |
+| `max_key_bytes` | 128 | Maximum UTF-8 byte length of one field-table key |
+| `max_value_bytes` | 8 KiB | Maximum measured size of one top-level value |
+| `max_total_bytes` | 32 KiB | Maximum sum of all measured keys and values |
+
+Every dimension is a byte length, never a count of Unicode scalars. Input
+sitting exactly on a limit is accepted, a one-byte overflow is rejected, and
+zero is a valid deny-all value. The constants are exported as
+`DEFAULT_MAX_HEADERS`, `DEFAULT_MAX_HEADER_KEY_BYTES`,
+`DEFAULT_MAX_HEADER_VALUE_BYTES` and `DEFAULT_MAX_METADATA_BYTES`.
+
+The framework's own `x-hexeract-*` protocol headers count toward the same
+budget as application headers, so an application that fills its header budget
+fails its own publish rather than silently dropping protocol metadata. The
+defaults leave ample room for trace context, tenancy metadata, the RPC wire
+fields and RabbitMQ's normal `x-death` history.
+
+Inbound accounting measures the whole decoded value, including nested arrays
+and tables, walked iteratively so attacker-controlled nesting cannot consume
+the call stack. Values that are not valid UTF-8 long strings are measured but
+never copied into a `BusEnvelope`, which carries string metadata only; an
+invalid UTF-8 long string is rejected rather than silently dropped.
+
+Configure the same value at each owner:
+
+```rust,ignore
+let transport = RabbitMqTransport::new(uri)
+    .await?
+    .with_metadata_limits(AmqpMetadataLimits {
+        max_headers: 16,
+        ..AmqpMetadataLimits::default()
+    });
+
+let worker = RabbitMqWorkerBuilder::new(connection)
+    .queue("orders.work")
+    .metadata_limits(AmqpMetadataLimits {
+        max_total_bytes: 8 * 1024,
+        ..AmqpMetadataLimits::default()
+    })
+    .build()?;
+
+let config = RabbitMqRequestClientConfigBuilder::new()
+    .metadata_limits(AmqpMetadataLimits {
+        max_headers: 16,
+        ..AmqpMetadataLimits::default()
+    })
+    .build();
+```
+
+The request-client setting reaches the publisher transport and every reply
+inbox the supervisor runs, including those rebuilt after a reconnect: a reply
+path left on weaker limits than the worker would be a complete bypass, and it
+is the path that feeds an RPC correlation slot.
+
+Disposition of a violation:
+
+- **Normal worker**: no typed handler runs. The delivery follows the existing
+  poison path, and when an application dead-letter target is configured the
+  quarantine copy rebuilds its AMQP properties with an empty field table rather
+  than republishing the metadata just refused. Bounded core fields
+  (`message_id`, `correlation_id`, `type`, `content_type`, `reply_to`,
+  `timestamp`, delivery mode, and the remaining scalars) are preserved so the
+  parked message stays diagnosable.
+- **Reply inbox**: the delivery is logged by reason and dropped under its
+  existing `no_ack` contract, before `RequestRegistry::resolve`, so it cannot
+  consume a correlation slot.
+
+Errors and structured logs carry a reason and the observed and configured
+sizes only. They never contain a header key or value.
+
+These limits run *after* `lapin` has decoded a delivery, so they bound the
+client's work rather than the network. Pair them with broker ingress limits;
+see the [production checklist](../operations/production-checklist.md).
 
 ### Worker
 
@@ -138,6 +222,7 @@ AMQP `BasicProperties` set on every publish: `message_id`, `correlation_id`, `co
 | `.max_attempts(n)` | Default 5. |
 | `.prefetch(n)` | Default 16. |
 | `.dead_letter_routing_key(rk)` | Routes exhausted deliveries to that routing key on the default exchange. |
+| `.metadata_limits(limits)` | Bounds the AMQP metadata of an inbound delivery. See [Metadata limits](#metadata-limits). |
 | `.build()?` | Returns `RabbitMqWorker`. Errors if `.queue(...)` was never set. |
 | `RabbitMqWorker::run(cancel)` | Drives the consume loop until the `CancellationToken` fires. |
 
@@ -146,7 +231,7 @@ AMQP `BasicProperties` set on every publish: `message_id`, `correlation_id`, `co
 | `AckMode::Manual` | Default. At-least-once. Retries per `message_id` up to `max_attempts`, then DLR or drop. |
 | `AckMode::AckOnReceive` | At-most-once. Explicit `basic_ack` on receive before the handler runs (`no_ack = false`). |
 | `AckMode::Unacknowledged` | Fire-and-forget. Consumer-side `no_ack = true`, lossy on handler failure or crash. |
-| `RabbitMqWorkerConfig` | Tunable knobs: `ack_mode`, `max_attempts`, `prefetch`, `dead_letter_routing_key`, `max_buffered: Option<usize>`. |
+| `RabbitMqWorkerConfig` | Tunable knobs: `ack_mode`, `max_attempts`, `prefetch`, `dead_letter_routing_key`, `max_buffered: Option<usize>`, `metadata_limits`. |
 | `.max_buffered(n)` | Bounds the in-memory delivery buffer under `AckMode::Unacknowledged` (`None` = unbounded, not recommended). Has no effect under `AckMode::Manual` or `AckMode::AckOnReceive`, which are already bounded by `basic.qos` prefetch. |
 
 See the [worker concept](../concepts/worker.md), the [ack modes](../concepts/ack-modes.md) and the [retry policy](../concepts/retry-policy.md).

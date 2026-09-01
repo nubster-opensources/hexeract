@@ -807,3 +807,54 @@ Confirm specifically that direct public-map mutation is revalidated outbound, no
 git add CHANGELOG.md crates/hexeract-bus-rabbitmq/CHANGELOG.md docs/reference/hexeract-bus.md docs/reference/hexeract-bus-rabbitmq.md docs/operations/production-checklist.md docs/operations/migration-v0.6-v0.7.md
 git commit -m "docs(bus): document AMQP metadata limits"
 ```
+
+---
+
+## Execution notes
+
+Deviations from the plan as written, and why.
+
+**Pre-work: the branch was not green.** Tasks 1-2 left `clippy -D warnings`
+failing on two counts: `remove_protocol_header` had no production caller (its
+only callers are tests, so it is now gated on `cfg(test)`), and six test
+envelopes built their header map through `Default::default()`. Fixed in its own
+commit before any new work, so each later commit starts and ends green.
+
+**Pre-work: the protocol headers had stopped reaching the wire.** After the
+split, `envelope_to_properties` still iterated `envelope.headers` alone, so
+`x-hexeract-*` fields never left the process. No unit test covered it and the
+end-to-end test that would have caught it is `#[ignore]`. Task 3 repairs this
+by construction (`encode_headers` iterates the combined wire view), and
+`protocol_headers_reach_the_wire` now pins it in a unit test.
+
+**Task 3.** `is_metadata_error` moved to Task 4, where its first production
+caller lives: introducing it in Task 3 would have committed a function no
+production code called, which `clippy -D warnings` rejects as dead code.
+`decode_headers` returns a named `DecodedMetadata` alias rather than the bare
+tuple, which `clippy::type_complexity` rejects.
+
+**Task 4.** `publish_dead_letter` takes the `BasicProperties` to publish rather
+than a positional `sanitize_metadata: bool`, so the call site names what it
+sends instead of encoding it in a boolean. The dispatch-level settlement
+injection was not built: `dispatch` needs a live `lapin::Channel`, which is not
+constructible in a unit test, and rebuilding it for injection is a large change
+to a hot path for a property the design already guarantees structurally
+(decoding precedes handler lookup). The spec assigns that proof to the ignored
+integration tests, and `oversized_metadata_is_quarantined_without_headers`
+provides it.
+
+**Task 5.** `decode_delivery` takes the properties and payload it actually
+reads instead of a whole `Delivery`: `lapin::message::Delivery` cannot be
+constructed outside `lapin` (its `Acker` is crate-private), so the previous
+signature was untestable. `spawn_reply_inbox_supervisor` now takes the
+`(Channel, String)` pair as one `ActiveInbox` argument, matching the concept
+`supervise_reply_inbox` already documents and staying within the seven-argument
+clippy bound.
+
+**Task 6, step 5.** The Docker-backed tests were not run: Docker is unavailable
+on this machine. Both are written, compile, and are gated `#[ignore = "requires
+Docker"]`; CI is their gate. Everything else verified locally:
+`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` and `cargo doc --workspace --all-features
+--no-deps` with `RUSTDOCFLAGS=-D warnings` all exit 0, and
+`cargo test --workspace --all-features` passes 894 tests.
