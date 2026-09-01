@@ -7,17 +7,20 @@ use hexeract_bus::Exchange;
 use hexeract_bus::ExchangeKind;
 use hexeract_bus::Queue;
 use hexeract_bus::RoutingKey;
-use hexeract_bus_rabbitmq::RabbitMqConnection;
 use hexeract_bus_rabbitmq::ensure_topology;
 use serde::Deserialize;
 
+use crate::commands::bus::transport_security::TransportSecurityArgs;
 use crate::conn_string::ConnString;
 use crate::error::CliError;
 
 /// CLI arguments for `hexeract bus declare`.
 #[derive(Args, Debug)]
 pub(crate) struct DeclareArgs {
-    /// AMQP connection string (e.g. `amqp://guest:guest@localhost:5672`).
+    /// AMQP connection string (e.g. `amqps://guest:guest@broker:5671`).
+    ///
+    /// A broker outside loopback requires `amqps://`; plain `amqp://` is
+    /// refused unless `--insecure-plaintext` is passed.
     ///
     /// Carries broker credentials in its userinfo component. Prefer
     /// setting `HEXERACT_BUS_URL` in the environment over passing this on
@@ -28,6 +31,8 @@ pub(crate) struct DeclareArgs {
     /// Path to the TOML topology file.
     #[arg(long)]
     topology: PathBuf,
+    #[command(flatten)]
+    transport: TransportSecurityArgs,
 }
 
 impl DeclareArgs {
@@ -40,9 +45,7 @@ impl DeclareArgs {
             .into_bus_values()
             .map_err(|e| CliError::Fatal(Box::new(e)))?;
 
-        let connection = RabbitMqConnection::connect(self.conn.as_str())
-            .await
-            .map_err(|e| CliError::Fatal(Box::new(e)))?;
+        let connection = self.transport.connect(self.conn.as_str()).await?;
         ensure_topology(&connection, &exchanges, &queues, &bindings)
             .await
             .map_err(|e| CliError::Fatal(Box::new(e)))?;

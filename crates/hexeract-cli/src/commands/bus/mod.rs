@@ -3,6 +3,7 @@ use clap::Subcommand;
 pub(crate) mod declare;
 pub(crate) mod peek;
 pub(crate) mod purge;
+pub(crate) mod transport_security;
 
 use crate::error::CliError;
 
