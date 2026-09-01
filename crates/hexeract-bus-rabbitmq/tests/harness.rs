@@ -222,6 +222,11 @@ async fn await_broker_ready(container: &ContainerAsync<GenericImage>) {
 }
 
 /// TLS material accepted by [`start_tls_rabbitmq`].
+///
+/// The fixtures are disposable and rebuilt wholesale by
+/// `tests/fixtures/tls/regenerate.sh`. Its `README.md` records why an
+/// unencrypted private key and the bundle password below belong in a public
+/// repository, and which subjects the broker configuration depends on.
 pub(crate) fn client_tls_config() -> OwnedTLSConfig {
     OwnedTLSConfig {
         identity: Some(OwnedIdentity::PKCS12 {
