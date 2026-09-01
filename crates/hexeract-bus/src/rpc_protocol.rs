@@ -8,8 +8,6 @@
 //! message rather than in the channel, so two versions can coexist on the
 //! same topology during a progressive rollout.
 
-use std::collections::HashMap;
-
 /// Prefix reserved for framework protocol headers.
 pub const RESERVED_HEADER_PREFIX: &str = "x-hexeract-";
 
@@ -38,22 +36,33 @@ pub const REPLY_ERROR_MESSAGE_TYPE: &str = "hexeract.rpc.error";
 /// timestamp. Reserved by this version, honored by a later one.
 pub const DEADLINE_HEADER: &str = "x-hexeract-deadline";
 
-/// Read the protocol version announced by `headers`.
+/// Read the protocol version announced by an envelope.
 ///
 /// Returns `None` when the header is absent or cannot be parsed. Both cases
 /// are treated as unsupported by callers: a peer that does not announce a
 /// version does not speak this protocol.
 #[must_use]
-#[allow(clippy::implicit_hasher)]
-pub fn read_protocol_version(headers: &HashMap<String, String>) -> Option<u32> {
-    headers.get(PROTOCOL_VERSION_HEADER)?.parse().ok()
+pub fn read_protocol_version(envelope: &crate::BusEnvelope) -> Option<u32> {
+    envelope.header(PROTOCOL_VERSION_HEADER)?.parse().ok()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
+    use crate::BusEnvelope;
+    use uuid::Uuid;
+
+    fn request_envelope() -> BusEnvelope {
+        BusEnvelope::restore(
+            Uuid::nil(),
+            "test.request".to_owned(),
+            Vec::new(),
+            Uuid::nil(),
+            None,
+            Default::default(),
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+    }
 
     #[test]
     fn headers_live_in_the_reserved_namespace() {
@@ -84,19 +93,26 @@ mod tests {
     }
 
     #[test]
-    fn reads_a_well_formed_version() {
-        let headers = HashMap::from([(PROTOCOL_VERSION_HEADER.to_owned(), "1".to_owned())]);
-        assert_eq!(read_protocol_version(&headers), Some(1));
+    fn request_wire_fields_do_not_occupy_application_headers() {
+        let mut envelope = request_envelope();
+        envelope.insert_protocol_header(REQUEST_ID_HEADER, "request-1".to_owned());
+        envelope.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
+
+        assert!(envelope.headers.keys().all(|key| !is_reserved_header(key)));
+        assert_eq!(envelope.header(REQUEST_ID_HEADER), Some("request-1"));
+        assert_eq!(envelope.header(PROTOCOL_VERSION_HEADER), Some("1"));
+        assert_eq!(read_protocol_version(&envelope), Some(1));
     }
 
     #[test]
     fn missing_version_reads_as_none() {
-        assert_eq!(read_protocol_version(&HashMap::new()), None);
+        assert_eq!(read_protocol_version(&request_envelope()), None);
     }
 
     #[test]
     fn unparsable_version_reads_as_none() {
-        let headers = HashMap::from([(PROTOCOL_VERSION_HEADER.to_owned(), "v1".to_owned())]);
-        assert_eq!(read_protocol_version(&headers), None);
+        let mut envelope = request_envelope();
+        envelope.insert_protocol_header(PROTOCOL_VERSION_HEADER, "v1".to_owned());
+        assert_eq!(read_protocol_version(&envelope), None);
     }
 }

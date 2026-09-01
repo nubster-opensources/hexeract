@@ -522,13 +522,8 @@ impl<T: Transport> RequestClient<T> {
         };
         let mut envelope = BusEnvelope::with_reply_to(correlation_id, inbox, request)
             .map_err(RequestError::Encode)?;
-        envelope
-            .headers
-            .insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
-        envelope.headers.insert(
-            PROTOCOL_VERSION_HEADER.to_owned(),
-            PROTOCOL_VERSION.to_string(),
-        );
+        envelope.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
+        envelope.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
         let publication = self.inner.publication_lifecycle.admit()?;
         match tokio::time::timeout_at(
             deadline,
@@ -588,7 +583,7 @@ fn reply_inbox_reconnecting() -> crate::BusError {
 /// unsupported version makes every later check meaningless, so it comes
 /// first.
 fn decode_reply<R: Request>(reply: BusEnvelope) -> Result<R::Reply, RequestError> {
-    match read_protocol_version(&reply.headers) {
+    match read_protocol_version(&reply) {
         Some(PROTOCOL_VERSION) => {}
         Some(version) => {
             return Err(RequestError::Protocol(
@@ -602,7 +597,7 @@ fn decode_reply<R: Request>(reply: BusEnvelope) -> Result<R::Reply, RequestError
         }
     }
 
-    match reply.headers.get(REPLY_STATUS_HEADER).map(String::as_str) {
+    match reply.header(REPLY_STATUS_HEADER) {
         Some(REPLY_STATUS_OK) => {
             if reply.message_type != R::Reply::MESSAGE_TYPE {
                 return Err(RequestError::Protocol(
@@ -638,7 +633,6 @@ fn decode_reply<R: Request>(reply: BusEnvelope) -> Result<R::Reply, RequestError
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -816,8 +810,7 @@ mod tests {
     /// Read the request identity the client stamped on its published envelope.
     fn published_request_id(published: &BusEnvelope) -> RequestId {
         let raw = published
-            .headers
-            .get(REQUEST_ID_HEADER)
+            .header(REQUEST_ID_HEADER)
             .expect("client stamps a request id header on every request");
         RequestId::from(
             raw.parse::<Uuid>()
@@ -827,14 +820,9 @@ mod tests {
 
     fn ok_reply(request_id: RequestId, seq: u64) -> BusEnvelope {
         let mut env = BusEnvelope::new(Uuid::now_v7(), &Pong { seq }).unwrap();
-        env.headers
-            .insert(REPLY_STATUS_HEADER.to_owned(), REPLY_STATUS_OK.to_owned());
-        env.headers
-            .insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
-        env.headers.insert(
-            PROTOCOL_VERSION_HEADER.to_owned(),
-            PROTOCOL_VERSION.to_string(),
-        );
+        env.insert_protocol_header(REPLY_STATUS_HEADER, REPLY_STATUS_OK.to_owned());
+        env.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
+        env.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
         env
     }
 
@@ -1205,6 +1193,15 @@ mod tests {
         }
         let published = transport.last_published().expect("a request was published");
         assert_eq!(published.reply_to.as_deref(), Some("reply.inbox"));
+        assert!(
+            published
+                .headers
+                .keys()
+                .all(|key| !crate::rpc_protocol::is_reserved_header(key)),
+            "request protocol fields must stay out of application headers"
+        );
+        assert!(published.header(REQUEST_ID_HEADER).is_some());
+        assert_eq!(published.header(PROTOCOL_VERSION_HEADER), Some("1"));
         registry.resolve(ok_reply(published_request_id(&published), 3));
         let pong = request_fut.await.expect("reply");
         assert_eq!(pong, Pong { seq: 3 });
@@ -1276,25 +1273,34 @@ mod tests {
             error_type: RemoteErrorType::Internal,
             request_id: *request_id.as_uuid(),
         };
-        let err_env = BusEnvelope::restore(
+        let mut err_env = BusEnvelope::restore(
             Uuid::now_v7(),
             REPLY_ERROR_MESSAGE_TYPE.to_owned(),
             serde_json::to_vec(&payload).unwrap(),
             published.correlation_id,
             None,
-            HashMap::from([
-                (
-                    REPLY_STATUS_HEADER.to_owned(),
-                    REPLY_STATUS_ERROR.to_owned(),
-                ),
-                (REQUEST_ID_HEADER.to_owned(), request_id.to_string()),
-                (
-                    PROTOCOL_VERSION_HEADER.to_owned(),
-                    PROTOCOL_VERSION.to_string(),
-                ),
-            ]),
+            Default::default(),
             std::time::SystemTime::UNIX_EPOCH,
         );
+        err_env.insert_protocol_header(REPLY_STATUS_HEADER, REPLY_STATUS_ERROR.to_owned());
+        err_env.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
+        err_env.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
+        assert!(
+            err_env
+                .headers
+                .keys()
+                .all(|key| !crate::rpc_protocol::is_reserved_header(key)),
+            "error reply protocol fields must stay out of application headers"
+        );
+        assert_eq!(
+            err_env.header(REPLY_STATUS_HEADER),
+            Some(REPLY_STATUS_ERROR)
+        );
+        assert_eq!(
+            err_env.header(REQUEST_ID_HEADER),
+            Some(request_id.to_string()).as_deref()
+        );
+        assert_eq!(err_env.header(PROTOCOL_VERSION_HEADER), Some("1"));
         registry.resolve(err_env);
         let err = request_fut.await.expect_err("remote error");
         assert!(matches!(
@@ -1309,7 +1315,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_reply_without_a_status_header_never_reaches_the_caller() {
         let (error, counters) = client_error_for_reply(|_request_id, reply| {
-            reply.headers.remove(REPLY_STATUS_HEADER);
+            reply.remove_protocol_header(REPLY_STATUS_HEADER);
         })
         .await;
         assert!(matches!(error, RequestError::Timeout(_)));
@@ -1319,9 +1325,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_reply_announcing_an_unknown_version_never_reaches_the_caller() {
         let (error, counters) = client_error_for_reply(|_request_id, reply| {
-            reply
-                .headers
-                .insert(PROTOCOL_VERSION_HEADER.to_owned(), "99".to_owned());
+            reply.insert_protocol_header(PROTOCOL_VERSION_HEADER, "99".to_owned());
         })
         .await;
         assert!(matches!(error, RequestError::Timeout(_)));
@@ -1349,7 +1353,7 @@ mod tests {
     #[test]
     fn decode_reply_defense_in_depth_rejects_a_missing_or_unsupported_protocol_version() {
         let mut missing_version = ok_reply(RequestId::new(), 1);
-        missing_version.headers.remove(PROTOCOL_VERSION_HEADER);
+        missing_version.remove_protocol_header(PROTOCOL_VERSION_HEADER);
         let error =
             decode_reply::<Ping>(missing_version).expect_err("missing protocol version header");
         assert!(matches!(
@@ -1360,9 +1364,7 @@ mod tests {
         ));
 
         let mut unsupported_version = ok_reply(RequestId::new(), 1);
-        unsupported_version
-            .headers
-            .insert(PROTOCOL_VERSION_HEADER.to_owned(), "99".to_owned());
+        unsupported_version.insert_protocol_header(PROTOCOL_VERSION_HEADER, "99".to_owned());
         let error =
             decode_reply::<Ping>(unsupported_version).expect_err("unsupported protocol version");
         assert!(matches!(
@@ -1374,7 +1376,7 @@ mod tests {
     #[test]
     fn decode_reply_defense_in_depth_rejects_a_missing_or_unrecognized_reply_status() {
         let mut missing_status = ok_reply(RequestId::new(), 1);
-        missing_status.headers.remove(REPLY_STATUS_HEADER);
+        missing_status.remove_protocol_header(REPLY_STATUS_HEADER);
         let error = decode_reply::<Ping>(missing_status).expect_err("missing reply status header");
         assert!(matches!(
             error,
@@ -1384,9 +1386,7 @@ mod tests {
         ));
 
         let mut unrecognized_status = ok_reply(RequestId::new(), 1);
-        unrecognized_status
-            .headers
-            .insert(REPLY_STATUS_HEADER.to_owned(), "pending".to_owned());
+        unrecognized_status.insert_protocol_header(REPLY_STATUS_HEADER, "pending".to_owned());
         let error =
             decode_reply::<Ping>(unrecognized_status).expect_err("unrecognized reply status");
         assert!(matches!(
@@ -1419,25 +1419,19 @@ mod tests {
             error_type: RemoteErrorType::Internal,
             request_id: *request_id.as_uuid(),
         };
-        BusEnvelope::restore(
+        let mut envelope = BusEnvelope::restore(
             Uuid::now_v7(),
             REPLY_ERROR_MESSAGE_TYPE.to_owned(),
             serde_json::to_vec(&payload).expect("payload must serialize"),
             Uuid::now_v7(),
             None,
-            HashMap::from([
-                (
-                    REPLY_STATUS_HEADER.to_owned(),
-                    REPLY_STATUS_ERROR.to_owned(),
-                ),
-                (REQUEST_ID_HEADER.to_owned(), request_id.to_string()),
-                (
-                    PROTOCOL_VERSION_HEADER.to_owned(),
-                    PROTOCOL_VERSION.to_string(),
-                ),
-            ]),
+            Default::default(),
             std::time::SystemTime::UNIX_EPOCH,
-        )
+        );
+        envelope.insert_protocol_header(REPLY_STATUS_HEADER, REPLY_STATUS_ERROR.to_owned());
+        envelope.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
+        envelope.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
+        envelope
     }
 
     #[test]
@@ -1493,26 +1487,22 @@ mod tests {
         let cases: Vec<(&str, BusEnvelope)> = vec![
             ("missing protocol version", {
                 let mut envelope = ok_reply(request_id, 1);
-                envelope.headers.remove(PROTOCOL_VERSION_HEADER);
+                envelope.remove_protocol_header(PROTOCOL_VERSION_HEADER);
                 envelope
             }),
             ("unsupported protocol version", {
                 let mut envelope = ok_reply(request_id, 1);
-                envelope
-                    .headers
-                    .insert(PROTOCOL_VERSION_HEADER.to_owned(), "99".to_owned());
+                envelope.insert_protocol_header(PROTOCOL_VERSION_HEADER, "99".to_owned());
                 envelope
             }),
             ("missing reply status", {
                 let mut envelope = ok_reply(request_id, 1);
-                envelope.headers.remove(REPLY_STATUS_HEADER);
+                envelope.remove_protocol_header(REPLY_STATUS_HEADER);
                 envelope
             }),
             ("unknown reply status", {
                 let mut envelope = ok_reply(request_id, 1);
-                envelope
-                    .headers
-                    .insert(REPLY_STATUS_HEADER.to_owned(), "pending".to_owned());
+                envelope.insert_protocol_header(REPLY_STATUS_HEADER, "pending".to_owned());
                 envelope
             }),
             ("unexpected message type on an ok status", {
@@ -1554,10 +1544,7 @@ mod tests {
                 request_id: *id.as_uuid(),
             })
             .expect("payload must serialize");
-            reply.headers.insert(
-                REPLY_STATUS_HEADER.to_owned(),
-                REPLY_STATUS_ERROR.to_owned(),
-            );
+            reply.insert_protocol_header(REPLY_STATUS_HEADER, REPLY_STATUS_ERROR.to_owned());
         })
         .await;
 
@@ -1855,22 +1842,19 @@ mod tests {
     /// protocol version and status, but a message type the caller never
     /// asked for.
     fn forged_reply(message_type: &str, request_id: RequestId) -> BusEnvelope {
-        let mut headers = HashMap::new();
-        headers.insert(
-            PROTOCOL_VERSION_HEADER.to_owned(),
-            PROTOCOL_VERSION.to_string(),
-        );
-        headers.insert(REPLY_STATUS_HEADER.to_owned(), REPLY_STATUS_OK.to_owned());
-        headers.insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
-        BusEnvelope::restore(
+        let mut envelope = BusEnvelope::restore(
             Uuid::now_v7(),
             message_type.to_owned(),
             Vec::new(),
             Uuid::now_v7(),
             None,
-            headers,
+            Default::default(),
             std::time::SystemTime::now(),
-        )
+        );
+        envelope.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
+        envelope.insert_protocol_header(REPLY_STATUS_HEADER, REPLY_STATUS_OK.to_owned());
+        envelope.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
+        envelope
     }
 
     /// The legitimate reply to a `Ping`, tagged with `request_id`.
@@ -1954,24 +1938,16 @@ mod tests {
             .expect("request must have published by now");
         let request_id = RequestId::from(
             published
-                .headers
-                .get(REQUEST_ID_HEADER)
+                .header(REQUEST_ID_HEADER)
                 .expect("request id header")
                 .parse::<Uuid>()
                 .expect("request id must parse"),
         );
         let mut reply = BusEnvelope::new(published.correlation_id, &Pong { seq: 1 })
             .expect("pong must serialize");
-        reply
-            .headers
-            .insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
-        reply.headers.insert(
-            PROTOCOL_VERSION_HEADER.to_owned(),
-            PROTOCOL_VERSION.to_string(),
-        );
-        reply
-            .headers
-            .insert(REPLY_STATUS_HEADER.to_owned(), REPLY_STATUS_OK.to_owned());
+        reply.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
+        reply.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
+        reply.insert_protocol_header(REPLY_STATUS_HEADER, REPLY_STATUS_OK.to_owned());
         mutate(request_id, &mut reply);
         registry.resolve(reply);
 

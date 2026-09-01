@@ -32,7 +32,10 @@ impl RemoteErrorType {
     #[must_use]
     pub fn from_bus_error(error: &BusError) -> Self {
         match error {
-            BusError::Serialization(_)
+            BusError::ReservedHeaderNamespace
+            | BusError::MetadataLimitExceeded { .. }
+            | BusError::InvalidMetadata { .. }
+            | BusError::Serialization(_)
             | BusError::TypeMismatch { .. }
             | BusError::PayloadTooLarge { .. } => Self::Malformed,
             BusError::Connection { .. } | BusError::Transport(_) | BusError::Unroutable { .. } => {
@@ -95,6 +98,28 @@ mod tests {
             RemoteErrorType::from_bus_error(&error),
             RemoteErrorType::Malformed
         );
+    }
+
+    #[test]
+    fn metadata_failures_map_to_malformed() {
+        let errors = [
+            BusError::ReservedHeaderNamespace,
+            BusError::MetadataLimitExceeded {
+                limit: crate::MetadataLimit::HeaderCount,
+                actual: 2,
+                max: 1,
+            },
+            BusError::InvalidMetadata {
+                reason: crate::InvalidMetadataReason::NonCanonicalReservedHeader,
+            },
+        ];
+
+        for error in &errors {
+            assert_eq!(
+                RemoteErrorType::from_bus_error(error),
+                RemoteErrorType::Malformed
+            );
+        }
     }
 
     #[test]

@@ -193,7 +193,7 @@ impl RequestRegistry {
     /// legitimate reply can still arrive and win. This is what makes the
     /// first valid reply win rather than the first delivery.
     pub fn resolve(&self, envelope: BusEnvelope) {
-        let Some(raw) = envelope.headers.get(REQUEST_ID_HEADER) else {
+        let Some(raw) = envelope.header(REQUEST_ID_HEADER) else {
             self.counters.orphaned.fetch_add(1, Ordering::Relaxed);
             tracing::debug!("reply without a request id header, dropping");
             return;
@@ -363,15 +363,13 @@ mod tests {
     fn reply_for(request_id: RequestId, correlation_id: Uuid, seq: u64) -> BusEnvelope {
         let mut envelope =
             BusEnvelope::new(correlation_id, &Pong { seq }).expect("pong must serialize");
-        envelope
-            .headers
-            .insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
-        envelope.headers.insert(
-            crate::rpc_protocol::PROTOCOL_VERSION_HEADER.to_owned(),
+        envelope.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
+        envelope.insert_protocol_header(
+            crate::rpc_protocol::PROTOCOL_VERSION_HEADER,
             crate::rpc_protocol::PROTOCOL_VERSION.to_string(),
         );
-        envelope.headers.insert(
-            crate::rpc_protocol::REPLY_STATUS_HEADER.to_owned(),
+        envelope.insert_protocol_header(
+            crate::rpc_protocol::REPLY_STATUS_HEADER,
             crate::rpc_protocol::REPLY_STATUS_OK.to_owned(),
         );
         envelope
@@ -382,30 +380,28 @@ mod tests {
     }
 
     fn ok_reply(message_type: &str) -> BusEnvelope {
-        let mut headers = std::collections::HashMap::new();
-        headers.insert(
-            crate::rpc_protocol::PROTOCOL_VERSION_HEADER.to_owned(),
-            crate::rpc_protocol::PROTOCOL_VERSION.to_string(),
-        );
-        headers.insert(
-            crate::rpc_protocol::REPLY_STATUS_HEADER.to_owned(),
-            crate::rpc_protocol::REPLY_STATUS_OK.to_owned(),
-        );
-        BusEnvelope::restore(
+        let mut envelope = BusEnvelope::restore(
             Uuid::now_v7(),
             message_type.to_owned(),
             Vec::new(),
             Uuid::now_v7(),
             None,
-            headers,
+            Default::default(),
             std::time::SystemTime::now(),
-        )
+        );
+        envelope.insert_protocol_header(
+            crate::rpc_protocol::PROTOCOL_VERSION_HEADER,
+            crate::rpc_protocol::PROTOCOL_VERSION.to_string(),
+        );
+        envelope.insert_protocol_header(
+            crate::rpc_protocol::REPLY_STATUS_HEADER,
+            crate::rpc_protocol::REPLY_STATUS_OK.to_owned(),
+        );
+        envelope
     }
 
     fn tagged(mut envelope: BusEnvelope, request_id: RequestId) -> BusEnvelope {
-        envelope
-            .headers
-            .insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
+        envelope.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
         envelope
     }
 
@@ -478,12 +474,32 @@ mod tests {
             .expect("registration succeeds");
         let mut envelope =
             BusEnvelope::new(Uuid::now_v7(), &Pong { seq: 7 }).expect("pong must serialize");
-        envelope
-            .headers
-            .insert(REQUEST_ID_HEADER.to_owned(), "not-a-uuid".to_owned());
+        envelope.insert_protocol_header(REQUEST_ID_HEADER, "not-a-uuid".to_owned());
         registry.resolve(envelope);
         assert_eq!(registry.len(), 1, "the slot must stay in flight");
         assert_eq!(registry.counters().orphaned, 1);
+    }
+
+    #[test]
+    fn an_application_reserved_header_cannot_change_request_resolution() {
+        let registry = Arc::new(RequestRegistry::default());
+        let request_id = RequestId::new();
+        let _pending = registry
+            .register(request_id, expectation())
+            .expect("registration succeeds");
+        let mut envelope = ok_reply(EXPECTED_REPLY);
+        envelope.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
+        envelope.headers.insert(
+            "X-Hexeract-Request-Id".to_owned(),
+            RequestId::new().to_string(),
+        );
+
+        registry.resolve(envelope);
+
+        assert!(
+            registry.is_empty(),
+            "the private request identity must win over a public-map forgery"
+        );
     }
 
     #[tokio::test]

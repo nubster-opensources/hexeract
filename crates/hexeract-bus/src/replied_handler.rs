@@ -110,7 +110,7 @@ enum RequestIdHeader {
 
 /// Parse the inbound `x-hexeract-request-id` header into a [`RequestIdHeader`].
 fn parse_request_id(envelope: &BusEnvelope) -> RequestIdHeader {
-    match envelope.headers.get(REQUEST_ID_HEADER) {
+    match envelope.header(REQUEST_ID_HEADER) {
         None => RequestIdHeader::Missing,
         Some(raw) => raw
             .parse::<uuid::Uuid>()
@@ -202,7 +202,7 @@ where
                 }
             };
 
-            let protocol_version = match read_protocol_version(&envelope.headers) {
+            let protocol_version = match read_protocol_version(envelope) {
                 Some(version) if version == PROTOCOL_VERSION => version,
                 _ => {
                     self.counters.count_unsupported_protocol_version();
@@ -236,12 +236,10 @@ where
             let reply_envelope = match self.handler.handle(request, &request_context).await {
                 Ok(reply) => match BusEnvelope::new(correlation_id, &reply) {
                     Ok(mut env) => {
-                        env.headers
-                            .insert(REPLY_STATUS_HEADER.to_owned(), REPLY_STATUS_OK.to_owned());
-                        env.headers
-                            .insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
-                        env.headers.insert(
-                            PROTOCOL_VERSION_HEADER.to_owned(),
+                        env.insert_protocol_header(REPLY_STATUS_HEADER, REPLY_STATUS_OK.to_owned());
+                        env.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
+                        env.insert_protocol_header(
+                            PROTOCOL_VERSION_HEADER,
                             PROTOCOL_VERSION.to_string(),
                         );
                         env
@@ -299,26 +297,19 @@ fn error_reply(
         error_type: category,
         request_id: *request_id.as_uuid(),
     };
-    let headers = std::collections::HashMap::from([
-        (
-            REPLY_STATUS_HEADER.to_owned(),
-            REPLY_STATUS_ERROR.to_owned(),
-        ),
-        (
-            PROTOCOL_VERSION_HEADER.to_owned(),
-            PROTOCOL_VERSION.to_string(),
-        ),
-        (REQUEST_ID_HEADER.to_owned(), request_id.to_string()),
-    ]);
-    Ok(BusEnvelope::restore(
+    let mut envelope = BusEnvelope::restore(
         uuid::Uuid::now_v7(),
         REPLY_ERROR_MESSAGE_TYPE.to_owned(),
         serde_json::to_vec(&payload)?,
         correlation_id,
         None,
-        headers,
+        Default::default(),
         std::time::SystemTime::now(),
-    ))
+    );
+    envelope.insert_protocol_header(REPLY_STATUS_HEADER, REPLY_STATUS_ERROR.to_owned());
+    envelope.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
+    envelope.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
+    Ok(envelope)
 }
 
 #[cfg(test)]
@@ -412,12 +403,8 @@ mod tests {
     fn request_envelope(reply_to: Option<&str>) -> BusEnvelope {
         let mut env = BusEnvelope::new(Uuid::now_v7(), &Ping { seq: 8 }).unwrap();
         env.reply_to = reply_to.map(str::to_owned);
-        env.headers
-            .insert(REQUEST_ID_HEADER.to_owned(), RequestId::new().to_string());
-        env.headers.insert(
-            PROTOCOL_VERSION_HEADER.to_owned(),
-            PROTOCOL_VERSION.to_string(),
-        );
+        env.insert_protocol_header(REQUEST_ID_HEADER, RequestId::new().to_string());
+        env.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
         env
     }
     fn ctx() -> HandlerContext {
@@ -436,19 +423,14 @@ mod tests {
         let (rk, env) = &recorded[0];
         assert_eq!(rk, "amq.gen-inbox");
         assert_eq!(env.correlation_id, request.correlation_id);
+        assert_eq!(env.header("x-hexeract-reply-status"), Some("ok"));
         assert_eq!(
-            env.headers
-                .get("x-hexeract-reply-status")
-                .map(String::as_str),
-            Some("ok")
-        );
-        assert_eq!(
-            env.headers.get(REQUEST_ID_HEADER).map(String::as_str),
-            request.headers.get(REQUEST_ID_HEADER).map(String::as_str),
+            env.header(REQUEST_ID_HEADER),
+            request.header(REQUEST_ID_HEADER),
             "reply must carry the exact inbound request id"
         );
         assert_eq!(
-            env.headers.get(PROTOCOL_VERSION_HEADER).map(String::as_str),
+            env.header(PROTOCOL_VERSION_HEADER),
             Some(PROTOCOL_VERSION.to_string()).as_deref()
         );
         let pong: Pong = env.decode().unwrap();
@@ -464,20 +446,15 @@ mod tests {
 
         let recorded = publisher.published.lock().unwrap();
         let (_, env) = &recorded[0];
-        assert_eq!(
-            env.headers
-                .get("x-hexeract-reply-status")
-                .map(String::as_str),
-            Some("error")
-        );
+        assert_eq!(env.header("x-hexeract-reply-status"), Some("error"));
         assert_eq!(env.message_type, REPLY_ERROR_MESSAGE_TYPE);
         assert_eq!(
-            env.headers.get(REQUEST_ID_HEADER).map(String::as_str),
-            request.headers.get(REQUEST_ID_HEADER).map(String::as_str),
+            env.header(REQUEST_ID_HEADER),
+            request.header(REQUEST_ID_HEADER),
             "an error reply must still carry the exact inbound request id"
         );
         assert_eq!(
-            env.headers.get(PROTOCOL_VERSION_HEADER).map(String::as_str),
+            env.header(PROTOCOL_VERSION_HEADER),
             Some(PROTOCOL_VERSION.to_string()).as_deref()
         );
         let payload: RemoteErrorPayload = serde_json::from_slice(&env.payload).unwrap();
@@ -517,13 +494,8 @@ mod tests {
             &Ping { seq: 1 },
         )
         .expect("ping must serialize");
-        request
-            .headers
-            .insert(REQUEST_ID_HEADER.to_owned(), RequestId::new().to_string());
-        request.headers.insert(
-            PROTOCOL_VERSION_HEADER.to_owned(),
-            PROTOCOL_VERSION.to_string(),
-        );
+        request.insert_protocol_header(REQUEST_ID_HEADER, RequestId::new().to_string());
+        request.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
 
         let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
         handler
@@ -585,12 +557,8 @@ mod tests {
             &Ping { seq: 1 },
         )
         .expect("ping must serialize");
-        request
-            .headers
-            .insert(REQUEST_ID_HEADER.to_owned(), RequestId::new().to_string());
-        request
-            .headers
-            .insert(PROTOCOL_VERSION_HEADER.to_owned(), "99".to_owned());
+        request.insert_protocol_header(REQUEST_ID_HEADER, RequestId::new().to_string());
+        request.insert_protocol_header(PROTOCOL_VERSION_HEADER, "99".to_owned());
 
         let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
         handler
@@ -624,9 +592,7 @@ mod tests {
         );
         let mut request =
             BusEnvelope::new(Uuid::now_v7(), &Ping { seq: 1 }).expect("ping must serialize");
-        request
-            .headers
-            .insert(PROTOCOL_VERSION_HEADER.to_owned(), "99".to_owned());
+        request.insert_protocol_header(PROTOCOL_VERSION_HEADER, "99".to_owned());
         // Deliberately no reply_to.
 
         let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
@@ -662,13 +628,8 @@ mod tests {
         )
         .expect("ping must serialize");
         request.payload = b"{ not json".to_vec();
-        request
-            .headers
-            .insert(REQUEST_ID_HEADER.to_owned(), RequestId::new().to_string());
-        request.headers.insert(
-            PROTOCOL_VERSION_HEADER.to_owned(),
-            PROTOCOL_VERSION.to_string(),
-        );
+        request.insert_protocol_header(REQUEST_ID_HEADER, RequestId::new().to_string());
+        request.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
 
         let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
         handler
@@ -748,13 +709,8 @@ mod tests {
             &WeirdPing { seq: 1 },
         )
         .expect("weird ping must serialize");
-        request
-            .headers
-            .insert(REQUEST_ID_HEADER.to_owned(), RequestId::new().to_string());
-        request.headers.insert(
-            PROTOCOL_VERSION_HEADER.to_owned(),
-            PROTOCOL_VERSION.to_string(),
-        );
+        request.insert_protocol_header(REQUEST_ID_HEADER, RequestId::new().to_string());
+        request.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
 
         let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
         handler
@@ -803,13 +759,8 @@ mod tests {
             &Ping { seq: 1 },
         )
         .expect("ping must serialize");
-        request
-            .headers
-            .insert(REQUEST_ID_HEADER.to_owned(), "not-a-uuid".to_owned());
-        request.headers.insert(
-            PROTOCOL_VERSION_HEADER.to_owned(),
-            PROTOCOL_VERSION.to_string(),
-        );
+        request.insert_protocol_header(REQUEST_ID_HEADER, "not-a-uuid".to_owned());
+        request.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
 
         let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
         handler
@@ -847,10 +798,7 @@ mod tests {
         )
         .expect("ping must serialize");
         // Deliberately no REQUEST_ID_HEADER.
-        request.headers.insert(
-            PROTOCOL_VERSION_HEADER.to_owned(),
-            PROTOCOL_VERSION.to_string(),
-        );
+        request.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
 
         let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
         handler
@@ -891,9 +839,7 @@ mod tests {
             &Ping { seq: 1 },
         )
         .expect("ping must serialize");
-        request
-            .headers
-            .insert(PROTOCOL_VERSION_HEADER.to_owned(), "99".to_owned());
+        request.insert_protocol_header(PROTOCOL_VERSION_HEADER, "99".to_owned());
         // Deliberately no REQUEST_ID_HEADER, combined with an unsupported version.
 
         let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
@@ -936,8 +882,7 @@ mod tests {
     /// observes.
     fn request_envelope_with_id(reply_to: Option<&str>, request_id: RequestId) -> BusEnvelope {
         let mut env = request_envelope(reply_to);
-        env.headers
-            .insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
+        env.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
         env
     }
 
@@ -1097,9 +1042,7 @@ mod tests {
             Arc::clone(&publisher),
         );
         let mut request = request_envelope(Some("orders.inbox"));
-        request
-            .headers
-            .insert(PROTOCOL_VERSION_HEADER.to_owned(), "99".to_owned());
+        request.insert_protocol_header(PROTOCOL_VERSION_HEADER, "99".to_owned());
         handler
             .handle(&request, &ctx())
             .await
@@ -1127,22 +1070,18 @@ mod tests {
         handler.handle(&rejected_reply_to, &ctx()).await.unwrap();
 
         let mut missing_request_id = request_envelope(Some("amq.gen-inbox"));
-        missing_request_id.headers.remove(REQUEST_ID_HEADER);
+        missing_request_id.remove_protocol_header(REQUEST_ID_HEADER);
         handler.handle(&missing_request_id, &ctx()).await.unwrap();
 
         let mut unreadable_request_id = request_envelope(Some("amq.gen-inbox"));
-        unreadable_request_id
-            .headers
-            .insert(REQUEST_ID_HEADER.to_owned(), "not-a-uuid".to_owned());
+        unreadable_request_id.insert_protocol_header(REQUEST_ID_HEADER, "not-a-uuid".to_owned());
         handler
             .handle(&unreadable_request_id, &ctx())
             .await
             .unwrap();
 
         let mut unsupported_version = request_envelope(Some("amq.gen-inbox"));
-        unsupported_version
-            .headers
-            .insert(PROTOCOL_VERSION_HEADER.to_owned(), "99".to_owned());
+        unsupported_version.insert_protocol_header(PROTOCOL_VERSION_HEADER, "99".to_owned());
         handler.handle(&unsupported_version, &ctx()).await.unwrap();
 
         let expected = ResponderCountersSnapshot {
