@@ -42,7 +42,8 @@ use tokio_util::sync::CancellationToken;
 use crate::connection::{
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BASE_DELAY, RabbitMqConnection, RabbitMqConnectionConfig,
 };
-use crate::reply_inbox::{declare_reply_inbox, run_reply_inbox};
+use crate::metadata::AmqpMetadataLimits;
+use crate::reply_inbox::{declare_reply_inbox, run_reply_inbox_with_limits};
 use crate::transport::RabbitMqTransport;
 
 /// Maximum time spent closing a connection from a failed reply-inbox setup.
@@ -78,6 +79,13 @@ pub struct RabbitMqRequestClientConfig {
     pub max_in_flight: usize,
     /// TLS settings used by the publisher and supervised reply-inbox sessions.
     pub connection_config: RabbitMqConnectionConfig,
+    /// Bounds applied to AMQP metadata on both legs of a request-reply call.
+    ///
+    /// One value governs the publisher transport and the supervised reply
+    /// inbox, including every inbox rebuilt after a reconnect. A reply inbox
+    /// running on weaker limits than the requests it answers would be the
+    /// bypass: it is the path that feeds an RPC correlation slot.
+    pub metadata_limits: AmqpMetadataLimits,
 }
 
 impl Default for RabbitMqRequestClientConfig {
@@ -85,6 +93,7 @@ impl Default for RabbitMqRequestClientConfig {
         Self {
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             connection_config: RabbitMqConnectionConfig::default(),
+            metadata_limits: AmqpMetadataLimits::default(),
         }
     }
 }
@@ -123,6 +132,17 @@ impl RabbitMqRequestClientConfigBuilder {
     #[must_use]
     pub fn connection_config(mut self, connection_config: RabbitMqConnectionConfig) -> Self {
         self.config.connection_config = connection_config;
+        self
+    }
+
+    /// Bound the AMQP metadata of both legs of a request-reply call.
+    ///
+    /// The same value reaches the publisher transport and every reply inbox
+    /// the supervisor runs, including those rebuilt after a reconnect. See
+    /// [`RabbitMqRequestClientConfig::metadata_limits`].
+    #[must_use]
+    pub fn metadata_limits(mut self, metadata_limits: AmqpMetadataLimits) -> Self {
+        self.config.metadata_limits = metadata_limits;
         self
     }
 
@@ -186,8 +206,11 @@ pub async fn connect_request_client_with_config(
     cancel: CancellationToken,
     config: RabbitMqRequestClientConfig,
 ) -> Result<RequestClient<RabbitMqTransport>, BusError> {
-    let transport =
-        Arc::new(RabbitMqTransport::new_with_config(uri, &config.connection_config).await?);
+    let transport = Arc::new(
+        RabbitMqTransport::new_with_config(uri, &config.connection_config)
+            .await?
+            .with_metadata_limits(config.metadata_limits),
+    );
     let registry = Arc::new(RequestRegistry::new(config.max_in_flight));
 
     // Supervised connection for the inbox consumer: NOT the recovering
@@ -218,12 +241,12 @@ pub async fn connect_request_client_with_config(
 
     let supervisor = spawn_reply_inbox_supervisor(
         uri,
-        channel,
-        inbox_name,
+        (channel, inbox_name),
         Arc::clone(&registry),
         Arc::clone(&reply_inbox),
         cancel,
         config.connection_config,
+        config.metadata_limits,
     );
 
     Ok(RequestClient::new(
@@ -246,14 +269,18 @@ pub async fn connect_request_client_with_config(
 /// task: [`connect_request_client`] hands that handle to the
 /// [`RequestClient`] it assembles, so `RequestClient::close` can await
 /// this task's actual termination instead of merely cancelling it.
+///
+/// `active_inbox` pairs the consuming channel with the exclusive inbox it
+/// declared, the same `ActiveInbox` value [`supervise_reply_inbox`] replaces
+/// wholesale on every reconnect.
 fn spawn_reply_inbox_supervisor(
     uri: &str,
-    channel: Channel,
-    inbox: String,
+    active_inbox: (Channel, String),
     registry: Arc<RequestRegistry>,
     reply_inbox: Arc<Mutex<ReplyInboxState>>,
     cancel: CancellationToken,
     connection_config: RabbitMqConnectionConfig,
+    metadata_limits: AmqpMetadataLimits,
 ) -> RequestClientSupervisor {
     let reconnect_uri = uri.to_owned();
     let reconnect_state = Arc::clone(&reply_inbox);
@@ -261,12 +288,22 @@ fn spawn_reply_inbox_supervisor(
 
     RequestClientSupervisor::spawn(cancel, move |cancel| async move {
         supervise_reply_inbox(
-            (channel, inbox),
+            active_inbox,
             registry,
             reply_inbox,
             cancel,
+            // `metadata_limits` is captured once and reused by every run the
+            // supervisor drives, so an inbox rebuilt after a reconnect keeps
+            // the configured bound instead of silently falling back to the
+            // defaults.
             move |(channel, inbox), cancel| {
-                run_reply_inbox(channel, inbox, Arc::clone(&run_registry), cancel)
+                run_reply_inbox_with_limits(
+                    channel,
+                    inbox,
+                    Arc::clone(&run_registry),
+                    cancel,
+                    metadata_limits,
+                )
             },
             move |cancel| {
                 let reconnect_uri = reconnect_uri.clone();
@@ -618,6 +655,76 @@ mod tests {
             .build();
 
         assert!(config.connection_config.has_custom_tls_config());
+    }
+
+    #[test]
+    fn an_untouched_builder_yields_the_default_metadata_limits() {
+        assert_eq!(
+            RabbitMqRequestClientConfigBuilder::new()
+                .build()
+                .metadata_limits,
+            AmqpMetadataLimits::default()
+        );
+    }
+
+    #[test]
+    fn the_builder_carries_custom_metadata_limits_into_the_config() {
+        let limits = AmqpMetadataLimits {
+            max_headers: 2,
+            ..AmqpMetadataLimits::default()
+        };
+        assert_eq!(
+            RabbitMqRequestClientConfigBuilder::new()
+                .metadata_limits(limits)
+                .build()
+                .metadata_limits,
+            limits
+        );
+    }
+
+    /// The supervisor rebuilds the inbox on reconnect, so the configured
+    /// limits must survive that rebuild. A run closure that captured its
+    /// bound once, the way production does, must hand the same value to every
+    /// run: falling back to the defaults on the second one would leave the
+    /// reply path quietly more permissive than the caller asked for.
+    #[tokio::test]
+    async fn every_run_after_a_reconnect_keeps_the_configured_metadata_limits() {
+        let configured = AmqpMetadataLimits {
+            max_headers: 3,
+            ..AmqpMetadataLimits::default()
+        };
+        let observed: Arc<Mutex<Vec<AmqpMetadataLimits>>> = Arc::new(Mutex::new(Vec::new()));
+        let cancel = CancellationToken::new();
+        let mut reconnects_left = 1;
+
+        supervise_reply_inbox(
+            (),
+            Arc::new(RequestRegistry::default()),
+            Arc::new(Mutex::new(ReplyInboxState::Ready("inbox-1".to_owned()))),
+            cancel,
+            {
+                let observed = Arc::clone(&observed);
+                move |(), _| {
+                    observed
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(configured);
+                    async { Err(BusError::connection(io::Error::other("lost"), true)) }
+                }
+            },
+            move |_| {
+                let another_inbox = reconnects_left > 0;
+                reconnects_left -= 1;
+                async move { another_inbox.then_some(()) }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            *observed.lock().unwrap_or_else(PoisonError::into_inner),
+            vec![configured, configured],
+            "the run before and the run after the reconnect must share one bound"
+        );
     }
 
     #[test]

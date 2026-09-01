@@ -41,6 +41,7 @@ use hexeract_bus::RequestOptions;
 use hexeract_bus::RequestRegistry;
 use hexeract_bus::ResponderCounters;
 use hexeract_bus::Transport;
+use hexeract_bus_rabbitmq::AmqpMetadataLimits;
 use hexeract_bus_rabbitmq::RabbitMqConnection;
 use hexeract_bus_rabbitmq::RabbitMqRequestClientConfigBuilder;
 use hexeract_bus_rabbitmq::RabbitMqTransport;
@@ -369,6 +370,130 @@ async fn a_round_trip_carries_the_protocol_headers_over_the_wire() {
     assert!(
         request.properties.reply_to().is_some(),
         "the request must carry a reply_to on the wire"
+    );
+
+    cancel.cancel();
+}
+
+/// A reply whose metadata exceeds the client's limits must be dropped by the
+/// inbox before it can resolve the pending slot it names.
+///
+/// The forged reply carries the correct request id, so without the bound it
+/// would resolve the call. Only a broker can prove the drop happens on the
+/// real consumer path rather than in a decoder called directly.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn oversized_reply_metadata_does_not_consume_slot() {
+    let broker = harness::start_rabbitmq().await;
+    let cancel = CancellationToken::new();
+
+    declare_ping_queue(broker.uri(), "tests.ping.metadata").await;
+
+    // 64 bytes leaves ample room for the protocol fields (a request id is a
+    // 36-byte UUID) while rejecting the 65-byte header forged below.
+    let config = RabbitMqRequestClientConfigBuilder::new()
+        .metadata_limits(AmqpMetadataLimits {
+            max_value_bytes: 64,
+            ..AmqpMetadataLimits::default()
+        })
+        .build();
+    let client = connect_request_client_with_config(
+        broker.uri(),
+        Duration::from_secs(10),
+        cancel.clone(),
+        config,
+    )
+    .await
+    .unwrap();
+
+    // No responder consumes the queue: the request waits while we forge the
+    // reply ourselves.
+    let caller = tokio::spawn({
+        let client = Arc::new(client);
+        let call_client = Arc::clone(&client);
+        async move {
+            call_client
+                .request_with(
+                    Ping { seq: 1 },
+                    RequestOptions::new().with_timeout(Duration::from_secs(3)),
+                )
+                .await
+        }
+    });
+
+    let inspect_connection = RabbitMqConnection::connect(broker.uri()).await.unwrap();
+    let inspect_channel = inspect_connection.create_channel().await.unwrap();
+    let mut attempts = 0;
+    let request = loop {
+        if let Some(delivery) = inspect_channel
+            .basic_get("tests.ping.metadata".into(), BasicGetOptions::default())
+            .await
+            .unwrap()
+        {
+            break delivery;
+        }
+        attempts += 1;
+        assert!(attempts < 100, "no request reached the broker");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    let reply_to = request
+        .properties
+        .reply_to()
+        .as_ref()
+        .expect("the request must carry a reply_to")
+        .as_str()
+        .to_owned();
+    let request_headers = request
+        .properties
+        .headers()
+        .as_ref()
+        .expect("the request must carry headers")
+        .clone();
+    let request_id = match request_headers.inner().get(REQUEST_ID_HEADER) {
+        Some(AMQPValue::LongString(value)) => {
+            String::from_utf8(value.as_bytes().to_vec()).expect("the request id must be UTF-8")
+        }
+        other => panic!("expected a request id long string, got {other:?}"),
+    };
+
+    let mut forged = FieldTable::default();
+    forged.insert(
+        REQUEST_ID_HEADER.into(),
+        AMQPValue::LongString(request_id.as_bytes().into()),
+    );
+    forged.insert(
+        PROTOCOL_VERSION_HEADER.into(),
+        AMQPValue::LongString(PROTOCOL_VERSION.to_string().as_bytes().into()),
+    );
+    forged.insert(
+        REPLY_STATUS_HEADER.into(),
+        AMQPValue::LongString(REPLY_STATUS_OK.as_bytes().into()),
+    );
+    forged.insert(
+        "tenant".into(),
+        AMQPValue::LongString(vec![b'x'; 65].into()),
+    );
+
+    inspect_channel
+        .basic_publish(
+            ShortString::from(""),
+            ShortString::from(reply_to.as_str()),
+            BasicPublishOptions::default(),
+            serde_json::to_vec(&Pong { seq: 1 }).unwrap().as_slice(),
+            BasicProperties::default()
+                .with_type(Pong::MESSAGE_TYPE.into())
+                .with_headers(forged),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+
+    let outcome = caller.await.unwrap();
+    assert!(
+        matches!(outcome, Err(RequestError::Timeout { .. })),
+        "an oversized reply must be dropped before it resolves the slot, got {outcome:?}"
     );
 
     cancel.cancel();
