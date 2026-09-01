@@ -48,6 +48,8 @@ pub fn read_protocol_version(envelope: &crate::BusEnvelope) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::BusEnvelope;
     use uuid::Uuid;
@@ -59,7 +61,7 @@ mod tests {
             Vec::new(),
             Uuid::nil(),
             None,
-            Default::default(),
+            HashMap::default(),
             std::time::SystemTime::UNIX_EPOCH,
         )
     }

@@ -633,6 +633,7 @@ fn decode_reply<R: Request>(reply: BusEnvelope) -> Result<R::Reply, RequestError
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1279,7 +1280,7 @@ mod tests {
             serde_json::to_vec(&payload).unwrap(),
             published.correlation_id,
             None,
-            Default::default(),
+            HashMap::default(),
             std::time::SystemTime::UNIX_EPOCH,
         );
         err_env.insert_protocol_header(REPLY_STATUS_HEADER, REPLY_STATUS_ERROR.to_owned());
@@ -1425,7 +1426,7 @@ mod tests {
             serde_json::to_vec(&payload).expect("payload must serialize"),
             Uuid::now_v7(),
             None,
-            Default::default(),
+            HashMap::default(),
             std::time::SystemTime::UNIX_EPOCH,
         );
         envelope.insert_protocol_header(REPLY_STATUS_HEADER, REPLY_STATUS_ERROR.to_owned());
@@ -1848,7 +1849,7 @@ mod tests {
             Vec::new(),
             Uuid::now_v7(),
             None,
-            Default::default(),
+            HashMap::default(),
             std::time::SystemTime::now(),
         );
         envelope.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());

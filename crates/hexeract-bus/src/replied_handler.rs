@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -303,7 +304,7 @@ fn error_reply(
         serde_json::to_vec(&payload)?,
         correlation_id,
         None,
-        Default::default(),
+        HashMap::default(),
         std::time::SystemTime::now(),
     );
     envelope.insert_protocol_header(REPLY_STATUS_HEADER, REPLY_STATUS_ERROR.to_owned());

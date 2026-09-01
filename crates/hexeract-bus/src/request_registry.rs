@@ -386,7 +386,7 @@ mod tests {
             Vec::new(),
             Uuid::now_v7(),
             None,
-            Default::default(),
+            HashMap::default(),
             std::time::SystemTime::now(),
         );
         envelope.insert_protocol_header(

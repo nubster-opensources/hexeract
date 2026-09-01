@@ -90,6 +90,8 @@ pub fn accepts(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::rpc_protocol::{
         PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, REPLY_ERROR_MESSAGE_TYPE, REPLY_STATUS_ERROR,
@@ -109,7 +111,7 @@ mod tests {
             Vec::new(),
             uuid::Uuid::now_v7(),
             None,
-            Default::default(),
+            HashMap::default(),
             std::time::SystemTime::now(),
         );
         if let Some(version) = version {

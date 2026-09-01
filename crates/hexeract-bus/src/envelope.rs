@@ -208,6 +208,13 @@ impl BusEnvelope {
         self.protocol_headers.insert(key.to_owned(), value);
     }
 
+    /// Remove a framework protocol header.
+    ///
+    /// Only the crate's own tests need this: production code writes protocol
+    /// metadata once and never retracts it, so gating the helper on `test`
+    /// keeps it out of the shipped binary instead of silencing the dead-code
+    /// lint on a method that would otherwise look reachable.
+    #[cfg(test)]
     pub(crate) fn remove_protocol_header(&mut self, key: &'static str) -> Option<String> {
         self.protocol_headers.remove(key)
     }
