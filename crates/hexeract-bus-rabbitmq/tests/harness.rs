@@ -106,9 +106,17 @@ fn install_test_crypto_provider() {
 
 /// Start a broker that serves only AMQPS and requires mutual TLS.
 pub(crate) async fn start_tls_rabbitmq() -> RunningTlsBroker {
+    // `loopback_users = none` restores a default this file overwrites. The
+    // official image ships its own `rabbitmq.conf` so that `guest` can log in
+    // from outside the container; copying ours over it takes that away, and
+    // `guest` reverts to loopback-only. The connection then arrives from the
+    // Docker gateway, is refused with ACCESS_REFUSED, and the failure looks
+    // like a TLS problem while TLS in fact succeeded.
     const RABBITMQ_TLS_CONFIG: &str = r"
 listeners.tcp = none
 listeners.ssl.default = 5671
+
+loopback_users = none
 
 ssl_options.cacertfile = /etc/rabbitmq/tls/ca.pem
 ssl_options.certfile = /etc/rabbitmq/tls/server.pem
