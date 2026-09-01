@@ -84,6 +84,20 @@ fn invalid_metadata(reason: InvalidMetadataReason) -> BusError {
 /// Application headers and framework protocol headers read from one delivery.
 type DecodedMetadata = (HashMap<String, String>, HashMap<String, String>);
 
+/// Whether `error` reports rejected metadata rather than another failure.
+///
+/// The worker uses this to route a metadata violation through the sanitized
+/// quarantine path: a dead-letter copy that clones the rejected field table
+/// would carry the very metadata the worker just refused.
+pub(crate) fn is_metadata_error(error: &BusError) -> bool {
+    matches!(
+        error,
+        BusError::ReservedHeaderNamespace
+            | BusError::MetadataLimitExceeded { .. }
+            | BusError::InvalidMetadata { .. }
+    )
+}
+
 /// Validate and encode an outbound envelope's metadata as an AMQP field table.
 ///
 /// Every dimension is checked before a single key is converted, so a rejected

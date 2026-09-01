@@ -50,6 +50,7 @@ use uuid::Uuid;
 use crate::connection::RabbitMqConnection;
 use crate::metadata::AmqpMetadataLimits;
 use crate::metadata::decode_headers;
+use crate::metadata::is_metadata_error;
 use crate::reply_publisher::RabbitMqReplyPublisher;
 use crate::transport::RabbitMqTransport;
 use crate::transport::to_short_string;
@@ -326,6 +327,15 @@ pub struct RabbitMqWorkerConfig {
     /// under [`AckMode::Unacknowledged`]; the other modes already get
     /// broker-side flow control through `basic.qos`.
     pub max_buffered: Option<usize>,
+    /// Bounds applied to the AMQP metadata of an inbound delivery.
+    ///
+    /// Metadata crosses the same trust boundary as the payload, and
+    /// [`Self::max_payload_bytes`] does not bound it: a tiny payload can carry
+    /// a large field table. A delivery whose metadata exceeds these limits is
+    /// rejected before any header is copied and before any typed handler runs,
+    /// and follows the poison path with a quarantine copy whose field table is
+    /// rebuilt empty rather than cloned.
+    pub metadata_limits: AmqpMetadataLimits,
 }
 
 impl Default for RabbitMqWorkerConfig {
@@ -338,6 +348,7 @@ impl Default for RabbitMqWorkerConfig {
             retry_delay: DEFAULT_RETRY_DELAY,
             max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
             max_buffered: None,
+            metadata_limits: AmqpMetadataLimits::default(),
         }
     }
 }
@@ -512,6 +523,16 @@ impl RabbitMqWorkerBuilder {
     #[must_use]
     pub fn max_payload_bytes(mut self, bytes: usize) -> Self {
         self.config.max_payload_bytes = bytes;
+        self
+    }
+
+    /// Bound the AMQP metadata this worker accepts from a delivery.
+    ///
+    /// See [`RabbitMqWorkerConfig::metadata_limits`] for the trust boundary
+    /// this bound enforces, which [`Self::max_payload_bytes`] does not cover.
+    #[must_use]
+    pub fn metadata_limits(mut self, limits: AmqpMetadataLimits) -> Self {
+        self.config.metadata_limits = limits;
         self
     }
 
@@ -770,7 +791,7 @@ impl RabbitMqWorker {
             &delivery.properties,
             &delivery.data,
             self.config.max_payload_bytes,
-            AmqpMetadataLimits::default(),
+            self.config.metadata_limits,
         ) {
             Ok(env) => env,
             Err(err) => return self.handle_poison(channel, &delivery, &err).await,
@@ -1141,17 +1162,36 @@ impl RabbitMqWorker {
         err: &BusError,
     ) -> DeliveryDisposition {
         let dead_letter = self.config.dead_letter_routing_key.as_deref();
+        // The error itself carries only a reason and sizes, never a header key
+        // or value, so logging it cannot echo the metadata that was refused.
+        let sanitize_metadata = is_metadata_error(err);
         tracing::warn!(
             delivery_tag = delivery.delivery_tag,
             error = %err,
             dead_letter = dead_letter.is_some(),
+            sanitized_metadata = sanitize_metadata,
             "rabbitmq delivery failed to decode before dispatch"
         );
+
+        // A metadata violation is quarantined with rebuilt properties; every
+        // other poison delivery keeps its original properties as before.
+        let quarantine_properties = || {
+            if sanitize_metadata {
+                properties_without_headers(&delivery.properties)
+            } else {
+                delivery.properties.clone()
+            }
+        };
 
         if matches!(self.config.ack_mode, AckMode::Unacknowledged) {
             if let Some(routing_key) = dead_letter {
                 let published = self
-                    .publish_dead_letter(channel, delivery, &delivery.data, routing_key)
+                    .publish_dead_letter(
+                        channel,
+                        quarantine_properties(),
+                        &delivery.data,
+                        routing_key,
+                    )
                     .await;
                 if let Err(err) = &published {
                     tracing::error!(
@@ -1170,7 +1210,12 @@ impl RabbitMqWorker {
             dead_letter.map(|routing_key| {
                 move || async move {
                     let published = self
-                        .publish_dead_letter(channel, delivery, &delivery.data, routing_key)
+                        .publish_dead_letter(
+                            channel,
+                            quarantine_properties(),
+                            &delivery.data,
+                            routing_key,
+                        )
                         .await;
                     if let Err(err) = &published {
                         tracing::error!(
@@ -1243,7 +1288,12 @@ impl RabbitMqWorker {
                 .map(|routing_key| {
                     move || async move {
                         let published = self
-                            .publish_dead_letter(channel, delivery, &envelope.payload, routing_key)
+                            .publish_dead_letter(
+                                channel,
+                                delivery.properties.clone(),
+                                &envelope.payload,
+                                routing_key,
+                            )
                             .await;
                         if let Err(err) = &published {
                             tracing::error!(
@@ -1360,7 +1410,7 @@ impl RabbitMqWorker {
     async fn publish_dead_letter(
         &self,
         channel: &Channel,
-        delivery: &Delivery,
+        properties: BasicProperties,
         payload: &[u8],
         routing_key: &str,
     ) -> Result<(), BusError> {
@@ -1373,7 +1423,7 @@ impl RabbitMqWorker {
                     ..BasicPublishOptions::default()
                 },
                 payload,
-                delivery.properties.clone().with_delivery_mode(2),
+                properties.with_delivery_mode(2),
             )
             .await
             .map_err(|err| BusError::Transport(Box::new(err)))?
@@ -1381,6 +1431,58 @@ impl RabbitMqWorker {
             .map_err(|err| BusError::Transport(Box::new(err)))?;
         crate::confirm::confirmation_to_result(confirmation, "dead-letter publish", routing_key)
     }
+}
+
+/// Rebuild `properties` with an empty field table, keeping the bounded core
+/// AMQP fields a quarantined message still needs to be diagnosed and routed.
+///
+/// Used for the dead-letter copy of a delivery rejected for its metadata.
+/// Cloning the original properties would republish the very field table the
+/// worker just refused, handing the sender a way to place unbounded metadata
+/// in the dead-letter queue and in whatever consumes it. Every field copied
+/// here is a bounded scalar the AMQP frame itself constrains.
+fn properties_without_headers(properties: &BasicProperties) -> BasicProperties {
+    let mut rebuilt = BasicProperties::default();
+    if let Some(content_type) = properties.content_type() {
+        rebuilt = rebuilt.with_content_type(content_type.clone());
+    }
+    if let Some(content_encoding) = properties.content_encoding() {
+        rebuilt = rebuilt.with_content_encoding(content_encoding.clone());
+    }
+    if let Some(delivery_mode) = properties.delivery_mode() {
+        rebuilt = rebuilt.with_delivery_mode(*delivery_mode);
+    }
+    if let Some(priority) = properties.priority() {
+        rebuilt = rebuilt.with_priority(*priority);
+    }
+    if let Some(correlation_id) = properties.correlation_id() {
+        rebuilt = rebuilt.with_correlation_id(correlation_id.clone());
+    }
+    if let Some(reply_to) = properties.reply_to() {
+        rebuilt = rebuilt.with_reply_to(reply_to.clone());
+    }
+    if let Some(expiration) = properties.expiration() {
+        rebuilt = rebuilt.with_expiration(expiration.clone());
+    }
+    if let Some(message_id) = properties.message_id() {
+        rebuilt = rebuilt.with_message_id(message_id.clone());
+    }
+    if let Some(timestamp) = properties.timestamp() {
+        rebuilt = rebuilt.with_timestamp(*timestamp);
+    }
+    if let Some(kind) = properties.kind() {
+        rebuilt = rebuilt.with_type(kind.clone());
+    }
+    if let Some(user_id) = properties.user_id() {
+        rebuilt = rebuilt.with_user_id(user_id.clone());
+    }
+    if let Some(app_id) = properties.app_id() {
+        rebuilt = rebuilt.with_app_id(app_id.clone());
+    }
+    if let Some(cluster_id) = properties.cluster_id() {
+        rebuilt = rebuilt.with_cluster_id(cluster_id.clone());
+    }
+    rebuilt.with_headers(FieldTable::default())
 }
 
 /// Name of the wait queue paired with `queue`.
@@ -1553,6 +1655,109 @@ mod tests {
         assert!(cfg.dead_letter_routing_key.is_none());
         assert_eq!(cfg.retry_delay, DEFAULT_RETRY_DELAY);
         assert_eq!(cfg.max_payload_bytes, DEFAULT_MAX_PAYLOAD_BYTES);
+        assert_eq!(cfg.metadata_limits, AmqpMetadataLimits::default());
+    }
+
+    /// Build AMQP properties carrying `headers` and the minimum a delivery
+    /// needs to decode into an envelope.
+    fn properties_with_headers<'a>(
+        headers: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> BasicProperties {
+        let mut table = lapin::types::FieldTable::default();
+        for (key, value) in headers {
+            table.insert(key.into(), AMQPValue::LongString(value.as_bytes().into()));
+        }
+        BasicProperties::default()
+            .with_type("orders.placed".into())
+            .with_headers(table)
+    }
+
+    #[test]
+    fn delivery_decoding_enforces_the_configured_metadata_limits() {
+        let props = properties_with_headers([("tenant", "acme")]);
+
+        let envelope = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+        )
+        .expect("an ordinary application header must decode under the defaults");
+        assert_eq!(
+            envelope.headers.get("tenant").map(String::as_str),
+            Some("acme")
+        );
+
+        let err = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits {
+                max_headers: 0,
+                ..AmqpMetadataLimits::default()
+            },
+        )
+        .expect_err("a deny-all header count must reject the delivery");
+        assert!(
+            matches!(
+                err,
+                BusError::MetadataLimitExceeded {
+                    limit: hexeract_bus::MetadataLimit::HeaderCount,
+                    ..
+                }
+            ),
+            "the configured limit must decide, not the default"
+        );
+    }
+
+    #[test]
+    fn metadata_errors_are_recognized_and_others_are_not() {
+        assert!(is_metadata_error(&BusError::ReservedHeaderNamespace));
+        assert!(is_metadata_error(&BusError::MetadataLimitExceeded {
+            limit: hexeract_bus::MetadataLimit::TotalBytes,
+            actual: 1,
+            max: 0,
+        }));
+        assert!(is_metadata_error(&BusError::InvalidMetadata {
+            reason: hexeract_bus::InvalidMetadataReason::NonUtf8LongString,
+        }));
+        assert!(!is_metadata_error(&BusError::InvalidTopology {
+            reason: "unrelated".to_owned(),
+        }));
+        assert!(!is_metadata_error(&BusError::PayloadTooLarge {
+            size: 2,
+            max: 1
+        }));
+    }
+
+    #[test]
+    fn sanitized_properties_preserve_core_fields_and_drop_headers() {
+        let original = properties_with_headers([("tenant", "acme")])
+            .with_content_type("application/json".into())
+            .with_message_id("11111111-1111-1111-1111-111111111111".into())
+            .with_correlation_id("22222222-2222-2222-2222-222222222222".into())
+            .with_reply_to("orders.replies".into())
+            .with_timestamp(1_756_000_000)
+            .with_delivery_mode(2);
+
+        let sanitized = properties_without_headers(&original);
+
+        assert_eq!(sanitized.message_id(), original.message_id());
+        assert_eq!(sanitized.correlation_id(), original.correlation_id());
+        assert_eq!(sanitized.kind(), original.kind());
+        assert_eq!(sanitized.content_type(), original.content_type());
+        assert_eq!(sanitized.reply_to(), original.reply_to());
+        assert_eq!(sanitized.timestamp(), original.timestamp());
+        assert_eq!(sanitized.delivery_mode(), original.delivery_mode());
+
+        let headers = sanitized
+            .headers()
+            .as_ref()
+            .expect("sanitized properties must carry an explicit empty table");
+        assert!(
+            headers.inner().is_empty(),
+            "the rejected field table must be rebuilt, never cloned"
+        );
     }
 
     #[test]
