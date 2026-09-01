@@ -721,13 +721,7 @@ mod tests {
         let recorded = publisher
             .last_published()
             .expect("a reply must still be published despite the serialization failure");
-        assert_eq!(
-            recorded
-                .headers
-                .get("x-hexeract-reply-status")
-                .map(String::as_str),
-            Some("error")
-        );
+        assert_eq!(recorded.header(REPLY_STATUS_HEADER), Some("error"));
         assert_eq!(recorded.message_type, REPLY_ERROR_MESSAGE_TYPE);
         let payload: RemoteErrorPayload =
             serde_json::from_slice(&recorded.payload).expect("payload must decode");
