@@ -48,6 +48,8 @@ use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
 use crate::connection::RabbitMqConnection;
+use crate::metadata::AmqpMetadataLimits;
+use crate::metadata::decode_headers;
 use crate::reply_publisher::RabbitMqReplyPublisher;
 use crate::transport::RabbitMqTransport;
 use crate::transport::to_short_string;
@@ -768,6 +770,7 @@ impl RabbitMqWorker {
             &delivery.properties,
             &delivery.data,
             self.config.max_payload_bytes,
+            AmqpMetadataLimits::default(),
         ) {
             Ok(env) => env,
             Err(err) => return self.handle_poison(channel, &delivery, &err).await,
@@ -1444,8 +1447,8 @@ pub(crate) fn delivery_to_envelope(
     props: &BasicProperties,
     payload: &[u8],
     max_payload_bytes: usize,
+    metadata_limits: AmqpMetadataLimits,
 ) -> Result<hexeract_bus::BusEnvelope, BusError> {
-    use std::collections::HashMap as StdHashMap;
     use std::time::SystemTime;
 
     if payload.len() > max_payload_bytes {
@@ -1454,6 +1457,11 @@ pub(crate) fn delivery_to_envelope(
             max: max_payload_bytes,
         });
     }
+
+    // Metadata is measured before anything is cloned out of the delivery, so
+    // an oversized field table costs a walk over memory `lapin` already
+    // decoded rather than a second copy of it in an envelope.
+    let (headers, protocol_headers) = decode_headers(props.headers().as_ref(), metadata_limits)?;
 
     let message_id = props
         .message_id()
@@ -1480,17 +1488,6 @@ pub(crate) fn delivery_to_envelope(
         })?;
     let reply_to = props.reply_to().as_ref().map(|s| s.as_str().to_owned());
 
-    let mut headers = StdHashMap::new();
-    if let Some(table) = props.headers().as_ref() {
-        for (key, value) in table.inner() {
-            if let lapin::types::AMQPValue::LongString(s) = value
-                && let Ok(text) = std::str::from_utf8(s.as_bytes())
-            {
-                headers.insert(key.as_str().to_owned(), text.to_owned());
-            }
-        }
-    }
-
     // `published_at` is the publisher's creation instant, not the
     // consume time. The transport writes it into the AMQP `timestamp`
     // property; restore it from there and fall back to now only when the
@@ -1499,13 +1496,14 @@ pub(crate) fn delivery_to_envelope(
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
     });
 
-    Ok(hexeract_bus::BusEnvelope::restore(
+    Ok(hexeract_bus::BusEnvelope::restore_from_transport(
         message_id,
         message_type,
         payload.to_vec(),
         correlation_id,
         reply_to,
         headers,
+        protocol_headers,
         published_at,
     ))
 }
@@ -1627,9 +1625,13 @@ mod tests {
             .with_correlation_id(correlation_id.to_string().into())
             .with_type("orders.placed".into());
 
-        let envelope =
-            delivery_to_envelope(&props, b"{\"order_id\":\"x\"}", DEFAULT_MAX_PAYLOAD_BYTES)
-                .expect("must decode");
+        let envelope = delivery_to_envelope(
+            &props,
+            b"{\"order_id\":\"x\"}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+        )
+        .expect("must decode");
         assert_eq!(envelope.message_id, message_id);
         assert_eq!(envelope.correlation_id, correlation_id);
         assert_eq!(envelope.message_type, "orders.placed");
@@ -1639,8 +1641,13 @@ mod tests {
     fn delivery_to_envelope_mints_fresh_message_id_when_property_missing() {
         let props = BasicProperties::default().with_type("orders.placed".into());
 
-        let envelope =
-            delivery_to_envelope(&props, b"{}", DEFAULT_MAX_PAYLOAD_BYTES).expect("must decode");
+        let envelope = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+        )
+        .expect("must decode");
         assert_ne!(envelope.message_id, Uuid::nil());
         assert_ne!(envelope.correlation_id, Uuid::nil());
         assert_eq!(envelope.message_type, "orders.placed");
@@ -1649,8 +1656,13 @@ mod tests {
     #[test]
     fn delivery_to_envelope_returns_invalid_topology_when_type_property_missing() {
         let props = BasicProperties::default();
-        let err = delivery_to_envelope(&props, b"{}", DEFAULT_MAX_PAYLOAD_BYTES)
-            .expect_err("missing `type` must surface as a non-Internal error");
+        let err = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+        )
+        .expect_err("missing `type` must surface as a non-Internal error");
         match err {
             BusError::InvalidTopology { reason } => assert!(reason.contains("type")),
             other => panic!(
@@ -1665,8 +1677,13 @@ mod tests {
         let props = BasicProperties::default()
             .with_type("orders.placed".into())
             .with_timestamp(published_at_secs);
-        let envelope =
-            delivery_to_envelope(&props, b"{}", DEFAULT_MAX_PAYLOAD_BYTES).expect("must decode");
+        let envelope = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+        )
+        .expect("must decode");
         let restored = envelope
             .published_at
             .duration_since(std::time::UNIX_EPOCH)
@@ -1684,8 +1701,13 @@ mod tests {
         // fresh UUIDs, and the context must reuse exactly those, not mint
         // a second independent pair.
         let props = BasicProperties::default().with_type("orders.placed".into());
-        let envelope =
-            delivery_to_envelope(&props, b"{}", DEFAULT_MAX_PAYLOAD_BYTES).expect("must decode");
+        let envelope = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+        )
+        .expect("must decode");
         let ctx = build_handler_context(&envelope);
         assert_eq!(*ctx.message_id.as_uuid(), envelope.message_id);
         assert_eq!(*ctx.correlation_id.as_uuid(), envelope.correlation_id);
@@ -1768,8 +1790,13 @@ mod tests {
             .with_reply_to(ShortString::from("orders.replies"))
             .with_headers(headers);
 
-        let envelope =
-            delivery_to_envelope(&props, b"{}", DEFAULT_MAX_PAYLOAD_BYTES).expect("must decode");
+        let envelope = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+        )
+        .expect("must decode");
         assert_eq!(
             envelope.headers.get("tenant").map(String::as_str),
             Some("acme")
@@ -1802,7 +1829,7 @@ mod tests {
         let props = BasicProperties::default().with_type("orders.placed".into());
         let payload = vec![b'x'; 9];
 
-        let err = delivery_to_envelope(&props, &payload, 8)
+        let err = delivery_to_envelope(&props, &payload, 8, AmqpMetadataLimits::default())
             .expect_err("oversize payload must be rejected before the copy");
         match err {
             BusError::PayloadTooLarge { size, max } => {
@@ -1818,8 +1845,13 @@ mod tests {
         let props = BasicProperties::default().with_type("orders.placed".into());
         let payload = b"{}";
 
-        let envelope = delivery_to_envelope(&props, payload, payload.len())
-            .expect("payload exactly at the limit must pass");
+        let envelope = delivery_to_envelope(
+            &props,
+            payload,
+            payload.len(),
+            AmqpMetadataLimits::default(),
+        )
+        .expect("payload exactly at the limit must pass");
         assert_eq!(envelope.payload, payload);
     }
 
@@ -1832,8 +1864,13 @@ mod tests {
             .with_correlation_id(correlation_id.to_string().into())
             .with_type("orders.placed".into());
 
-        let envelope =
-            delivery_to_envelope(&props, b"{}", DEFAULT_MAX_PAYLOAD_BYTES).expect("must decode");
+        let envelope = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+        )
+        .expect("must decode");
         let ctx = build_handler_context(&envelope);
         assert_eq!(*ctx.message_id.as_uuid(), message_id);
         assert_eq!(*ctx.correlation_id.as_uuid(), correlation_id);
@@ -1842,8 +1879,13 @@ mod tests {
     #[test]
     fn build_handler_context_mints_fresh_ids_when_properties_missing() {
         let props = BasicProperties::default().with_type("orders.placed".into());
-        let envelope =
-            delivery_to_envelope(&props, b"{}", DEFAULT_MAX_PAYLOAD_BYTES).expect("must decode");
+        let envelope = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+        )
+        .expect("must decode");
         let ctx = build_handler_context(&envelope);
         assert_ne!(*ctx.message_id.as_uuid(), Uuid::nil());
         assert_ne!(*ctx.correlation_id.as_uuid(), Uuid::nil());

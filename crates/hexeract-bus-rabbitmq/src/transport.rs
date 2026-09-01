@@ -12,7 +12,6 @@ use hexeract_bus::Transport;
 use lapin::BasicProperties;
 use lapin::options::BasicPublishOptions;
 use lapin::options::ExchangeDeclareOptions;
-use lapin::types::AMQPValue;
 use lapin::types::FieldTable;
 use lapin::types::ShortString;
 use uuid::Uuid;
@@ -20,6 +19,8 @@ use uuid::Uuid;
 use crate::connection::DEFAULT_RETRY_ATTEMPTS;
 use crate::connection::DEFAULT_RETRY_BASE_DELAY;
 use crate::connection::{RabbitMqConnection, RabbitMqConnectionConfig};
+use crate::metadata::AmqpMetadataLimits;
+use crate::metadata::encode_headers;
 use crate::pool::ChannelPool;
 use crate::pool::DEFAULT_POOL_MAX_SIZE;
 
@@ -75,6 +76,7 @@ pub(crate) fn to_short_string(value: &str, field: &str) -> Result<ShortString, B
 pub struct RabbitMqTransport {
     pool: Arc<ChannelPool>,
     exchange: String,
+    metadata_limits: AmqpMetadataLimits,
 }
 
 impl RabbitMqTransport {
@@ -137,6 +139,7 @@ impl RabbitMqTransport {
         Ok(Self {
             pool,
             exchange: String::new(),
+            metadata_limits: AmqpMetadataLimits::default(),
         })
     }
 
@@ -228,6 +231,7 @@ impl RabbitMqTransport {
             .map(|exchange_name| Self {
                 pool: Arc::new(ChannelPool::new(connection, DEFAULT_POOL_MAX_SIZE)),
                 exchange: exchange_name,
+                metadata_limits: AmqpMetadataLimits::default(),
             })
     }
 
@@ -241,7 +245,25 @@ impl RabbitMqTransport {
         Self {
             pool: Arc::new(ChannelPool::new(connection, pool_size)),
             exchange: String::new(),
+            metadata_limits: AmqpMetadataLimits::default(),
         }
+    }
+
+    /// Bound the AMQP metadata this transport is willing to publish.
+    ///
+    /// Applies to the combined application and framework protocol headers of
+    /// every subsequent publish. Validation happens before a channel is
+    /// acquired, so a rejected envelope never reaches the broker.
+    #[must_use]
+    pub fn with_metadata_limits(mut self, metadata_limits: AmqpMetadataLimits) -> Self {
+        self.metadata_limits = metadata_limits;
+        self
+    }
+
+    /// Borrow the metadata limits applied to outbound publishes.
+    #[must_use]
+    pub fn metadata_limits(&self) -> AmqpMetadataLimits {
+        self.metadata_limits
     }
 
     /// Switch the transport to fire-and-forget publishing.
@@ -285,7 +307,7 @@ impl Transport for RabbitMqTransport {
         routing_key: &str,
         envelope: &BusEnvelope,
     ) -> Result<Uuid, BusError> {
-        let properties = envelope_to_properties(envelope)?;
+        let properties = envelope_to_properties(envelope, self.metadata_limits)?;
         let exchange = to_short_string(self.exchange.as_str(), "exchange name")?;
         let routing_key_short = to_short_string(routing_key, "routing key")?;
         let confirms = self.pool.confirms();
@@ -378,14 +400,11 @@ pub(crate) fn exchange_kind_to_lapin(kind: ExchangeKind) -> Result<lapin::Exchan
     }
 }
 
-fn envelope_to_properties(envelope: &BusEnvelope) -> Result<BasicProperties, BusError> {
-    let mut amqp_headers = FieldTable::default();
-    for (k, v) in &envelope.headers {
-        amqp_headers.insert(
-            to_short_string(k.as_str(), "header key")?,
-            AMQPValue::LongString(v.as_str().into()),
-        );
-    }
+fn envelope_to_properties(
+    envelope: &BusEnvelope,
+    metadata_limits: AmqpMetadataLimits,
+) -> Result<BasicProperties, BusError> {
+    let amqp_headers = encode_headers(envelope, metadata_limits)?;
     let published_at_secs = envelope
         .published_at
         .duration_since(std::time::UNIX_EPOCH)
@@ -413,6 +432,7 @@ mod tests {
     use std::time::Duration;
 
     use hexeract_bus::Message;
+    use lapin::types::AMQPValue;
     use serde::Deserialize;
     use serde::Serialize;
 
@@ -476,11 +496,34 @@ mod tests {
             },
         )
         .unwrap();
-        // Must return an error rather than panic inside ShortString::from.
-        let result = envelope_to_properties(&envelope);
+
+        // Under the defaults the metadata limit is stricter than the AMQP
+        // short-string bound, so the key is rejected by dimension.
         assert!(
-            matches!(result, Err(BusError::InvalidTopology { .. })),
-            "an oversize header key must surface as InvalidTopology"
+            matches!(
+                envelope_to_properties(&envelope, AmqpMetadataLimits::default()),
+                Err(BusError::MetadataLimitExceeded {
+                    limit: hexeract_bus::MetadataLimit::KeyBytes,
+                    actual: 256,
+                    max: 128,
+                })
+            ),
+            "an oversize header key must surface as a key-bytes limit violation"
+        );
+
+        // Raising the limit past the AMQP short-string bound hands the key to
+        // `to_short_string`, which must still return an error rather than
+        // panic inside `ShortString::from`.
+        let permissive = AmqpMetadataLimits {
+            max_key_bytes: 1024,
+            ..AmqpMetadataLimits::default()
+        };
+        assert!(
+            matches!(
+                envelope_to_properties(&envelope, permissive),
+                Err(BusError::InvalidTopology { .. })
+            ),
+            "a key past the AMQP short-string bound must surface as InvalidTopology"
         );
     }
 
@@ -493,7 +536,7 @@ mod tests {
             },
         )
         .unwrap();
-        let properties = envelope_to_properties(&envelope).unwrap();
+        let properties = envelope_to_properties(&envelope, AmqpMetadataLimits::default()).unwrap();
         assert_eq!(
             properties.content_type().as_ref().map(ShortString::as_str),
             Some(JSON_CONTENT_TYPE)
@@ -528,7 +571,7 @@ mod tests {
             },
         )
         .unwrap();
-        let properties = envelope_to_properties(&envelope).unwrap();
+        let properties = envelope_to_properties(&envelope, AmqpMetadataLimits::default()).unwrap();
         let table = properties.headers().as_ref().expect("headers must be set");
         let value = table.inner().get(&ShortString::from("tenant"));
         match value {
@@ -549,7 +592,7 @@ mod tests {
             },
         )
         .unwrap();
-        let properties = envelope_to_properties(&envelope).unwrap();
+        let properties = envelope_to_properties(&envelope, AmqpMetadataLimits::default()).unwrap();
         assert_eq!(*properties.delivery_mode(), Some(2));
     }
 
@@ -567,7 +610,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let properties = envelope_to_properties(&envelope).unwrap();
+        let properties = envelope_to_properties(&envelope, AmqpMetadataLimits::default()).unwrap();
         assert_eq!(*properties.timestamp(), Some(expected));
     }
 

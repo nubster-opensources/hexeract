@@ -28,6 +28,8 @@
 pub(crate) mod confirm;
 /// Bounded reconnect loop around a `lapin` connection.
 pub mod connection;
+/// Bounded AMQP metadata codec shared by the transport, worker and reply inbox.
+pub mod metadata;
 /// Per-publisher pool of `lapin` channels.
 pub mod pool;
 /// Consumer for the exclusive, auto-delete reply inbox of the
@@ -49,6 +51,11 @@ pub use connection::RabbitMqConnectionConfig;
 pub use connection::redact_uri;
 pub use lapin::tcp::OwnedIdentity;
 pub use lapin::tcp::OwnedTLSConfig;
+pub use metadata::AmqpMetadataLimits;
+pub use metadata::DEFAULT_MAX_HEADER_KEY_BYTES;
+pub use metadata::DEFAULT_MAX_HEADER_VALUE_BYTES;
+pub use metadata::DEFAULT_MAX_HEADERS;
+pub use metadata::DEFAULT_MAX_METADATA_BYTES;
 pub use pool::ChannelPool;
 pub use pool::PooledChannel;
 pub use reply_publisher::RabbitMqReplyPublisher;

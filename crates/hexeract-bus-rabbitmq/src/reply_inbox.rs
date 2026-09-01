@@ -28,6 +28,7 @@ use lapin::options::QueueDeclareOptions;
 use lapin::types::FieldTable;
 use tokio_util::sync::CancellationToken;
 
+use crate::metadata::AmqpMetadataLimits;
 use crate::transport::to_short_string;
 use crate::worker::DEFAULT_MAX_PAYLOAD_BYTES;
 use crate::worker::delivery_to_envelope;
@@ -72,6 +73,7 @@ fn decode_delivery(delivery: &lapin::message::Delivery) -> Result<BusEnvelope, B
         &delivery.properties,
         &delivery.data,
         DEFAULT_MAX_PAYLOAD_BYTES,
+        AmqpMetadataLimits::default(),
     )
 }
 
