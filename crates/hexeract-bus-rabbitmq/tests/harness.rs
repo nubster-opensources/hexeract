@@ -31,7 +31,6 @@ use testcontainers::core::IntoContainerPort;
 use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::rabbitmq::RabbitMq;
-use tokio::net::TcpStream;
 
 /// A running RabbitMQ test container, kept alive for the container's
 /// AMQP URI to stay reachable.
@@ -120,12 +119,11 @@ ssl_options.fail_if_no_peer_cert = true
 
     install_test_crypto_provider();
 
-    // The readiness probe is deliberately NOT `WaitFor::message_on_stdout`.
-    // Waiting on a startup banner couples the test to a log line, and a broker
-    // that refuses its own configuration never prints one: the wait then blocks
-    // until the CI job is killed, with no error and no container to inspect.
-    // Handing back the container immediately and probing the port ourselves
-    // means a broker that never comes up is reported with its own logs instead.
+    // `WaitFor::seconds` hands the container back straight away; readiness is
+    // then established by `await_broker_ready`, which reads the broker's own
+    // log under a bounded budget. Delegating the wait to testcontainers would
+    // give away the container, leaving nothing to inspect when a broker
+    // refuses its configuration and never reports itself ready.
     let container = GenericImage::new("rabbitmq", "3.8.22-management")
         .with_exposed_port(5671.tcp())
         .with_wait_for(WaitFor::seconds(1))
@@ -157,7 +155,7 @@ ssl_options.fail_if_no_peer_cert = true
         .await
         .expect("TLS RabbitMQ container must expose AMQPS port");
 
-    await_tls_listener(&container, &format!("{host}:{port}")).await;
+    await_broker_ready(&container).await;
 
     let uri = format!("amqps://guest:guest@{host}:{port}/%2f");
 
@@ -167,38 +165,51 @@ ssl_options.fail_if_no_peer_cert = true
     }
 }
 
-/// How long a TLS broker is given to open its AMQPS listener.
+/// How long a TLS broker is given to finish booting.
 ///
 /// Generous enough for a cold image on a loaded CI runner, and short enough
 /// that a broker which will never come up fails with a diagnosis rather than
 /// hanging until the job is cancelled.
-const TLS_LISTENER_BUDGET: Duration = Duration::from_secs(120);
+const TLS_BOOT_BUDGET: Duration = Duration::from_secs(120);
 
-/// Block until the broker accepts TCP on `address`, or fail with its logs.
+/// The line RabbitMQ prints once every listener is accepting connections.
 ///
-/// A TLS listener that never opens means RabbitMQ rejected its own
-/// configuration (unreadable key, malformed `rabbitmq.conf`, refused cipher
-/// setup) and exited or stalled during boot. That reason is only ever written
-/// to the container's own output, so it is surfaced here: without it the test
-/// reports nothing but a timeout, which is what made the first CI failure
-/// impossible to diagnose.
-async fn await_tls_listener(container: &ContainerAsync<GenericImage>, address: &str) {
-    let deadline = Instant::now() + TLS_LISTENER_BUDGET;
+/// Deliberately a prefix. The full line ends with the plugin count
+/// ("Server startup complete; 4 plugins started."), and matching that count
+/// couples the suite to the image: any change to the enabled plugins would
+/// leave the wait hanging with no usable message.
+const BROKER_READY_MARKER: &str = "Server startup complete";
+
+/// Block until the broker reports itself ready, or fail with its own logs.
+///
+/// Readiness is read from the container's log, not from a TCP probe. Probing
+/// the published port proves nothing under Docker: the port is bound by the
+/// daemon's proxy and accepts connections while the service inside is still
+/// booting, so a probe returns immediately and the first TLS handshake dies
+/// against a broker that is not listening yet. That false positive is exactly
+/// what made the suite fail in six seconds against a healthy broker.
+///
+/// Reading the log ourselves, rather than delegating to `WaitFor`, keeps the
+/// container in hand: a broker that rejects its own configuration and never
+/// prints the marker is reported with its output instead of hanging the job.
+async fn await_broker_ready(container: &ContainerAsync<GenericImage>) {
+    let deadline = Instant::now() + TLS_BOOT_BUDGET;
     loop {
-        if TcpStream::connect(address).await.is_ok() {
+        let stdout = container.stdout_to_vec().await.unwrap_or_default();
+        if String::from_utf8_lossy(&stdout).contains(BROKER_READY_MARKER) {
             return;
         }
         if Instant::now() >= deadline {
-            let stdout = container.stdout_to_vec().await.unwrap_or_default();
             let stderr = container.stderr_to_vec().await.unwrap_or_default();
             panic!(
-                "the TLS broker never opened {address} within {TLS_LISTENER_BUDGET:?}.\n\
-                 --- container stdout ---\n{}\n--- container stderr ---\n{}",
+                "the TLS broker never reported {BROKER_READY_MARKER:?} within \
+                 {TLS_BOOT_BUDGET:?}.\n--- container stdout ---\n{}\n\
+                 --- container stderr ---\n{}",
                 String::from_utf8_lossy(&stdout),
                 String::from_utf8_lossy(&stderr),
             );
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 

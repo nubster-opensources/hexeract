@@ -76,11 +76,17 @@ async fn connecting_without_the_private_ca_is_refused_permanently() {
         .await
         .expect_err("a broker signed by an unknown authority must not be trusted");
 
+    // The named cause is reported on failure: the classification depends on the
+    // io kind rustls produces for a rejected certificate, and asserting blind
+    // would cost a full CI round trip to learn what it actually was.
+    let cause = std::error::Error::source(&error)
+        .map(ToString::to_string)
+        .unwrap_or_default();
     assert_eq!(
         error.is_retryable_connection(),
         Some(false),
         "a rejected certificate fails identically on every retry, so it must \
-         classify as permanent instead of being hammered"
+         classify as permanent instead of being hammered; reported cause: {cause}"
     );
 }
 

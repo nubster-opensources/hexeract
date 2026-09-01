@@ -34,7 +34,7 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] 
 serde = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true, features = ["rabbitmq"] }
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true }
 
 [package.metadata.docs.rs]
