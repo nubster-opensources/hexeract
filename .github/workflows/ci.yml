@@ -134,4 +134,8 @@ jobs:
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           key: doc
+      # The restored cache leaves an inconsistent target/doc tree, on which the
+      # stale output collector of rustdoc fails with ENOENT. Discarding it costs
+      # a few seconds and keeps the dependency cache.
+      - run: cargo clean --doc
       - run: cargo doc --workspace --all-features --no-deps
