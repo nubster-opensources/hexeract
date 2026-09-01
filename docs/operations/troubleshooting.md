@@ -35,9 +35,13 @@ Expected behaviour: at-least-once delivery permits duplicates on crash or `max_a
 
 | Likely cause | Fix |
 | --- | --- |
-| Wrong URI scheme | Use `amqp://` or `amqps://`; not `amqp+ssl://` |
-| Broker not reachable | `nc -zv host 5672` to confirm; check firewall, NAT, TLS cert chain |
+| `plaintext amqp is restricted to loopback` | Since v0.7.0 a plain `amqp://` URI is refused for any host other than loopback, before the socket opens, because the AMQP handshake sends the broker password in cleartext. Point the URI at `amqps://` (port 5671 by default). Only if the broker has no TLS listener yet, opt out explicitly with `RabbitMqConnectionConfig::allow_insecure_plaintext_transport`, or `--insecure-plaintext` on the `hexeract bus` commands. See [Migration v0.6 to v0.7](migration-v0.6-v0.7.md). |
+| Wrong URI scheme | Use `amqps://` for a remote broker, `amqp://` for loopback; not `amqp+ssl://` |
+| `invalid amqp uri` | The URI did not parse. Percent-encode the vhost (`/` becomes `%2f`) and any reserved character in the password, and drop stray spaces. |
+| Broker not reachable | `nc -zv host 5671` to confirm; check firewall, NAT, TLS cert chain |
 | Default retry exhausted | Raise `connect_with_retry` attempts or `base_delay` when wrapping `RabbitMqConnection::connect_with_retry` directly |
+
+A cleartext refusal is permanent: it is classified non-retryable so a supervisor stops instead of reconnecting forever against a configuration no retry can fix.
 
 ### Consumer registered but handler never invoked
 

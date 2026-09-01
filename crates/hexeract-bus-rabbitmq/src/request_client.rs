@@ -149,7 +149,10 @@ impl RabbitMqRequestClientConfigBuilder {
 ///
 /// Returns [`BusError::Connection`] if either the recovering publisher
 /// connection or the initial supervised inbox connection cannot be
-/// established.
+/// established, and a permanent one, before any socket opens, when the
+/// transport would carry the session in cleartext: `uri` selecting `amqp://`
+/// against a host outside loopback, or TLS material an `amqp://` URI would
+/// discard.
 pub async fn connect_request_client(
     uri: &str,
     default_timeout: Duration,
@@ -173,7 +176,10 @@ pub async fn connect_request_client(
 ///
 /// Returns [`BusError::Connection`] if either the recovering publisher
 /// connection or the initial supervised inbox connection cannot be
-/// established.
+/// established, and a permanent one, before any socket opens, when the
+/// transport would carry the session in cleartext: `uri` selecting `amqp://`
+/// against a host outside loopback, or TLS material an `amqp://` URI would
+/// discard.
 pub async fn connect_request_client_with_config(
     uri: &str,
     default_timeout: Duration,

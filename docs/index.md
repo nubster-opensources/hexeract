@@ -10,6 +10,7 @@ Hexeract is a six-dimension Rust messaging framework: **Mediator**, **Bus**, **O
 | Persist outgoing events transactionally with PostgreSQL, MySQL or SQLite | [Outbox quick start](getting-started/outbox-quick-start.md) |
 | Publish and consume messages on RabbitMQ | [Bus quick start](getting-started/bus-quick-start.md) |
 | Schedule delayed or recurring messages | [Scheduler quick start](getting-started/scheduler-quick-start.md) |
+| Migrate an existing project from v0.6.0 to v0.7.0 | [Migration v0.6 to v0.7](operations/migration-v0.6-v0.7.md) |
 | Migrate an existing project from v0.5.0 to v0.6.0 | [Migration v0.5 to v0.6](operations/migration-v0.5-v0.6.md) |
 | Migrate an existing project from v0.4.0 to v0.5.0 | [Migration v0.4 to v0.5](operations/migration-v0.4-v0.5.md) |
 | Migrate an existing project from v0.3.0 to v0.4.0 | [Migration v0.3 to v0.4](operations/migration-v0.3-v0.4.md) |
@@ -88,6 +89,7 @@ How to run Hexeract services after the SDK leaves your hands.
 - [Production checklist](operations/production-checklist.md)
 - [Observability](operations/observability.md)
 - [Troubleshooting](operations/troubleshooting.md)
+- [Migration v0.6 to v0.7](operations/migration-v0.6-v0.7.md)
 - [Migration v0.5 to v0.6](operations/migration-v0.5-v0.6.md)
 - [Migration v0.4 to v0.5](operations/migration-v0.4-v0.5.md)
 - [Migration v0.3 to v0.4](operations/migration-v0.3-v0.4.md)
