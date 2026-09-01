@@ -1,6 +1,7 @@
 use std::fmt;
 use std::future::Future;
 use std::io;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,6 +12,7 @@ use lapin::ConnectionProperties;
 use lapin::DefaultConnectionBuilder;
 use lapin::ErrorKind;
 use lapin::tcp::OwnedTLSConfig;
+use lapin::uri::{AMQPScheme, AMQPUri};
 
 /// Redact the credentials of a connection URI for safe logging.
 ///
@@ -278,11 +280,21 @@ pub const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// # Security
 ///
+/// Two cleartext downgrades are refused before any socket opens.
+///
 /// A configuration carrying TLS material is only honoured by an `amqps://`
 /// URI. Pairing it with a plaintext `amqp://` URI is refused rather than
 /// ignored, so a mistyped or mis-templated scheme cannot silently downgrade a
 /// session to cleartext while the deployment believes it is running mutual
-/// TLS. [`Self::allow_insecure_plaintext_transport`] opts out of that refusal.
+/// TLS.
+///
+/// Independently of any TLS material, a plain `amqp://` URI is restricted to
+/// loopback: the AMQP handshake carries the broker password, so an
+/// unencrypted session to any other host exposes it to the network path.
+///
+/// [`Self::allow_insecure_plaintext_transport`] opts out of both refusals.
+/// The host is the one lapin resolves out of the URI, never the raw text, so
+/// the check covers exactly what the dialer connects to.
 #[derive(Clone, Default)]
 pub struct RabbitMqConnectionConfig {
     tls_config: Option<OwnedTLSConfig>,
@@ -360,26 +372,53 @@ impl fmt::Debug for RabbitMqConnectionConfig {
     }
 }
 
-/// Whether the URI scheme selects an encrypted transport.
+/// Read a connection URI the way the dialer reads it.
 ///
-/// lapin only consults the TLS configuration for a scheme that selects TLS,
-/// which for AMQP is `amqps`. The comparison is case-insensitive because URI
-/// schemes are, and it deliberately looks at the scheme alone: a URI that
-/// carries no `://` at all cannot select TLS.
-fn uri_scheme_and_host(uri: &str) -> Option<(&str, &str)> {
-    let (scheme, remainder) = uri.split_once("://")?;
-    let authority = remainder.split('/').next()?;
-    let host_and_port = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    if let Some(bracketed) = host_and_port.strip_prefix('[') {
-        let (host, _) = bracketed.split_once(']')?;
-        return Some((scheme, host));
-    }
-    let host = host_and_port.split(':').next()?;
-    (!host.is_empty()).then_some((scheme, host))
+/// The transport gate decides whether a URI may be dialled, so it has to see
+/// the same scheme and the same host as the component that dials it. lapin
+/// parses with [`AMQPUri`] and [`connect_once`] hands it the very same
+/// string, so parsing here with anything else would be a divergence: the gate
+/// clearing one host while lapin opens a session to another. A hand-rolled
+/// split gets this wrong on an empty authority (`amqp://` means `localhost`)
+/// and on a query string appended to a URI that omits the default port.
+///
+/// The parser's own error is discarded rather than propagated: it echoes the
+/// offending URI, password included.
+///
+/// # Errors
+///
+/// Returns a permanent (non-retryable) [`BusError::Connection`] naming
+/// whether the scheme or the rest of the URI is at fault.
+fn parse_dialled_uri(uri: &str) -> Result<AMQPUri, BusError> {
+    AMQPUri::from_str(uri).map_err(|_| {
+        let failure = if uri_announces_an_amqp_scheme(uri) {
+            "invalid amqp uri"
+        } else {
+            "unsupported amqp uri scheme"
+        };
+        connection_error_with_kind(uri, false, failure)
+    })
 }
 
+/// Whether the URI announces a scheme lapin can dial at all.
+///
+/// This is a diagnostic aid and nothing else: it authorises no connection, it
+/// only picks which of the two refusal messages an unparseable URI deserves.
+/// An operator who mistyped `amqps` needs a different hint from one who
+/// pointed the bus at an `http://` endpoint.
+fn uri_announces_an_amqp_scheme(uri: &str) -> bool {
+    uri.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("amqp") || scheme.eq_ignore_ascii_case("amqps")
+    })
+}
+
+/// Whether a cleartext session to this host stays on the machine.
+///
+/// `host` is the host lapin resolved, never the raw URI text, so the check
+/// covers exactly what the dialer will connect to. `localhost` is accepted by
+/// name because that is what lapin yields for an empty authority and for a
+/// bracketed IPv6 literal, and every address the platform routes back to the
+/// loopback interface is accepted numerically.
 fn is_plaintext_loopback_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost")
         || host
@@ -387,32 +426,27 @@ fn is_plaintext_loopback_host(host: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
-/// Refuse a configuration whose TLS material the URI would silently discard.
+/// Refuse a transport that would carry the session in cleartext off the host.
 ///
-/// lapin ignores [`OwnedTLSConfig`] unless the scheme selects TLS, so a
-/// private CA and a client identity paired with `amqp://` produce a cleartext
-/// session with no error and no log line. That is a downgrade in the unsafe
-/// direction and it is refused here, at every connect path, unless the caller
+/// Two cleartext downgrades are refused here, before any socket is opened, so
+/// that no credential reaches the wire first. lapin ignores [`OwnedTLSConfig`]
+/// unless the scheme selects TLS, so a private CA and a client identity paired
+/// with `amqp://` produce a cleartext session with no error and no log line.
+/// And `amqp://` against a host that is not loopback exposes the broker
+/// password to anyone on the path. Both are downgrades in the unsafe
+/// direction, and both are refused at every connect path unless the caller
 /// opted in through
 /// [`RabbitMqConnectionConfig::allow_insecure_plaintext_transport`].
 ///
 /// # Errors
 ///
-/// Returns a permanent (non-retryable) [`BusError::Connection`]: a scheme
-/// mismatch is a configuration fault that every retry would reproduce.
+/// Returns a permanent (non-retryable) [`BusError::Connection`]: an
+/// unencrypted transport is a configuration fault that every retry would
+/// reproduce.
 fn ensure_transport_security(uri: &str, config: &RabbitMqConnectionConfig) -> Result<(), BusError> {
-    let Some((scheme, host)) = uri_scheme_and_host(uri) else {
-        return Err(connection_error_with_kind(uri, false, "invalid amqp uri"));
-    };
-    if scheme.eq_ignore_ascii_case("amqps") {
+    let dialled = parse_dialled_uri(uri)?;
+    if dialled.scheme == AMQPScheme::AMQPS {
         return Ok(());
-    }
-    if !scheme.eq_ignore_ascii_case("amqp") {
-        return Err(connection_error_with_kind(
-            uri,
-            false,
-            "unsupported amqp uri scheme",
-        ));
     }
     if config.allows_plaintext_transport() {
         return Ok(());
@@ -424,7 +458,7 @@ fn ensure_transport_security(uri: &str, config: &RabbitMqConnectionConfig) -> Re
             "tls material was configured but the uri scheme is not amqps, which would discard it and connect in cleartext",
         ));
     }
-    if is_plaintext_loopback_host(host) {
+    if is_plaintext_loopback_host(&dialled.authority.host) {
         return Ok(());
     }
     Err(connection_error_with_kind(
@@ -532,9 +566,11 @@ pub struct RabbitMqConnection {
 impl RabbitMqConnection {
     /// Connect to the broker described by `uri`, single attempt.
     ///
-    /// Pass an `amqps://` URI in production so the session is encrypted
-    /// with TLS; `amqp://` is plaintext and intended for local
-    /// development only.
+    /// Pass an `amqps://` URI for any broker that is not loopback: a plain
+    /// `amqp://` session sends the broker password in cleartext and is
+    /// refused before the socket opens unless the caller opted in through
+    /// [`RabbitMqConnectionConfig::allow_insecure_plaintext_transport`].
+    /// `amqp://` remains available for local development.
     ///
     /// # Security
     ///
@@ -545,9 +581,11 @@ impl RabbitMqConnection {
     /// # Errors
     ///
     /// Returns [`BusError::Connection`] if `lapin` fails to negotiate
-    /// the AMQP handshake. The error never includes `uri` or its
-    /// credentials: the raw `lapin` error (which can echo a malformed
-    /// URI back) is dropped in favour of a credential-redacted message.
+    /// the AMQP handshake, and a permanent (non-retryable) one if `uri`
+    /// selects an unencrypted transport to a host outside loopback. The
+    /// error never includes `uri` or its credentials: the raw `lapin` error
+    /// (which can echo a malformed URI back) is dropped in favour of a
+    /// credential-redacted message.
     pub async fn connect(uri: &str) -> Result<Self, BusError> {
         Self::connect_with_config(uri, &RabbitMqConnectionConfig::default()).await
     }
@@ -562,8 +600,10 @@ impl RabbitMqConnection {
     /// # Errors
     ///
     /// Returns a credential-redacted [`BusError::Connection`] when the AMQP
-    /// or TLS handshake fails, or a permanent one when `config` carries TLS
-    /// material that `uri` would silently discard.
+    /// or TLS handshake fails, and a permanent one when the transport would
+    /// carry the session in cleartext: either `config` holds TLS material
+    /// that `uri` would silently discard, or `uri` selects `amqp://` against
+    /// a host outside loopback.
     pub async fn connect_with_config(
         uri: &str,
         config: &RabbitMqConnectionConfig,
@@ -598,11 +638,13 @@ impl RabbitMqConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`BusError::Connection`] after the final attempt. The
-    /// error never includes `uri` or its credentials: the raw `lapin`
-    /// error (which can echo a malformed URI back, password included)
-    /// is dropped in favour of a credential-redacted message, and only
-    /// the attempt counter and the redacted URI are logged.
+    /// Returns [`BusError::Connection`] after the final attempt, and a
+    /// permanent one on the first, without retrying, when `uri` selects an
+    /// unencrypted `amqp://` transport to a host outside loopback: no retry
+    /// can fix a configuration fault. The error never includes `uri` or its
+    /// credentials: the raw `lapin` error (which can echo a malformed URI
+    /// back, password included) is dropped in favour of a credential-redacted
+    /// message, and only the attempt counter and the redacted URI are logged.
     pub async fn connect_with_retry(
         uri: &str,
         attempts: u32,
@@ -625,7 +667,11 @@ impl RabbitMqConnection {
     /// # Errors
     ///
     /// Returns a credential-redacted [`BusError::Connection`] after the final
-    /// attempt or on a permanent handshake failure.
+    /// attempt, or on a permanent failure without spending the budget: a
+    /// rejected certificate, and a transport that would carry the session in
+    /// cleartext (TLS material an `amqp://` URI would discard, or `amqp://`
+    /// against a host outside loopback), the latter refused before any socket
+    /// opens.
     pub async fn connect_with_retry_with_config(
         uri: &str,
         attempts: u32,
@@ -827,6 +873,15 @@ mod tests {
 
     /// TLS material carrying a client identity, whose PKCS#12 password is the
     /// only genuine secret in the configuration.
+    /// Read the named failure a connection error carries. `BusError::Connection`
+    /// renders as the bare `"connection error"`, so the detail only shows up
+    /// through the source.
+    fn failure_detail(error: &BusError) -> String {
+        std::error::Error::source(error)
+            .expect("a connection error carries its detail as a source")
+            .to_string()
+    }
+
     fn mutual_tls_config() -> OwnedTLSConfig {
         OwnedTLSConfig {
             cert_chain: Some("private-ca-pem".to_owned()),
@@ -878,6 +933,101 @@ mod tests {
             .expect_err("remote plaintext must be refused before connecting");
         assert_eq!(error.is_retryable_connection(), Some(false));
         assert!(!error.to_string().contains("s3cr3t"));
+    }
+
+    /// The gate and the dialer must read one URI the same way. Any other
+    /// arrangement is a parser differential: the gate authorises one host
+    /// while lapin connects to another. The shapes below are the ones a
+    /// hand-rolled split gets wrong - an empty authority, and a query string
+    /// on a URI that omits the default port - and every one of them dials
+    /// loopback, so refusing them would break local development.
+    #[test]
+    fn the_transport_gate_reads_the_same_host_as_the_dialer() {
+        let config = RabbitMqConnectionConfig::default();
+
+        for uri in [
+            "amqp://",
+            "amqp:///%2f",
+            "amqp://localhost?heartbeat=10",
+            "amqp://localhost:5672?heartbeat=10",
+            "amqp://localhost/%2f?heartbeat=10",
+        ] {
+            let dialled = AMQPUri::from_str(uri)
+                .unwrap_or_else(|error| panic!("lapin must accept {uri}, got {error}"));
+            assert_eq!(
+                dialled.authority.host, "localhost",
+                "the dialer resolves {uri} to loopback"
+            );
+            assert!(
+                ensure_transport_security(uri, &config).is_ok(),
+                "{uri} dials loopback, so the gate must not refuse it"
+            );
+        }
+    }
+
+    /// lapin reads the host with `Url::domain`, which yields `None` for a
+    /// bracketed IPv6 literal, so every `amqp://[...]` URI dials `localhost`.
+    /// The gate mirrors that instead of reading the literal itself: a gate
+    /// that disagreed with the dialer would be authorising a host nobody
+    /// connects to. If lapin ever honours the literal, this test fails and
+    /// the gate must follow it.
+    #[test]
+    fn a_bracketed_ipv6_literal_follows_the_dialer_to_loopback() {
+        let config = RabbitMqConnectionConfig::default();
+
+        for uri in ["amqp://[::1]:5672", "amqp://[2001:db8::1]:5672"] {
+            let dialled = AMQPUri::from_str(uri)
+                .unwrap_or_else(|error| panic!("lapin must accept {uri}, got {error}"));
+            assert_eq!(
+                dialled.authority.host, "localhost",
+                "lapin discards the bracketed literal of {uri}"
+            );
+            assert!(
+                ensure_transport_security(uri, &config).is_ok(),
+                "{uri} dials loopback, so the gate must agree"
+            );
+        }
+    }
+
+    /// The opt-in is the only route to a remote plaintext broker, and without
+    /// this test nothing covers it: the other opt-in test uses a loopback URI
+    /// the default already allows, so deleting the opt-in branch would still
+    /// leave the suite green.
+    #[test]
+    fn an_explicit_opt_in_allows_remote_plaintext() {
+        let permissive = RabbitMqConnectionConfig::default().allow_insecure_plaintext_transport();
+        ensure_transport_security("amqp://broker.example:5672", &permissive)
+            .expect("the explicit opt-in must reach a remote plaintext broker");
+
+        let refusing = RabbitMqConnectionConfig::default();
+        ensure_transport_security("amqp://broker.example:5672", &refusing)
+            .expect_err("without the opt-in the same uri must be refused");
+    }
+
+    /// A scheme lapin cannot dial and a URI it cannot parse are different
+    /// faults, and the operator needs to be told which one they hit.
+    #[test]
+    fn an_unusable_uri_names_the_fault_it_hit() {
+        let config = RabbitMqConnectionConfig::default();
+
+        let scheme = failure_detail(
+            &ensure_transport_security("http://broker.example:5672", &config)
+                .expect_err("a non-amqp scheme must be refused"),
+        );
+        assert!(
+            scheme.contains("unsupported amqp uri scheme"),
+            "got {scheme}"
+        );
+
+        let malformed = failure_detail(
+            &ensure_transport_security("amqp://user:s3cr3t@ho st", &config)
+                .expect_err("an unparseable uri must be refused"),
+        );
+        assert!(malformed.contains("invalid amqp uri"), "got {malformed}");
+        assert!(
+            !malformed.contains("s3cr3t"),
+            "the parser error must not echo the uri, got {malformed}"
+        );
     }
 
     /// A configuration whose TLS material an `amqp://` URI would discard is a
