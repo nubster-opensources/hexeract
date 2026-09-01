@@ -1,12 +1,12 @@
 //! Wire constants of the request-reply protocol.
 //!
 //! Every header prefixed `x-hexeract-` is reserved by the framework: an
-//! application must not write one of its own. Nothing filters or rejects
-//! an application-supplied header in this namespace today; a domain header
-//! sharing the prefix silently collides with the framework's own value
-//! instead of being ignored or rejected. The protocol version travels in
-//! the message rather than in the channel, so two versions can coexist on
-//! the same topology during a progressive rollout.
+//! application must not write one of its own. `BusEnvelope::with_headers`
+//! rejects application headers in this namespace, and outbound adapters can
+//! revalidate the public application-header map before publishing. Protocol
+//! headers remain separate from that map. The protocol version travels in the
+//! message rather than in the channel, so two versions can coexist on the
+//! same topology during a progressive rollout.
 
 use std::collections::HashMap;
 
