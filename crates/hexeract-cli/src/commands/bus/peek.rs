@@ -1,13 +1,13 @@
 use clap::Args;
 use clap::builder::RangedU64ValueParser;
 use hexeract_bus::Queue;
-use hexeract_bus_rabbitmq::RabbitMqConnection;
 use lapin::Channel;
 use lapin::message::BasicGetMessage;
 use lapin::options::BasicGetOptions;
 use lapin::options::BasicNackOptions;
 use lapin::types::ShortString;
 
+use crate::commands::bus::transport_security::TransportSecurityArgs;
 use crate::conn_string::ConnString;
 use crate::error::CliError;
 
@@ -28,6 +28,9 @@ const TRUNCATION_MARKER: &str = " ...<truncated, use --raw or --max-bytes to see
 #[derive(Args, Debug)]
 pub(crate) struct PeekArgs {
     /// AMQP connection string.
+    ///
+    /// A broker outside loopback requires `amqps://`; plain `amqp://` is
+    /// refused unless `--insecure-plaintext` is passed.
     ///
     /// Carries broker credentials in its userinfo component. Prefer
     /// setting `HEXERACT_BUS_URL` in the environment over passing this on
@@ -57,6 +60,8 @@ pub(crate) struct PeekArgs {
     /// Ignored when `--raw` is set.
     #[arg(long, default_value_t = DEFAULT_MAX_PAYLOAD_BYTES)]
     max_bytes: usize,
+    #[command(flatten)]
+    transport: TransportSecurityArgs,
 }
 
 impl PeekArgs {
@@ -68,9 +73,7 @@ impl PeekArgs {
         let queue = Queue::new(self.queue.as_str()).map_err(|e| CliError::Fatal(Box::new(e)))?;
         let queue_short = ShortString::from(queue.name.as_str());
 
-        let connection = RabbitMqConnection::connect(self.conn.as_str())
-            .await
-            .map_err(|e| CliError::Fatal(Box::new(e)))?;
+        let connection = self.transport.connect(self.conn.as_str()).await?;
         let channel = connection
             .create_channel()
             .await

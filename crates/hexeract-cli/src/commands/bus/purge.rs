@@ -1,9 +1,9 @@
 use clap::Args;
 use hexeract_bus::Queue;
-use hexeract_bus_rabbitmq::RabbitMqConnection;
 use lapin::options::QueuePurgeOptions;
 use lapin::types::ShortString;
 
+use crate::commands::bus::transport_security::TransportSecurityArgs;
 use crate::conn_string::ConnString;
 use crate::error::CliError;
 
@@ -14,6 +14,9 @@ use crate::error::CliError;
 #[derive(Args, Debug)]
 pub(crate) struct PurgeArgs {
     /// AMQP connection string.
+    ///
+    /// A broker outside loopback requires `amqps://`; plain `amqp://` is
+    /// refused unless `--insecure-plaintext` is passed.
     ///
     /// Carries broker credentials in its userinfo component. Prefer
     /// setting `HEXERACT_BUS_URL` in the environment over passing this on
@@ -27,6 +30,8 @@ pub(crate) struct PurgeArgs {
     /// Required to purge; without it, the command refuses and prints guidance.
     #[arg(long = "yes-i-know")]
     yes_i_know: bool,
+    #[command(flatten)]
+    transport: TransportSecurityArgs,
 }
 
 impl PurgeArgs {
@@ -50,9 +55,7 @@ impl PurgeArgs {
         // rather than a panic (#366).
         let queue = Queue::new(self.queue.as_str()).map_err(|e| CliError::Fatal(Box::new(e)))?;
 
-        let connection = RabbitMqConnection::connect(self.conn.as_str())
-            .await
-            .map_err(|e| CliError::Fatal(Box::new(e)))?;
+        let connection = self.transport.connect(self.conn.as_str()).await?;
         let channel = connection
             .create_channel()
             .await

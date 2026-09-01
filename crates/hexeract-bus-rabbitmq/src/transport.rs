@@ -91,7 +91,9 @@ impl RabbitMqTransport {
     /// # Errors
     ///
     /// Returns [`BusError::Connection`] if the broker remains
-    /// unreachable after the retry loop exits.
+    /// unreachable after the retry loop exits, and a permanent one, before
+    /// any socket opens, when `connection_string` selects an unencrypted
+    /// `amqp://` transport to a host outside loopback.
     ///
     /// Against an unreachable broker the constructor retries up to
     /// [`DEFAULT_RETRY_ATTEMPTS`] times in each phase before giving up, or
@@ -114,8 +116,12 @@ impl RabbitMqTransport {
     /// # Errors
     ///
     /// Returns a credential-redacted [`BusError::Connection`] when the broker
-    /// cannot be reached within the connect bounds, or a permanent one when
-    /// `config` carries TLS material that `connection_string` would discard.
+    /// cannot be reached within the connect bounds, and a permanent one when
+    /// the transport would carry the session in cleartext: either `config`
+    /// holds TLS material that `connection_string` would discard, or
+    /// `connection_string` selects `amqp://` against a host outside loopback.
+    /// [`RabbitMqConnectionConfig::allow_insecure_plaintext_transport`] opts
+    /// out of both.
     pub async fn new_with_config(
         connection_string: &str,
         config: &RabbitMqConnectionConfig,
@@ -143,7 +149,9 @@ impl RabbitMqTransport {
     ///
     /// # Errors
     ///
-    /// Returns [`BusError::Connection`] if the broker is unreachable
+    /// Returns [`BusError::Connection`] if the broker is unreachable, a
+    /// permanent one, before any socket opens, when `connection_string`
+    /// selects an unencrypted `amqp://` transport to a host outside loopback,
     /// or [`BusError::Transport`] if the exchange declaration is
     /// rejected (typically a mismatch with a pre-existing exchange).
     ///
@@ -176,8 +184,12 @@ impl RabbitMqTransport {
     /// # Errors
     ///
     /// Returns a credential-redacted [`BusError::Connection`] when the broker
-    /// cannot be reached within the connect bounds, or a permanent one when
-    /// `config` carries TLS material that `connection_string` would discard.
+    /// cannot be reached within the connect bounds, and a permanent one when
+    /// the transport would carry the session in cleartext: either `config`
+    /// holds TLS material that `connection_string` would discard, or
+    /// `connection_string` selects `amqp://` against a host outside loopback.
+    /// [`RabbitMqConnectionConfig::allow_insecure_plaintext_transport`] opts
+    /// out of both.
     /// Returns [`BusError`] when the exchange cannot be declared.
     pub async fn with_exchange_with_config(
         connection_string: &str,

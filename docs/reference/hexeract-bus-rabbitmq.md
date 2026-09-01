@@ -94,7 +94,7 @@ plaintext `amqp://` URI is refused with a permanent connection error rather
 than silently ignored, so a mis-templated scheme cannot downgrade a session to
 cleartext while the deployment believes it runs mutual TLS. A test harness that
 deliberately reuses one configuration across both transports opts out with
-`RabbitMqConnectionConfig::allow_plaintext_transport`.
+`RabbitMqConnectionConfig::allow_insecure_plaintext_transport`.
 
 A rejected certificate (unknown authority, hostname outside the SAN, expired
 certificate, refused client certificate) is classified as a permanent
