@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::connection::DEFAULT_RETRY_ATTEMPTS;
 use crate::connection::DEFAULT_RETRY_BASE_DELAY;
-use crate::connection::RabbitMqConnection;
+use crate::connection::{RabbitMqConnection, RabbitMqConnectionConfig};
 use crate::pool::ChannelPool;
 use crate::pool::DEFAULT_POOL_MAX_SIZE;
 
@@ -105,10 +105,26 @@ impl RabbitMqTransport {
     /// [`crate::connection::DEFAULT_SESSION_TIMEOUT`]. No path blocks
     /// forever.
     pub async fn new(connection_string: &str) -> Result<Self, BusError> {
-        let connection = RabbitMqConnection::connect_with_retry_recovering(
+        Self::new_with_config(connection_string, &RabbitMqConnectionConfig::default()).await
+    }
+
+    /// Connect to `connection_string` with caller-selected TLS settings and
+    /// target the AMQP default exchange.
+    ///
+    /// # Errors
+    ///
+    /// Returns a credential-redacted [`BusError::Connection`] when the broker
+    /// cannot be reached within the connect bounds, or a permanent one when
+    /// `config` carries TLS material that `connection_string` would discard.
+    pub async fn new_with_config(
+        connection_string: &str,
+        config: &RabbitMqConnectionConfig,
+    ) -> Result<Self, BusError> {
+        let connection = RabbitMqConnection::connect_with_retry_recovering_with_config(
             connection_string,
             DEFAULT_RETRY_ATTEMPTS,
             DEFAULT_RETRY_BASE_DELAY,
+            config,
         )
         .await?;
         let pool = Arc::new(ChannelPool::new(connection, DEFAULT_POOL_MAX_SIZE));
@@ -146,10 +162,33 @@ impl RabbitMqTransport {
         connection_string: &str,
         exchange: Exchange,
     ) -> Result<Self, BusError> {
-        let connection = RabbitMqConnection::connect_with_retry_recovering(
+        Self::with_exchange_with_config(
+            connection_string,
+            exchange,
+            &RabbitMqConnectionConfig::default(),
+        )
+        .await
+    }
+
+    /// Connect with caller-selected TLS settings, declare `exchange`, and use
+    /// it for subsequent publishes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a credential-redacted [`BusError::Connection`] when the broker
+    /// cannot be reached within the connect bounds, or a permanent one when
+    /// `config` carries TLS material that `connection_string` would discard.
+    /// Returns [`BusError`] when the exchange cannot be declared.
+    pub async fn with_exchange_with_config(
+        connection_string: &str,
+        exchange: Exchange,
+        config: &RabbitMqConnectionConfig,
+    ) -> Result<Self, BusError> {
+        let connection = RabbitMqConnection::connect_with_retry_recovering_with_config(
             connection_string,
             DEFAULT_RETRY_ATTEMPTS,
             DEFAULT_RETRY_BASE_DELAY,
+            config,
         )
         .await?;
         let exchange_kind = exchange_kind_to_lapin(exchange.kind)?;
@@ -523,8 +562,8 @@ mod tests {
     // The connect-failure path of `new` and `with_exchange` is covered by
     // `connection::tests::connect_with_retry_returns_connection_error_after_max_attempts`
     // and by `connection::tests::connect_recovering_gives_up_once_its_bound_elapses`.
-    // Both constructors only forward `connect_with_retry_recovering` through
-    // `?`, so exercising them here would re-test the same mapping.
+    // Both constructors only forward `connect_with_retry_recovering_with_config`
+    // through `?`, so exercising them here would re-test the same mapping.
 
     #[test]
     fn default_constants_are_sane() {

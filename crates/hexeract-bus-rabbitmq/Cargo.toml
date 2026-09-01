@@ -30,6 +30,7 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 serde = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true, features = ["rabbitmq"] }

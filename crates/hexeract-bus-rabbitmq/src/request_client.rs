@@ -39,7 +39,9 @@ use hexeract_bus::{
 use lapin::Channel;
 use tokio_util::sync::CancellationToken;
 
-use crate::connection::{DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BASE_DELAY, RabbitMqConnection};
+use crate::connection::{
+    DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BASE_DELAY, RabbitMqConnection, RabbitMqConnectionConfig,
+};
 use crate::reply_inbox::{declare_reply_inbox, run_reply_inbox};
 use crate::transport::RabbitMqTransport;
 
@@ -74,12 +76,15 @@ pub struct RabbitMqRequestClientConfig {
     /// no request at all, which turns request-reply off without stopping the
     /// process. See [`hexeract_bus::RequestRegistry::new`].
     pub max_in_flight: usize,
+    /// TLS settings used by the publisher and supervised reply-inbox sessions.
+    pub connection_config: RabbitMqConnectionConfig,
 }
 
 impl Default for RabbitMqRequestClientConfig {
     fn default() -> Self {
         Self {
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            connection_config: RabbitMqConnectionConfig::default(),
         }
     }
 }
@@ -111,6 +116,13 @@ impl RabbitMqRequestClientConfigBuilder {
     #[must_use]
     pub fn max_in_flight(mut self, max_in_flight: usize) -> Self {
         self.config.max_in_flight = max_in_flight;
+        self
+    }
+
+    /// Use the supplied TLS settings for every connection owned by the client.
+    #[must_use]
+    pub fn connection_config(mut self, connection_config: RabbitMqConnectionConfig) -> Self {
+        self.config.connection_config = connection_config;
         self
     }
 
@@ -168,15 +180,17 @@ pub async fn connect_request_client_with_config(
     cancel: CancellationToken,
     config: RabbitMqRequestClientConfig,
 ) -> Result<RequestClient<RabbitMqTransport>, BusError> {
-    let transport = Arc::new(RabbitMqTransport::new(uri).await?);
+    let transport =
+        Arc::new(RabbitMqTransport::new_with_config(uri, &config.connection_config).await?);
     let registry = Arc::new(RequestRegistry::new(config.max_in_flight));
 
     // Supervised connection for the inbox consumer: NOT the recovering
     // connection used by the publisher above.
-    let connection = RabbitMqConnection::connect_with_retry(
+    let connection = RabbitMqConnection::connect_with_retry_with_config(
         uri,
         DEFAULT_RETRY_ATTEMPTS,
         DEFAULT_RETRY_BASE_DELAY,
+        &config.connection_config,
     )
     .await?;
     // Same contract as the reconnect path: a setup that fails after this
@@ -203,6 +217,7 @@ pub async fn connect_request_client_with_config(
         Arc::clone(&registry),
         Arc::clone(&reply_inbox),
         cancel,
+        config.connection_config,
     );
 
     Ok(RequestClient::new(
@@ -232,6 +247,7 @@ fn spawn_reply_inbox_supervisor(
     registry: Arc<RequestRegistry>,
     reply_inbox: Arc<Mutex<ReplyInboxState>>,
     cancel: CancellationToken,
+    connection_config: RabbitMqConnectionConfig,
 ) -> RequestClientSupervisor {
     let reconnect_uri = uri.to_owned();
     let reconnect_state = Arc::clone(&reply_inbox);
@@ -249,8 +265,15 @@ fn spawn_reply_inbox_supervisor(
             move |cancel| {
                 let reconnect_uri = reconnect_uri.clone();
                 let reconnect_state = Arc::clone(&reconnect_state);
+                let connection_config = connection_config.clone();
                 async move {
-                    reconnect_reply_inbox(&reconnect_uri, &reconnect_state, &cancel).await
+                    reconnect_reply_inbox(
+                        &reconnect_uri,
+                        &reconnect_state,
+                        &cancel,
+                        &connection_config,
+                    )
+                    .await
                 }
             },
         )
@@ -354,12 +377,14 @@ async fn reconnect_reply_inbox(
     uri: &str,
     reply_inbox: &Mutex<ReplyInboxState>,
     cancel: &CancellationToken,
+    connection_config: &RabbitMqConnectionConfig,
 ) -> Option<(Channel, String)> {
     let next_inbox = retry_reply_inbox_after_failures(cancel, DEFAULT_RETRY_BASE_DELAY, || async {
-        let connection = RabbitMqConnection::connect_with_retry(
+        let connection = RabbitMqConnection::connect_with_retry_with_config(
             uri,
             DEFAULT_RETRY_ATTEMPTS,
             DEFAULT_RETRY_BASE_DELAY,
+            connection_config,
         )
         .await
         .map_err(|error| {
@@ -562,16 +587,31 @@ mod tests {
 
     use hexeract_bus::ReplyExpectation;
     use hexeract_core::RequestId;
+    use lapin::tcp::OwnedTLSConfig;
     use tokio::sync::Notify;
 
     use super::*;
 
     #[test]
     fn request_client_config_preserves_the_default_in_flight_bound() {
-        assert_eq!(
-            RabbitMqRequestClientConfig::default().max_in_flight,
-            DEFAULT_MAX_IN_FLIGHT
-        );
+        let config = RabbitMqRequestClientConfig::default();
+
+        assert_eq!(config.max_in_flight, DEFAULT_MAX_IN_FLIGHT);
+        assert!(!config.connection_config.has_custom_tls_config());
+    }
+
+    #[test]
+    fn request_client_builder_keeps_the_selected_connection_configuration() {
+        let config = RabbitMqRequestClientConfigBuilder::new()
+            .connection_config(RabbitMqConnectionConfig::default().with_tls_config(
+                OwnedTLSConfig {
+                    cert_chain: Some("private-ca-pem".to_owned()),
+                    identity: None,
+                },
+            ))
+            .build();
+
+        assert!(config.connection_config.has_custom_tls_config());
     }
 
     #[test]
