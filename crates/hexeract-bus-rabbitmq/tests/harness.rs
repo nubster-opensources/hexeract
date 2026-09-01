@@ -89,6 +89,22 @@ pub(crate) async fn start_rabbitmq() -> RunningBroker {
     RunningBroker { container, uri }
 }
 
+/// Select the rustls crypto provider for the whole test process.
+///
+/// `rustls` refuses to pick a provider on its own when its crate features name
+/// more than one, and panics inside lapin's io loop at the first handshake
+/// instead of returning an error. This test binary is exactly that case: the
+/// production graph resolves `aws-lc-rs` alone through `tcp-stream`, but
+/// `testcontainers` pulls `bollard`, which adds `ring`. The ambiguity is an
+/// artefact of the dev-dependencies, not of the crate under test, so the tests
+/// resolve it explicitly and pick the provider production would have used.
+///
+/// Safe to call from every test: `install_default` wins once per process and
+/// the losers of the race are ignored.
+fn install_test_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 /// Start a broker that serves only AMQPS and requires mutual TLS.
 pub(crate) async fn start_tls_rabbitmq() -> RunningTlsBroker {
     const RABBITMQ_TLS_CONFIG: &str = r"
@@ -101,6 +117,8 @@ ssl_options.keyfile = /etc/rabbitmq/tls/server-key.pem
 ssl_options.verify = verify_peer
 ssl_options.fail_if_no_peer_cert = true
 ";
+
+    install_test_crypto_provider();
 
     // The readiness probe is deliberately NOT `WaitFor::message_on_stdout`.
     // Waiting on a startup banner couples the test to a log line, and a broker

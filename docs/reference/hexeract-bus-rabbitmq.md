@@ -56,6 +56,31 @@ do not place private keys or PKCS#12 passwords in source control. The same
 and `RabbitMqRequestClientConfigBuilder::connection_config`, the latter applying
 it to both the publisher and reply-inbox connections.
 
+#### Prerequisite: one rustls crypto provider
+
+TLS goes through `rustls`, which refuses to choose a cryptographic provider on
+its own when its crate features name more than one. It does not return an
+error in that case: it **panics inside lapin's io loop at the first
+handshake**, and the failure reaches the caller as an ordinary retryable
+connection error, so a supervisor will retry it forever.
+
+The dependency graph of this crate alone resolves `aws-lc-rs` and nothing
+else, so `amqps://` works with no action required. The ambiguity appears when
+the final binary pulls a second provider, which is common: an HTTP client on
+`ring`, a database driver on a different provider, or `testcontainers` in a
+test binary. Whenever that happens, select one explicitly, once, before the
+first connection:
+
+```rust,ignore
+rustls::crypto::aws_lc_rs::default_provider()
+    .install_default()
+    .expect("the crypto provider must be selected once, before any TLS use");
+```
+
+The choice belongs to the binary, never to a library, which is why this crate
+installs nothing on your behalf. `cargo tree -i ring` and
+`cargo tree -i aws-lc-rs` tell you whether your build is ambiguous.
+
 A private CA is an **additional** trust anchor, not a replacement: it is
 appended to the platform trust store, so a certificate issued by any publicly
 trusted authority for the broker hostname stays acceptable. Supplying an

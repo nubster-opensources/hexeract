@@ -452,6 +452,28 @@ async fn connect_once(
 /// the session silently. See
 /// [`RabbitMqConnectionConfig::allow_plaintext_transport`].
 ///
+/// # Crypto provider
+///
+/// TLS runs on `rustls`, which refuses to choose a cryptographic provider
+/// when its crate features name more than one, and **panics inside lapin's
+/// io loop at the first handshake** rather than returning an error. The
+/// failure then reaches the caller as an ordinary retryable connection
+/// error, so a supervisor retries it forever.
+///
+/// This crate's own graph resolves `aws-lc-rs` alone, so `amqps://` needs no
+/// action. A binary that pulls a second provider (an HTTP client on `ring`,
+/// `testcontainers` in a test binary) must select one explicitly, once,
+/// before the first connection:
+///
+/// ```rust,ignore
+/// rustls::crypto::aws_lc_rs::default_provider()
+///     .install_default()
+///     .expect("the crypto provider must be selected once, before any TLS use");
+/// ```
+///
+/// The choice belongs to the binary, so this crate installs nothing on the
+/// caller's behalf.
+///
 /// # Security
 ///
 /// The URI embeds the broker credentials in its userinfo component
