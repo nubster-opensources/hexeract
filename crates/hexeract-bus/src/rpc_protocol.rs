@@ -10,6 +10,16 @@
 
 use std::collections::HashMap;
 
+/// Prefix reserved for framework protocol headers.
+pub const RESERVED_HEADER_PREFIX: &str = "x-hexeract-";
+
+/// Whether `key` belongs to the framework-reserved protocol namespace.
+#[must_use]
+pub fn is_reserved_header(key: &str) -> bool {
+    key.get(..RESERVED_HEADER_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_HEADER_PREFIX))
+}
+
 /// Header carrying the protocol version of a request or a reply.
 pub const PROTOCOL_VERSION_HEADER: &str = "x-hexeract-protocol-version";
 /// Protocol version implemented by this crate.
@@ -58,6 +68,19 @@ mod tests {
                 "{header} escapes the reserved namespace"
             );
         }
+    }
+
+    #[test]
+    fn reserved_namespace_is_ascii_case_insensitive() {
+        for key in [
+            "x-hexeract-request-id",
+            "X-Hexeract-Request-Id",
+            "X-HEXERACT-future",
+        ] {
+            assert!(is_reserved_header(key), "{key} must be reserved");
+        }
+        assert!(!is_reserved_header("x-hexeract"));
+        assert!(!is_reserved_header("x-hexeractx-request-id"));
     }
 
     #[test]
