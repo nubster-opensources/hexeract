@@ -1545,6 +1545,25 @@ pub(crate) fn death_count(props: &BasicProperties, wait_queue: &str) -> u32 {
     0
 }
 
+/// Rebuild a [`hexeract_bus::BusEnvelope`] from one AMQP delivery.
+///
+/// Shared by the consumer worker and the reply inbox so both reconstruct a
+/// delivery identically and, more importantly, bound it identically: a path
+/// that decoded on weaker limits than the other would be a bypass of the
+/// stricter one.
+///
+/// Both bounds are checked before anything is copied out of the delivery.
+/// `max_payload_bytes` caps the message body; `metadata_limits` caps the AMQP
+/// field table, which the payload cap does not cover, since a tiny payload can
+/// still carry a large table.
+///
+/// # Errors
+///
+/// Returns [`BusError::PayloadTooLarge`] when the body exceeds
+/// `max_payload_bytes`, [`BusError::MetadataLimitExceeded`] or
+/// [`BusError::InvalidMetadata`] when the field table violates
+/// `metadata_limits`, and [`BusError::InvalidTopology`] when the delivery
+/// carries no AMQP `type` property to derive a `message_type` from.
 pub(crate) fn delivery_to_envelope(
     props: &BasicProperties,
     payload: &[u8],
