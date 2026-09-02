@@ -1441,6 +1441,13 @@ impl RabbitMqWorker {
 /// worker just refused, handing the sender a way to place unbounded metadata
 /// in the dead-letter queue and in whatever consumes it. Every field copied
 /// here is a bounded scalar the AMQP frame itself constrains.
+///
+/// The broker's own `x-death` history goes with the rest of the table, so a
+/// quarantined copy replayed from the dead-letter queue starts its retry count
+/// from zero (see [`death_count`]). That is the intended trade: the history is
+/// attacker-supplied metadata like any other entry, and a replayed message
+/// whose metadata is still invalid is refused again before a handler runs, so
+/// a reset counter cannot turn into an unbounded retry loop.
 fn properties_without_headers(properties: &BasicProperties) -> BasicProperties {
     let mut rebuilt = BasicProperties::default();
     if let Some(content_type) = properties.content_type() {
