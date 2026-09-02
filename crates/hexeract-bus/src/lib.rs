@@ -78,6 +78,8 @@ pub mod transport;
 
 pub use envelope::BusEnvelope;
 pub use error::BusError;
+pub use error::InvalidMetadataReason;
+pub use error::MetadataLimit;
 pub use handler::BoxFuture;
 pub use handler::ErasedHandler;
 pub use handler::Handler;
@@ -115,6 +117,8 @@ pub use rpc_protocol::REPLY_STATUS_ERROR;
 pub use rpc_protocol::REPLY_STATUS_HEADER;
 pub use rpc_protocol::REPLY_STATUS_OK;
 pub use rpc_protocol::REQUEST_ID_HEADER;
+pub use rpc_protocol::RESERVED_HEADER_PREFIX;
+pub use rpc_protocol::is_reserved_header;
 pub use topology::Binding;
 pub use topology::Exchange;
 pub use topology::ExchangeKind;

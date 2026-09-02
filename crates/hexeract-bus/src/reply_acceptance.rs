@@ -62,17 +62,13 @@ pub fn accepts(
     expectation: &ReplyExpectation,
     envelope: &BusEnvelope,
 ) -> Result<(), ReplyRejection> {
-    match read_protocol_version(&envelope.headers) {
+    match read_protocol_version(envelope) {
         Some(PROTOCOL_VERSION) => {}
         Some(version) => return Err(ReplyRejection::UnsupportedVersion { version }),
         None => return Err(ReplyRejection::MissingVersion),
     }
 
-    match envelope
-        .headers
-        .get(REPLY_STATUS_HEADER)
-        .map(String::as_str)
-    {
+    match envelope.header(REPLY_STATUS_HEADER) {
         Some(REPLY_STATUS_OK) => {
             if envelope.message_type == expectation.reply_message_type {
                 Ok(())
@@ -108,34 +104,31 @@ mod tests {
         ReplyExpectation::new(EXPECTED_REPLY)
     }
 
-    fn envelope(message_type: &str, headers: HashMap<String, String>) -> BusEnvelope {
-        BusEnvelope::restore(
+    fn envelope(message_type: &str, version: Option<u32>, status: Option<&str>) -> BusEnvelope {
+        let mut envelope = BusEnvelope::restore(
             uuid::Uuid::now_v7(),
             message_type.to_owned(),
             Vec::new(),
             uuid::Uuid::now_v7(),
             None,
-            headers,
+            HashMap::default(),
             std::time::SystemTime::now(),
-        )
-    }
-
-    fn headers(version: Option<u32>, status: Option<&str>) -> HashMap<String, String> {
-        let mut map = HashMap::new();
+        );
         if let Some(version) = version {
-            map.insert(PROTOCOL_VERSION_HEADER.to_owned(), version.to_string());
+            envelope.insert_protocol_header(PROTOCOL_VERSION_HEADER, version.to_string());
         }
         if let Some(status) = status {
-            map.insert(REPLY_STATUS_HEADER.to_owned(), status.to_owned());
+            envelope.insert_protocol_header(REPLY_STATUS_HEADER, status.to_owned());
         }
-        map
+        envelope
     }
 
     #[test]
     fn accepts_a_well_formed_ok_reply() {
         let envelope = envelope(
             EXPECTED_REPLY,
-            headers(Some(PROTOCOL_VERSION), Some(REPLY_STATUS_OK)),
+            Some(PROTOCOL_VERSION),
+            Some(REPLY_STATUS_OK),
         );
         assert_eq!(accepts(&expectation(), &envelope), Ok(()));
     }
@@ -144,14 +137,15 @@ mod tests {
     fn accepts_a_well_formed_error_reply() {
         let envelope = envelope(
             REPLY_ERROR_MESSAGE_TYPE,
-            headers(Some(PROTOCOL_VERSION), Some(REPLY_STATUS_ERROR)),
+            Some(PROTOCOL_VERSION),
+            Some(REPLY_STATUS_ERROR),
         );
         assert_eq!(accepts(&expectation(), &envelope), Ok(()));
     }
 
     #[test]
     fn rejects_a_missing_protocol_version() {
-        let envelope = envelope(EXPECTED_REPLY, headers(None, Some(REPLY_STATUS_OK)));
+        let envelope = envelope(EXPECTED_REPLY, None, Some(REPLY_STATUS_OK));
         assert_eq!(
             accepts(&expectation(), &envelope),
             Err(ReplyRejection::MissingVersion)
@@ -160,7 +154,7 @@ mod tests {
 
     #[test]
     fn rejects_an_unsupported_protocol_version() {
-        let envelope = envelope(EXPECTED_REPLY, headers(Some(99), Some(REPLY_STATUS_OK)));
+        let envelope = envelope(EXPECTED_REPLY, Some(99), Some(REPLY_STATUS_OK));
         assert_eq!(
             accepts(&expectation(), &envelope),
             Err(ReplyRejection::UnsupportedVersion { version: 99 })
@@ -169,7 +163,7 @@ mod tests {
 
     #[test]
     fn rejects_a_missing_status() {
-        let envelope = envelope(EXPECTED_REPLY, headers(Some(PROTOCOL_VERSION), None));
+        let envelope = envelope(EXPECTED_REPLY, Some(PROTOCOL_VERSION), None);
         assert_eq!(
             accepts(&expectation(), &envelope),
             Err(ReplyRejection::MissingStatus)
@@ -178,10 +172,7 @@ mod tests {
 
     #[test]
     fn rejects_an_unknown_status() {
-        let envelope = envelope(
-            EXPECTED_REPLY,
-            headers(Some(PROTOCOL_VERSION), Some("maybe")),
-        );
+        let envelope = envelope(EXPECTED_REPLY, Some(PROTOCOL_VERSION), Some("maybe"));
         assert_eq!(
             accepts(&expectation(), &envelope),
             Err(ReplyRejection::UnknownStatus)
@@ -192,7 +183,8 @@ mod tests {
     fn rejects_an_ok_status_carrying_the_wrong_reply_type() {
         let envelope = envelope(
             "some.other.type",
-            headers(Some(PROTOCOL_VERSION), Some(REPLY_STATUS_OK)),
+            Some(PROTOCOL_VERSION),
+            Some(REPLY_STATUS_OK),
         );
         assert_eq!(
             accepts(&expectation(), &envelope),
@@ -204,7 +196,8 @@ mod tests {
     fn rejects_an_error_status_without_the_error_sentinel() {
         let envelope = envelope(
             EXPECTED_REPLY,
-            headers(Some(PROTOCOL_VERSION), Some(REPLY_STATUS_ERROR)),
+            Some(PROTOCOL_VERSION),
+            Some(REPLY_STATUS_ERROR),
         );
         assert_eq!(
             accepts(&expectation(), &envelope),

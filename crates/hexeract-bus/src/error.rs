@@ -1,5 +1,49 @@
 use thiserror::Error;
 
+/// Metadata dimension subject to a transport limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataLimit {
+    /// Number of headers carried by a message.
+    HeaderCount,
+    /// Byte length of one header key.
+    KeyBytes,
+    /// Byte length of one header value.
+    ValueBytes,
+    /// Total byte length of all header keys and values.
+    TotalBytes,
+}
+
+impl std::fmt::Display for MetadataLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self {
+            Self::HeaderCount => "header count",
+            Self::KeyBytes => "key bytes",
+            Self::ValueBytes => "value bytes",
+            Self::TotalBytes => "total bytes",
+        };
+        f.write_str(reason)
+    }
+}
+
+/// Reason a transport-provided metadata value was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidMetadataReason {
+    /// An AMQP long string could not be decoded as UTF-8.
+    NonUtf8LongString,
+    /// A reserved protocol header was not transmitted in canonical form.
+    NonCanonicalReservedHeader,
+}
+
+impl std::fmt::Display for InvalidMetadataReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self {
+            Self::NonUtf8LongString => "non-utf8 long string",
+            Self::NonCanonicalReservedHeader => "non-canonical reserved header",
+        };
+        f.write_str(reason)
+    }
+}
+
 /// Errors raised by the bus primitives, transports and workers.
 ///
 /// Marked `#[non_exhaustive]` so new variants can be added without a
@@ -7,6 +51,28 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum BusError {
+    /// An application attempted to set a framework-reserved header.
+    #[error("application header uses the reserved x-hexeract-* namespace")]
+    ReservedHeaderNamespace,
+
+    /// Metadata exceeded a configured transport limit.
+    #[error("metadata {limit} limit exceeded: observed {actual}, maximum {max}")]
+    MetadataLimitExceeded {
+        /// Metadata dimension whose limit was exceeded.
+        limit: MetadataLimit,
+        /// Measured size of the metadata.
+        actual: usize,
+        /// Maximum permitted size of the metadata.
+        max: usize,
+    },
+
+    /// Metadata could not be represented safely by the transport.
+    #[error("invalid metadata: {reason}")]
+    InvalidMetadata {
+        /// Stable category of invalid metadata.
+        reason: InvalidMetadataReason,
+    },
+
     /// The message payload could not be serialized or deserialized as JSON.
     #[error("failed to (de)serialize message payload as JSON")]
     Serialization(#[from] serde_json::Error),
@@ -210,5 +276,31 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("users.registered"));
         assert!(message.contains("orders.placed"));
+    }
+
+    #[test]
+    fn metadata_limit_error_includes_only_limit_dimension_and_sizes() {
+        let message = BusError::MetadataLimitExceeded {
+            limit: MetadataLimit::KeyBytes,
+            actual: 257,
+            max: 256,
+        }
+        .to_string();
+
+        assert!(message.contains("key bytes"));
+        assert!(message.contains("257"));
+        assert!(message.contains("256"));
+        assert!(!message.contains("tenant-secret"));
+    }
+
+    #[test]
+    fn invalid_metadata_error_includes_stable_reason_name() {
+        let message = BusError::InvalidMetadata {
+            reason: InvalidMetadataReason::NonUtf8LongString,
+        }
+        .to_string();
+
+        assert!(message.contains("non-utf8 long string"));
+        assert!(!message.contains("tenant-secret"));
     }
 }

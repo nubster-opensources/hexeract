@@ -16,13 +16,42 @@ The full rustdoc lives at <https://docs.rs/hexeract-bus>.
 
 | Item | Role |
 | --- | --- |
-| `BusEnvelope` | In-flight representation of a message. Holds `message_id` (UUIDv7), `message_type`, JSON payload, `correlation_id`, optional `reply_to`, free-form `headers`, `published_at`. `Debug` masks the payload. |
+| `BusEnvelope` | In-flight representation of a message. Holds `message_id` (UUIDv7), `message_type`, JSON payload, `correlation_id`, optional `reply_to`, free-form application `headers`, `published_at`. Framework protocol metadata lives in a separate private collection. `Debug` masks the payload. |
 | `BusEnvelope::new(correlation_id, &M)` | Builds a fresh envelope; mints `message_id`. |
-| `BusEnvelope::with_headers(correlation_id, headers, &M)` | Builds a fresh envelope with custom headers. |
+| `BusEnvelope::with_headers(correlation_id, headers, &M)` | Builds a fresh envelope with custom headers. Rejects a reserved key with `BusError::ReservedHeaderNamespace`. |
 | `BusEnvelope::with_reply_to(correlation_id, reply_to, &M)` | Builds a fresh envelope with a reply queue. |
-| `BusEnvelope::restore(...)` | Backend hook to rebuild an envelope from broker properties. |
+| `BusEnvelope::header(key)` | Reads one header: a reserved key is served from the protocol collection, every other key from the application map. |
+| `BusEnvelope::restore(...)` | Backend hook to rebuild an envelope from broker properties. Its map is application metadata. |
 | `BusEnvelope::decode::<M>()` | Deserialises the payload and validates the `message_type` matches `M::MESSAGE_TYPE`. |
-| `BusError` | Non-exhaustive error enum: `Serialization`, `Transport(Box<...>)`, `Connection(Box<...>)`, `MissingHandler { message_type }`, `TypeMismatch { expected, actual }`, `InvalidTopology { reason }`, `Internal(String)`. |
+| `BusError` | Non-exhaustive error enum: `Serialization`, `Transport(Box<...>)`, `Connection(Box<...>)`, `MissingHandler { message_type }`, `TypeMismatch { expected, actual }`, `InvalidTopology { reason }`, `ReservedHeaderNamespace`, `MetadataLimitExceeded { limit, actual, max }`, `InvalidMetadata { reason }`, `Internal(String)`. |
+
+#### The reserved `x-hexeract-*` namespace
+
+`BusEnvelope::headers` carries application metadata only. The complete
+`x-hexeract-*` prefix belongs to the framework, and it is reserved in every
+ASCII case variant: `X-Hexeract-Anything` is as reserved as
+`x-hexeract-anything`.
+
+An application helper that would place a reserved key in the application map
+returns `BusError::ReservedHeaderNamespace`. `BusEnvelope::with_headers` and
+`Transport::publish_with_headers` check it up front, and a RabbitMQ publish
+revalidates the map, so mutating the public field directly after construction
+cannot smuggle one onto the wire either.
+
+Framework protocol fields (`x-hexeract-request-id`,
+`x-hexeract-protocol-version`, `x-hexeract-reply-status`) are written through
+an internal API and read back with `BusEnvelope::header`. Reading a reserved
+key never returns an application value, and vice versa, so an application
+header can no longer collide with a current or future protocol field.
+
+`RESERVED_HEADER_PREFIX` and `is_reserved_header` are public for backends that
+need to recognise the namespace themselves.
+
+Metadata size limits are a backend concern; `hexeract-bus` owns the typed,
+value-free error surface (`MetadataLimit`, `InvalidMetadataReason`) that
+backends report through. See
+[`hexeract-bus-rabbitmq`](hexeract-bus-rabbitmq.md#metadata-limits) for the
+RabbitMQ bounds and their defaults.
 
 ### Topology
 

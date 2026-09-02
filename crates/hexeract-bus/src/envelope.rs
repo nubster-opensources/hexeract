@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::BusError;
 use crate::Message;
+use crate::rpc_protocol::is_reserved_header;
 
 /// In-flight representation of a message crossing the bus.
 ///
@@ -36,6 +37,8 @@ pub struct BusEnvelope {
     pub reply_to: Option<String>,
     /// Free-form metadata propagated alongside the message.
     pub headers: HashMap<String, String>,
+    /// Framework protocol metadata kept separate from application headers.
+    protocol_headers: HashMap<String, String>,
     /// Instant at which the envelope was created by the publisher.
     pub published_at: SystemTime,
 }
@@ -49,6 +52,7 @@ impl std::fmt::Debug for BusEnvelope {
             .field("correlation_id", &self.correlation_id)
             .field("reply_to", &self.reply_to)
             .field("headers", &self.headers)
+            .field("protocol_headers", &self.protocol_headers)
             .field("published_at", &self.published_at)
             .finish()
     }
@@ -73,6 +77,7 @@ impl BusEnvelope {
             correlation_id,
             reply_to: None,
             headers: HashMap::new(),
+            protocol_headers: HashMap::new(),
             published_at: SystemTime::now(),
         })
     }
@@ -90,6 +95,7 @@ impl BusEnvelope {
     ) -> Result<Self, BusError> {
         let mut envelope = Self::new(correlation_id, message)?;
         envelope.headers = headers;
+        envelope.validate_application_headers()?;
         Ok(envelope)
     }
 
@@ -136,8 +142,81 @@ impl BusEnvelope {
             correlation_id,
             reply_to,
             headers,
+            protocol_headers: HashMap::new(),
             published_at,
         }
+    }
+
+    /// Reconstruct an envelope from application and protocol metadata read by a transport.
+    ///
+    /// Transport adapters use this to preserve the protocol metadata boundary while
+    /// reconstructing a delivery from the wire.
+    #[doc(hidden)]
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore_from_transport(
+        message_id: Uuid,
+        message_type: String,
+        payload: Vec<u8>,
+        correlation_id: Uuid,
+        reply_to: Option<String>,
+        headers: HashMap<String, String>,
+        protocol_headers: HashMap<String, String>,
+        published_at: SystemTime,
+    ) -> Self {
+        Self {
+            message_id,
+            message_type,
+            payload,
+            correlation_id,
+            reply_to,
+            headers,
+            protocol_headers,
+            published_at,
+        }
+    }
+
+    /// Read an application header or framework protocol header.
+    #[must_use]
+    pub fn header(&self, key: &str) -> Option<&str> {
+        if is_reserved_header(key) {
+            self.protocol_headers.get(key).map(String::as_str)
+        } else {
+            self.headers.get(key).map(String::as_str)
+        }
+    }
+
+    /// Iterate over application and protocol headers in their wire representation.
+    #[doc(hidden)]
+    pub fn wire_headers(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.headers
+            .iter()
+            .chain(&self.protocol_headers)
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+    }
+
+    /// Validate public application headers before an outbound transport operation.
+    #[doc(hidden)]
+    pub fn validate_application_headers(&self) -> Result<(), BusError> {
+        if self.headers.keys().any(|key| is_reserved_header(key)) {
+            return Err(BusError::ReservedHeaderNamespace);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn insert_protocol_header(&mut self, key: &'static str, value: String) {
+        self.protocol_headers.insert(key.to_owned(), value);
+    }
+
+    /// Remove a framework protocol header.
+    ///
+    /// Only the crate's own tests need this: production code writes protocol
+    /// metadata once and never retracts it, so gating the helper on `test`
+    /// keeps it out of the shipped binary instead of silencing the dead-code
+    /// lint on a method that would otherwise look reachable.
+    #[cfg(test)]
+    pub(crate) fn remove_protocol_header(&mut self, key: &'static str) -> Option<String> {
+        self.protocol_headers.remove(key)
     }
 
     /// Deserialize the payload back into the strongly-typed message.
@@ -174,6 +253,7 @@ impl BusEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rpc_protocol::REQUEST_ID_HEADER;
     use serde::Deserialize;
     use serde::Serialize;
 
@@ -229,6 +309,86 @@ mod tests {
         let envelope =
             BusEnvelope::with_headers(Uuid::nil(), headers.clone(), &sample_order()).unwrap();
         assert_eq!(envelope.headers, headers);
+    }
+
+    #[test]
+    fn application_constructor_rejects_reserved_header_case_variants() {
+        let headers = HashMap::from([("X-Hexeract-Request-Id".to_owned(), "spoofed".to_owned())]);
+        assert!(matches!(
+            BusEnvelope::with_headers(Uuid::nil(), headers, &sample_order()),
+            Err(BusError::ReservedHeaderNamespace)
+        ));
+    }
+
+    #[test]
+    fn mutated_application_headers_must_be_revalidated_before_transport() {
+        let mut envelope = BusEnvelope::new(Uuid::nil(), &sample_order()).unwrap();
+        envelope
+            .headers
+            .insert("X-Hexeract-Request-Id".into(), "spoofed".into());
+
+        assert!(matches!(
+            envelope.validate_application_headers(),
+            Err(BusError::ReservedHeaderNamespace)
+        ));
+    }
+
+    #[test]
+    fn protocol_headers_are_private_but_visible_to_wire_and_protocol_readers() {
+        let mut envelope = BusEnvelope::new(Uuid::nil(), &sample_order()).unwrap();
+        envelope.headers.insert("tenant".into(), "acme".into());
+        envelope.insert_protocol_header(REQUEST_ID_HEADER, "request-1".into());
+        assert_eq!(envelope.headers.get(REQUEST_ID_HEADER), None);
+        assert_eq!(envelope.header(REQUEST_ID_HEADER), Some("request-1"));
+        assert_eq!(envelope.header("tenant"), Some("acme"));
+        assert_eq!(envelope.wire_headers().count(), 2);
+    }
+
+    #[test]
+    fn removing_protocol_header_does_not_touch_application_headers() {
+        let mut envelope = BusEnvelope::new(Uuid::nil(), &sample_order()).unwrap();
+        envelope.headers.insert("tenant".into(), "acme".into());
+        envelope.insert_protocol_header(REQUEST_ID_HEADER, "request-1".into());
+
+        assert_eq!(
+            envelope
+                .remove_protocol_header(REQUEST_ID_HEADER)
+                .as_deref(),
+            Some("request-1")
+        );
+        assert_eq!(envelope.header(REQUEST_ID_HEADER), None);
+        assert_eq!(envelope.header("tenant"), Some("acme"));
+    }
+
+    #[test]
+    fn reserved_lookup_cannot_be_shadowed_by_mutated_application_headers() {
+        let mut envelope = BusEnvelope::new(Uuid::nil(), &sample_order()).unwrap();
+        envelope
+            .headers
+            .insert(REQUEST_ID_HEADER.into(), "spoofed".into());
+        envelope.insert_protocol_header(REQUEST_ID_HEADER, "request-1".into());
+
+        assert_eq!(envelope.header(REQUEST_ID_HEADER), Some("request-1"));
+    }
+
+    #[test]
+    fn restoration_keeps_application_and_protocol_headers_separate() {
+        let application_headers = HashMap::from([("tenant".into(), "acme".into())]);
+        let protocol_headers = HashMap::from([(REQUEST_ID_HEADER.into(), "request-1".into())]);
+        let envelope = BusEnvelope::restore_from_transport(
+            Uuid::nil(),
+            OrderPlaced::MESSAGE_TYPE.into(),
+            Vec::new(),
+            Uuid::nil(),
+            None,
+            application_headers.clone(),
+            protocol_headers,
+            SystemTime::UNIX_EPOCH,
+        );
+
+        assert_eq!(envelope.headers, application_headers);
+        assert_eq!(envelope.header(REQUEST_ID_HEADER), Some("request-1"));
+        assert_eq!(envelope.wire_headers().count(), 2);
     }
 
     #[test]

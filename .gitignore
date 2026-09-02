@@ -28,6 +28,7 @@ target
 # Local test scratch
 .hexeract/
 .scratch/
+.worktrees/
 
 # Coverage
 *.profraw

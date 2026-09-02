@@ -22,12 +22,14 @@ use futures_util::StreamExt;
 use hexeract_bus::BusEnvelope;
 use hexeract_bus::BusError;
 use hexeract_bus::RequestRegistry;
+use lapin::BasicProperties;
 use lapin::Channel;
 use lapin::options::BasicConsumeOptions;
 use lapin::options::QueueDeclareOptions;
 use lapin::types::FieldTable;
 use tokio_util::sync::CancellationToken;
 
+use crate::metadata::AmqpMetadataLimits;
 use crate::transport::to_short_string;
 use crate::worker::DEFAULT_MAX_PAYLOAD_BYTES;
 use crate::worker::delivery_to_envelope;
@@ -67,11 +69,16 @@ pub async fn declare_reply_inbox(channel: &Channel) -> Result<String, BusError> 
 /// AMQP-property-to-envelope reconstruction: `message_type` from the
 /// `type` property, `correlation_id` and `reply_to` from their
 /// respective properties, and free-form headers.
-fn decode_delivery(delivery: &lapin::message::Delivery) -> Result<BusEnvelope, BusError> {
+fn decode_delivery(
+    properties: &BasicProperties,
+    payload: &[u8],
+    metadata_limits: AmqpMetadataLimits,
+) -> Result<BusEnvelope, BusError> {
     delivery_to_envelope(
-        &delivery.properties,
-        &delivery.data,
+        properties,
+        payload,
         DEFAULT_MAX_PAYLOAD_BYTES,
+        metadata_limits,
     )
 }
 
@@ -95,6 +102,33 @@ pub async fn run_reply_inbox(
     registry: Arc<RequestRegistry>,
     cancel: CancellationToken,
 ) -> Result<(), BusError> {
+    run_reply_inbox_with_limits(
+        channel,
+        inbox,
+        registry,
+        cancel,
+        AmqpMetadataLimits::default(),
+    )
+    .await
+}
+
+/// Consume the reply inbox under caller-selected metadata limits.
+///
+/// The reply path applies exactly the same limits, through exactly the same
+/// decoder, as the normal worker: a reply inbox that accepted metadata the
+/// worker refuses would be a complete bypass of the worker's bound, and it is
+/// the path that feeds an RPC correlation slot.
+///
+/// # Errors
+///
+/// Same contract as [`run_reply_inbox`].
+pub(crate) async fn run_reply_inbox_with_limits(
+    channel: Channel,
+    inbox: String,
+    registry: Arc<RequestRegistry>,
+    cancel: CancellationToken,
+    metadata_limits: AmqpMetadataLimits,
+) -> Result<(), BusError> {
     let mut consumer = channel
         .basic_consume(
             to_short_string(inbox.as_str(), "reply inbox queue name")?,
@@ -112,8 +146,16 @@ pub async fn run_reply_inbox(
         tokio::select! {
             () = cancel.cancelled() => return Ok(()),
             next = consumer.next() => match next {
-                Some(Ok(delivery)) => match decode_delivery(&delivery) {
+                Some(Ok(delivery)) => match decode_delivery(
+                    &delivery.properties,
+                    &delivery.data,
+                    metadata_limits,
+                ) {
                     Ok(envelope) => registry.resolve(envelope),
+                    // The typed error carries a reason and sizes only, never a
+                    // header key or value, and the delivery is dropped under
+                    // the existing no_ack contract before it can take a
+                    // correlation slot.
                     Err(error) => {
                         tracing::warn!(%error, "undecodable reply delivery, dropping");
                     }
@@ -129,5 +171,55 @@ pub async fn run_reply_inbox(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hexeract_bus::REQUEST_ID_HEADER;
+    use lapin::types::AMQPValue;
+
+    use super::*;
+
+    /// Build reply properties carrying `headers` and the AMQP `type` a
+    /// delivery needs to decode into an envelope.
+    fn reply_properties<'a>(
+        headers: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> BasicProperties {
+        let mut table = FieldTable::default();
+        for (key, value) in headers {
+            table.insert(key.into(), AMQPValue::LongString(value.as_bytes().into()));
+        }
+        BasicProperties::default()
+            .with_type("orders.replied".into())
+            .with_headers(table)
+    }
+
+    #[test]
+    fn a_bounded_reply_decodes_and_keeps_its_protocol_header() {
+        let properties = reply_properties([(REQUEST_ID_HEADER, "request-1")]);
+        let envelope = decode_delivery(&properties, b"{}", AmqpMetadataLimits::default())
+            .expect("a bounded reply must decode");
+        assert_eq!(envelope.header(REQUEST_ID_HEADER), Some("request-1"));
+    }
+
+    #[test]
+    fn oversized_reply_metadata_fails_before_resolution() {
+        let properties = reply_properties([(REQUEST_ID_HEADER, "request-1")]);
+        let limits = AmqpMetadataLimits {
+            max_headers: 0,
+            ..AmqpMetadataLimits::default()
+        };
+        assert!(
+            matches!(
+                decode_delivery(&properties, b"{}", limits),
+                Err(BusError::MetadataLimitExceeded {
+                    limit: hexeract_bus::MetadataLimit::HeaderCount,
+                    actual: 1,
+                    max: 0,
+                })
+            ),
+            "an oversized reply must fail decoding, never reach RequestRegistry::resolve"
+        );
     }
 }

@@ -23,6 +23,7 @@ use hexeract_bus::RawBusPublish;
 use hexeract_bus::RoutingKey;
 use hexeract_bus::Transport;
 use hexeract_bus_rabbitmq::AckMode;
+use hexeract_bus_rabbitmq::AmqpMetadataLimits;
 use hexeract_bus_rabbitmq::ChannelPool;
 use hexeract_bus_rabbitmq::RabbitMqConnection;
 use hexeract_bus_rabbitmq::RabbitMqTransport;
@@ -35,6 +36,7 @@ use lapin::ConnectionProperties;
 use lapin::options::BasicGetOptions;
 use lapin::options::BasicPublishOptions;
 use lapin::options::QueueDeclareOptions;
+use lapin::types::AMQPValue;
 use lapin::types::FieldTable;
 use lapin::types::ShortString;
 use serde::Deserialize;
@@ -881,6 +883,137 @@ async fn worker_routes_oversize_delivery_to_dead_letter_queue() {
         attempts.load(Ordering::SeqCst),
         0,
         "handler must never run for an oversize delivery"
+    );
+
+    cancel.cancel();
+    handle.await.unwrap().unwrap();
+}
+
+/// Poll `dead_letter_queue` until the worker parks a delivery there.
+///
+/// The queue is declared by the worker, so an early probe can race its
+/// startup: a `basic_get` on a missing queue is a channel-closing soft error,
+/// hence a fresh channel per attempt.
+async fn wait_for_dead_letter(
+    uri: &str,
+    dead_letter_queue: &str,
+) -> Option<lapin::message::BasicGetMessage> {
+    let probe = Connection::connect(uri, ConnectionProperties::default())
+        .await
+        .unwrap();
+    for _ in 0..80 {
+        let probe_channel = probe.create_channel().await.unwrap();
+        if let Ok(candidate) = probe_channel
+            .basic_get(dead_letter_queue.into(), BasicGetOptions::default())
+            .await
+            && candidate.is_some()
+        {
+            return candidate;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    None
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn oversized_metadata_is_quarantined_without_headers() {
+    let (_container, uri) = start_rabbit().await;
+    let queue_name = "worker.metadata.source";
+    let dlr_queue = "worker.metadata.parked";
+    declare_temporary_queue(&uri, queue_name).await;
+
+    let publisher = Connection::connect(&uri, ConnectionProperties::default())
+        .await
+        .unwrap();
+    let publish_channel = publisher.create_channel().await.unwrap();
+
+    // A tiny payload with one header a single byte over the configured value
+    // limit: the payload cap alone would let this through.
+    let mut headers = FieldTable::default();
+    headers.insert("tenant".into(), AMQPValue::LongString(vec![b'x'; 9].into()));
+    publish_channel
+        .basic_publish(
+            ShortString::from(""),
+            ShortString::from(queue_name),
+            BasicPublishOptions::default(),
+            b"{\"order_id\":\"00000000-0000-0000-0000-000000000001\"}",
+            BasicProperties::default()
+                .with_type("orders.placed".into())
+                .with_message_id("33333333-3333-3333-3333-333333333333".into())
+                .with_correlation_id("44444444-4444-4444-4444-444444444444".into())
+                .with_headers(headers),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .metadata_limits(AmqpMetadataLimits {
+            max_value_bytes: 8,
+            ..AmqpMetadataLimits::default()
+        })
+        .dead_letter_routing_key(dlr_queue)
+        .register_handler::<OrderPlaced, _>(AlwaysFailingHandler {
+            attempts: Arc::clone(&attempts),
+        })
+        .build()
+        .unwrap();
+
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
+
+    let parked = wait_for_dead_letter(&uri, dlr_queue)
+        .await
+        .expect("oversized metadata must be routed to the dead-letter queue");
+
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        0,
+        "handler must never run for a delivery whose metadata was refused"
+    );
+    let quarantined_headers = parked
+        .delivery
+        .properties
+        .headers()
+        .as_ref()
+        .expect("the quarantine copy must carry an explicit empty table");
+    assert!(
+        quarantined_headers.inner().is_empty(),
+        "the refused field table must be rebuilt empty, never republished"
+    );
+    assert_eq!(
+        parked
+            .delivery
+            .properties
+            .message_id()
+            .as_ref()
+            .map(ShortString::as_str),
+        Some("33333333-3333-3333-3333-333333333333"),
+        "the quarantine copy must stay diagnosable"
+    );
+    assert_eq!(
+        parked
+            .delivery
+            .properties
+            .correlation_id()
+            .as_ref()
+            .map(ShortString::as_str),
+        Some("44444444-4444-4444-4444-444444444444"),
+    );
+    assert_eq!(
+        parked
+            .delivery
+            .properties
+            .kind()
+            .as_ref()
+            .map(ShortString::as_str),
+        Some("orders.placed"),
     );
 
     cancel.cancel();
