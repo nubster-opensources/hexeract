@@ -26,6 +26,8 @@
 //! Backend implementations live in companion crates such as
 //! `hexeract-bus-rabbitmq`.
 
+/// Absolute deadlines carried across the bus by the request-reply protocol.
+pub mod deadline;
 /// In-flight representation of a message crossing the bus.
 pub mod envelope;
 /// Errors raised by the bus primitives, transports and workers.
@@ -76,6 +78,10 @@ pub mod topology;
 /// Backend-agnostic publish contract implemented by bus backends.
 pub mod transport;
 
+pub use deadline::Deadline;
+pub use deadline::DeadlineReading;
+pub use deadline::DeadlineViolation;
+pub use deadline::LocalDeadline;
 pub use envelope::BusEnvelope;
 pub use error::BusError;
 pub use error::InvalidMetadataReason;
