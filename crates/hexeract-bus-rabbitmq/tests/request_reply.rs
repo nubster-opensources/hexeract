@@ -375,6 +375,41 @@ async fn a_round_trip_carries_the_protocol_headers_over_the_wire() {
     cancel.cancel();
 }
 
+/// Poll `queue` until the client's request lands there.
+///
+/// No responder consumes the queue in these tests, so the request sits on it
+/// and can be inspected exactly as it came off the wire.
+async fn wait_for_request_on(channel: &Channel, queue: &str) -> lapin::message::BasicGetMessage {
+    let mut attempts = 0;
+    loop {
+        if let Some(delivery) = channel
+            .basic_get(queue.into(), BasicGetOptions::default())
+            .await
+            .unwrap()
+        {
+            return delivery;
+        }
+        attempts += 1;
+        assert!(attempts < 100, "no request reached the broker");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Read the request id a request carries on the wire.
+fn read_request_id(request: &lapin::message::BasicGetMessage) -> String {
+    let headers = request
+        .properties
+        .headers()
+        .as_ref()
+        .expect("the request must carry headers");
+    match headers.inner().get(REQUEST_ID_HEADER) {
+        Some(AMQPValue::LongString(value)) => {
+            String::from_utf8(value.as_bytes().to_vec()).expect("the request id must be UTF-8")
+        }
+        other => panic!("expected a request id long string, got {other:?}"),
+    }
+}
+
 /// A reply whose metadata exceeds the client's limits must be dropped by the
 /// inbox before it can resolve the pending slot it names.
 ///
@@ -387,7 +422,10 @@ async fn oversized_reply_metadata_does_not_consume_slot() {
     let broker = harness::start_rabbitmq().await;
     let cancel = CancellationToken::new();
 
-    declare_ping_queue(broker.uri(), "tests.ping.metadata").await;
+    // `Ping::DESTINATION` derives from its `MESSAGE_TYPE`, so the request
+    // always routes to `tests.ping`: declaring any other queue would leave the
+    // publish unroutable.
+    declare_ping_queue(broker.uri(), "tests.ping").await;
 
     // 64 bytes leaves ample room for the protocol fields (a request id is a
     // 36-byte UUID) while rejecting the 65-byte header forged below.
@@ -406,8 +444,9 @@ async fn oversized_reply_metadata_does_not_consume_slot() {
     .await
     .unwrap();
 
-    // No responder consumes the queue: the request waits while we forge the
-    // reply ourselves.
+    // No responder consumes the queue: the request waits while we forge both
+    // replies ourselves. The timeout is generous on purpose, so a pass proves
+    // the oversized reply was rejected rather than merely slow to arrive.
     let caller = tokio::spawn({
         let client = Arc::new(client);
         let call_client = Arc::clone(&client);
@@ -415,7 +454,7 @@ async fn oversized_reply_metadata_does_not_consume_slot() {
             call_client
                 .request_with(
                     Ping { seq: 1 },
-                    RequestOptions::new().with_timeout(Duration::from_secs(3)),
+                    RequestOptions::new().with_timeout(Duration::from_secs(20)),
                 )
                 .await
         }
@@ -423,19 +462,7 @@ async fn oversized_reply_metadata_does_not_consume_slot() {
 
     let inspect_connection = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let inspect_channel = inspect_connection.create_channel().await.unwrap();
-    let mut attempts = 0;
-    let request = loop {
-        if let Some(delivery) = inspect_channel
-            .basic_get("tests.ping.metadata".into(), BasicGetOptions::default())
-            .await
-            .unwrap()
-        {
-            break delivery;
-        }
-        attempts += 1;
-        assert!(attempts < 100, "no request reached the broker");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    let request = wait_for_request_on(&inspect_channel, "tests.ping").await;
 
     let reply_to = request
         .properties
@@ -444,56 +471,63 @@ async fn oversized_reply_metadata_does_not_consume_slot() {
         .expect("the request must carry a reply_to")
         .as_str()
         .to_owned();
-    let request_headers = request
-        .properties
-        .headers()
-        .as_ref()
-        .expect("the request must carry headers")
-        .clone();
-    let request_id = match request_headers.inner().get(REQUEST_ID_HEADER) {
-        Some(AMQPValue::LongString(value)) => {
-            String::from_utf8(value.as_bytes().to_vec()).expect("the request id must be UTF-8")
-        }
-        other => panic!("expected a request id long string, got {other:?}"),
+    let request_id = read_request_id(&request);
+
+    let protocol_headers = || {
+        let mut headers = FieldTable::default();
+        headers.insert(
+            REQUEST_ID_HEADER.into(),
+            AMQPValue::LongString(request_id.as_bytes().into()),
+        );
+        headers.insert(
+            PROTOCOL_VERSION_HEADER.into(),
+            AMQPValue::LongString(PROTOCOL_VERSION.to_string().as_bytes().into()),
+        );
+        headers.insert(
+            REPLY_STATUS_HEADER.into(),
+            AMQPValue::LongString(REPLY_STATUS_OK.as_bytes().into()),
+        );
+        headers
     };
 
-    let mut forged = FieldTable::default();
-    forged.insert(
-        REQUEST_ID_HEADER.into(),
-        AMQPValue::LongString(request_id.as_bytes().into()),
-    );
-    forged.insert(
-        PROTOCOL_VERSION_HEADER.into(),
-        AMQPValue::LongString(PROTOCOL_VERSION.to_string().as_bytes().into()),
-    );
-    forged.insert(
-        REPLY_STATUS_HEADER.into(),
-        AMQPValue::LongString(REPLY_STATUS_OK.as_bytes().into()),
-    );
-    forged.insert(
+    let publish_reply = async |headers: FieldTable, seq: u64| {
+        inspect_channel
+            .basic_publish(
+                ShortString::from(""),
+                ShortString::from(reply_to.as_str()),
+                BasicPublishOptions::default(),
+                serde_json::to_vec(&Pong { seq }).unwrap().as_slice(),
+                BasicProperties::default()
+                    .with_type(Pong::MESSAGE_TYPE.into())
+                    .with_headers(headers),
+            )
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+    };
+
+    // First reply: correct request id, but one header a single byte over the
+    // configured value limit. Without the bound this would resolve the call
+    // with seq 99.
+    let mut oversized = protocol_headers();
+    oversized.insert(
         "tenant".into(),
         AMQPValue::LongString(vec![b'x'; 65].into()),
     );
+    publish_reply(oversized, 99).await;
 
-    inspect_channel
-        .basic_publish(
-            ShortString::from(""),
-            ShortString::from(reply_to.as_str()),
-            BasicPublishOptions::default(),
-            serde_json::to_vec(&Pong { seq: 1 }).unwrap().as_slice(),
-            BasicProperties::default()
-                .with_type(Pong::MESSAGE_TYPE.into())
-                .with_headers(forged),
-        )
-        .await
-        .unwrap()
-        .await
-        .unwrap();
+    // Second reply: bounded, and the one the caller must actually observe.
+    // AMQP preserves publish order on one queue from one channel, so this
+    // arrives after the oversized one.
+    publish_reply(protocol_headers(), 1).await;
 
     let outcome = caller.await.unwrap();
-    assert!(
-        matches!(outcome, Err(RequestError::Timeout { .. })),
-        "an oversized reply must be dropped before it resolves the slot, got {outcome:?}"
+    let pong = outcome.expect("the bounded reply must resolve the call");
+    assert_eq!(
+        pong.seq, 1,
+        "the oversized reply must be dropped before it resolves the slot; \
+         observing seq 99 would mean it consumed the pending slot"
     );
 
     cancel.cancel();
@@ -666,8 +700,11 @@ impl Transport for RecordingTransport {
         routing_key: &str,
         envelope: &BusEnvelope,
     ) -> Result<Uuid, BusError> {
-        if let Some(request_id) = envelope.headers.get(REQUEST_ID_HEADER) {
-            *self.last_request_id.lock().unwrap() = Some(request_id.clone());
+        // Read through `header`, not the public map: the request id is
+        // framework protocol metadata and no longer lives in the application
+        // headers.
+        if let Some(request_id) = envelope.header(REQUEST_ID_HEADER) {
+            *self.last_request_id.lock().unwrap() = Some(request_id.to_owned());
         }
         self.inner.publish_envelope(routing_key, envelope).await
     }
