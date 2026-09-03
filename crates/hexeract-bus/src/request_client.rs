@@ -1219,13 +1219,16 @@ mod tests {
         let transport = Arc::new(CapturingTransport::default());
         let registry = Arc::new(RequestRegistry::default());
         let client = client(Arc::clone(&transport), Arc::clone(&registry));
+        let timeout = Duration::from_millis(200);
 
+        let before = SystemTime::now();
         let request_fut = client.request(Ping { seq: 1 });
         tokio::pin!(request_fut);
         tokio::select! {
             _ = &mut request_fut => panic!("should still be pending"),
             () = tokio::time::sleep(Duration::from_millis(20)) => {}
         }
+        let after = SystemTime::now();
 
         let published = transport.last_published().expect("a request was published");
         let deadline: Deadline = published
@@ -1237,6 +1240,17 @@ mod tests {
             deadline.anchor(SystemTime::now()),
             DeadlineReading::Live(_)
         ));
+        let earliest_allowed =
+            Deadline::from_wall_clock(before, timeout - Duration::from_millis(1));
+        let latest_allowed = Deadline::from_wall_clock(after, timeout);
+        assert!(
+            deadline >= earliest_allowed,
+            "the published deadline is earlier than the effective timeout allows"
+        );
+        assert!(
+            deadline <= latest_allowed,
+            "the published deadline is later than the effective timeout allows"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1244,16 +1258,17 @@ mod tests {
         let transport = Arc::new(CapturingTransport::default());
         let registry = Arc::new(RequestRegistry::default());
         let client = client(Arc::clone(&transport), Arc::clone(&registry));
+        let timeout = Duration::from_secs(600);
 
-        let request_fut = client.request_with(
-            Ping { seq: 1 },
-            RequestOptions::new().with_timeout(Duration::from_secs(600)),
-        );
+        let before = SystemTime::now();
+        let request_fut =
+            client.request_with(Ping { seq: 1 }, RequestOptions::new().with_timeout(timeout));
         tokio::pin!(request_fut);
         tokio::select! {
             _ = &mut request_fut => panic!("should still be pending"),
             () = tokio::time::sleep(Duration::from_millis(20)) => {}
         }
+        let after = SystemTime::now();
 
         let published = transport.last_published().expect("a request was published");
         let deadline: Deadline = published
@@ -1264,6 +1279,17 @@ mod tests {
         assert!(
             deadline > Deadline::from_wall_clock(SystemTime::now(), Duration::from_millis(200)),
             "a ten minute call must publish a deadline far beyond the client default"
+        );
+        let earliest_allowed =
+            Deadline::from_wall_clock(before, timeout - Duration::from_millis(1));
+        let latest_allowed = Deadline::from_wall_clock(after, timeout);
+        assert!(
+            deadline >= earliest_allowed,
+            "the published deadline is earlier than the effective timeout allows"
+        );
+        assert!(
+            deadline <= latest_allowed,
+            "the published deadline is later than the effective timeout allows"
         );
     }
 
