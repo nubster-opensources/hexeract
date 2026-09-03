@@ -1,15 +1,18 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use hexeract_core::{HandlerContext, RequestId};
 
+use crate::deadline::{DeadlineReading, LocalDeadline};
 use crate::remote_error::{RemoteErrorPayload, RemoteErrorType};
 use crate::request_context::RequestContext;
 use crate::responder_counters::{ResponderCounters, ResponderCountersSnapshot};
 use crate::rpc_protocol::{
     PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, REPLY_ERROR_MESSAGE_TYPE, REPLY_STATUS_ERROR,
-    REPLY_STATUS_HEADER, REPLY_STATUS_OK, REQUEST_ID_HEADER, read_protocol_version,
+    REPLY_STATUS_HEADER, REPLY_STATUS_OK, REQUEST_ID_HEADER, read_deadline, read_protocol_version,
 };
 use crate::{
     BoxFuture, BusEnvelope, BusError, ErasedHandler, ReplyDestination, ReplyPublisher, Request,
@@ -91,6 +94,95 @@ where
             }
         }
     }
+
+    /// Read and judge the inbound deadline header, once `reply_to` and
+    /// `request_id` are already known good.
+    ///
+    /// Returns [`ControlFlow::Continue`] with the anchored deadline (or
+    /// `None` when the caller set none) to let dispatch proceed, and
+    /// [`ControlFlow::Break`] once this guard has already stopped the
+    /// request: silently for an elapsed deadline, or after publishing a
+    /// categorized error reply for an unreadable or out-of-range one. See
+    /// [`RepliedHandler::handle`] for why this guard runs where it does.
+    async fn judge_deadline(
+        &self,
+        envelope: &BusEnvelope,
+        reply_to: &ReplyDestination,
+        correlation_id: uuid::Uuid,
+        request_id: RequestId,
+    ) -> Result<ControlFlow<(), Option<LocalDeadline>>, BusError> {
+        match read_deadline(envelope, SystemTime::now()) {
+            DeadlineReading::Absent => Ok(ControlFlow::Continue(None)),
+            DeadlineReading::Live(deadline) => Ok(ControlFlow::Continue(Some(deadline))),
+            DeadlineReading::Expired => {
+                self.counters.count_expired_deadline();
+                tracing::warn!(
+                    message_type = R::MESSAGE_TYPE,
+                    %request_id,
+                    "request deadline already elapsed, dropping without running the handler"
+                );
+                Ok(ControlFlow::Break(()))
+            }
+            DeadlineReading::Invalid(violation) => {
+                self.counters.count_invalid_deadline();
+                tracing::warn!(
+                    message_type = R::MESSAGE_TYPE,
+                    %request_id,
+                    ?violation,
+                    "request carries an unusable deadline, rejecting"
+                );
+                let reply = error_reply(RemoteErrorType::Malformed, correlation_id, request_id)?;
+                self.replies.publish_reply(reply_to, &reply).await?;
+                Ok(ControlFlow::Break(()))
+            }
+        }
+    }
+
+    /// Encode a nominal reply as its OK envelope, or fall back to an opaque
+    /// internal error if serialization fails.
+    fn encode_ok_reply(
+        correlation_id: uuid::Uuid,
+        request_id: RequestId,
+        reply: &R::Reply,
+    ) -> Result<BusEnvelope, BusError> {
+        match BusEnvelope::new(correlation_id, reply) {
+            Ok(mut env) => {
+                env.insert_protocol_header(REPLY_STATUS_HEADER, REPLY_STATUS_OK.to_owned());
+                env.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
+                env.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
+                Ok(env)
+            }
+            Err(error) => {
+                tracing::error!(
+                    %request_id,
+                    message_type = R::MESSAGE_TYPE,
+                    %error,
+                    "reply serialization failed, replying with an opaque category"
+                );
+                error_reply(RemoteErrorType::Internal, correlation_id, request_id)
+            }
+        }
+    }
+
+    /// Encode a handler failure as its sanitized error envelope.
+    fn encode_handler_error_reply(
+        correlation_id: uuid::Uuid,
+        request_id: RequestId,
+        error: H::Error,
+    ) -> Result<BusEnvelope, BusError> {
+        let error: BusError = error.into();
+        tracing::error!(
+            %request_id,
+            message_type = R::MESSAGE_TYPE,
+            %error,
+            "request handler failed, replying with an opaque category"
+        );
+        error_reply(
+            RemoteErrorType::from_bus_error(&error),
+            correlation_id,
+            request_id,
+        )
+    }
 }
 
 /// Outcome of reading the inbound `x-hexeract-request-id` header.
@@ -133,10 +225,11 @@ where
 
     /// Decode the inbound request, run the handler, and publish the reply.
     ///
-    /// Four guards run in a fixed order before the handler is ever invoked,
-    /// each one stopping the request before the handler runs, two of them
-    /// silently and two of them with a categorized error reply, rather than
-    /// running the handler on incomplete input:
+    /// Five guards run in a fixed order before the handler is ever invoked,
+    /// each one stopping the request before the handler runs, rather than
+    /// running the handler on incomplete input. Guards 1, 2, and the elapsed
+    /// case of guard 4 drop the request silently; guards 3, 5, and the
+    /// unusable case of guard 4 answer it with a categorized error reply:
     ///
     /// 1. `reply_to` is parsed and validated against
     ///    [`ReplyPublisher::accept_destination`] FIRST, before any other
@@ -163,12 +256,32 @@ where
     ///    `request_id` are known good: its own rejection branch is the
     ///    first one in this method that publishes, and it now has both a
     ///    validated destination and a definite identity to publish with.
-    /// 4. The payload is decoded fourth, and its own rejection reuses the
+    /// 4. The deadline is judged fourth, after the version and before the
+    ///    payload. After the version, because interpreting a protocol
+    ///    header presupposes knowing which protocol is being spoken. Before
+    ///    the decode, because deserializing a payload whose work is already
+    ///    known to be pointless spends the exact resource the deadline
+    ///    exists to protect. An elapsed deadline is dropped silently, like
+    ///    guards 1 and 2, since its caller has already failed locally; an
+    ///    unreadable or out-of-range one is answered with
+    ///    [`RemoteErrorType::Malformed`], like guard 5, not with the
+    ///    `Unsupported` category guard 3 uses: it is a defect in this one
+    ///    request's deadline, caller-fixable by correcting a clock or
+    ///    shortening a timeout, not in the peer's protocol version, which
+    ///    only an upgrade can fix. Sharing a category with guard 3 would
+    ///    make that distinction unrecoverable from the wire, since
+    ///    [`RemoteErrorPayload`] carries no free-form text.
+    /// 5. The payload is decoded fifth, and its own rejection reuses the
     ///    same guarantees.
     ///
     /// A nominal reply the framework fails to serialize is treated the same
     /// as an undecodable request: an opaque internal error is published
     /// instead of leaving the caller to exhaust its timeout in silence.
+    ///
+    /// The deadline is judged once more, immediately before publication: a
+    /// reply whose deadline passed while the handler ran is suppressed
+    /// rather than published, since by then it could reach nothing but an
+    /// orphaned inbox.
     fn handle<'a>(
         &'a self,
         envelope: &'a BusEnvelope,
@@ -218,6 +331,14 @@ where
                 }
             };
 
+            let deadline = match self
+                .judge_deadline(envelope, &reply_to, correlation_id, request_id)
+                .await?
+            {
+                ControlFlow::Break(()) => return Ok(()),
+                ControlFlow::Continue(deadline) => deadline,
+            };
+
             let request: R = match envelope.decode() {
                 Ok(request) => request,
                 Err(error) => {
@@ -233,43 +354,23 @@ where
                 }
             };
 
-            let request_context = RequestContext::new(request_id, protocol_version, ctx);
+            let mut request_context = RequestContext::new(request_id, protocol_version, ctx);
+            if let Some(deadline) = deadline {
+                request_context = request_context.with_deadline(deadline);
+            }
             let reply_envelope = match self.handler.handle(request, &request_context).await {
-                Ok(reply) => match BusEnvelope::new(correlation_id, &reply) {
-                    Ok(mut env) => {
-                        env.insert_protocol_header(REPLY_STATUS_HEADER, REPLY_STATUS_OK.to_owned());
-                        env.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
-                        env.insert_protocol_header(
-                            PROTOCOL_VERSION_HEADER,
-                            PROTOCOL_VERSION.to_string(),
-                        );
-                        env
-                    }
-                    Err(error) => {
-                        tracing::error!(
-                            %request_id,
-                            message_type = R::MESSAGE_TYPE,
-                            %error,
-                            "reply serialization failed, replying with an opaque category"
-                        );
-                        error_reply(RemoteErrorType::Internal, correlation_id, request_id)?
-                    }
-                },
-                Err(error) => {
-                    let error: BusError = error.into();
-                    tracing::error!(
-                        %request_id,
-                        message_type = R::MESSAGE_TYPE,
-                        %error,
-                        "request handler failed, replying with an opaque category"
-                    );
-                    error_reply(
-                        RemoteErrorType::from_bus_error(&error),
-                        correlation_id,
-                        request_id,
-                    )?
-                }
+                Ok(reply) => Self::encode_ok_reply(correlation_id, request_id, &reply)?,
+                Err(error) => Self::encode_handler_error_reply(correlation_id, request_id, error)?,
             };
+            if deadline.is_some_and(LocalDeadline::is_expired) {
+                self.counters.count_reply_dropped_after_deadline();
+                tracing::warn!(
+                    message_type = R::MESSAGE_TYPE,
+                    %request_id,
+                    "deadline passed while handling, suppressing a reply nobody awaits"
+                );
+                return Ok(());
+            }
             self.replies
                 .publish_reply(&reply_to, &reply_envelope)
                 .await?;
@@ -316,6 +417,8 @@ fn error_reply(
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, SystemTime};
 
     use hexeract_core::{CorrelationId, MessageId, RequestId};
     use serde::{Deserialize, Serialize};
@@ -324,6 +427,8 @@ mod tests {
     use super::*;
     use crate::Message;
     use crate::RequestContext;
+    use crate::deadline::Deadline;
+    use crate::rpc_protocol::DEADLINE_HEADER;
     use crate::{ReplyDestination, ReplyDestinationError, ReplyPublisher};
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -1083,6 +1188,9 @@ mod tests {
             invalid_reply_to: 2,
             invalid_request_id: 2,
             unsupported_protocol_version: 1,
+            expired_deadline: 0,
+            invalid_deadline: 0,
+            reply_dropped_after_deadline: 0,
         };
         assert_eq!(handler.counters(), expected);
         assert_eq!(counters.snapshot(), expected);
@@ -1120,8 +1228,317 @@ mod tests {
                 invalid_reply_to: 0,
                 invalid_request_id: 0,
                 unsupported_protocol_version: 0,
+                expired_deadline: 0,
+                invalid_deadline: 0,
+                reply_dropped_after_deadline: 0,
             },
             "a rejection counter must not move on a request the responder accepted"
+        );
+    }
+
+    /// Builds a deadline that expired sixty seconds ago, for tests exercising
+    /// the pre-dispatch expiry guard.
+    fn a_deadline_that_passed() -> Deadline {
+        Deadline::from_wall_clock(SystemTime::now() - Duration::from_secs(60), Duration::ZERO)
+    }
+
+    /// A handler whose work takes `work` to complete, so a test running under
+    /// `start_paused` can let a deadline elapse mid-handler without waiting
+    /// in real time.
+    struct SlowHandler {
+        work: Duration,
+    }
+
+    impl RequestHandler<Ping> for SlowHandler {
+        type Error = BusError;
+
+        async fn handle(&self, request: Ping, _ctx: &RequestContext<'_>) -> Result<Pong, BusError> {
+            tokio::time::sleep(self.work).await;
+            Ok(Pong { seq: request.seq })
+        }
+    }
+
+    /// A handler that records the time left on [`RequestContext::remaining`]
+    /// at the moment it runs, so a test can inspect exactly what a handler
+    /// observed.
+    struct DeadlineCapturingHandler {
+        remaining: Arc<StdMutex<Option<Duration>>>,
+    }
+
+    impl RequestHandler<Ping> for DeadlineCapturingHandler {
+        type Error = BusError;
+
+        async fn handle(&self, request: Ping, ctx: &RequestContext<'_>) -> Result<Pong, BusError> {
+            *self.remaining.lock().unwrap() = ctx.remaining();
+            Ok(Pong { seq: request.seq })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_expired_before_dispatch_never_reaches_the_handler() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let counters = ResponderCounters::default();
+        let erased = RepliedHandler::with_counters(
+            RecordingHandler {
+                ran: Arc::clone(&ran),
+            },
+            Arc::clone(&publisher),
+            counters.clone(),
+        );
+        let mut request = request_envelope(Some("amq.gen-inbox"));
+        request.insert_protocol_header(DEADLINE_HEADER, a_deadline_that_passed().to_string());
+
+        erased.handle(&request, &ctx()).await.unwrap();
+
+        assert!(!ran.load(Ordering::Relaxed), "the handler must not run");
+        assert!(
+            publisher.published.lock().unwrap().is_empty(),
+            "an expired request is dropped, never answered"
+        );
+        assert_eq!(counters.snapshot().expired_deadline, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_deadline_is_answered_with_a_protocol_error() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let counters = ResponderCounters::default();
+        let erased = RepliedHandler::with_counters(
+            RecordingHandler {
+                ran: Arc::clone(&ran),
+            },
+            Arc::clone(&publisher),
+            counters.clone(),
+        );
+        let mut request = request_envelope(Some("amq.gen-inbox"));
+        request.insert_protocol_header(DEADLINE_HEADER, "soon".to_owned());
+
+        erased.handle(&request, &ctx()).await.unwrap();
+
+        assert!(!ran.load(Ordering::Relaxed), "the handler must not run");
+        let recorded = publisher.last_published().expect("an error reply");
+        assert_eq!(recorded.message_type, REPLY_ERROR_MESSAGE_TYPE);
+        let payload: RemoteErrorPayload =
+            serde_json::from_slice(&recorded.payload).expect("payload must decode");
+        assert_eq!(
+            payload.error_type,
+            RemoteErrorType::Malformed,
+            "an invalid deadline is caller-fixable, unlike an unsupported version, and must not \
+             share its category"
+        );
+        assert_eq!(counters.snapshot().invalid_deadline, 1);
+    }
+
+    /// A deadline further ahead than the accepted horizon is unusable for the
+    /// same reason an unreadable one is: it is answered with a protocol
+    /// error, never dropped silently. Without this test, a bug that routed
+    /// `DeadlineViolation::BeyondHorizon` into the silent-drop path (the one
+    /// `DeadlineReading::Expired` uses) would pass unnoticed, since only the
+    /// unreadable-string case of `Invalid` was otherwise exercised here.
+    #[tokio::test(start_paused = true)]
+    async fn a_deadline_beyond_the_horizon_is_answered_with_a_protocol_error() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let counters = ResponderCounters::default();
+        let erased = RepliedHandler::with_counters(
+            RecordingHandler {
+                ran: Arc::clone(&ran),
+            },
+            Arc::clone(&publisher),
+            counters.clone(),
+        );
+        let mut request = request_envelope(Some("amq.gen-inbox"));
+        request.insert_protocol_header(
+            DEADLINE_HEADER,
+            Deadline::from_wall_clock(SystemTime::now(), Duration::from_secs(3_601)).to_string(),
+        );
+
+        erased.handle(&request, &ctx()).await.unwrap();
+
+        assert!(!ran.load(Ordering::Relaxed), "the handler must not run");
+        let recorded = publisher.last_published().expect("an error reply");
+        let payload: RemoteErrorPayload =
+            serde_json::from_slice(&recorded.payload).expect("payload must decode");
+        assert_eq!(payload.error_type, RemoteErrorType::Malformed);
+        assert_eq!(counters.snapshot().invalid_deadline, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_without_a_deadline_is_served_as_before() {
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let counters = ResponderCounters::default();
+        let erased = RepliedHandler::with_counters(Echo, Arc::clone(&publisher), counters.clone());
+
+        erased
+            .handle(&request_envelope(Some("amq.gen-inbox")), &ctx())
+            .await
+            .unwrap();
+
+        let recorded = publisher.last_published().expect("a reply");
+        assert_eq!(recorded.header(REPLY_STATUS_HEADER), Some(REPLY_STATUS_OK));
+        assert_eq!(counters.snapshot().expired_deadline, 0);
+    }
+
+    /// Pins the live path, which no other deadline test in this module
+    /// covers: two assert nothing is published, one is refused before
+    /// dispatch, and the remaining-time test only inspects
+    /// `RequestContext::remaining`, never publication. Changing the
+    /// pre-publication recheck from "the deadline has expired" to merely
+    /// "a deadline was set" (`deadline.is_some()`) would leave every one of
+    /// those tests green while silently dropping the reply to every request
+    /// that carries a live deadline, which is now every request the caller
+    /// sends.
+    #[tokio::test(start_paused = true)]
+    async fn a_live_deadline_publishes_its_reply_normally() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let erased = RepliedHandler::new(
+            RecordingHandler {
+                ran: Arc::clone(&ran),
+            },
+            Arc::clone(&publisher),
+        );
+        let mut request = request_envelope(Some("amq.gen-inbox"));
+        request.insert_protocol_header(
+            DEADLINE_HEADER,
+            Deadline::from_wall_clock(SystemTime::now(), Duration::from_secs(30)).to_string(),
+        );
+
+        erased.handle(&request, &ctx()).await.unwrap();
+
+        assert!(
+            ran.load(Ordering::Relaxed),
+            "the handler must run for a comfortably live deadline"
+        );
+        let recorded = publisher
+            .last_published()
+            .expect("a reply must be published for a live deadline");
+        assert_eq!(recorded.header(REPLY_STATUS_HEADER), Some(REPLY_STATUS_OK));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_handler_sees_the_time_left_before_the_caller_deadline() {
+        let remaining = Arc::new(StdMutex::new(None));
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let erased = RepliedHandler::new(
+            DeadlineCapturingHandler {
+                remaining: Arc::clone(&remaining),
+            },
+            Arc::clone(&publisher),
+        );
+        let mut request = request_envelope(Some("amq.gen-inbox"));
+        request.insert_protocol_header(
+            DEADLINE_HEADER,
+            Deadline::from_wall_clock(SystemTime::now(), Duration::from_secs(30)).to_string(),
+        );
+
+        erased.handle(&request, &ctx()).await.unwrap();
+
+        let seen = remaining
+            .lock()
+            .unwrap()
+            .expect("the handler must see a deadline");
+        assert!(
+            seen > Duration::from_secs(25),
+            "roughly thirty seconds must still be left, saw {seen:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_is_not_published_when_the_deadline_passed_while_handling() {
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let counters = ResponderCounters::default();
+        let erased = RepliedHandler::with_counters(
+            SlowHandler {
+                work: Duration::from_secs(30),
+            },
+            Arc::clone(&publisher),
+            counters.clone(),
+        );
+        let mut request = request_envelope(Some("amq.gen-inbox"));
+        request.insert_protocol_header(
+            DEADLINE_HEADER,
+            Deadline::from_wall_clock(SystemTime::now(), Duration::from_secs(5)).to_string(),
+        );
+
+        erased.handle(&request, &ctx()).await.unwrap();
+
+        assert!(
+            publisher.published.lock().unwrap().is_empty(),
+            "a reply nobody awaits must not be published"
+        );
+        assert_eq!(counters.snapshot().reply_dropped_after_deadline, 1);
+    }
+
+    /// Pins the deadline guard above the payload decode. Every other
+    /// deadline test in this module carries a decodable payload, so none of
+    /// them would notice the guard sliding below `envelope.decode()`. Were
+    /// that to happen, this request's undecodable payload would be reached
+    /// first and answered with `RemoteErrorType::Malformed`, instead of the
+    /// deadline guard dropping it silently before decoding ever runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_with_an_expired_deadline_and_an_undecodable_payload_is_dropped_by_the_deadline_first()
+     {
+        let ran = Arc::new(AtomicBool::new(false));
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let counters = ResponderCounters::default();
+        let erased = RepliedHandler::with_counters(
+            RecordingHandler {
+                ran: Arc::clone(&ran),
+            },
+            Arc::clone(&publisher),
+            counters.clone(),
+        );
+        let mut request = request_envelope(Some("amq.gen-inbox"));
+        request.insert_protocol_header(DEADLINE_HEADER, a_deadline_that_passed().to_string());
+        request.payload = b"{ not json".to_vec();
+
+        erased.handle(&request, &ctx()).await.unwrap();
+
+        assert!(!ran.load(Ordering::Relaxed), "the handler must not run");
+        assert!(
+            publisher.published.lock().unwrap().is_empty(),
+            "the deadline guard must drop the request before the payload is ever decoded"
+        );
+        assert_eq!(counters.snapshot().expired_deadline, 1);
+    }
+
+    /// Pins the deadline guard below the version check. Were it ever moved
+    /// ahead of guard 3, this expired deadline would be dropped silently by
+    /// the deadline guard before the version guard ever saw the request,
+    /// instead of the version guard answering first with its own
+    /// `RemoteErrorType::Unsupported` reply.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_with_an_expired_deadline_and_an_unsupported_version_is_rejected_by_the_version_first()
+     {
+        let ran = Arc::new(AtomicBool::new(false));
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let counters = ResponderCounters::default();
+        let erased = RepliedHandler::with_counters(
+            RecordingHandler {
+                ran: Arc::clone(&ran),
+            },
+            Arc::clone(&publisher),
+            counters.clone(),
+        );
+        let mut request = request_envelope(Some("amq.gen-inbox"));
+        request.insert_protocol_header(PROTOCOL_VERSION_HEADER, "99".to_owned());
+        request.insert_protocol_header(DEADLINE_HEADER, a_deadline_that_passed().to_string());
+
+        erased.handle(&request, &ctx()).await.unwrap();
+
+        assert!(!ran.load(Ordering::Relaxed), "the handler must not run");
+        let recorded = publisher
+            .last_published()
+            .expect("the version guard must still answer ahead of the deadline guard");
+        let payload: RemoteErrorPayload =
+            serde_json::from_slice(&recorded.payload).expect("payload must decode");
+        assert_eq!(payload.error_type, RemoteErrorType::Unsupported);
+        assert_eq!(
+            counters.snapshot().expired_deadline,
+            0,
+            "the deadline guard must never run once the version guard already rejected"
         );
     }
 }

@@ -68,6 +68,9 @@ instrumentation of your own, only a periodic read.
 | `ResponderCountersSnapshot.invalid_reply_to` | a retained `ResponderCounters` handle | Requests refused for an absent or policy-rejected reply destination |
 | `ResponderCountersSnapshot.invalid_request_id` | idem | Requests with an absent or unparsable `x-hexeract-request-id` |
 | `ResponderCountersSnapshot.unsupported_protocol_version` | idem | Requests announcing a missing or unsupported protocol version |
+| `ResponderCountersSnapshot.expired_deadline` | idem | Requests dropped before dispatch because the caller's deadline had already elapsed |
+| `ResponderCountersSnapshot.invalid_deadline` | idem | Requests answered with a protocol error because their `x-hexeract-deadline` was unreadable or beyond the one hour horizon |
+| `ResponderCountersSnapshot.reply_dropped_after_deadline` | idem | Replies not published because the deadline passed while the handler ran, the work having already been done |
 
 The caller-side snapshot comes from the registry the client already owns. The
 responder-side handle is supplied at registration instead, because the worker
@@ -87,6 +90,7 @@ let worker = RabbitMqWorkerBuilder::new(connection)
 // from your metrics loop, on the clone you kept
 let snapshot = counters.snapshot();
 report_counter("rpc.responder.invalid_reply_to", snapshot.invalid_reply_to);
+report_counter("rpc.responder.expired_deadline", snapshot.expired_deadline);
 ```
 
 Read them as rates rather than as totals. They are monotonic for the life of
@@ -95,6 +99,37 @@ delivery the transport redelivers is counted again. They also merge
 sub-reasons that share one remedy, so when you need to tell a missing header
 from an unreadable one, the `warn` event on the same path names the sub-reason
 and the message type.
+
+The three deadline counters answer different questions, and only the first two
+are refusals. A rising `expired_deadline` means requests arrive already dead,
+for one of four reasons: the responder is saturated and its queue drains
+slower than callers are willing to wait; the two clocks have drifted past the
+one second tolerance; a redelivered request has aged past its original
+deadline, because a reply publication failure nacks the delivery and the
+transport redelivers the request with the same, now-elapsed, absolute
+deadline still attached, so a flapping broker inflates this counter with no
+clock problem and no saturation, correlating with transport errors rather
+than with queue depth; or one caller's clock is grossly wrong, far in the
+past rather than merely drifted, in which case every one of its requests is
+dropped silently and this counter is the only trace. Note the asymmetry: the
+mirror case, a caller clock far in the future, is answered with the protocol
+error `invalid_deadline` instead, because a deadline long past is
+indistinguishable from a request that legitimately sat in a queue during an
+incident, and dropping that one silently is correct, whereas a deadline far
+beyond the horizon can only be a defect worth naming. These causes are
+largely indistinguishable in this counter alone, so compare it against queue
+depth and recent transport errors before suspecting a clock. A rising
+`invalid_deadline` is not a load signal at all: it names one peer publishing
+a deadline this responder cannot use, and the remedy belongs to that caller.
+
+`reply_dropped_after_deadline` is the odd one out, and the most expensive
+thing this table can report. It counts work that ran to completion and was
+then discarded, because the caller stopped waiting while the handler was still
+running. Nothing was refused and nothing was saved: the responder paid the
+full cost of the request and published nothing. A sustained rate here means
+callers' timeouts are shorter than this handler's real latency, so raise the
+timeout or make the handler faster. No setting on the deadline path will fix
+it.
 
 These are the drops nothing else reports. A request refused on its envelope
 never reaches a handler and never produces a reply, so the caller observes

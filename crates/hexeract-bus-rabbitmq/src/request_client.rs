@@ -165,6 +165,12 @@ impl RabbitMqRequestClientConfigBuilder {
 /// The client admits [`DEFAULT_MAX_IN_FLIGHT`] concurrent requests. Use
 /// [`connect_request_client_with_config`] to select another bound.
 ///
+/// `default_timeout` has no ceiling enforced here: a value beyond the one
+/// hour horizon a responder applies is honored locally, in full, but the
+/// published request carries no `x-hexeract-deadline` header at all, since
+/// a responder would only refuse a deadline built past that horizon. A
+/// responder therefore cannot refuse such a call early.
+///
 /// # Errors
 ///
 /// Returns [`BusError::Connection`] if either the recovering publisher

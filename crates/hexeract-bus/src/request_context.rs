@@ -1,4 +1,8 @@
+use std::time::Duration;
+
 use hexeract_core::{HandlerContext, RequestId};
+
+use crate::deadline::LocalDeadline;
 
 /// What a request handler knows about the call it is serving.
 ///
@@ -23,6 +27,15 @@ pub struct RequestContext<'a> {
     /// single value. It exists as the vehicle for a future multi-version
     /// negotiation, not as a value this handler is meant to branch on.
     pub protocol_version: u32,
+    /// Absolute deadline the caller attached to this call, anchored on the
+    /// local monotonic clock, or `None` when the caller set none.
+    ///
+    /// Reaching the deadline does not interrupt a running handler. A handler
+    /// doing long or segmented work is expected to consult
+    /// [`RequestContext::remaining`] itself and stop early when it chooses
+    /// to; the framework only refuses work before dispatch and suppresses a
+    /// reply nobody awaits.
+    pub deadline: Option<LocalDeadline>,
     /// Local dispatch context: correlation, cancellation, span.
     pub handler: &'a HandlerContext,
 }
@@ -48,8 +61,30 @@ impl<'a> RequestContext<'a> {
         Self {
             request_id,
             protocol_version,
+            deadline: None,
             handler,
         }
+    }
+
+    /// Attaches the caller's deadline to a context.
+    ///
+    /// Separate from [`RequestContext::new`] so that adding it breaks no
+    /// existing caller, in particular the application unit tests that build
+    /// a context to exercise their own handler.
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: LocalDeadline) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    /// Time left before the caller's deadline, or `None` when no deadline
+    /// was set or it has already passed.
+    ///
+    /// Recomputed on every call rather than frozen at dispatch, so a handler
+    /// consulting it after thirty seconds of work sees thirty seconds less.
+    #[must_use]
+    pub fn remaining(&self) -> Option<Duration> {
+        self.deadline?.remaining()
     }
 }
 
@@ -69,5 +104,37 @@ mod tests {
         assert_eq!(ctx.request_id, request_id);
         assert_eq!(ctx.protocol_version, 7);
         assert_eq!(ctx.handler.correlation_id, handler_ctx.correlation_id);
+    }
+
+    #[test]
+    fn a_context_built_without_a_deadline_reports_no_remaining_time() {
+        let handler_ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
+
+        let ctx = RequestContext::new(RequestId::new(), 1, &handler_ctx);
+
+        assert_eq!(ctx.deadline, None);
+        assert_eq!(ctx.remaining(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remaining_time_shrinks_as_the_handler_works() {
+        let handler_ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
+        let ctx = RequestContext::new(RequestId::new(), 1, &handler_ctx)
+            .with_deadline(LocalDeadline::after(Duration::from_secs(10)));
+
+        tokio::time::advance(Duration::from_secs(7)).await;
+
+        assert_eq!(ctx.remaining(), Some(Duration::from_secs(3)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remaining_time_is_absent_once_the_deadline_has_passed() {
+        let handler_ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
+        let ctx = RequestContext::new(RequestId::new(), 1, &handler_ctx)
+            .with_deadline(LocalDeadline::after(Duration::from_secs(10)));
+
+        tokio::time::advance(Duration::from_secs(11)).await;
+
+        assert_eq!(ctx.remaining(), None);
     }
 }

@@ -14,12 +14,15 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use hexeract_bus::BusEnvelope;
 use hexeract_bus::BusError;
+use hexeract_bus::DEADLINE_HEADER;
 use hexeract_bus::Exchange;
 use hexeract_bus::ExchangeKind;
 use hexeract_bus::Message;
@@ -1131,6 +1134,182 @@ async fn a_registered_responder_counts_into_the_handle_the_caller_kept() {
     assert_eq!(
         snapshot.unsupported_protocol_version, 0,
         "the request announced the current protocol version"
+    );
+
+    cancel.cancel();
+    let _ = worker_handle.await;
+}
+
+/// Echo handler that records whether its body ever ran, so a test can prove
+/// a guard stopped dispatch rather than merely suppressing the reply.
+struct RecordingEcho {
+    ran: Arc<AtomicBool>,
+}
+
+impl RequestHandler<Ping> for RecordingEcho {
+    type Error = BusError;
+
+    async fn handle(&self, request: Ping, _ctx: &RequestContext<'_>) -> Result<Pong, BusError> {
+        self.ran.store(true, Ordering::Relaxed);
+        Ok(Pong { seq: request.seq })
+    }
+}
+
+/// Publish a forged ping request straight to `queue`, carrying a fresh
+/// request id, the current protocol version, and an `x-hexeract-deadline`
+/// header naming `deadline_millis` (decimal Unix milliseconds).
+///
+/// Every property but the deadline and the payload is identical between two
+/// calls, which is exactly what turns a second call into a positive control:
+/// the deadline is then the only variable that can explain a different
+/// outcome for otherwise-twin requests on the same queue, through the same
+/// channel, to the same worker.
+async fn publish_ping_with_deadline(
+    channel: &Channel,
+    queue: &str,
+    envelope: &BusEnvelope,
+    deadline_millis: i64,
+) {
+    let mut headers = FieldTable::default();
+    headers.insert(
+        ShortString::from(REQUEST_ID_HEADER),
+        AMQPValue::LongString(Uuid::now_v7().to_string().into()),
+    );
+    headers.insert(
+        ShortString::from(PROTOCOL_VERSION_HEADER),
+        AMQPValue::LongString(PROTOCOL_VERSION.to_string().into()),
+    );
+    headers.insert(
+        ShortString::from(DEADLINE_HEADER),
+        AMQPValue::LongString(deadline_millis.to_string().into()),
+    );
+
+    channel
+        .basic_publish(
+            "".into(),
+            queue.into(),
+            BasicPublishOptions::default(),
+            &envelope.payload,
+            BasicProperties::default()
+                .with_headers(headers)
+                .with_message_id(envelope.message_id.to_string().into())
+                .with_correlation_id(envelope.correlation_id.to_string().into())
+                .with_type(Ping::MESSAGE_TYPE.into())
+                .with_reply_to("amq.gen-probe".into()),
+        )
+        .await
+        .expect("publish must succeed");
+}
+
+/// Asserting only that the handler never ran cannot tell "the deadline guard
+/// refused this" from "this never got that far for some unrelated reason":
+/// a regression that classified every deadline as expired, live ones
+/// included, would keep such an assertion green while breaking every real
+/// caller. This test instead pins WHICH guard acted, through
+/// `ResponderCountersSnapshot::expired_deadline`, and pairs the expired
+/// request with a positive control: a second request, forged the same way
+/// through the same channel onto the same queue for the same worker, whose
+/// only difference is a deadline comfortably ahead instead of behind. Only
+/// if the control reaches the handler while the first request does not is
+/// the deadline provably the cause.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn a_request_whose_deadline_expired_in_the_queue_never_reaches_the_handler() {
+    let broker = harness::start_rabbitmq().await;
+    let cancel = CancellationToken::new();
+    let queue = "tests.ping.expired";
+
+    declare_ping_queue(broker.uri(), queue).await;
+
+    let ran = Arc::new(AtomicBool::new(false));
+    let counters = ResponderCounters::default();
+    let responder_transport = Arc::new(RabbitMqTransport::new(broker.uri()).await.unwrap());
+    let worker = RabbitMqWorkerBuilder::new(
+        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+            .await
+            .unwrap(),
+    )
+    .queue(queue)
+    .register_request_handler_with_counters::<Ping, _>(
+        RecordingEcho {
+            ran: Arc::clone(&ran),
+        },
+        Arc::clone(&responder_transport),
+        counters.clone(),
+    )
+    .build()
+    .unwrap();
+    let worker_cancel = cancel.clone();
+    let worker_handle = tokio::spawn(async move { worker.run(worker_cancel).await });
+
+    let connection = RabbitMqConnection::connect(broker.uri())
+        .await
+        .expect("publisher connection must open");
+    let channel = connection
+        .create_channel()
+        .await
+        .expect("publisher channel must open");
+
+    let now_millis = i64::try_from(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock is after the epoch")
+            .as_millis(),
+    )
+    .expect("representable");
+
+    // The request under test: its deadline elapsed sixty seconds ago.
+    let expired_envelope =
+        BusEnvelope::new(Uuid::now_v7(), &Ping { seq: 5 }).expect("request encodes");
+    publish_ping_with_deadline(&channel, queue, &expired_envelope, now_millis - 60_000).await;
+
+    let mut attempts = 0;
+    loop {
+        if counters.snapshot().expired_deadline > 0 {
+            break;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 100,
+            "the expired request was never refused by the deadline guard"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        counters.snapshot().expired_deadline,
+        1,
+        "exactly the expired request must be counted as refused for an elapsed deadline"
+    );
+    assert!(
+        !ran.load(Ordering::Relaxed),
+        "a request whose deadline expired in the queue must never reach the handler"
+    );
+
+    // Positive control: the same forging, the same queue, the same worker,
+    // published on the same channel, but a deadline thirty seconds ahead
+    // rather than sixty seconds behind. `ran` is reset first so this
+    // publish's own effect on it can be observed cleanly.
+    ran.store(false, Ordering::Relaxed);
+    let live_envelope =
+        BusEnvelope::new(Uuid::now_v7(), &Ping { seq: 6 }).expect("request encodes");
+    publish_ping_with_deadline(&channel, queue, &live_envelope, now_millis + 30_000).await;
+
+    let mut attempts = 0;
+    loop {
+        if ran.load(Ordering::Relaxed) {
+            break;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 100,
+            "the live control never reached the handler, so it did not control anything"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        counters.snapshot().expired_deadline,
+        1,
+        "the live control must not itself be counted as an expired deadline"
     );
 
     cancel.cancel();

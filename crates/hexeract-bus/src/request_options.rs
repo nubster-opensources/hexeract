@@ -52,6 +52,14 @@ impl RequestOptions {
     }
 
     /// Override the client's default end-to-end local timeout for this call.
+    ///
+    /// A `timeout` beyond the one hour horizon a responder enforces is
+    /// still honored locally: this call keeps waiting for the full
+    /// duration. What changes is the wire: the published request carries
+    /// no `x-hexeract-deadline` header at all, since a responder would
+    /// only refuse a deadline built past that horizon. This lets the call
+    /// run exactly as it would without the deadline feature; a responder
+    /// cannot refuse it early.
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);

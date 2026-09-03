@@ -6,6 +6,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::deadline::Deadline;
 use crate::remote_error::RemoteErrorPayload;
 use crate::reply_acceptance::ReplyExpectation;
 use crate::reply_inbox_state::ReplyInboxState;
@@ -14,8 +15,9 @@ use crate::request_error::ProtocolViolation;
 use crate::request_options::RequestOptions;
 use crate::request_registry::RequestRegistry;
 use crate::rpc_protocol::{
-    PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, REPLY_ERROR_MESSAGE_TYPE, REPLY_STATUS_ERROR,
-    REPLY_STATUS_HEADER, REPLY_STATUS_OK, REQUEST_ID_HEADER, read_protocol_version,
+    DEADLINE_HEADER, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, REPLY_ERROR_MESSAGE_TYPE,
+    REPLY_STATUS_ERROR, REPLY_STATUS_HEADER, REPLY_STATUS_OK, REQUEST_ID_HEADER,
+    read_protocol_version,
 };
 use crate::{BusEnvelope, Message, Request, RequestError, Transport};
 
@@ -182,6 +184,14 @@ impl<T: Transport> Drop for RequestClientInner<T> {
 impl<T: Transport> RequestClient<T> {
     /// Assemble a client from its collaborators. The `reply_inbox` is shared
     /// so a transport supervisor can update it across reconnects.
+    ///
+    /// `default_timeout`, like a per-call override through
+    /// [`RequestOptions::with_timeout`](crate::RequestOptions::with_timeout),
+    /// has no ceiling enforced here: a value beyond the one hour horizon a
+    /// responder applies is honored locally, in full, but the published
+    /// request carries no `x-hexeract-deadline` header, since a responder
+    /// would only refuse a deadline built past that horizon. A responder
+    /// therefore cannot refuse such a call early.
     ///
     /// [`Self::request_with`] reads `reply_inbox` only after it has
     /// registered with `registry`, never before: that order is what lets
@@ -524,6 +534,14 @@ impl<T: Transport> RequestClient<T> {
             .map_err(RequestError::Encode)?;
         envelope.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
         envelope.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
+        // A timeout beyond the horizon a responder enforces would only be
+        // refused as `BeyondHorizon`; publishing no header at all restores
+        // the pre-deadline behaviour for that call instead of clamping it,
+        // which would make a responder refuse work its caller is still
+        // genuinely waiting for.
+        if let Some(deadline) = Deadline::within_horizon(timeout) {
+            envelope.insert_protocol_header(DEADLINE_HEADER, deadline.to_string());
+        }
         let publication = self.inner.publication_lifecycle.admit()?;
         match tokio::time::timeout_at(
             deadline,
@@ -636,6 +654,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::SystemTime;
 
     use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
@@ -646,9 +665,11 @@ mod tests {
 
     use super::*;
     use crate::BusError;
+    use crate::deadline::{Deadline, DeadlineReading};
     use crate::remote_error::RemoteErrorType;
     use crate::request_options::RequestOptions;
     use crate::request_registry::ReplyCountersSnapshot;
+    use crate::rpc_protocol::DEADLINE_HEADER;
 
     #[derive(Debug, Serialize, Deserialize)]
     struct Ping {
@@ -1206,6 +1227,117 @@ mod tests {
         registry.resolve(ok_reply(published_request_id(&published), 3));
         let pong = request_fut.await.expect("reply");
         assert_eq!(pong, Pong { seq: 3 });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_published_request_carries_a_deadline_derived_from_the_default_timeout() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = client(Arc::clone(&transport), Arc::clone(&registry));
+        let timeout = Duration::from_millis(200);
+
+        let before = SystemTime::now();
+        let request_fut = client.request(Ping { seq: 1 });
+        tokio::pin!(request_fut);
+        tokio::select! {
+            _ = &mut request_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let after = SystemTime::now();
+
+        let published = transport.last_published().expect("a request was published");
+        let deadline: Deadline = published
+            .header(DEADLINE_HEADER)
+            .expect("a request carries a deadline")
+            .parse()
+            .expect("a decimal millisecond count");
+        assert!(matches!(
+            deadline.anchor(SystemTime::now()),
+            DeadlineReading::Live(_)
+        ));
+        let earliest_allowed =
+            Deadline::from_wall_clock(before, timeout - Duration::from_millis(1));
+        let latest_allowed = Deadline::from_wall_clock(after, timeout);
+        assert!(
+            deadline >= earliest_allowed,
+            "the published deadline is earlier than the effective timeout allows"
+        );
+        assert!(
+            deadline <= latest_allowed,
+            "the published deadline is later than the effective timeout allows"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_explicit_per_call_timeout_replaces_the_client_default() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = client(Arc::clone(&transport), Arc::clone(&registry));
+        let timeout = Duration::from_secs(600);
+
+        let before = SystemTime::now();
+        let request_fut =
+            client.request_with(Ping { seq: 1 }, RequestOptions::new().with_timeout(timeout));
+        tokio::pin!(request_fut);
+        tokio::select! {
+            _ = &mut request_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let after = SystemTime::now();
+
+        let published = transport.last_published().expect("a request was published");
+        let deadline: Deadline = published
+            .header(DEADLINE_HEADER)
+            .expect("a request carries a deadline")
+            .parse()
+            .expect("a decimal millisecond count");
+        assert!(
+            deadline > Deadline::from_wall_clock(SystemTime::now(), Duration::from_millis(200)),
+            "a ten minute call must publish a deadline far beyond the client default"
+        );
+        let earliest_allowed =
+            Deadline::from_wall_clock(before, timeout - Duration::from_millis(1));
+        let latest_allowed = Deadline::from_wall_clock(after, timeout);
+        assert!(
+            deadline >= earliest_allowed,
+            "the published deadline is earlier than the effective timeout allows"
+        );
+        assert!(
+            deadline <= latest_allowed,
+            "the published deadline is later than the effective timeout allows"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timeout_beyond_the_horizon_publishes_no_deadline_but_still_enforces_it_locally() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = client(Arc::clone(&transport), Arc::clone(&registry));
+        // One second beyond `deadline::MAX_DEADLINE_HORIZON`, which is
+        // private to that module; the value is mirrored here.
+        let timeout = Duration::from_secs(3_601);
+
+        let request_fut =
+            client.request_with(Ping { seq: 1 }, RequestOptions::new().with_timeout(timeout));
+        tokio::pin!(request_fut);
+        tokio::select! {
+            _ = &mut request_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        let published = transport.last_published().expect("a request was published");
+        assert!(
+            published.header(DEADLINE_HEADER).is_none(),
+            "a timeout beyond the horizon must publish no deadline header at all"
+        );
+        assert!(published.header(REQUEST_ID_HEADER).is_some());
+        assert_eq!(published.header(PROTOCOL_VERSION_HEADER), Some("1"));
+
+        tokio::time::advance(timeout).await;
+        let error = request_fut
+            .await
+            .expect_err("no reply arrived before the caller's own local timeout");
+        assert!(matches!(error, RequestError::Timeout(elapsed) if elapsed == timeout));
     }
 
     #[tokio::test]
