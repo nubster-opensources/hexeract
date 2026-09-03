@@ -6,6 +6,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::deadline::Deadline;
 use crate::remote_error::RemoteErrorPayload;
 use crate::reply_acceptance::ReplyExpectation;
 use crate::reply_inbox_state::ReplyInboxState;
@@ -14,8 +15,9 @@ use crate::request_error::ProtocolViolation;
 use crate::request_options::RequestOptions;
 use crate::request_registry::RequestRegistry;
 use crate::rpc_protocol::{
-    PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, REPLY_ERROR_MESSAGE_TYPE, REPLY_STATUS_ERROR,
-    REPLY_STATUS_HEADER, REPLY_STATUS_OK, REQUEST_ID_HEADER, read_protocol_version,
+    DEADLINE_HEADER, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, REPLY_ERROR_MESSAGE_TYPE,
+    REPLY_STATUS_ERROR, REPLY_STATUS_HEADER, REPLY_STATUS_OK, REQUEST_ID_HEADER,
+    read_protocol_version,
 };
 use crate::{BusEnvelope, Message, Request, RequestError, Transport};
 
@@ -524,6 +526,7 @@ impl<T: Transport> RequestClient<T> {
             .map_err(RequestError::Encode)?;
         envelope.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
         envelope.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
+        envelope.insert_protocol_header(DEADLINE_HEADER, Deadline::after(timeout).to_string());
         let publication = self.inner.publication_lifecycle.admit()?;
         match tokio::time::timeout_at(
             deadline,
@@ -636,6 +639,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::SystemTime;
 
     use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
@@ -646,9 +650,11 @@ mod tests {
 
     use super::*;
     use crate::BusError;
+    use crate::deadline::{Deadline, DeadlineReading};
     use crate::remote_error::RemoteErrorType;
     use crate::request_options::RequestOptions;
     use crate::request_registry::ReplyCountersSnapshot;
+    use crate::rpc_protocol::DEADLINE_HEADER;
 
     #[derive(Debug, Serialize, Deserialize)]
     struct Ping {
@@ -1206,6 +1212,59 @@ mod tests {
         registry.resolve(ok_reply(published_request_id(&published), 3));
         let pong = request_fut.await.expect("reply");
         assert_eq!(pong, Pong { seq: 3 });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_published_request_carries_a_deadline_derived_from_the_default_timeout() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = client(Arc::clone(&transport), Arc::clone(&registry));
+
+        let request_fut = client.request(Ping { seq: 1 });
+        tokio::pin!(request_fut);
+        tokio::select! {
+            _ = &mut request_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        let published = transport.last_published().expect("a request was published");
+        let deadline: Deadline = published
+            .header(DEADLINE_HEADER)
+            .expect("a request carries a deadline")
+            .parse()
+            .expect("a decimal millisecond count");
+        assert!(matches!(
+            deadline.anchor(SystemTime::now()),
+            DeadlineReading::Live(_)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_explicit_per_call_timeout_replaces_the_client_default() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = client(Arc::clone(&transport), Arc::clone(&registry));
+
+        let request_fut = client.request_with(
+            Ping { seq: 1 },
+            RequestOptions::new().with_timeout(Duration::from_secs(600)),
+        );
+        tokio::pin!(request_fut);
+        tokio::select! {
+            _ = &mut request_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        let published = transport.last_published().expect("a request was published");
+        let deadline: Deadline = published
+            .header(DEADLINE_HEADER)
+            .expect("a request carries a deadline")
+            .parse()
+            .expect("a decimal millisecond count");
+        assert!(
+            deadline > Deadline::from_wall_clock(SystemTime::now(), Duration::from_millis(200)),
+            "a ten minute call must publish a deadline far beyond the client default"
+        );
     }
 
     #[tokio::test]
