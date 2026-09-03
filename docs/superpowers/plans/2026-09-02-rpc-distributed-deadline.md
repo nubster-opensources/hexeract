@@ -14,6 +14,7 @@
 
 - Before any `cargo` command in PowerShell, run `$env:PATH = "C:\msys64\mingw64\bin;" + $env:PATH`. Without it the MinGW linker fails on this machine.
 - Clippy runs with `clippy::all` and `clippy::pedantic` at deny level. `unwrap` and `expect` are forbidden outside `#[cfg(test)]` code.
+- Every task runs `cargo fmt --all -- --check` before committing, alongside clippy. The CI format gate refuses a branch rustfmt would rewrite, and clippy does not catch formatting.
 - Every public item carries an English doc comment. No inline `//` commentary explaining what a line does; explanation belongs in doc comments.
 - Never bump `PROTOCOL_VERSION`. Adding a header to protocol version 1 is compatible in both directions.
 - `MAX_DEADLINE_HORIZON` is `Duration::from_secs(3600)`. `CLOCK_SKEW_TOLERANCE` is `Duration::from_secs(1)`. Both stay private to the `deadline` module.
