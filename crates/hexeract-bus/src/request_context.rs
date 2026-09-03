@@ -90,11 +90,7 @@ impl<'a> RequestContext<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use hexeract_core::{CorrelationId, MessageId};
-
-    use crate::deadline::LocalDeadline;
 
     use super::*;
 
