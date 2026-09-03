@@ -42,6 +42,23 @@ impl Deadline {
         Self::from_wall_clock(SystemTime::now(), timeout)
     }
 
+    /// Builds the deadline a caller reaches `timeout` from now, if a
+    /// responder applying the accepted horizon would accept it.
+    ///
+    /// Returns `None` when `timeout` exceeds the horizon: a header built
+    /// from it would only be refused with [`DeadlineViolation::BeyondHorizon`],
+    /// so nothing is worth publishing. This is not an error, it mirrors
+    /// [`DeadlineReading::Absent`]: the caller keeps its own, longer local
+    /// timeout, the request is published exactly as it would be without
+    /// this feature, and the responder runs the work as it always did.
+    ///
+    /// The bound is inclusive, matching the check in [`Deadline::anchor`]:
+    /// a `timeout` exactly on the horizon still returns `Some`.
+    #[must_use]
+    pub fn within_horizon(timeout: Duration) -> Option<Self> {
+        (timeout <= MAX_DEADLINE_HORIZON).then(|| Self::after(timeout))
+    }
+
     /// Builds the deadline reached `timeout` after `now`.
     ///
     /// A `timeout` that overflows the wall clock yields `now` itself, an
@@ -137,6 +154,13 @@ impl LocalDeadline {
     ///
     /// Application code needs this only to unit-test a handler against a
     /// [`RequestContext`](crate::RequestContext) it builds itself.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `remaining` overflows `tokio::time::Instant::now()`, for
+    /// instance a `remaining` near [`Duration::MAX`]. The production path
+    /// never reaches this: [`Deadline::anchor`] caps its operand at the
+    /// horizon plus the skew tolerance before calling this constructor.
     #[must_use]
     pub fn after(remaining: Duration) -> Self {
         Self(tokio::time::Instant::now() + remaining)
@@ -183,6 +207,7 @@ pub enum DeadlineViolation {
 /// invalid one is answered with a protocol error because it signals a defect
 /// in a peer that believes it speaks this protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DeadlineReading {
     /// The caller set no deadline.
     Absent,
@@ -235,6 +260,16 @@ mod tests {
             deadline.anchor(now),
             DeadlineReading::Invalid(DeadlineViolation::BeyondHorizon)
         );
+    }
+
+    #[test]
+    fn a_timeout_exactly_on_the_horizon_is_still_publishable() {
+        assert!(Deadline::within_horizon(Duration::from_secs(3_600)).is_some());
+    }
+
+    #[test]
+    fn a_timeout_one_second_beyond_the_horizon_is_not_publishable() {
+        assert!(Deadline::within_horizon(Duration::from_secs(3_601)).is_none());
     }
 
     #[tokio::test(start_paused = true)]

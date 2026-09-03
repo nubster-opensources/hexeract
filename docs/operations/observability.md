@@ -101,13 +101,26 @@ from an unreadable one, the `warn` event on the same path names the sub-reason
 and the message type.
 
 The three deadline counters answer different questions, and only the first two
-are refusals. A rising `expired_deadline` means requests arrive already dead:
-either the responder is saturated and its queue drains slower than callers are
-willing to wait, or the two clocks have drifted past the one second tolerance.
-Those two causes are indistinguishable in this counter alone, so compare it
-against queue depth before suspecting a clock. A rising `invalid_deadline` is
-not a load signal at all: it names one peer publishing a deadline this
-responder cannot use, and the remedy belongs to that caller.
+are refusals. A rising `expired_deadline` means requests arrive already dead,
+for one of four reasons: the responder is saturated and its queue drains
+slower than callers are willing to wait; the two clocks have drifted past the
+one second tolerance; a redelivered request has aged past its original
+deadline, because a reply publication failure nacks the delivery and the
+transport redelivers the request with the same, now-elapsed, absolute
+deadline still attached, so a flapping broker inflates this counter with no
+clock problem and no saturation, correlating with transport errors rather
+than with queue depth; or one caller's clock is grossly wrong, far in the
+past rather than merely drifted, in which case every one of its requests is
+dropped silently and this counter is the only trace. Note the asymmetry: the
+mirror case, a caller clock far in the future, is answered with the protocol
+error `invalid_deadline` instead, because a deadline long past is
+indistinguishable from a request that legitimately sat in a queue during an
+incident, and dropping that one silently is correct, whereas a deadline far
+beyond the horizon can only be a defect worth naming. These causes are
+largely indistinguishable in this counter alone, so compare it against queue
+depth and recent transport errors before suspecting a clock. A rising
+`invalid_deadline` is not a load signal at all: it names one peer publishing
+a deadline this responder cannot use, and the remedy belongs to that caller.
 
 `reply_dropped_after_deadline` is the odd one out, and the most expensive
 thing this table can report. It counts work that ran to completion and was
