@@ -78,8 +78,9 @@ impl Deadline {
     pub fn to_unix_millis(self) -> i64 {
         match self.0.duration_since(SystemTime::UNIX_EPOCH) {
             Ok(since) => i64::try_from(since.as_millis()).unwrap_or(i64::MAX),
-            Err(before) => i64::try_from(before.duration().as_millis())
-                .map_or(i64::MIN, |millis| -millis),
+            Err(before) => {
+                i64::try_from(before.duration().as_millis()).map_or(i64::MIN, |millis| -millis)
+            }
         }
     }
 
