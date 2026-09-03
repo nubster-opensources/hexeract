@@ -32,8 +32,12 @@ pub const REPLY_STATUS_OK: &str = "ok";
 pub const REPLY_STATUS_ERROR: &str = "error";
 /// Sentinel `message_type` stamped on an error reply envelope.
 pub const REPLY_ERROR_MESSAGE_TYPE: &str = "hexeract.rpc.error";
-/// Header reserved for the absolute request deadline, as an RFC 3339 UTC
-/// timestamp. Reserved by this version, honored by a later one.
+/// Header carrying the absolute request deadline, as a decimal count of Unix
+/// milliseconds in UTC.
+///
+/// One instant has exactly one rendering in this form, which keeps the
+/// canonical representation stable for envelope authentication. Optional: a
+/// request without this header is served with no deadline.
 pub const DEADLINE_HEADER: &str = "x-hexeract-deadline";
 
 /// Read the protocol version announced by an envelope.
@@ -46,12 +50,36 @@ pub fn read_protocol_version(envelope: &crate::BusEnvelope) -> Option<u32> {
     envelope.header(PROTOCOL_VERSION_HEADER)?.parse().ok()
 }
 
+/// Read and judge the optional deadline announced by an envelope.
+///
+/// `now` is supplied by the caller rather than read here, so the judgement
+/// is a pure function of its inputs and can be tested without touching the
+/// system clock. The responder passes `SystemTime::now()`; that call is the
+/// one wall-clock reading of an inbound request.
+#[must_use]
+pub fn read_deadline(
+    envelope: &crate::BusEnvelope,
+    now: std::time::SystemTime,
+) -> crate::deadline::DeadlineReading {
+    use crate::deadline::{Deadline, DeadlineReading};
+
+    let Some(raw) = envelope.header(DEADLINE_HEADER) else {
+        return DeadlineReading::Absent;
+    };
+    match raw.parse::<Deadline>() {
+        Ok(deadline) => deadline.anchor(now),
+        Err(violation) => DeadlineReading::Invalid(violation),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::time::{Duration, SystemTime};
 
     use super::*;
     use crate::BusEnvelope;
+    use crate::deadline::{Deadline, DeadlineReading, DeadlineViolation};
     use uuid::Uuid;
 
     fn request_envelope() -> BusEnvelope {
@@ -116,5 +144,56 @@ mod tests {
         let mut envelope = request_envelope();
         envelope.insert_protocol_header(PROTOCOL_VERSION_HEADER, "v1".to_owned());
         assert_eq!(read_protocol_version(&envelope), None);
+    }
+
+    #[test]
+    fn an_envelope_without_a_deadline_header_reads_as_absent() {
+        let envelope = request_envelope();
+
+        assert_eq!(
+            read_deadline(&envelope, SystemTime::UNIX_EPOCH),
+            DeadlineReading::Absent
+        );
+    }
+
+    #[test]
+    fn a_future_deadline_header_reads_as_live() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut envelope = request_envelope();
+        envelope.insert_protocol_header(
+            DEADLINE_HEADER,
+            Deadline::from_wall_clock(now, Duration::from_secs(30)).to_string(),
+        );
+
+        assert!(matches!(
+            read_deadline(&envelope, now),
+            DeadlineReading::Live(_)
+        ));
+    }
+
+    #[test]
+    fn an_elapsed_deadline_header_reads_as_expired() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut envelope = request_envelope();
+        envelope.insert_protocol_header(
+            DEADLINE_HEADER,
+            Deadline::from_wall_clock(now, Duration::ZERO).to_string(),
+        );
+
+        assert_eq!(
+            read_deadline(&envelope, now + Duration::from_secs(5)),
+            DeadlineReading::Expired
+        );
+    }
+
+    #[test]
+    fn an_unparsable_deadline_header_reads_as_invalid() {
+        let mut envelope = request_envelope();
+        envelope.insert_protocol_header(DEADLINE_HEADER, "yesterday".to_owned());
+
+        assert_eq!(
+            read_deadline(&envelope, SystemTime::UNIX_EPOCH),
+            DeadlineReading::Invalid(DeadlineViolation::Unreadable)
+        );
     }
 }
