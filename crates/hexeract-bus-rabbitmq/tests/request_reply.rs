@@ -14,12 +14,15 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use hexeract_bus::BusEnvelope;
 use hexeract_bus::BusError;
+use hexeract_bus::DEADLINE_HEADER;
 use hexeract_bus::Exchange;
 use hexeract_bus::ExchangeKind;
 use hexeract_bus::Message;
@@ -1131,6 +1134,108 @@ async fn a_registered_responder_counts_into_the_handle_the_caller_kept() {
     assert_eq!(
         snapshot.unsupported_protocol_version, 0,
         "the request announced the current protocol version"
+    );
+
+    cancel.cancel();
+    let _ = worker_handle.await;
+}
+
+/// Echo handler that records whether its body ever ran, so a test can prove
+/// a guard stopped dispatch rather than merely suppressing the reply.
+struct RecordingEcho {
+    ran: Arc<AtomicBool>,
+}
+
+impl RequestHandler<Ping> for RecordingEcho {
+    type Error = BusError;
+
+    async fn handle(&self, request: Ping, _ctx: &RequestContext<'_>) -> Result<Pong, BusError> {
+        self.ran.store(true, Ordering::Relaxed);
+        Ok(Pong { seq: request.seq })
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn a_request_whose_deadline_expired_in_the_queue_never_reaches_the_handler() {
+    let broker = harness::start_rabbitmq().await;
+    let cancel = CancellationToken::new();
+    let queue = "tests.ping.expired";
+
+    declare_ping_queue(broker.uri(), queue).await;
+
+    let ran = Arc::new(AtomicBool::new(false));
+    let responder_transport = Arc::new(RabbitMqTransport::new(broker.uri()).await.unwrap());
+    let worker = RabbitMqWorkerBuilder::new(
+        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+            .await
+            .unwrap(),
+    )
+    .queue(queue)
+    .register_request_handler::<Ping, _>(
+        RecordingEcho {
+            ran: Arc::clone(&ran),
+        },
+        Arc::clone(&responder_transport),
+    )
+    .build()
+    .unwrap();
+    let worker_cancel = cancel.clone();
+    let worker_handle = tokio::spawn(async move { worker.run(worker_cancel).await });
+
+    let connection = RabbitMqConnection::connect(broker.uri())
+        .await
+        .expect("publisher connection must open");
+    let channel = connection
+        .create_channel()
+        .await
+        .expect("publisher channel must open");
+
+    let envelope = BusEnvelope::new(Uuid::now_v7(), &Ping { seq: 5 }).expect("request encodes");
+    let expired_millis = i64::try_from(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock is after the epoch")
+            .as_millis(),
+    )
+    .expect("representable")
+        - 60_000;
+
+    let mut headers = FieldTable::default();
+    headers.insert(
+        ShortString::from(REQUEST_ID_HEADER),
+        AMQPValue::LongString(Uuid::now_v7().to_string().into()),
+    );
+    headers.insert(
+        ShortString::from(PROTOCOL_VERSION_HEADER),
+        AMQPValue::LongString(PROTOCOL_VERSION.to_string().into()),
+    );
+    headers.insert(
+        ShortString::from(DEADLINE_HEADER),
+        AMQPValue::LongString(expired_millis.to_string().into()),
+    );
+
+    channel
+        .basic_publish(
+            "".into(),
+            queue.into(),
+            BasicPublishOptions::default(),
+            &envelope.payload,
+            BasicProperties::default()
+                .with_headers(headers)
+                .with_message_id(envelope.message_id.to_string().into())
+                .with_correlation_id(envelope.correlation_id.to_string().into())
+                .with_type(Ping::MESSAGE_TYPE.into())
+                .with_reply_to("amq.gen-probe".into()),
+        )
+        .await
+        .expect("publish must succeed");
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    assert!(
+        !ran.load(Ordering::Relaxed),
+        "a request whose deadline expired in the queue must never reach the handler"
     );
 
     cancel.cancel();

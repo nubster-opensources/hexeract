@@ -44,6 +44,18 @@ Both the request and the reply carry the header `x-hexeract-protocol-version`. A
 
 A request that reaches `RepliedHandler` without a usable `reply_to` (bypassing `RequestClient`, for example a hand-crafted envelope) is dropped before the handler runs. That covers both an absent `reply_to` and one the reply publisher refuses, the RabbitMQ backend accepting only a server-named `amq.gen-` inbox. Since the handler never runs, there is no handler `Result` to drive the delivery, and this guard publishes nothing at all: `RepliedHandler::handle` logs a warning carrying the request's `correlation_id` and counts the rejection under `ResponderCountersSnapshot::invalid_reply_to` (see [Counters Hexeract exposes directly](../operations/observability.md#counters-hexeract-exposes-directly)), the only traces of the incident anywhere in the system, and returns `Ok(())`. Under the default `AckMode::Manual` the delivery is therefore acked exactly as a successfully answered request would be, and the worker's nack, retry and dead-letter policy is never reached (see [Retry policy](retry-policy.md) and [Ack modes](ack-modes.md)). A real `RequestClient` always stamps `reply_to`, so this path is only reachable from a non-conforming producer. It is not a way to use a `Request` fire-and-forget: a handler reached that way never runs at all. For work that produces a side effect and returns nothing, use a plain `Handler<M>` (see [Message and envelope](message-envelope.md)).
 
+## Deadlines
+
+A caller's effective timeout travels with the request, as an absolute deadline carried on the wire (see [RPC protocol: headers](../architecture/rpc-protocol.md#headers) for the exact wire format). A responder refuses work whose deadline has already passed rather than running it.
+
+A deadline is **not** remote cancellation. A handler already running when its deadline passes is never interrupted from the outside: the guard only stops a request from being dispatched in the first place. A handler doing long or segmented work is expected to consult its own remaining time, through `RequestContext::remaining`, and stop early when it chooses to.
+
+An expired request is dropped silently, with no reply published: its caller has already failed locally on its own timeout, so there is nothing to gain from answering it, and no reply could reach a caller no longer waiting.
+
+Caller and responder clocks are expected to be synchronized within one second; that tolerance is what absorbs ordinary drift between two independent machines. Sustained drift beyond it shows up in the responder's `expired_deadline` counter (see [Counters Hexeract exposes directly](../operations/observability.md#counters-hexeract-exposes-directly)), which is the operational signal to fix the clocks rather than to widen the tolerance.
+
+That same one-second tolerance is why `RequestContext::remaining` is optimistic by up to one second: the tolerance is applied once, when the deadline is anchored on arrival, and is therefore already baked into the value every later read of `remaining` returns for the life of the call. A handler that must not overrun its caller's real deadline should keep its own margin rather than treat `remaining` as exact.
+
 ## Business rejection versus protocol failure
 
 An expected domain outcome, an unknown account, a frozen one, an empty search result, is not a failure of the request-reply protocol: it is a value the responder always knows how to produce and the caller always knows how to handle. It belongs in `Request::Reply`, encoded as an ordinary successful reply, never on the protocol's error channel.
