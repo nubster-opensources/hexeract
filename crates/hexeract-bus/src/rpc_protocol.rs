@@ -61,14 +61,12 @@ pub fn read_deadline(
     envelope: &crate::BusEnvelope,
     now: std::time::SystemTime,
 ) -> crate::deadline::DeadlineReading {
-    use crate::deadline::{Deadline, DeadlineReading};
-
     let Some(raw) = envelope.header(DEADLINE_HEADER) else {
-        return DeadlineReading::Absent;
+        return crate::deadline::DeadlineReading::Absent;
     };
-    match raw.parse::<Deadline>() {
+    match raw.parse::<crate::deadline::Deadline>() {
         Ok(deadline) => deadline.anchor(now),
-        Err(violation) => DeadlineReading::Invalid(violation),
+        Err(violation) => crate::deadline::DeadlineReading::Invalid(violation),
     }
 }
 
@@ -156,8 +154,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_future_deadline_header_reads_as_live() {
+    #[tokio::test(start_paused = true)]
+    async fn a_future_deadline_header_reads_as_live() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         let mut envelope = request_envelope();
         envelope.insert_protocol_header(
