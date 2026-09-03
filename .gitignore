@@ -40,3 +40,6 @@ cobertura.xml
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Development method artifacts, kept out of the published tree
+docs/superpowers/
