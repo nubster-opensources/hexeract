@@ -68,6 +68,10 @@ pub struct ResponderCountersSnapshot {
     pub expired_deadline: u64,
     /// Requests answered with a protocol error because their deadline header
     /// was unreadable or beyond the accepted horizon.
+    ///
+    /// Should that reply fail to publish, the delivery fails with it, so a
+    /// transport that redelivers counts the retry again: this is a count of
+    /// rejections, not of distinct requests.
     pub invalid_deadline: u64,
     /// Replies suppressed because the deadline passed while the handler ran.
     ///
@@ -211,9 +215,17 @@ mod tests {
         counters.count_reply_dropped_after_deadline();
         counters.count_expired_deadline();
 
-        let snapshot = counters.snapshot();
-        assert_eq!(snapshot.expired_deadline, 2);
-        assert_eq!(snapshot.invalid_deadline, 1);
-        assert_eq!(snapshot.reply_dropped_after_deadline, 1);
+        assert_eq!(
+            counters.snapshot(),
+            ResponderCountersSnapshot {
+                invalid_reply_to: 0,
+                invalid_request_id: 0,
+                unsupported_protocol_version: 0,
+                expired_deadline: 2,
+                invalid_deadline: 1,
+                reply_dropped_after_deadline: 1,
+            },
+            "a counter method that also bumps an unrelated counter must fail this test"
+        );
     }
 }

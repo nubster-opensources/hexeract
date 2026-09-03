@@ -131,7 +131,7 @@ where
                     ?violation,
                     "request carries an unusable deadline, rejecting"
                 );
-                let reply = error_reply(RemoteErrorType::Unsupported, correlation_id, request_id)?;
+                let reply = error_reply(RemoteErrorType::Malformed, correlation_id, request_id)?;
                 self.replies.publish_reply(reply_to, &reply).await?;
                 Ok(ControlFlow::Break(()))
             }
@@ -263,8 +263,14 @@ where
     ///    known to be pointless spends the exact resource the deadline
     ///    exists to protect. An elapsed deadline is dropped silently, like
     ///    guards 1 and 2, since its caller has already failed locally; an
-    ///    unreadable or out-of-range one is answered, like guard 3, since it
-    ///    signals a defect in a peer that believes it speaks this protocol.
+    ///    unreadable or out-of-range one is answered with
+    ///    [`RemoteErrorType::Malformed`], like guard 5, not with the
+    ///    `Unsupported` category guard 3 uses: it is a defect in this one
+    ///    request's deadline, caller-fixable by correcting a clock or
+    ///    shortening a timeout, not in the peer's protocol version, which
+    ///    only an upgrade can fix. Sharing a category with guard 3 would
+    ///    make that distinction unrecoverable from the wire, since
+    ///    [`RemoteErrorPayload`] carries no free-form text.
     /// 5. The payload is decoded fifth, and its own rejection reuses the
     ///    same guarantees.
     ///
@@ -1313,6 +1319,48 @@ mod tests {
         assert!(!ran.load(Ordering::Relaxed), "the handler must not run");
         let recorded = publisher.last_published().expect("an error reply");
         assert_eq!(recorded.message_type, REPLY_ERROR_MESSAGE_TYPE);
+        let payload: RemoteErrorPayload =
+            serde_json::from_slice(&recorded.payload).expect("payload must decode");
+        assert_eq!(
+            payload.error_type,
+            RemoteErrorType::Malformed,
+            "an invalid deadline is caller-fixable, unlike an unsupported version, and must not \
+             share its category"
+        );
+        assert_eq!(counters.snapshot().invalid_deadline, 1);
+    }
+
+    /// A deadline further ahead than the accepted horizon is unusable for the
+    /// same reason an unreadable one is: it is answered with a protocol
+    /// error, never dropped silently. Without this test, a bug that routed
+    /// `DeadlineViolation::BeyondHorizon` into the silent-drop path (the one
+    /// `DeadlineReading::Expired` uses) would pass unnoticed, since only the
+    /// unreadable-string case of `Invalid` was otherwise exercised here.
+    #[tokio::test(start_paused = true)]
+    async fn a_deadline_beyond_the_horizon_is_answered_with_a_protocol_error() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let counters = ResponderCounters::default();
+        let erased = RepliedHandler::with_counters(
+            RecordingHandler {
+                ran: Arc::clone(&ran),
+            },
+            Arc::clone(&publisher),
+            counters.clone(),
+        );
+        let mut request = request_envelope(Some("amq.gen-inbox"));
+        request.insert_protocol_header(
+            DEADLINE_HEADER,
+            Deadline::from_wall_clock(SystemTime::now(), Duration::from_secs(3_601)).to_string(),
+        );
+
+        erased.handle(&request, &ctx()).await.unwrap();
+
+        assert!(!ran.load(Ordering::Relaxed), "the handler must not run");
+        let recorded = publisher.last_published().expect("an error reply");
+        let payload: RemoteErrorPayload =
+            serde_json::from_slice(&recorded.payload).expect("payload must decode");
+        assert_eq!(payload.error_type, RemoteErrorType::Malformed);
         assert_eq!(counters.snapshot().invalid_deadline, 1);
     }
 
@@ -1330,6 +1378,43 @@ mod tests {
         let recorded = publisher.last_published().expect("a reply");
         assert_eq!(recorded.header(REPLY_STATUS_HEADER), Some(REPLY_STATUS_OK));
         assert_eq!(counters.snapshot().expired_deadline, 0);
+    }
+
+    /// Pins the live path, which no other deadline test in this module
+    /// covers: two assert nothing is published, one is refused before
+    /// dispatch, and the remaining-time test only inspects
+    /// `RequestContext::remaining`, never publication. Changing the
+    /// pre-publication recheck from "the deadline has expired" to merely
+    /// "a deadline was set" (`deadline.is_some()`) would leave every one of
+    /// those tests green while silently dropping the reply to every request
+    /// that carries a live deadline, which is now every request the caller
+    /// sends.
+    #[tokio::test(start_paused = true)]
+    async fn a_live_deadline_publishes_its_reply_normally() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let erased = RepliedHandler::new(
+            RecordingHandler {
+                ran: Arc::clone(&ran),
+            },
+            Arc::clone(&publisher),
+        );
+        let mut request = request_envelope(Some("amq.gen-inbox"));
+        request.insert_protocol_header(
+            DEADLINE_HEADER,
+            Deadline::from_wall_clock(SystemTime::now(), Duration::from_secs(30)).to_string(),
+        );
+
+        erased.handle(&request, &ctx()).await.unwrap();
+
+        assert!(
+            ran.load(Ordering::Relaxed),
+            "the handler must run for a comfortably live deadline"
+        );
+        let recorded = publisher
+            .last_published()
+            .expect("a reply must be published for a live deadline");
+        assert_eq!(recorded.header(REPLY_STATUS_HEADER), Some(REPLY_STATUS_OK));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1384,5 +1469,76 @@ mod tests {
             "a reply nobody awaits must not be published"
         );
         assert_eq!(counters.snapshot().reply_dropped_after_deadline, 1);
+    }
+
+    /// Pins the deadline guard above the payload decode. Every other
+    /// deadline test in this module carries a decodable payload, so none of
+    /// them would notice the guard sliding below `envelope.decode()`. Were
+    /// that to happen, this request's undecodable payload would be reached
+    /// first and answered with `RemoteErrorType::Malformed`, instead of the
+    /// deadline guard dropping it silently before decoding ever runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_with_an_expired_deadline_and_an_undecodable_payload_is_dropped_by_the_deadline_first()
+     {
+        let ran = Arc::new(AtomicBool::new(false));
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let counters = ResponderCounters::default();
+        let erased = RepliedHandler::with_counters(
+            RecordingHandler {
+                ran: Arc::clone(&ran),
+            },
+            Arc::clone(&publisher),
+            counters.clone(),
+        );
+        let mut request = request_envelope(Some("amq.gen-inbox"));
+        request.insert_protocol_header(DEADLINE_HEADER, a_deadline_that_passed().to_string());
+        request.payload = b"{ not json".to_vec();
+
+        erased.handle(&request, &ctx()).await.unwrap();
+
+        assert!(!ran.load(Ordering::Relaxed), "the handler must not run");
+        assert!(
+            publisher.published.lock().unwrap().is_empty(),
+            "the deadline guard must drop the request before the payload is ever decoded"
+        );
+        assert_eq!(counters.snapshot().expired_deadline, 1);
+    }
+
+    /// Pins the deadline guard below the version check. Were it ever moved
+    /// ahead of guard 3, this expired deadline would be dropped silently by
+    /// the deadline guard before the version guard ever saw the request,
+    /// instead of the version guard answering first with its own
+    /// `RemoteErrorType::Unsupported` reply.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_with_an_expired_deadline_and_an_unsupported_version_is_rejected_by_the_version_first()
+     {
+        let ran = Arc::new(AtomicBool::new(false));
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let counters = ResponderCounters::default();
+        let erased = RepliedHandler::with_counters(
+            RecordingHandler {
+                ran: Arc::clone(&ran),
+            },
+            Arc::clone(&publisher),
+            counters.clone(),
+        );
+        let mut request = request_envelope(Some("amq.gen-inbox"));
+        request.insert_protocol_header(PROTOCOL_VERSION_HEADER, "99".to_owned());
+        request.insert_protocol_header(DEADLINE_HEADER, a_deadline_that_passed().to_string());
+
+        erased.handle(&request, &ctx()).await.unwrap();
+
+        assert!(!ran.load(Ordering::Relaxed), "the handler must not run");
+        let recorded = publisher
+            .last_published()
+            .expect("the version guard must still answer ahead of the deadline guard");
+        let payload: RemoteErrorPayload =
+            serde_json::from_slice(&recorded.payload).expect("payload must decode");
+        assert_eq!(payload.error_type, RemoteErrorType::Unsupported);
+        assert_eq!(
+            counters.snapshot().expired_deadline,
+            0,
+            "the deadline guard must never run once the version guard already rejected"
+        );
     }
 }
