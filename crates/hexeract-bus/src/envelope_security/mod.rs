@@ -17,6 +17,8 @@ pub mod canonical;
 pub mod error;
 /// Identities carried by the envelope security protocol.
 pub mod identity;
+/// Sources of signing and verification key material.
+pub mod key_source;
 /// Publisher identity established by a successful verification.
 pub mod principal;
 /// Wire constants of the envelope security protocol.
