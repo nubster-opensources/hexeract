@@ -12,21 +12,27 @@ use std::time::Duration;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use hexeract_bus::Audience;
 use hexeract_bus::Binding;
 use hexeract_bus::BusError;
 use hexeract_bus::Exchange;
 use hexeract_bus::ExchangeKind;
 use hexeract_bus::Handler;
+use hexeract_bus::Issuer;
 use hexeract_bus::Message;
 use hexeract_bus::Queue;
 use hexeract_bus::RawBusPublish;
 use hexeract_bus::RoutingKey;
+use hexeract_bus::SigningKeySource;
+use hexeract_bus::StaticKeySource;
 use hexeract_bus::Transport;
 use hexeract_bus_rabbitmq::AckMode;
 use hexeract_bus_rabbitmq::AmqpMetadataLimits;
 use hexeract_bus_rabbitmq::ChannelPool;
+use hexeract_bus_rabbitmq::OutboundEnvelopeSecurity;
 use hexeract_bus_rabbitmq::RabbitMqConnection;
 use hexeract_bus_rabbitmq::RabbitMqTransport;
+use hexeract_bus_rabbitmq::RabbitMqTransportConfig;
 use hexeract_bus_rabbitmq::RabbitMqWorkerBuilder;
 use hexeract_bus_rabbitmq::ensure_topology;
 use hexeract_core::HandlerContext;
@@ -560,6 +566,41 @@ async fn declare_temporary_queue(uri: &str, name: &str) {
         )
         .await
         .expect("queue declare must succeed");
+}
+
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn transport_config_settings_reach_the_connected_transport() {
+    let (_container, uri) = start_rabbit().await;
+
+    let limits = AmqpMetadataLimits {
+        max_headers: 3,
+        ..AmqpMetadataLimits::default()
+    };
+    let keys: Arc<dyn SigningKeySource> = Arc::new(StaticKeySource::builder().build());
+    let security = Arc::new(OutboundEnvelopeSecurity::new(
+        Issuer::new("billing-service").expect("valid issuer"),
+        Audience::new("ledger-service").expect("valid audience"),
+        keys,
+    ));
+
+    let config = RabbitMqTransportConfig::default()
+        .with_metadata_limits(limits)
+        .with_outbound_envelope_security(Arc::clone(&security));
+
+    let transport = RabbitMqTransport::new_with_transport_config(&uri, &config)
+        .await
+        .expect("transport must connect");
+
+    assert_eq!(
+        transport.metadata_limits(),
+        limits,
+        "the metadata limits carried by RabbitMqTransportConfig must reach the connected transport"
+    );
+    assert!(
+        transport.outbound_envelope_security().is_some(),
+        "the outbound envelope security carried by RabbitMqTransportConfig must reach the connected transport"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

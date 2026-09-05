@@ -25,6 +25,7 @@ use hexeract_bus::Request;
 use hexeract_bus::RequestHandler;
 use hexeract_bus::ResponderCounters;
 use hexeract_bus::TypedHandler;
+use hexeract_bus::VerificationPolicy;
 use hexeract_core::CorrelationId;
 use hexeract_core::HandlerContext;
 use hexeract_core::MessageId;
@@ -48,6 +49,7 @@ use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
 use crate::connection::RabbitMqConnection;
+use crate::envelope_security::InboundEnvelopeSecurity;
 use crate::metadata::AmqpMetadataLimits;
 use crate::metadata::decode_headers;
 use crate::metadata::is_metadata_error;
@@ -336,6 +338,21 @@ pub struct RabbitMqWorkerConfig {
     /// and follows the poison path with a quarantine copy whose field table is
     /// rebuilt empty rather than cloned.
     pub metadata_limits: AmqpMetadataLimits,
+    /// Verification material and policy applied to every inbound delivery.
+    ///
+    /// `None` (the default) preserves the historical behaviour: deliveries
+    /// are dispatched regardless of whether they carry a signature, and a
+    /// missing `message_id`, `correlation_id` or timestamp is minted rather
+    /// than rejected (the crate-private `RequiredEnvelopeFields::Lenient`).
+    /// Configuring this under [`hexeract_bus::VerificationPolicy::Required`]
+    /// additionally switches unsigned deliveries to the stricter mode: see
+    /// [`RabbitMqWorkerBuilder::envelope_security`].
+    ///
+    /// Held behind an [`Arc`] rather than by value because
+    /// [`hexeract_bus::EnvelopeVerifier`] carries a `Mutex` for its
+    /// key-refresh rate limit and is therefore never [`Clone`], while this
+    /// config is.
+    pub envelope_security: Option<Arc<InboundEnvelopeSecurity>>,
 }
 
 impl Default for RabbitMqWorkerConfig {
@@ -349,6 +366,7 @@ impl Default for RabbitMqWorkerConfig {
             max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
             max_buffered: None,
             metadata_limits: AmqpMetadataLimits::default(),
+            envelope_security: None,
         }
     }
 }
@@ -533,6 +551,17 @@ impl RabbitMqWorkerBuilder {
     #[must_use]
     pub fn metadata_limits(mut self, limits: AmqpMetadataLimits) -> Self {
         self.config.metadata_limits = limits;
+        self
+    }
+
+    /// Verify every inbound delivery against `security`.
+    ///
+    /// See [`RabbitMqWorkerConfig::envelope_security`] for the effect a
+    /// [`hexeract_bus::VerificationPolicy::Required`] policy has on how
+    /// strictly an unsigned delivery's AMQP properties must be present.
+    #[must_use]
+    pub fn envelope_security(mut self, security: Arc<InboundEnvelopeSecurity>) -> Self {
+        self.config.envelope_security = Some(security);
         self
     }
 
@@ -792,7 +821,7 @@ impl RabbitMqWorker {
             &delivery.data,
             self.config.max_payload_bytes,
             self.config.metadata_limits,
-            RequiredEnvelopeFields::default(),
+            derive_required_envelope_fields(self.config.envelope_security.as_deref()),
         ) {
             Ok(env) => env,
             Err(err) => return self.handle_poison(channel, &delivery, &err).await,
@@ -1569,6 +1598,49 @@ pub(crate) enum RequiredEnvelopeFields {
     Strict,
 }
 
+/// Derive how strictly an *unsigned* delivery's AMQP properties must be
+/// present, from the worker's configured inbound envelope security.
+///
+/// No configured security derives [`RequiredEnvelopeFields::Lenient`]: a
+/// worker that never opted into envelope security keeps exactly its
+/// behaviour from before this configuration existed. Once security is
+/// configured, only the explicitly named
+/// [`hexeract_bus::VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes`]
+/// opt-out derives `Lenient`; every other policy, including one this crate
+/// does not yet know about, derives [`RequiredEnvelopeFields::Strict`].
+///
+/// [`VerificationPolicy`] is `#[non_exhaustive]`, so a catch-all arm is
+/// unavoidable from this crate; the choice is which side the unknown falls
+/// on. It falls on `Strict` because a lax policy in this codebase always
+/// announces itself with a deliberately alarming name (this opt-out,
+/// [`crate::connection::RabbitMqConnectionConfig::allow_insecure_plaintext_transport`]),
+/// so a future variant that does not match this one arm is far more likely to be
+/// a stricter refinement of `Required` (a key-rotation grace window, say)
+/// than an unnamed second way to relax verification. Falling back to
+/// `Lenient` for such a variant would silently defeat the very hardening its
+/// author believed they had turned on; falling back to `Strict` instead
+/// rejects traffic loudly, which is corrected by upgrading this crate,
+/// rather than quietly, which nobody notices. A signed delivery is already
+/// held to `Strict` regardless of this value (see [`delivery_to_envelope`]),
+/// so this choice only ever governs an unsigned one, and the opt-out accepts
+/// an unsigned delivery without verifying it at all: minting a fresh
+/// `message_id`, `correlation_id` or `published_at` for such a delivery is
+/// harmless, since there is no signature left for a minted value to
+/// invalidate.
+fn derive_required_envelope_fields(
+    envelope_security: Option<&InboundEnvelopeSecurity>,
+) -> RequiredEnvelopeFields {
+    match envelope_security {
+        None => RequiredEnvelopeFields::Lenient,
+        Some(security) => match security.policy() {
+            VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes => {
+                RequiredEnvelopeFields::Lenient
+            }
+            _ => RequiredEnvelopeFields::Strict,
+        },
+    }
+}
+
 /// Rebuild a [`hexeract_bus::BusEnvelope`] from one AMQP delivery.
 ///
 /// Shared by the consumer worker and the reply inbox so both reconstruct a
@@ -1751,6 +1823,96 @@ mod tests {
         assert_eq!(cfg.retry_delay, DEFAULT_RETRY_DELAY);
         assert_eq!(cfg.max_payload_bytes, DEFAULT_MAX_PAYLOAD_BYTES);
         assert_eq!(cfg.metadata_limits, AmqpMetadataLimits::default());
+        assert!(cfg.envelope_security.is_none());
+    }
+
+    fn inbound_security_with_policy(policy: VerificationPolicy) -> InboundEnvelopeSecurity {
+        let keys: Arc<dyn hexeract_bus::VerificationKeySource> =
+            Arc::new(hexeract_bus::StaticKeySource::builder().build());
+        let mut builder = hexeract_bus::EnvelopeSecurityConfig::builder().with_policy(policy);
+        if policy == VerificationPolicy::Required {
+            builder = builder.with_accepted_audience(
+                hexeract_bus::Audience::new("ledger-service").expect("valid audience"),
+            );
+        }
+        InboundEnvelopeSecurity::new(keys, builder.build().expect("valid configuration"))
+    }
+
+    #[test]
+    fn the_worker_derives_strict_fields_from_a_required_policy() {
+        let security = inbound_security_with_policy(VerificationPolicy::Required);
+
+        assert_eq!(
+            derive_required_envelope_fields(Some(&security)),
+            RequiredEnvelopeFields::Strict
+        );
+    }
+
+    #[test]
+    fn the_worker_stays_lenient_without_configured_security() {
+        assert_eq!(
+            derive_required_envelope_fields(None),
+            RequiredEnvelopeFields::Lenient
+        );
+    }
+
+    #[test]
+    fn the_worker_stays_lenient_under_the_insecure_opt_out() {
+        let security =
+            inbound_security_with_policy(VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes);
+
+        // A signed envelope is already forced to `Strict` by
+        // `delivery_to_envelope` regardless of this derivation (its own
+        // `signature_present` check), so the opt-out only ever changes the
+        // fate of an *unsigned* one. Under the opt-out an unsigned delivery
+        // is accepted without any verification at all, so there is no
+        // signature a minted `message_id`/`correlation_id`/`published_at`
+        // could invalidate: `Lenient` is correct here, not `Strict`.
+        assert_eq!(
+            derive_required_envelope_fields(Some(&security)),
+            RequiredEnvelopeFields::Lenient
+        );
+    }
+
+    #[test]
+    fn only_the_named_insecure_opt_out_derives_lenient_under_configured_security() {
+        // `VerificationPolicy` is `#[non_exhaustive]`: this crate cannot name,
+        // let alone construct, a third variant to prove the catch-all arm of
+        // `derive_required_envelope_fields` falls on the strict side rather
+        // than the lenient one. That is a real limit of what a test in this
+        // crate can force: the two existing variants agree on the answer
+        // whichever way the catch-all is written, since `Required` never hits
+        // it under either shape and `AllowInsecureUnauthenticatedEnvelopes`
+        // is always matched explicitly, not by the catch-all. What this test
+        // *can* lock in is the shape of the reasoning: it enumerates every
+        // variant `hexeract_bus::VerificationPolicy` can name today and
+        // asserts the complement directly, rather than asserting only the
+        // positive case for `Required` as a special value. Read together with
+        // `derive_required_envelope_fields`'s doc comment, which states the
+        // policy for a variant this crate does not yet know about, this pins
+        // the exhaustiveness argument down to something a reviewer can check
+        // by inspection of the match arms, which is the honest substitute for
+        // a test that cannot be written against an enum whose whole point is
+        // that outside crates cannot construct its future variants.
+        let known_variants = [
+            VerificationPolicy::Required,
+            VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes,
+        ];
+
+        for policy in known_variants {
+            let security = inbound_security_with_policy(policy);
+            let expected = if policy == VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes {
+                RequiredEnvelopeFields::Lenient
+            } else {
+                RequiredEnvelopeFields::Strict
+            };
+
+            assert_eq!(
+                derive_required_envelope_fields(Some(&security)),
+                expected,
+                "policy {policy:?} must derive {expected:?}"
+            );
+        }
     }
 
     /// Build AMQP properties carrying `headers` and the minimum a delivery

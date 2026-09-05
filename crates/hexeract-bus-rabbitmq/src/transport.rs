@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::connection::DEFAULT_RETRY_ATTEMPTS;
 use crate::connection::DEFAULT_RETRY_BASE_DELAY;
 use crate::connection::{RabbitMqConnection, RabbitMqConnectionConfig};
+use crate::envelope_security::OutboundEnvelopeSecurity;
 use crate::metadata::AmqpMetadataLimits;
 use crate::metadata::encode_headers;
 use crate::pool::ChannelPool;
@@ -77,6 +78,70 @@ pub struct RabbitMqTransport {
     pool: Arc<ChannelPool>,
     exchange: String,
     metadata_limits: AmqpMetadataLimits,
+    envelope_security: Option<Arc<OutboundEnvelopeSecurity>>,
+}
+
+/// Composite configuration for [`RabbitMqTransport::new_with_transport_config`].
+///
+/// The crate already exposes six `_with_config` constructors across
+/// [`RabbitMqTransport`], [`RabbitMqConnection`] and
+/// `RabbitMqRequestClientConfig`, each accepting a different slice of
+/// tuning. Rather than add a seventh that only accepts outbound envelope
+/// security, this type bundles the three settings an application supplies
+/// together (connection-level TLS settings, outbound metadata bounds, and
+/// outbound envelope security) behind the crate's one remaining
+/// `_with_config` constructor for [`RabbitMqTransport`]. Mirrors
+/// [`RabbitMqConnectionConfig`]'s construction style exactly: private
+/// fields, a `with_*` method per setting that consumes and returns `Self`,
+/// and an untouched value producing exactly the defaults of
+/// [`RabbitMqTransport::new`].
+#[derive(Clone, Default)]
+pub struct RabbitMqTransportConfig {
+    connection_config: RabbitMqConnectionConfig,
+    metadata_limits: AmqpMetadataLimits,
+    envelope_security: Option<Arc<OutboundEnvelopeSecurity>>,
+}
+
+impl RabbitMqTransportConfig {
+    /// Use the supplied TLS settings for the connection this transport opens.
+    #[must_use]
+    pub fn with_connection_config(mut self, connection_config: RabbitMqConnectionConfig) -> Self {
+        self.connection_config = connection_config;
+        self
+    }
+
+    /// Bound the AMQP metadata this transport is willing to publish.
+    ///
+    /// See [`RabbitMqTransport::with_metadata_limits`].
+    #[must_use]
+    pub fn with_metadata_limits(mut self, metadata_limits: AmqpMetadataLimits) -> Self {
+        self.metadata_limits = metadata_limits;
+        self
+    }
+
+    /// Sign every envelope the resulting transport publishes with `security`.
+    ///
+    /// See [`RabbitMqTransport::with_outbound_envelope_security`].
+    #[must_use]
+    pub fn with_outbound_envelope_security(
+        mut self,
+        security: Arc<OutboundEnvelopeSecurity>,
+    ) -> Self {
+        self.envelope_security = Some(security);
+        self
+    }
+
+    pub(crate) fn connection_config(&self) -> &RabbitMqConnectionConfig {
+        &self.connection_config
+    }
+
+    pub(crate) fn metadata_limits(&self) -> AmqpMetadataLimits {
+        self.metadata_limits
+    }
+
+    pub(crate) fn outbound_envelope_security(&self) -> Option<Arc<OutboundEnvelopeSecurity>> {
+        self.envelope_security.clone()
+    }
 }
 
 impl RabbitMqTransport {
@@ -140,6 +205,35 @@ impl RabbitMqTransport {
             pool,
             exchange: String::new(),
             metadata_limits: AmqpMetadataLimits::default(),
+            envelope_security: None,
+        })
+    }
+
+    /// Connect to `connection_string` and target the AMQP default exchange,
+    /// applying every setting `config` carries in one call.
+    ///
+    /// Introduced so an application supplying TLS settings, metadata limits
+    /// and outbound envelope security together does not have to pick among
+    /// the crate's other `_with_config` constructors and then thread
+    /// whatever `config` covers that the chosen one does not through further
+    /// builder calls. Composed entirely from [`Self::new_with_config`],
+    /// [`Self::with_metadata_limits`] and
+    /// [`Self::with_outbound_envelope_security`]: it duplicates none of
+    /// their logic.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::new_with_config`].
+    pub async fn new_with_transport_config(
+        connection_string: &str,
+        config: &RabbitMqTransportConfig,
+    ) -> Result<Self, BusError> {
+        let transport = Self::new_with_config(connection_string, config.connection_config())
+            .await?
+            .with_metadata_limits(config.metadata_limits());
+        Ok(match config.outbound_envelope_security() {
+            Some(security) => transport.with_outbound_envelope_security(security),
+            None => transport,
         })
     }
 
@@ -232,6 +326,7 @@ impl RabbitMqTransport {
                 pool: Arc::new(ChannelPool::new(connection, DEFAULT_POOL_MAX_SIZE)),
                 exchange: exchange_name,
                 metadata_limits: AmqpMetadataLimits::default(),
+                envelope_security: None,
             })
     }
 
@@ -246,6 +341,7 @@ impl RabbitMqTransport {
             pool: Arc::new(ChannelPool::new(connection, pool_size)),
             exchange: String::new(),
             metadata_limits: AmqpMetadataLimits::default(),
+            envelope_security: None,
         }
     }
 
@@ -264,6 +360,25 @@ impl RabbitMqTransport {
     #[must_use]
     pub fn metadata_limits(&self) -> AmqpMetadataLimits {
         self.metadata_limits
+    }
+
+    /// Sign every envelope this transport publishes with `security`.
+    ///
+    /// Stored but not yet consulted: [`hexeract_bus::EnvelopeSigner::sign`]
+    /// is wired into [`Self::publish_envelope`] by issue #444 lot B task 3.
+    #[must_use]
+    pub fn with_outbound_envelope_security(
+        mut self,
+        security: Arc<OutboundEnvelopeSecurity>,
+    ) -> Self {
+        self.envelope_security = Some(security);
+        self
+    }
+
+    /// The outbound envelope security configured for this transport, if any.
+    #[must_use]
+    pub fn outbound_envelope_security(&self) -> Option<Arc<OutboundEnvelopeSecurity>> {
+        self.envelope_security.clone()
     }
 
     /// Switch the transport to fire-and-forget publishing.
@@ -623,5 +738,44 @@ mod tests {
     #[test]
     fn default_constants_are_sane() {
         assert!(DEFAULT_RETRY_BASE_DELAY <= Duration::from_secs(1));
+    }
+
+    fn outbound_security() -> Arc<OutboundEnvelopeSecurity> {
+        let keys: Arc<dyn hexeract_bus::SigningKeySource> =
+            Arc::new(hexeract_bus::StaticKeySource::builder().build());
+        Arc::new(OutboundEnvelopeSecurity::new(
+            hexeract_bus::Issuer::new("billing-service").expect("valid issuer"),
+            hexeract_bus::Audience::new("ledger-service").expect("valid audience"),
+            keys,
+        ))
+    }
+
+    #[test]
+    fn transport_config_default_matches_new_with_config_defaults() {
+        let config = RabbitMqTransportConfig::default();
+
+        assert!(!config.connection_config().allows_plaintext_transport());
+        assert_eq!(config.metadata_limits(), AmqpMetadataLimits::default());
+        assert!(config.outbound_envelope_security().is_none());
+    }
+
+    #[test]
+    fn transport_config_builder_carries_every_setting() {
+        let limits = AmqpMetadataLimits {
+            max_headers: 3,
+            ..AmqpMetadataLimits::default()
+        };
+        let security = outbound_security();
+
+        let config = RabbitMqTransportConfig::default()
+            .with_connection_config(
+                RabbitMqConnectionConfig::default().allow_insecure_plaintext_transport(),
+            )
+            .with_metadata_limits(limits)
+            .with_outbound_envelope_security(Arc::clone(&security));
+
+        assert!(config.connection_config().allows_plaintext_transport());
+        assert_eq!(config.metadata_limits(), limits);
+        assert!(config.outbound_envelope_security().is_some());
     }
 }
