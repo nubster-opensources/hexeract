@@ -25,6 +25,7 @@ use hexeract_bus::Request;
 use hexeract_bus::RequestHandler;
 use hexeract_bus::ResponderCounters;
 use hexeract_bus::TypedHandler;
+#[cfg(test)]
 use hexeract_bus::VerificationPolicy;
 use hexeract_core::CorrelationId;
 use hexeract_core::HandlerContext;
@@ -1604,40 +1605,29 @@ pub(crate) enum RequiredEnvelopeFields {
 /// No configured security derives [`RequiredEnvelopeFields::Lenient`]: a
 /// worker that never opted into envelope security keeps exactly its
 /// behaviour from before this configuration existed. Once security is
-/// configured, only the explicitly named
-/// [`hexeract_bus::VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes`]
-/// opt-out derives `Lenient`; every other policy, including one this crate
-/// does not yet know about, derives [`RequiredEnvelopeFields::Strict`].
-///
-/// [`VerificationPolicy`] is `#[non_exhaustive]`, so a catch-all arm is
-/// unavoidable from this crate; the choice is which side the unknown falls
-/// on. It falls on `Strict` because a lax policy in this codebase always
-/// announces itself with a deliberately alarming name (this opt-out,
-/// [`crate::connection::RabbitMqConnectionConfig::allow_insecure_plaintext_transport`]),
-/// so a future variant that does not match this one arm is far more likely to be
-/// a stricter refinement of `Required` (a key-rotation grace window, say)
-/// than an unnamed second way to relax verification. Falling back to
-/// `Lenient` for such a variant would silently defeat the very hardening its
-/// author believed they had turned on; falling back to `Strict` instead
-/// rejects traffic loudly, which is corrected by upgrading this crate,
-/// rather than quietly, which nobody notices. A signed delivery is already
-/// held to `Strict` regardless of this value (see [`delivery_to_envelope`]),
-/// so this choice only ever governs an unsigned one, and the opt-out accepts
-/// an unsigned delivery without verifying it at all: minting a fresh
-/// `message_id`, `correlation_id` or `published_at` for such a delivery is
-/// harmless, since there is no signature left for a minted value to
-/// invalidate.
+/// configured, the policy's own
+/// [`hexeract_bus::VerificationPolicy::allows_unauthenticated_envelopes`]
+/// decides: this crate cannot even name a policy
+/// [`hexeract_bus::VerificationPolicy`] does not yet expose, since the type
+/// is `#[non_exhaustive]`, so the strict-by-default
+/// reasoning for a future variant has to live where the enum is exhaustive,
+/// with the type itself, not here as a catch-all this crate would have to
+/// guess the side of. A signed delivery is already held to `Strict`
+/// regardless of this value (see [`delivery_to_envelope`]), so this choice
+/// only ever governs an unsigned one, and a policy that allows
+/// unauthenticated envelopes accepts an unsigned delivery without verifying
+/// it at all: minting a fresh `message_id`, `correlation_id` or
+/// `published_at` for such a delivery is harmless, since there is no
+/// signature left for a minted value to invalidate.
 fn derive_required_envelope_fields(
     envelope_security: Option<&InboundEnvelopeSecurity>,
 ) -> RequiredEnvelopeFields {
     match envelope_security {
         None => RequiredEnvelopeFields::Lenient,
-        Some(security) => match security.policy() {
-            VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes => {
-                RequiredEnvelopeFields::Lenient
-            }
-            _ => RequiredEnvelopeFields::Strict,
-        },
+        Some(security) if security.policy().allows_unauthenticated_envelopes() => {
+            RequiredEnvelopeFields::Lenient
+        }
+        Some(_) => RequiredEnvelopeFields::Strict,
     }
 }
 
@@ -1667,13 +1657,16 @@ fn derive_required_envelope_fields(
 /// [`BusError::InvalidMetadata`] when the field table violates
 /// `metadata_limits`, [`BusError::InvalidTopology`] when the delivery carries
 /// no AMQP `type` property to derive a `message_type` from, and
-/// [`BusError::EnvelopeSecurity`] with
-/// [`hexeract_bus::EnvelopeSecurityError::MissingRequiredField`] when a
-/// signed delivery, or an unsigned one under
-/// [`RequiredEnvelopeFields::Strict`], omits or carries an unparsable
-/// `message_id` or `correlation_id`, or omits its `timestamp` property
-/// (reported as `published_at`, the name of the field in the signature's
-/// canonical representation).
+/// [`BusError::EnvelopeSecurity`] when a signed delivery, or an unsigned one
+/// under [`RequiredEnvelopeFields::Strict`], has a problem with
+/// `message_id`, `correlation_id` or its `timestamp` property (reported as
+/// `published_at`, the name of the field in the signature's canonical
+/// representation): [`hexeract_bus::EnvelopeSecurityError::MissingRequiredField`]
+/// when the property is absent, or
+/// [`hexeract_bus::EnvelopeSecurityError::MalformedRequiredField`] when
+/// `message_id` or `correlation_id` is present but does not parse as a
+/// UUID. `published_at` has no malformed case: the AMQP `timestamp`
+/// property is a typed integer, so it can only be absent, never unparsable.
 pub(crate) fn delivery_to_envelope(
     props: &BasicProperties,
     payload: &[u8],
@@ -1703,12 +1696,18 @@ pub(crate) fn delivery_to_envelope(
         protocol_headers.contains_key(hexeract_bus::envelope_security::protocol::SIGNATURE_HEADER);
     let strict = signature_present || required_fields == RequiredEnvelopeFields::Strict;
 
-    let message_id = match props
-        .message_id()
-        .as_ref()
-        .and_then(|s| Uuid::parse_str(s.as_str()).ok())
-    {
-        Some(id) => id,
+    let message_id = match props.message_id().as_ref() {
+        Some(raw) => match Uuid::parse_str(raw.as_str()) {
+            Ok(id) => id,
+            Err(_) if strict => {
+                return Err(BusError::EnvelopeSecurity(
+                    hexeract_bus::EnvelopeSecurityError::MalformedRequiredField {
+                        field: "message_id",
+                    },
+                ));
+            }
+            Err(_) => Uuid::now_v7(),
+        },
         None if strict => {
             return Err(BusError::EnvelopeSecurity(
                 hexeract_bus::EnvelopeSecurityError::MissingRequiredField {
@@ -1718,12 +1717,18 @@ pub(crate) fn delivery_to_envelope(
         }
         None => Uuid::now_v7(),
     };
-    let correlation_id = match props
-        .correlation_id()
-        .as_ref()
-        .and_then(|s| Uuid::parse_str(s.as_str()).ok())
-    {
-        Some(id) => id,
+    let correlation_id = match props.correlation_id().as_ref() {
+        Some(raw) => match Uuid::parse_str(raw.as_str()) {
+            Ok(id) => id,
+            Err(_) if strict => {
+                return Err(BusError::EnvelopeSecurity(
+                    hexeract_bus::EnvelopeSecurityError::MalformedRequiredField {
+                        field: "correlation_id",
+                    },
+                ));
+            }
+            Err(_) => Uuid::now_v7(),
+        },
         None if strict => {
             return Err(BusError::EnvelopeSecurity(
                 hexeract_bus::EnvelopeSecurityError::MissingRequiredField {
@@ -1876,24 +1881,17 @@ mod tests {
 
     #[test]
     fn only_the_named_insecure_opt_out_derives_lenient_under_configured_security() {
-        // `VerificationPolicy` is `#[non_exhaustive]`: this crate cannot name,
-        // let alone construct, a third variant to prove the catch-all arm of
-        // `derive_required_envelope_fields` falls on the strict side rather
-        // than the lenient one. That is a real limit of what a test in this
-        // crate can force: the two existing variants agree on the answer
-        // whichever way the catch-all is written, since `Required` never hits
-        // it under either shape and `AllowInsecureUnauthenticatedEnvelopes`
-        // is always matched explicitly, not by the catch-all. What this test
-        // *can* lock in is the shape of the reasoning: it enumerates every
-        // variant `hexeract_bus::VerificationPolicy` can name today and
-        // asserts the complement directly, rather than asserting only the
-        // positive case for `Required` as a special value. Read together with
-        // `derive_required_envelope_fields`'s doc comment, which states the
-        // policy for a variant this crate does not yet know about, this pins
-        // the exhaustiveness argument down to something a reviewer can check
-        // by inspection of the match arms, which is the honest substitute for
-        // a test that cannot be written against an enum whose whole point is
-        // that outside crates cannot construct its future variants.
+        // `derive_required_envelope_fields` no longer matches on
+        // `VerificationPolicy` itself: it asks
+        // `VerificationPolicy::allows_unauthenticated_envelopes`, whose match
+        // lives in `hexeract-bus`, the crate that owns the enum and can
+        // therefore write it without a catch-all. A third variant added
+        // there fails that match's compilation, not a guess made from here.
+        // This crate still cannot name, let alone construct, such a variant,
+        // since the type is `#[non_exhaustive]`, so what this test *can*
+        // lock in is only the two variants it can name today, asserting the
+        // complement directly rather than only the positive case for
+        // `Required` as a special value.
         let known_variants = [
             VerificationPolicy::Required,
             VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes,
@@ -2466,9 +2464,9 @@ mod tests {
         .expect_err("strict mode must reject an unparsable message_id rather than mint one");
         match err {
             BusError::EnvelopeSecurity(
-                hexeract_bus::EnvelopeSecurityError::MissingRequiredField { field },
+                hexeract_bus::EnvelopeSecurityError::MalformedRequiredField { field },
             ) => assert_eq!(field, "message_id"),
-            other => panic!("expected EnvelopeSecurity(MissingRequiredField), got {other:?}"),
+            other => panic!("expected EnvelopeSecurity(MalformedRequiredField), got {other:?}"),
         }
     }
 
@@ -2489,10 +2487,27 @@ mod tests {
         .expect_err("strict mode must reject an unparsable correlation_id rather than mint one");
         match err {
             BusError::EnvelopeSecurity(
-                hexeract_bus::EnvelopeSecurityError::MissingRequiredField { field },
+                hexeract_bus::EnvelopeSecurityError::MalformedRequiredField { field },
             ) => assert_eq!(field, "correlation_id"),
-            other => panic!("expected EnvelopeSecurity(MissingRequiredField), got {other:?}"),
+            other => panic!("expected EnvelopeSecurity(MalformedRequiredField), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lenient_mode_mints_an_unparsable_message_id() {
+        let props = BasicProperties::default()
+            .with_type("orders.placed".into())
+            .with_message_id("not-a-uuid".into());
+
+        let envelope = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
+        )
+        .expect("lenient mode must mint a fresh id rather than reject an unparsable one");
+        assert_ne!(envelope.message_id, Uuid::nil());
     }
 
     #[test]

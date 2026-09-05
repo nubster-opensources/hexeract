@@ -1568,6 +1568,7 @@ name = "hexeract-bus-rabbitmq"
 version = "0.6.0"
 dependencies = [
  "async-trait",
+ "ed25519-dalek",
  "futures-util",
  "hexeract-bus",
  "hexeract-core",

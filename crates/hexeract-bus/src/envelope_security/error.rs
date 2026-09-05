@@ -82,6 +82,20 @@ pub enum EnvelopeSecurityError {
         field: &'static str,
     },
 
+    /// A field covered by the signature is present but does not parse as the
+    /// type the signature was computed over.
+    ///
+    /// Kept distinct from [`Self::MissingRequiredField`]: an absent field
+    /// points at an uninstrumented foreign producer, a migration concern,
+    /// while a present but malformed one points at a value corrupted in
+    /// transit or tampered with, an incident. Folding both into one reason
+    /// code would make the second indistinguishable from the first in a log.
+    #[error("required field {field} is malformed")]
+    MalformedRequiredField {
+        /// Name of the malformed field.
+        field: &'static str,
+    },
+
     /// A configuration value is present but not usable.
     #[error("configuration value {field} is not usable")]
     InvalidConfiguration {
@@ -126,6 +140,10 @@ impl std::fmt::Debug for EnvelopeSecurityError {
             Self::SignatureMismatch => formatter.write_str("SignatureMismatch"),
             Self::MissingRequiredField { field } => formatter
                 .debug_struct("MissingRequiredField")
+                .field("field", field)
+                .finish(),
+            Self::MalformedRequiredField { field } => formatter
+                .debug_struct("MalformedRequiredField")
                 .field("field", field)
                 .finish(),
             Self::InvalidConfiguration { field } => formatter
@@ -209,6 +227,9 @@ mod tests {
             EnvelopeSecurityError::SignatureMismatch,
             EnvelopeSecurityError::MissingRequiredField {
                 field: "published_at",
+            },
+            EnvelopeSecurityError::MalformedRequiredField {
+                field: "message_id",
             },
             EnvelopeSecurityError::InvalidConfiguration {
                 field: "key_refresh_interval",
