@@ -8,7 +8,7 @@
 //! behind `Arc<dyn ...>`, so an application can share one key source across
 //! several transports and workers without that type parameter becoming
 //! contagious to every struct that holds one, and carry the configuration to
-//! the points that will read it: [`crate::RabbitMqTransport`]'s publish path
+//! the points that read it: [`crate::RabbitMqTransport`]'s publish path
 //! (issue #444 lot B task 3) and [`crate::RabbitMqWorker`]'s dispatch path
 //! (issue #444 lot B task 4).
 
@@ -25,8 +25,10 @@ use hexeract_bus::Issuer;
 use hexeract_bus::SecurityHeaders;
 use hexeract_bus::SigningContext;
 use hexeract_bus::SigningKeySource;
+use hexeract_bus::VerificationContext;
 use hexeract_bus::VerificationKeySource;
 use hexeract_bus::VerificationPolicy;
+use hexeract_bus::VerifiedPrincipal;
 
 /// Signing material and audience a publisher binds to every outbound envelope.
 ///
@@ -131,16 +133,14 @@ impl fmt::Debug for OutboundEnvelopeSecurity {
 /// envelope.
 ///
 /// Carries the configuration [`hexeract_bus::EnvelopeVerifier::verify`]
-/// needs. Wiring it into [`crate::RabbitMqWorker`]'s dispatch path is issue
-/// #444 lot B task 4; until then this facade only transports the
-/// configuration, except for its crate-private `policy` accessor, which the
-/// worker already reads to decide how strictly an unsigned delivery's AMQP
-/// properties must be present (see `crate::worker::delivery_to_envelope`).
+/// needs, and applies it through a crate-private method, `verify`, which
+/// [`crate::RabbitMqWorker`]'s dispatch path calls on the destination it
+/// actually observed, before any typed decoding and before any settlement,
+/// so it never has to name [`hexeract_bus::VerificationContext`] itself.
+/// Its crate-private `policy` accessor is read separately, to decide how
+/// strictly an unsigned delivery's AMQP properties must be present (see
+/// `crate::worker::delivery_to_envelope`).
 pub struct InboundEnvelopeSecurity {
-    #[expect(
-        dead_code,
-        reason = "read by issue #444 lot B task 4, which wires EnvelopeVerifier::verify into the dispatch path"
-    )]
     verifier: EnvelopeVerifier<Arc<dyn VerificationKeySource>>,
     policy: VerificationPolicy,
 }
@@ -174,6 +174,28 @@ impl InboundEnvelopeSecurity {
     /// since [`VerificationPolicy`] is [`Copy`].
     pub(crate) fn policy(&self) -> VerificationPolicy {
         self.policy
+    }
+
+    /// Verify `envelope`, delivered to `destination`, against the
+    /// configured verifier.
+    ///
+    /// Builds the [`VerificationContext`] from the one fact only a caller
+    /// observes: the destination the delivery actually arrived on. `destination`
+    /// must be that observed value, never one read back from the envelope
+    /// itself (such as a signed header): the verifier compares the two, and
+    /// that comparison is what catches a message rerouted to another queue
+    /// after being signed.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`EnvelopeVerifier::verify`] returns.
+    pub(crate) async fn verify(
+        &self,
+        envelope: &BusEnvelope,
+        destination: &str,
+    ) -> Result<Option<VerifiedPrincipal>, EnvelopeSecurityError> {
+        let context = VerificationContext { destination };
+        self.verifier.verify(envelope, &context).await
     }
 }
 

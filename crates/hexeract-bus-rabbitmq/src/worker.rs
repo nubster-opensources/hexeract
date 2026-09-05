@@ -10,6 +10,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
+use std::ops::ControlFlow;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
@@ -815,6 +816,61 @@ impl RabbitMqWorker {
         Ok(())
     }
 
+    /// Verify `envelope`, delivered to `destination`, against `envelope_security`,
+    /// then, only once verification passes, apply [`AckMode::AckOnReceive`]'s
+    /// settle-before-handler behaviour.
+    ///
+    /// Generic over the broker operations (`ack`, `reject`) so the ordering,
+    /// verification always strictly before any settlement, is unit-testable
+    /// without a broker, the same pattern [`Self::retry_core`] and
+    /// [`Self::exhausted_core`] already use for the retry and poison paths.
+    /// [`Self::dispatch`] is the only real caller, and its `Channel` cannot
+    /// be constructed outside a live connection.
+    ///
+    /// No `envelope_security` configured is an unconditional pass: `verify`
+    /// is never even reached, so a key source such a worker might otherwise
+    /// carry elsewhere in the process is never touched, and the worker's
+    /// behaviour is exactly what it was before an envelope's producer could
+    /// be authenticated at all.
+    ///
+    /// A verification failure is handed to `reject`, the same poison path a
+    /// decode failure already uses, and `ack` is never called for it: an
+    /// [`AckMode::AckOnReceive`] worker must not settle a forged or
+    /// rerouted envelope as a success. `ack` runs only once verification has
+    /// passed, and its own failure still stops [`Self::dispatch`] short of
+    /// the handler, matching the settle-before-handler contract.
+    async fn verify_before_settlement<A, AF, R, RF>(
+        envelope_security: Option<&InboundEnvelopeSecurity>,
+        envelope: &hexeract_bus::BusEnvelope,
+        destination: &str,
+        ack_on_receive: bool,
+        ack: A,
+        reject: R,
+    ) -> ControlFlow<DeliveryDisposition, Option<hexeract_bus::VerifiedPrincipal>>
+    where
+        A: FnOnce() -> AF,
+        AF: Future<Output = DeliveryDisposition>,
+        R: FnOnce(hexeract_bus::EnvelopeSecurityError) -> RF,
+        RF: Future<Output = DeliveryDisposition>,
+    {
+        let principal = match envelope_security {
+            None => None,
+            Some(security) => match security.verify(envelope, destination).await {
+                Ok(principal) => principal,
+                Err(err) => return ControlFlow::Break(reject(err).await),
+            },
+        };
+
+        if ack_on_receive {
+            let disposition = ack().await;
+            if !matches!(disposition, DeliveryDisposition::Settled) {
+                return ControlFlow::Break(disposition);
+            }
+        }
+
+        ControlFlow::Continue(principal)
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn dispatch(&self, channel: &Channel, delivery: Delivery) -> DeliveryDisposition {
         let envelope = match delivery_to_envelope(
@@ -828,21 +884,47 @@ impl RabbitMqWorker {
             Err(err) => return self.handle_poison(channel, &delivery, &err).await,
         };
 
-        // AckOnReceive settles the delivery before the handler runs, so a
-        // handler failure is never retried (at-most-once).
-        if matches!(self.config.ack_mode, AckMode::AckOnReceive) {
-            let ack = channel
-                .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
-                .await
-                .map_err(|err| BusError::Transport(Box::new(err)));
-            if let Err(err) = &ack {
-                tracing::warn!(
-                    delivery_tag = delivery.delivery_tag,
-                    error = %err,
-                    "rabbitmq ack-on-receive failed; consumer continues, broker will redeliver"
+        // The producer's identity is established before any settlement, so a
+        // forged or rerouted envelope is never acknowledged as a success
+        // under AckMode::AckOnReceive; see Self::verify_before_settlement.
+        let ack_on_receive = matches!(self.config.ack_mode, AckMode::AckOnReceive);
+        let verification = Self::verify_before_settlement(
+            self.config.envelope_security.as_deref(),
+            &envelope,
+            delivery.routing_key.as_str(),
+            ack_on_receive,
+            || async {
+                let ack = channel
+                    .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
+                    .await
+                    .map_err(|err| BusError::Transport(Box::new(err)));
+                if let Err(err) = &ack {
+                    tracing::warn!(
+                        delivery_tag = delivery.delivery_tag,
+                        error = %err,
+                        "rabbitmq ack-on-receive failed; consumer continues, broker will redeliver"
+                    );
+                }
+                DeliveryDisposition::from_settle_result(&ack)
+            },
+            |err| {
+                let error = BusError::EnvelopeSecurity(err);
+                let delivery = &delivery;
+                async move { self.handle_poison(channel, delivery, &error).await }
+            },
+        )
+        .await;
+
+        match verification {
+            ControlFlow::Break(disposition) => return disposition,
+            ControlFlow::Continue(Some(principal)) => {
+                tracing::debug!(
+                    issuer = %principal.issuer(),
+                    key_id = %principal.key_id(),
+                    "inbound envelope verified"
                 );
-                return DeliveryDisposition::from_settle_result(&ack);
             }
+            ControlFlow::Continue(None) => {}
         }
 
         let ctx = build_handler_context(&envelope);
@@ -2863,5 +2945,457 @@ mod tests {
             x_death_entry("orders.retry", "expired", 3),
         ]);
         assert_eq!(death_count(&props, "orders.retry"), 3);
+    }
+
+    mod verify_before_settlement {
+        //! `RabbitMqWorker::verify_before_settlement` establishes the
+        //! producer's identity before any settlement, without a broker: the
+        //! `ack` and `reject` operations are closures a test can observe
+        //! instead of a live `Channel`, the same pattern already used by
+        //! `Self::retry_core` and `Self::exhausted_core` above.
+
+        use std::sync::atomic::AtomicUsize;
+
+        use async_trait::async_trait;
+        use ed25519_dalek::SigningKey;
+        use hexeract_bus::Audience;
+        use hexeract_bus::BusEnvelope;
+        use hexeract_bus::EnvelopeSecurityConfig;
+        use hexeract_bus::EnvelopeSecurityError;
+        use hexeract_bus::Issuer;
+        use hexeract_bus::KeyId;
+        use hexeract_bus::KeySourceError;
+        use hexeract_bus::SecurityHeaders;
+        use hexeract_bus::SigningKeyHandle;
+        use hexeract_bus::SigningKeySource;
+        use hexeract_bus::StaticKeySource;
+        use hexeract_bus::VerificationKey;
+        use hexeract_bus::VerificationKeySource;
+
+        use super::*;
+        use crate::envelope_security::OutboundEnvelopeSecurity;
+
+        const ANNOUNCED_DESTINATION: &str = "orders.placed";
+        const REROUTED_DESTINATION: &str = "orders.placed.eu";
+
+        fn issuer() -> Issuer {
+            Issuer::new("billing-service").expect("valid issuer")
+        }
+
+        fn audience() -> Audience {
+            Audience::new("ledger-service").expect("valid audience")
+        }
+
+        fn key_id() -> KeyId {
+            KeyId::new("2026-09").expect("valid key id")
+        }
+
+        fn signing_key() -> SigningKey {
+            SigningKey::from_bytes(&[7; 32])
+        }
+
+        fn security_with_policy(policy: VerificationPolicy) -> InboundEnvelopeSecurity {
+            let keys: Arc<dyn VerificationKeySource> = Arc::new(
+                StaticKeySource::builder()
+                    .with_verification_key(
+                        issuer(),
+                        key_id(),
+                        VerificationKey::from(signing_key().verifying_key()),
+                    )
+                    .build(),
+            );
+            let config = EnvelopeSecurityConfig::builder()
+                .with_policy(policy)
+                .with_accepted_audience(audience())
+                .build()
+                .expect("valid configuration");
+            InboundEnvelopeSecurity::new(keys, config)
+        }
+
+        fn required_security() -> InboundEnvelopeSecurity {
+            security_with_policy(VerificationPolicy::Required)
+        }
+
+        fn derogation_security() -> InboundEnvelopeSecurity {
+            security_with_policy(VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes)
+        }
+
+        fn unsigned_envelope() -> BusEnvelope {
+            BusEnvelope::restore_from_transport(
+                Uuid::from_u128(1),
+                "orders.placed.v1".to_owned(),
+                b"{}".to_vec(),
+                Uuid::from_u128(2),
+                None,
+                HashMap::new(),
+                HashMap::new(),
+                std::time::SystemTime::now(),
+            )
+        }
+
+        fn apply_security_headers(
+            envelope: &BusEnvelope,
+            headers: &SecurityHeaders,
+        ) -> BusEnvelope {
+            let mut protocol_headers = HashMap::new();
+            for (name, value) in headers {
+                protocol_headers.insert(name.to_owned(), value.to_owned());
+            }
+            BusEnvelope::restore_from_transport(
+                envelope.message_id,
+                envelope.message_type.clone(),
+                envelope.payload.clone(),
+                envelope.correlation_id,
+                envelope.reply_to.clone(),
+                envelope.headers.clone(),
+                protocol_headers,
+                envelope.published_at,
+            )
+        }
+
+        /// Sign a fresh envelope for `destination`, correctly, with the same
+        /// key `required_security`/`derogation_security` trust.
+        fn signed_envelope(destination: &str) -> BusEnvelope {
+            let envelope = unsigned_envelope();
+            let signing_keys: Arc<dyn SigningKeySource> = Arc::new(
+                StaticKeySource::builder()
+                    .with_signing_key(key_id(), SigningKeyHandle::from(signing_key()))
+                    .build(),
+            );
+            let outbound = OutboundEnvelopeSecurity::new(issuer(), audience(), signing_keys);
+            let headers = outbound
+                .sign(&envelope, destination)
+                .expect("signing must succeed");
+            apply_security_headers(&envelope, &headers)
+        }
+
+        /// A signed envelope whose payload was altered after signing: the
+        /// signature headers are present and well-formed, but no longer
+        /// match the canonical representation. Stands in for a forged
+        /// delivery, distinct from one delivered to the wrong destination.
+        fn forged_envelope(destination: &str) -> BusEnvelope {
+            let mut envelope = signed_envelope(destination);
+            envelope.payload = b"{ \"tampered\": true }".to_vec();
+            envelope
+        }
+
+        #[derive(Debug, Default, Clone)]
+        struct CountingKeySource {
+            lookups: Arc<AtomicUsize>,
+        }
+
+        impl CountingKeySource {
+            fn lookups(&self) -> Arc<AtomicUsize> {
+                Arc::clone(&self.lookups)
+            }
+        }
+
+        #[async_trait]
+        impl VerificationKeySource for CountingKeySource {
+            async fn verification_key(
+                &self,
+                _issuer: &Issuer,
+                _key_id: &KeyId,
+            ) -> Result<VerificationKey, KeySourceError> {
+                self.lookups.fetch_add(1, Ordering::Relaxed);
+                Err(KeySourceError::UnknownKey)
+            }
+
+            async fn refresh(&self) -> Result<(), KeySourceError> {
+                Ok(())
+            }
+        }
+
+        /// Stand-in for `Self::dispatch`'s handler invocation: reached only
+        /// when `verify_before_settlement` resolves to `ControlFlow::Continue`,
+        /// exactly as `Self::dispatch` only reaches `self.handlers.get(...)`
+        /// in that case.
+        async fn dispatch_like<A, AF, R, RF>(
+            envelope_security: Option<&InboundEnvelopeSecurity>,
+            envelope: &BusEnvelope,
+            destination: &str,
+            ack_on_receive: bool,
+            ack: A,
+            reject: R,
+            handler_calls: &AtomicUsize,
+        ) -> DeliveryDisposition
+        where
+            A: FnOnce() -> AF,
+            AF: Future<Output = DeliveryDisposition>,
+            R: FnOnce(EnvelopeSecurityError) -> RF,
+            RF: Future<Output = DeliveryDisposition>,
+        {
+            match RabbitMqWorker::verify_before_settlement(
+                envelope_security,
+                envelope,
+                destination,
+                ack_on_receive,
+                ack,
+                reject,
+            )
+            .await
+            {
+                ControlFlow::Break(disposition) => disposition,
+                ControlFlow::Continue(_) => {
+                    handler_calls.fetch_add(1, Ordering::SeqCst);
+                    DeliveryDisposition::Settled
+                }
+            }
+        }
+
+        fn noop_ack() -> DeliveryDisposition {
+            DeliveryDisposition::Settled
+        }
+
+        #[tokio::test]
+        async fn a_forged_envelope_never_reaches_the_handler() {
+            let security = required_security();
+            let envelope = forged_envelope(ANNOUNCED_DESTINATION);
+            let handler_calls = AtomicUsize::new(0);
+            let reject_error = std::sync::Mutex::new(None);
+
+            let disposition = dispatch_like(
+                Some(&security),
+                &envelope,
+                ANNOUNCED_DESTINATION,
+                true,
+                || async { noop_ack() },
+                |err| {
+                    *reject_error.lock().expect("lock") = Some(err);
+                    async { DeliveryDisposition::LeftForRedelivery }
+                },
+                &handler_calls,
+            )
+            .await;
+
+            assert_eq!(disposition, DeliveryDisposition::LeftForRedelivery);
+            assert_eq!(
+                handler_calls.load(Ordering::SeqCst),
+                0,
+                "a forged envelope must never reach the handler"
+            );
+            assert!(matches!(
+                *reject_error.lock().expect("lock"),
+                Some(EnvelopeSecurityError::SignatureMismatch)
+            ));
+        }
+
+        #[tokio::test]
+        async fn a_rerouted_envelope_is_rejected_as_a_destination_mismatch() {
+            let security = required_security();
+            // Signed for ANNOUNCED_DESTINATION, but the delivery actually
+            // arrived on REROUTED_DESTINATION: a valid signature produced
+            // for one queue replayed onto another.
+            let envelope = signed_envelope(ANNOUNCED_DESTINATION);
+            let handler_calls = AtomicUsize::new(0);
+            let reject_error = std::sync::Mutex::new(None);
+
+            let disposition = dispatch_like(
+                Some(&security),
+                &envelope,
+                REROUTED_DESTINATION,
+                true,
+                || async { noop_ack() },
+                |err| {
+                    *reject_error.lock().expect("lock") = Some(err);
+                    async { DeliveryDisposition::LeftForRedelivery }
+                },
+                &handler_calls,
+            )
+            .await;
+
+            assert_eq!(disposition, DeliveryDisposition::LeftForRedelivery);
+            assert_eq!(
+                handler_calls.load(Ordering::SeqCst),
+                0,
+                "a rerouted envelope must never reach the handler"
+            );
+            // Distinct from a forged envelope's rejection reason: a caller
+            // reading this error (or the log line it feeds) can tell a
+            // destination mismatch apart from a broken signature.
+            assert!(matches!(
+                *reject_error.lock().expect("lock"),
+                Some(EnvelopeSecurityError::DestinationMismatch)
+            ));
+        }
+
+        #[tokio::test]
+        async fn a_correctly_signed_envelope_reaches_the_handler() {
+            // Symmetric to the two rejection tests above: a worker that
+            // rejected every envelope would also satisfy them, so this
+            // proves a validly signed one, delivered to the destination it
+            // was signed for, still reaches the handler under the same
+            // `Required` policy.
+            let security = required_security();
+            let envelope = signed_envelope(ANNOUNCED_DESTINATION);
+            let handler_calls = AtomicUsize::new(0);
+            let ack_called = AtomicBool::new(false);
+
+            let disposition = dispatch_like(
+                Some(&security),
+                &envelope,
+                ANNOUNCED_DESTINATION,
+                true,
+                || async {
+                    ack_called.store(true, Ordering::SeqCst);
+                    noop_ack()
+                },
+                |_err| async { DeliveryDisposition::LeftForRedelivery },
+                &handler_calls,
+            )
+            .await;
+
+            assert_eq!(disposition, DeliveryDisposition::Settled);
+            assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+            assert!(ack_called.load(Ordering::SeqCst));
+        }
+
+        #[tokio::test]
+        async fn verification_precedes_the_ack_on_receive_settlement() {
+            // A worker under AckMode::AckOnReceive settles before the
+            // handler runs, but must never settle a delivery whose producer
+            // failed verification as a success: proved here by asserting
+            // `ack` is never called, not merely that the final disposition
+            // happens to look right.
+            let security = required_security();
+            let envelope = forged_envelope(ANNOUNCED_DESTINATION);
+            let ack_called = AtomicBool::new(false);
+            let reject_called = AtomicBool::new(false);
+
+            let outcome = RabbitMqWorker::verify_before_settlement(
+                Some(&security),
+                &envelope,
+                ANNOUNCED_DESTINATION,
+                true,
+                || async {
+                    ack_called.store(true, Ordering::SeqCst);
+                    noop_ack()
+                },
+                |_err| async {
+                    reject_called.store(true, Ordering::SeqCst);
+                    DeliveryDisposition::LeftForRedelivery
+                },
+            )
+            .await;
+
+            assert!(matches!(
+                outcome,
+                ControlFlow::Break(DeliveryDisposition::LeftForRedelivery)
+            ));
+            assert!(
+                reject_called.load(Ordering::SeqCst),
+                "a rejected envelope must be settled through the poison path"
+            );
+            assert!(
+                !ack_called.load(Ordering::SeqCst),
+                "ack-on-receive must never settle a delivery whose producer failed \
+                 verification as a success"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_unsigned_envelope_passes_under_the_named_derogation() {
+            let security = derogation_security();
+            let envelope = unsigned_envelope();
+            let handler_calls = AtomicUsize::new(0);
+            let ack_called = AtomicBool::new(false);
+
+            let disposition = dispatch_like(
+                Some(&security),
+                &envelope,
+                ANNOUNCED_DESTINATION,
+                true,
+                || async {
+                    ack_called.store(true, Ordering::SeqCst);
+                    noop_ack()
+                },
+                |_err| async { DeliveryDisposition::LeftForRedelivery },
+                &handler_calls,
+            )
+            .await;
+
+            assert_eq!(disposition, DeliveryDisposition::Settled);
+            assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+            assert!(ack_called.load(Ordering::SeqCst));
+        }
+
+        #[tokio::test]
+        async fn a_signed_envelope_is_still_verified_under_the_derogation() {
+            // The derogation tolerates the *absence* of a signature; it must
+            // never skip verification of one that is present. A worker that
+            // short-circuits to "always accept" once the derogation is
+            // configured would pass the previous test but fail this one.
+            let security = derogation_security();
+            let envelope = forged_envelope(ANNOUNCED_DESTINATION);
+            let handler_calls = AtomicUsize::new(0);
+            let ack_called = AtomicBool::new(false);
+            let reject_error = std::sync::Mutex::new(None);
+
+            let disposition = dispatch_like(
+                Some(&security),
+                &envelope,
+                ANNOUNCED_DESTINATION,
+                true,
+                || async {
+                    ack_called.store(true, Ordering::SeqCst);
+                    noop_ack()
+                },
+                |err| {
+                    *reject_error.lock().expect("lock") = Some(err);
+                    async { DeliveryDisposition::LeftForRedelivery }
+                },
+                &handler_calls,
+            )
+            .await;
+
+            assert_eq!(disposition, DeliveryDisposition::LeftForRedelivery);
+            assert_eq!(
+                handler_calls.load(Ordering::SeqCst),
+                0,
+                "a broken signature must still be rejected under the derogation"
+            );
+            assert!(!ack_called.load(Ordering::SeqCst));
+            assert!(matches!(
+                *reject_error.lock().expect("lock"),
+                Some(EnvelopeSecurityError::SignatureMismatch)
+            ));
+        }
+
+        #[tokio::test]
+        async fn an_unconfigured_worker_behaves_exactly_as_before() {
+            // No `InboundEnvelopeSecurity` is ever constructed for an
+            // unconfigured worker, so there is no verification key source it
+            // could reach for; this counting source stands in for one that
+            // exists elsewhere in the process (shared across workers) but
+            // was never wired into this one, and must stay untouched.
+            let counting = CountingKeySource::default();
+            let lookups = counting.lookups();
+            let envelope = unsigned_envelope();
+            let handler_calls = AtomicUsize::new(0);
+            let ack_called = AtomicBool::new(false);
+
+            let disposition = dispatch_like(
+                None,
+                &envelope,
+                ANNOUNCED_DESTINATION,
+                true,
+                || async {
+                    ack_called.store(true, Ordering::SeqCst);
+                    noop_ack()
+                },
+                |_err| async { DeliveryDisposition::LeftForRedelivery },
+                &handler_calls,
+            )
+            .await;
+
+            assert_eq!(disposition, DeliveryDisposition::Settled);
+            assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+            assert!(ack_called.load(Ordering::SeqCst));
+            assert_eq!(
+                lookups.load(Ordering::Relaxed),
+                0,
+                "an unconfigured worker must never consult a verification key source"
+            );
+        }
     }
 }
