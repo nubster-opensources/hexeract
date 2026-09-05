@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::envelope_security::error::EnvelopeSecurityError;
+
 /// Metadata dimension subject to a transport limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataLimit {
@@ -165,6 +167,11 @@ pub enum BusError {
     /// Report occurrences upstream.
     #[error("internal bus error: {0}")]
     Internal(String),
+
+    /// An inbound envelope failed signature verification, or an outbound
+    /// envelope could not be signed.
+    #[error("envelope security check failed: {0}")]
+    EnvelopeSecurity(#[source] EnvelopeSecurityError),
 }
 
 impl BusError {
@@ -291,6 +298,36 @@ mod tests {
         assert!(message.contains("257"));
         assert!(message.contains("256"));
         assert!(!message.contains("tenant-secret"));
+    }
+
+    #[test]
+    fn bus_error_debug_hides_the_security_cause() {
+        let inner = std::io::Error::other("SUPER_SECRET_KEY_MATERIAL");
+        let error = BusError::EnvelopeSecurity(EnvelopeSecurityError::KeySource(Box::new(inner)));
+
+        let rendered = format!("{error:?}");
+
+        assert!(
+            !rendered.contains("SUPER_SECRET_KEY_MATERIAL"),
+            "rendered as {rendered}"
+        );
+        assert!(
+            rendered.contains("EnvelopeSecurity"),
+            "rendered as {rendered}"
+        );
+        assert!(rendered.contains("KeySource"), "rendered as {rendered}");
+    }
+
+    #[test]
+    fn bus_error_display_names_the_security_reason() {
+        let error = BusError::EnvelopeSecurity(EnvelopeSecurityError::SignatureMismatch);
+
+        let message = error.to_string();
+
+        assert!(
+            message.contains("signature does not match the envelope"),
+            "got {message}"
+        );
     }
 
     #[test]
