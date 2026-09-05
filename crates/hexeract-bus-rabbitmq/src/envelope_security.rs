@@ -16,25 +16,27 @@ use std::fmt;
 use std::sync::Arc;
 
 use hexeract_bus::Audience;
+use hexeract_bus::BusEnvelope;
 use hexeract_bus::EnvelopeSecurityConfig;
+use hexeract_bus::EnvelopeSecurityError;
 use hexeract_bus::EnvelopeSigner;
 use hexeract_bus::EnvelopeVerifier;
 use hexeract_bus::Issuer;
+use hexeract_bus::SecurityHeaders;
+use hexeract_bus::SigningContext;
 use hexeract_bus::SigningKeySource;
 use hexeract_bus::VerificationKeySource;
 use hexeract_bus::VerificationPolicy;
 
 /// Signing material and audience a publisher binds to every outbound envelope.
 ///
-/// Carries the configuration [`hexeract_bus::EnvelopeSigner::sign`] needs.
-/// Wiring it into [`crate::RabbitMqTransport`]'s publish path is issue #444
-/// lot B task 3; until then this facade only transports the configuration.
+/// Carries the configuration [`hexeract_bus::EnvelopeSigner::sign`] needs, and
+/// applies it through two crate-private methods, one producing the security
+/// headers and one the `user-id` policy: [`crate::RabbitMqTransport`]'s
+/// publish path calls both, never [`EnvelopeSigner::sign`] directly, so it
+/// never has to know this facade's audience or its `user-id` policy.
 pub struct OutboundEnvelopeSecurity {
     issuer: Issuer,
-    #[expect(
-        dead_code,
-        reason = "read by issue #444 lot B task 3, which wires EnvelopeSigner::sign into the publish path"
-    )]
     signer: EnvelopeSigner<Arc<dyn SigningKeySource>>,
     audience: Audience,
     binds_issuer_to_broker_user: bool,
@@ -72,6 +74,40 @@ impl OutboundEnvelopeSecurity {
     pub fn bind_issuer_to_broker_user(mut self) -> Self {
         self.binds_issuer_to_broker_user = true;
         self
+    }
+
+    /// Sign `envelope` for publication to `destination`.
+    ///
+    /// Builds the [`SigningContext`] from this facade's own audience, so a
+    /// caller only ever supplies the one fact it alone observes: the
+    /// destination the envelope is actually being published to. Passing
+    /// anything other than that observed destination, such as a value read
+    /// back from the envelope, would let the canonical representation bind
+    /// to a destination the publish never used.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`EnvelopeSigner::sign`] returns.
+    pub(crate) fn sign(
+        &self,
+        envelope: &BusEnvelope,
+        destination: &str,
+    ) -> Result<SecurityHeaders, EnvelopeSecurityError> {
+        let context = SigningContext {
+            destination,
+            audience: &self.audience,
+        };
+        self.signer.sign(envelope, &context)
+    }
+
+    /// The AMQP `user-id` property to publish alongside a signed envelope.
+    ///
+    /// `Some(issuer)` only when [`Self::bind_issuer_to_broker_user`] was
+    /// called; `None` otherwise. A caller never decides this policy itself,
+    /// it only applies whatever this facade returns.
+    pub(crate) fn broker_user_id(&self) -> Option<&str> {
+        self.binds_issuer_to_broker_user
+            .then(|| self.issuer.as_str())
     }
 }
 
@@ -154,6 +190,8 @@ impl fmt::Debug for InboundEnvelopeSecurity {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use ed25519_dalek::SigningKey;
     use hexeract_bus::EnvelopeSecurityError;
     use hexeract_bus::KeyId;
@@ -309,5 +347,98 @@ mod tests {
             "rendered as {rendered}"
         );
         assert!(!rendered.contains("VerifyingKey"), "rendered as {rendered}");
+    }
+
+    fn signed_envelope() -> BusEnvelope {
+        BusEnvelope::restore_from_transport(
+            uuid::Uuid::from_u128(1),
+            "billing.invoice.issued".to_owned(),
+            b"{}".to_vec(),
+            uuid::Uuid::from_u128(2),
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            std::time::SystemTime::now(),
+        )
+    }
+
+    fn outbound_security() -> OutboundEnvelopeSecurity {
+        let keys: Arc<dyn SigningKeySource> = Arc::new(
+            StaticKeySource::builder()
+                .with_signing_key(
+                    KeyId::new("2026-09").expect("valid key id"),
+                    SigningKeyHandle::from(SigningKey::from_bytes(&[7; 32])),
+                )
+                .build(),
+        );
+        OutboundEnvelopeSecurity::new(issuer(), audience(), keys)
+    }
+
+    fn header_value(headers: &SecurityHeaders, name: &str) -> String {
+        headers
+            .iter()
+            .find(|(header, _)| *header == name)
+            .map_or_else(
+                || panic!("header {name} is present"),
+                |(_, value)| value.to_owned(),
+            )
+    }
+
+    #[test]
+    fn signing_binds_the_observed_destination_and_the_facades_own_audience() {
+        let security = outbound_security();
+
+        let headers = security
+            .sign(&signed_envelope(), "billing.invoice.issued")
+            .expect("signing must succeed");
+
+        assert_eq!(
+            header_value(&headers, "x-hexeract-destination"),
+            "billing.invoice.issued",
+            "the destination header must carry the value the caller passed in, not one read \
+             back from the envelope"
+        );
+        assert_eq!(
+            header_value(&headers, "x-hexeract-audience"),
+            "ledger-service"
+        );
+        assert_eq!(
+            header_value(&headers, "x-hexeract-issuer"),
+            "billing-service"
+        );
+    }
+
+    #[test]
+    fn signing_for_two_destinations_produces_two_different_signatures() {
+        let security = outbound_security();
+        let envelope = signed_envelope();
+
+        let first = security
+            .sign(&envelope, "billing.invoice.issued")
+            .expect("signing must succeed");
+        let second = security
+            .sign(&envelope, "audit.siphon")
+            .expect("signing must succeed");
+
+        assert_ne!(
+            header_value(&first, "x-hexeract-signature"),
+            header_value(&second, "x-hexeract-signature"),
+            "a destination passed by the caller must reach the canonical representation, or \
+             a message re-routed to another destination would keep a valid signature"
+        );
+    }
+
+    #[test]
+    fn broker_user_id_is_none_unless_the_publisher_binds_it() {
+        let security = outbound_security();
+
+        assert_eq!(security.broker_user_id(), None);
+    }
+
+    #[test]
+    fn broker_user_id_is_the_issuer_once_bound() {
+        let security = outbound_security().bind_issuer_to_broker_user();
+
+        assert_eq!(security.broker_user_id(), Some("billing-service"));
     }
 }

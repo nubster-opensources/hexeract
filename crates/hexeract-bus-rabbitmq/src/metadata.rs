@@ -18,6 +18,7 @@ use hexeract_bus::BusEnvelope;
 use hexeract_bus::BusError;
 use hexeract_bus::InvalidMetadataReason;
 use hexeract_bus::MetadataLimit;
+use hexeract_bus::SecurityHeaders;
 use hexeract_bus::is_reserved_header;
 use lapin::types::AMQPValue;
 use lapin::types::FieldTable;
@@ -98,26 +99,51 @@ pub(crate) fn is_metadata_error(error: &BusError) -> bool {
     )
 }
 
+/// Iterate over application headers, framework protocol headers, and, when
+/// present, the security headers a signature produced, as one stream.
+///
+/// A signed publish must never be measured or encoded through
+/// [`BusEnvelope::wire_headers`] alone: the six security headers travel on
+/// the same AMQP field table and therefore must count against the same
+/// bounds. Merging them here, once, keeps every pass over this stream
+/// (dimension checks and the final insertion) agreeing on what "the
+/// headers" are.
+fn all_headers<'a>(
+    envelope: &'a BusEnvelope,
+    security_headers: Option<&'a SecurityHeaders>,
+) -> impl Iterator<Item = (&'a str, &'a str)> {
+    let security = security_headers
+        .into_iter()
+        .flat_map(SecurityHeaders::iter)
+        .map(|(name, value): (&'static str, &'a str)| -> (&'a str, &'a str) { (name, value) });
+    envelope.wire_headers().chain(security)
+}
+
 /// Validate and encode an outbound envelope's metadata as an AMQP field table.
 ///
 /// Every dimension is checked before a single key is converted, so a rejected
 /// publish never allocates a field table and never reaches a pooled channel.
+/// `security_headers`, when present, is measured and inserted alongside the
+/// envelope's own headers in every pass: the six security headers occupy the
+/// same bounded budget as application and protocol metadata, not an
+/// unbounded addition to it.
 ///
 /// # Errors
 ///
 /// Returns [`BusError::ReservedHeaderNamespace`] when an application header
 /// occupies any case variant of the reserved namespace, and
-/// [`BusError::MetadataLimitExceeded`] when the combined application and
-/// protocol metadata exceeds `limits` in any dimension.
+/// [`BusError::MetadataLimitExceeded`] when the combined application,
+/// protocol and security metadata exceeds `limits` in any dimension.
 pub(crate) fn encode_headers(
     envelope: &BusEnvelope,
     limits: AmqpMetadataLimits,
+    security_headers: Option<&SecurityHeaders>,
 ) -> Result<FieldTable, BusError> {
     envelope.validate_application_headers()?;
 
     // Dimensions are checked in their own passes so the reported dimension
     // never depends on the iteration order of the underlying hash map.
-    let count = envelope.wire_headers().count();
+    let count = all_headers(envelope, security_headers).count();
     if count > limits.max_headers {
         return Err(limit_error(
             MetadataLimit::HeaderCount,
@@ -126,7 +152,7 @@ pub(crate) fn encode_headers(
         ));
     }
 
-    for (key, _) in envelope.wire_headers() {
+    for (key, _) in all_headers(envelope, security_headers) {
         if key.len() > limits.max_key_bytes {
             return Err(limit_error(
                 MetadataLimit::KeyBytes,
@@ -136,7 +162,7 @@ pub(crate) fn encode_headers(
         }
     }
 
-    for (_, value) in envelope.wire_headers() {
+    for (_, value) in all_headers(envelope, security_headers) {
         if value.len() > limits.max_value_bytes {
             return Err(limit_error(
                 MetadataLimit::ValueBytes,
@@ -149,7 +175,7 @@ pub(crate) fn encode_headers(
     // Saturating rather than wrapping: an implausible overflow must land on
     // `usize::MAX` and be rejected, never wrap around into an accepted total.
     let mut total: usize = 0;
-    for (key, value) in envelope.wire_headers() {
+    for (key, value) in all_headers(envelope, security_headers) {
         total = total.saturating_add(key.len()).saturating_add(value.len());
     }
     if total > limits.max_total_bytes {
@@ -161,7 +187,7 @@ pub(crate) fn encode_headers(
     }
 
     let mut fields = FieldTable::default();
-    for (key, value) in envelope.wire_headers() {
+    for (key, value) in all_headers(envelope, security_headers) {
         fields.insert(
             to_short_string(key, "header key")?,
             AMQPValue::LongString(value.into()),
@@ -313,16 +339,49 @@ mod tests {
     use std::collections::HashMap;
     use std::time::SystemTime;
 
+    use ed25519_dalek::SigningKey;
+    use hexeract_bus::Audience;
     use hexeract_bus::BusEnvelope;
     use hexeract_bus::BusError;
+    use hexeract_bus::EnvelopeSigner;
     use hexeract_bus::InvalidMetadataReason;
+    use hexeract_bus::Issuer;
+    use hexeract_bus::KeyId;
     use hexeract_bus::MetadataLimit;
+    use hexeract_bus::SigningContext;
+    use hexeract_bus::SigningKeyHandle;
+    use hexeract_bus::StaticKeySource;
     use lapin::types::AMQPValue;
     use lapin::types::FieldArray;
     use lapin::types::FieldTable;
     use uuid::Uuid;
 
     use super::*;
+
+    /// The six security headers a signature over `envelope` produces.
+    ///
+    /// Backed by a fixed test key: the signature's own validity is
+    /// [`hexeract_bus::EnvelopeSigner::sign`]'s concern, not this module's.
+    /// This crate only needs headers shaped like real ones to prove they are
+    /// measured and bounded like any other metadata.
+    fn security_headers(envelope: &BusEnvelope) -> SecurityHeaders {
+        let issuer = Issuer::new("billing-service").expect("valid issuer");
+        let audience = Audience::new("ledger-service").expect("valid audience");
+        let keys = StaticKeySource::builder()
+            .with_signing_key(
+                KeyId::new("2026-09").expect("valid key id"),
+                SigningKeyHandle::from(SigningKey::from_bytes(&[9; 32])),
+            )
+            .build();
+        let signer = EnvelopeSigner::new(issuer, keys);
+        let context = SigningContext {
+            destination: "orders.placed",
+            audience: &audience,
+        };
+        signer
+            .sign(envelope, &context)
+            .expect("signing must succeed")
+    }
 
     /// Build an envelope carrying only application headers.
     fn envelope_with_headers<'a>(
@@ -402,11 +461,11 @@ mod tests {
             max_total_bytes: 4,
         };
         let mut envelope = envelope_with_headers([("k", "é")]);
-        assert!(encode_headers(&envelope, limits).is_ok());
+        assert!(encode_headers(&envelope, limits, None).is_ok());
 
         envelope.headers.insert("k".into(), "éé".into());
         assert!(matches!(
-            encode_headers(&envelope, limits),
+            encode_headers(&envelope, limits, None),
             Err(BusError::MetadataLimitExceeded {
                 limit: MetadataLimit::ValueBytes,
                 actual: 4,
@@ -422,7 +481,7 @@ mod tests {
             .headers
             .insert("X-Hexeract-Future".into(), "x".into());
         assert!(matches!(
-            encode_headers(&envelope, AmqpMetadataLimits::default()),
+            encode_headers(&envelope, AmqpMetadataLimits::default(), None),
             Err(BusError::ReservedHeaderNamespace)
         ));
     }
@@ -434,11 +493,11 @@ mod tests {
             ..AmqpMetadataLimits::default()
         };
         let exact = envelope_with_headers([("a", "1"), ("b", "2")]);
-        assert!(encode_headers(&exact, limits).is_ok());
+        assert!(encode_headers(&exact, limits, None).is_ok());
 
         let over = envelope_with_headers([("a", "1"), ("b", "2"), ("c", "3")]);
         assert!(matches!(
-            encode_headers(&over, limits),
+            encode_headers(&over, limits, None),
             Err(BusError::MetadataLimitExceeded {
                 limit: MetadataLimit::HeaderCount,
                 actual: 3,
@@ -454,11 +513,11 @@ mod tests {
             ..AmqpMetadataLimits::default()
         };
         let exact = envelope_with_headers([("abcd", "1")]);
-        assert!(encode_headers(&exact, limits).is_ok());
+        assert!(encode_headers(&exact, limits, None).is_ok());
 
         let over = envelope_with_headers([("abcde", "1")]);
         assert!(matches!(
-            encode_headers(&over, limits),
+            encode_headers(&over, limits, None),
             Err(BusError::MetadataLimitExceeded {
                 limit: MetadataLimit::KeyBytes,
                 actual: 5,
@@ -474,11 +533,11 @@ mod tests {
             ..AmqpMetadataLimits::default()
         };
         let exact = envelope_with_headers([("aaa", "1"), ("bbb", "2")]);
-        assert!(encode_headers(&exact, limits).is_ok());
+        assert!(encode_headers(&exact, limits, None).is_ok());
 
         let over = envelope_with_headers([("aaa", "1"), ("bbb", "22")]);
         assert!(matches!(
-            encode_headers(&over, limits),
+            encode_headers(&over, limits, None),
             Err(BusError::MetadataLimitExceeded {
                 limit: MetadataLimit::TotalBytes,
                 actual: 9,
@@ -492,7 +551,7 @@ mod tests {
         let owned_keys: Vec<String> = (0..65).map(|index| format!("h{index}")).collect();
         let envelope = envelope_with_headers(owned_keys.iter().map(|key| (key.as_str(), "v")));
         assert!(matches!(
-            encode_headers(&envelope, AmqpMetadataLimits::default()),
+            encode_headers(&envelope, AmqpMetadataLimits::default(), None),
             Err(BusError::MetadataLimitExceeded {
                 limit: MetadataLimit::HeaderCount,
                 actual: 65,
@@ -504,7 +563,7 @@ mod tests {
     #[test]
     fn protocol_headers_reach_the_wire() {
         let envelope = envelope_with_split_headers([], [("x-hexeract-request-id", "request-1")]);
-        let fields = encode_headers(&envelope, AmqpMetadataLimits::default())
+        let fields = encode_headers(&envelope, AmqpMetadataLimits::default(), None)
             .expect("canonical protocol metadata must encode");
         assert_eq!(fields.inner().len(), 1);
         assert!(matches!(
@@ -524,7 +583,7 @@ mod tests {
             [("x-hexeract-request-id", "request-1")],
         );
         assert!(matches!(
-            encode_headers(&envelope, limits),
+            encode_headers(&envelope, limits, None),
             Err(BusError::MetadataLimitExceeded {
                 limit: MetadataLimit::HeaderCount,
                 actual: 2,
@@ -541,9 +600,9 @@ mod tests {
             max_value_bytes: 0,
             max_total_bytes: 0,
         };
-        assert!(encode_headers(&envelope_with_headers([]), limits).is_ok());
+        assert!(encode_headers(&envelope_with_headers([]), limits, None).is_ok());
         assert!(matches!(
-            encode_headers(&envelope_with_headers([("k", "")]), limits),
+            encode_headers(&envelope_with_headers([("k", "")]), limits, None),
             Err(BusError::MetadataLimitExceeded {
                 limit: MetadataLimit::HeaderCount,
                 actual: 1,
@@ -782,5 +841,99 @@ mod tests {
             AMQPValue::FieldArray(FieldArray::from(vec![AMQPValue::FieldTable(entry)])),
         )]);
         assert!(decode_headers(Some(&headers), AmqpMetadataLimits::default()).is_ok());
+    }
+
+    // --------------------------------------------------------- security headers
+
+    #[test]
+    fn security_headers_count_against_the_metadata_limits() {
+        // The default header-count budget is 64. The six security headers
+        // occupy part of that budget, not an allowance on top of it: 58
+        // application headers plus the six security headers land exactly on
+        // the limit, and one more application header tips it over.
+        let owned_keys: Vec<String> = (0..58).map(|index| format!("h{index}")).collect();
+        let fits = envelope_with_headers(owned_keys.iter().map(|key| (key.as_str(), "v")));
+        let headers = security_headers(&fits);
+        assert!(
+            encode_headers(&fits, AmqpMetadataLimits::default(), Some(&headers)).is_ok(),
+            "58 application headers plus the six security headers must fit the default \
+             64-header budget exactly"
+        );
+
+        let owned_keys: Vec<String> = (0..59).map(|index| format!("h{index}")).collect();
+        let over = envelope_with_headers(owned_keys.iter().map(|key| (key.as_str(), "v")));
+        let headers = security_headers(&over);
+        assert!(
+            matches!(
+                encode_headers(&over, AmqpMetadataLimits::default(), Some(&headers)),
+                Err(BusError::MetadataLimitExceeded {
+                    limit: MetadataLimit::HeaderCount,
+                    actual: 65,
+                    max: 64,
+                })
+            ),
+            "an implementation that only bounds application headers, and lets the six \
+             security headers ride for free, would accept this publish instead of rejecting it"
+        );
+    }
+
+    #[test]
+    fn an_unsigned_publish_is_unaffected_by_the_security_header_budget() {
+        // The symmetric case: passing `None` must behave exactly as before
+        // security headers existed, so a degenerate implementation that
+        // always reserves six slots for security headers, whether or not any
+        // are supplied, is caught here.
+        let owned_keys: Vec<String> = (0..64).map(|index| format!("h{index}")).collect();
+        let exact = envelope_with_headers(owned_keys.iter().map(|key| (key.as_str(), "v")));
+        assert!(encode_headers(&exact, AmqpMetadataLimits::default(), None).is_ok());
+    }
+
+    #[test]
+    fn security_headers_count_against_the_total_byte_budget() {
+        // A second dimension, not only the header count: the byte weight of
+        // the six security headers must also draw down `max_total_bytes`.
+        let envelope = envelope_with_headers([]);
+        let headers = security_headers(&envelope);
+        let security_bytes: usize = headers
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum();
+
+        let exact = AmqpMetadataLimits {
+            max_total_bytes: security_bytes,
+            ..AmqpMetadataLimits::default()
+        };
+        assert!(
+            encode_headers(&envelope, exact, Some(&headers)).is_ok(),
+            "the security headers alone must fit a budget sized to their exact byte weight"
+        );
+
+        let one_byte_short = AmqpMetadataLimits {
+            max_total_bytes: security_bytes - 1,
+            ..AmqpMetadataLimits::default()
+        };
+        assert!(
+            matches!(
+                encode_headers(&envelope, one_byte_short, Some(&headers)),
+                Err(BusError::MetadataLimitExceeded {
+                    limit: MetadataLimit::TotalBytes,
+                    max,
+                    ..
+                }) if max == security_bytes - 1
+            ),
+            "an implementation that measures security headers only at insertion time, after \
+             the total-bytes pass, would let this publish through"
+        );
+    }
+
+    #[test]
+    fn a_signed_envelope_with_no_application_headers_still_encodes_the_security_headers() {
+        let envelope = envelope_with_headers([]);
+        let headers = security_headers(&envelope);
+
+        let fields = encode_headers(&envelope, AmqpMetadataLimits::default(), Some(&headers))
+            .expect("a signed envelope with no application headers must still encode");
+
+        assert_eq!(fields.inner().len(), 6);
     }
 }

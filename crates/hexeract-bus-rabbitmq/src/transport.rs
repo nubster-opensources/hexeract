@@ -8,8 +8,10 @@ use hexeract_bus::BusError;
 use hexeract_bus::Exchange;
 use hexeract_bus::ExchangeKind;
 use hexeract_bus::RawBusPublish;
+use hexeract_bus::SecurityHeaders;
 use hexeract_bus::Transport;
 use lapin::BasicProperties;
+use lapin::Confirmation;
 use lapin::options::BasicPublishOptions;
 use lapin::options::ExchangeDeclareOptions;
 use lapin::types::FieldTable;
@@ -364,8 +366,10 @@ impl RabbitMqTransport {
 
     /// Sign every envelope this transport publishes with `security`.
     ///
-    /// Stored but not yet consulted: [`hexeract_bus::EnvelopeSigner::sign`]
-    /// is wired into [`Self::publish_envelope`] by issue #444 lot B task 3.
+    /// [`Self::publish_envelope`] signs each envelope for the routing key it
+    /// is actually publishing to, once, before entering its channel-recovery
+    /// loop, and merges the resulting headers into the AMQP properties
+    /// alongside the application and protocol metadata.
     #[must_use]
     pub fn with_outbound_envelope_security(
         mut self,
@@ -422,56 +426,109 @@ impl Transport for RabbitMqTransport {
         routing_key: &str,
         envelope: &BusEnvelope,
     ) -> Result<Uuid, BusError> {
-        let properties = envelope_to_properties(envelope, self.metadata_limits)?;
+        // Signing happens exactly once here, before the properties are built
+        // and before the channel-recovery loop below runs, so a transient
+        // channel failure retries only the publish, never the signature: the
+        // canonical representation is bound to `routing_key`, the routing key
+        // actually observed at publication, never to a value read back from
+        // the envelope.
+        let security_headers = self
+            .envelope_security
+            .as_ref()
+            .map(|security| security.sign(envelope, routing_key))
+            .transpose()
+            .map_err(BusError::EnvelopeSecurity)?;
+        let broker_user_id = self
+            .envelope_security
+            .as_ref()
+            .and_then(|security| security.broker_user_id());
+
+        let properties = envelope_to_properties(
+            envelope,
+            self.metadata_limits,
+            security_headers.as_ref(),
+            broker_user_id,
+        )?;
         let exchange = to_short_string(self.exchange.as_str(), "exchange name")?;
         let routing_key_short = to_short_string(routing_key, "routing key")?;
         let confirms = self.pool.confirms();
 
-        // One recovery-aware attempt. When the connection is mid auto-recovery
-        // the first publish can fail with a recoverable lapin error; await the
-        // channel recovery and retry once on a fresh channel, so a transient
-        // broker blip does not surface as a publish failure. This matters for a
-        // synchronous request/reply waiting on the reply (#334).
-        let mut recovered = false;
-        let confirmation = loop {
-            let pooled = self.pool.acquire().await?;
-            let outcome = async {
-                pooled
-                    .channel()
-                    .basic_publish(
-                        exchange.clone(),
-                        routing_key_short.clone(),
-                        BasicPublishOptions {
-                            mandatory: confirms,
-                            ..BasicPublishOptions::default()
-                        },
-                        &envelope.payload,
-                        properties.clone(),
-                    )
-                    .await?
-                    .await
-            }
-            .await;
-            match outcome {
-                Ok(confirmation) => break confirmation,
-                Err(err) => {
-                    if recovered {
-                        return Err(BusError::Transport(Box::new(err)));
-                    }
-                    match pooled.channel().wait_for_recovery(err).await {
-                        // Recovered: loop once more on a freshly acquired
-                        // channel. Falling through to the end of the loop body
-                        // re-enters the attempt, so no explicit continue.
-                        Ok(()) => recovered = true,
-                        Err(err) => return Err(BusError::Transport(Box::new(err))),
-                    }
-                }
-            }
-        };
+        let confirmation = publish_with_recovery(
+            &self.pool,
+            exchange,
+            routing_key_short,
+            &envelope.payload,
+            properties,
+            confirms,
+        )
+        .await?;
         if confirms {
             crate::confirm::confirmation_to_result(confirmation, "publish", routing_key)?;
         }
         Ok(envelope.message_id)
+    }
+}
+
+/// Publish one already-built message, retrying once across a channel recovery.
+///
+/// When the connection is mid auto-recovery the first publish can fail with a
+/// recoverable lapin error; await the channel recovery and retry once on a
+/// fresh channel, so a transient broker blip does not surface as a publish
+/// failure. This matters for a synchronous request/reply waiting on the reply
+/// (#334).
+///
+/// A free function rather than a method on [`RabbitMqTransport`], and
+/// deliberately so. A signature covers one publication, never one attempt: a
+/// retry must re-send the properties it was handed, and must not ask the key
+/// source for a second signature, which would both waste the work and make
+/// recovery from a broker blip depend on the key source still being
+/// reachable. Taking the pool and the finished properties, and nothing else,
+/// puts every signing input out of scope in this body, so re-signing inside
+/// the retry stops being a mistake to remember not to make and becomes a line
+/// that does not compile.
+async fn publish_with_recovery(
+    pool: &ChannelPool,
+    exchange: ShortString,
+    routing_key: ShortString,
+    payload: &[u8],
+    properties: BasicProperties,
+    mandatory: bool,
+) -> Result<Confirmation, BusError> {
+    let mut recovered = false;
+    loop {
+        let pooled = pool.acquire().await?;
+        let outcome = async {
+            pooled
+                .channel()
+                .basic_publish(
+                    exchange.clone(),
+                    routing_key.clone(),
+                    BasicPublishOptions {
+                        mandatory,
+                        ..BasicPublishOptions::default()
+                    },
+                    payload,
+                    properties.clone(),
+                )
+                .await?
+                .await
+        }
+        .await;
+        match outcome {
+            Ok(confirmation) => return Ok(confirmation),
+            Err(err) => {
+                if recovered {
+                    return Err(BusError::Transport(Box::new(err)));
+                }
+                match pooled.channel().wait_for_recovery(err).await {
+                    // Recovered: loop once more on a freshly acquired channel.
+                    // Falling through to the end of the loop body re-enters the
+                    // attempt, so no explicit continue.
+                    Ok(()) => recovered = true,
+                    Err(err) => return Err(BusError::Transport(Box::new(err))),
+                }
+            }
+        }
     }
 }
 
@@ -515,11 +572,19 @@ pub(crate) fn exchange_kind_to_lapin(kind: ExchangeKind) -> Result<lapin::Exchan
     }
 }
 
+/// Assemble the AMQP properties published for `envelope`.
+///
+/// `security_headers`, when present, is bound to the same
+/// [`AmqpMetadataLimits`] as every other header: see [`encode_headers`].
+/// `broker_user_id`, when present, is published as the AMQP `user-id`
+/// property alongside the signed `x-hexeract-issuer` header.
 fn envelope_to_properties(
     envelope: &BusEnvelope,
     metadata_limits: AmqpMetadataLimits,
+    security_headers: Option<&SecurityHeaders>,
+    broker_user_id: Option<&str>,
 ) -> Result<BasicProperties, BusError> {
-    let amqp_headers = encode_headers(envelope, metadata_limits)?;
+    let amqp_headers = encode_headers(envelope, metadata_limits, security_headers)?;
     let published_at_secs = envelope
         .published_at
         .duration_since(std::time::UNIX_EPOCH)
@@ -539,6 +604,9 @@ fn envelope_to_properties(
     if let Some(reply_to) = &envelope.reply_to {
         properties = properties.with_reply_to(to_short_string(reply_to.as_str(), "reply_to")?);
     }
+    if let Some(user_id) = broker_user_id {
+        properties = properties.with_user_id(to_short_string(user_id, "user id")?);
+    }
     Ok(properties)
 }
 
@@ -546,12 +614,23 @@ fn envelope_to_properties(
 mod tests {
     use std::time::Duration;
 
+    use ed25519_dalek::SigningKey;
     use hexeract_bus::Message;
     use lapin::types::AMQPValue;
     use serde::Deserialize;
     use serde::Serialize;
 
     use super::*;
+
+    /// The wire names of the six security headers, in no particular order.
+    const SECURITY_HEADER_NAMES: [&str; 6] = [
+        "x-hexeract-signature",
+        "x-hexeract-key-id",
+        "x-hexeract-issuer",
+        "x-hexeract-audience",
+        "x-hexeract-algorithm",
+        "x-hexeract-destination",
+    ];
 
     #[derive(Debug, Serialize, Deserialize)]
     struct OrderPlaced {
@@ -616,7 +695,7 @@ mod tests {
         // short-string bound, so the key is rejected by dimension.
         assert!(
             matches!(
-                envelope_to_properties(&envelope, AmqpMetadataLimits::default()),
+                envelope_to_properties(&envelope, AmqpMetadataLimits::default(), None, None),
                 Err(BusError::MetadataLimitExceeded {
                     limit: hexeract_bus::MetadataLimit::KeyBytes,
                     actual: 256,
@@ -635,7 +714,7 @@ mod tests {
         };
         assert!(
             matches!(
-                envelope_to_properties(&envelope, permissive),
+                envelope_to_properties(&envelope, permissive, None, None),
                 Err(BusError::InvalidTopology { .. })
             ),
             "a key past the AMQP short-string bound must surface as InvalidTopology"
@@ -651,7 +730,8 @@ mod tests {
             },
         )
         .unwrap();
-        let properties = envelope_to_properties(&envelope, AmqpMetadataLimits::default()).unwrap();
+        let properties =
+            envelope_to_properties(&envelope, AmqpMetadataLimits::default(), None, None).unwrap();
         assert_eq!(
             properties.content_type().as_ref().map(ShortString::as_str),
             Some(JSON_CONTENT_TYPE)
@@ -686,7 +766,8 @@ mod tests {
             },
         )
         .unwrap();
-        let properties = envelope_to_properties(&envelope, AmqpMetadataLimits::default()).unwrap();
+        let properties =
+            envelope_to_properties(&envelope, AmqpMetadataLimits::default(), None, None).unwrap();
         let table = properties.headers().as_ref().expect("headers must be set");
         let value = table.inner().get(&ShortString::from("tenant"));
         match value {
@@ -707,7 +788,8 @@ mod tests {
             },
         )
         .unwrap();
-        let properties = envelope_to_properties(&envelope, AmqpMetadataLimits::default()).unwrap();
+        let properties =
+            envelope_to_properties(&envelope, AmqpMetadataLimits::default(), None, None).unwrap();
         assert_eq!(*properties.delivery_mode(), Some(2));
     }
 
@@ -725,7 +807,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let properties = envelope_to_properties(&envelope, AmqpMetadataLimits::default()).unwrap();
+        let properties =
+            envelope_to_properties(&envelope, AmqpMetadataLimits::default(), None, None).unwrap();
         assert_eq!(*properties.timestamp(), Some(expected));
     }
 
@@ -748,6 +831,148 @@ mod tests {
             hexeract_bus::Audience::new("ledger-service").expect("valid audience"),
             keys,
         ))
+    }
+
+    /// An [`OutboundEnvelopeSecurity`] carrying an actual signing key, unlike
+    /// [`outbound_security`], which is only ever used to prove configuration
+    /// carries through unsigned wiring paths.
+    fn signed_security() -> OutboundEnvelopeSecurity {
+        let keys: Arc<dyn hexeract_bus::SigningKeySource> = Arc::new(
+            hexeract_bus::StaticKeySource::builder()
+                .with_signing_key(
+                    hexeract_bus::KeyId::new("2026-09").expect("valid key id"),
+                    hexeract_bus::SigningKeyHandle::from(SigningKey::from_bytes(&[3; 32])),
+                )
+                .build(),
+        );
+        OutboundEnvelopeSecurity::new(
+            hexeract_bus::Issuer::new("billing-service").expect("valid issuer"),
+            hexeract_bus::Audience::new("ledger-service").expect("valid audience"),
+            keys,
+        )
+    }
+
+    fn order_placed(seed: u128) -> BusEnvelope {
+        BusEnvelope::new(
+            Uuid::from_u128(1),
+            &OrderPlaced {
+                order_id: Uuid::from_u128(seed),
+            },
+        )
+        .unwrap()
+    }
+
+    // ------------------------------------------------------ security headers
+
+    #[test]
+    fn signing_puts_the_six_security_headers_on_the_wire() {
+        let security = signed_security();
+        let envelope = order_placed(101);
+        let headers = security
+            .sign(&envelope, "orders.placed")
+            .expect("signing must succeed");
+
+        let properties = envelope_to_properties(
+            &envelope,
+            AmqpMetadataLimits::default(),
+            Some(&headers),
+            None,
+        )
+        .unwrap();
+        let table = properties.headers().as_ref().expect("headers must be set");
+
+        for name in SECURITY_HEADER_NAMES {
+            assert!(
+                table.inner().contains_key(&ShortString::from(name)),
+                "missing security header {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unsigned_transport_publishes_no_security_header() {
+        let envelope = order_placed(102);
+
+        let properties =
+            envelope_to_properties(&envelope, AmqpMetadataLimits::default(), None, None).unwrap();
+        let table = properties.headers().as_ref().expect("headers must be set");
+
+        for name in SECURITY_HEADER_NAMES {
+            assert!(
+                !table.inner().contains_key(&ShortString::from(name)),
+                "unexpected security header {name} on an unsigned publish"
+            );
+        }
+    }
+
+    #[test]
+    fn the_published_timestamp_is_the_second_the_signature_covers() {
+        let published_at =
+            std::time::UNIX_EPOCH + Duration::from_secs(1_757_000_000) + Duration::from_millis(999);
+        let envelope = BusEnvelope::restore_from_transport(
+            Uuid::from_u128(1),
+            "orders.placed".to_owned(),
+            b"{}".to_vec(),
+            Uuid::from_u128(2),
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            published_at,
+        );
+        let security = signed_security();
+        let headers = security
+            .sign(&envelope, "orders.placed")
+            .expect("signing must succeed");
+
+        let properties = envelope_to_properties(
+            &envelope,
+            AmqpMetadataLimits::default(),
+            Some(&headers),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            *properties.timestamp(),
+            Some(1_757_000_000),
+            "the AMQP timestamp must be the whole second the canonical representation covers, \
+             not a value that also carries the sub-second remainder the signature ignores"
+        );
+    }
+
+    #[test]
+    fn user_id_is_absent_unless_the_publisher_binds_it() {
+        let security = signed_security();
+        let envelope = order_placed(103);
+
+        let properties = envelope_to_properties(
+            &envelope,
+            AmqpMetadataLimits::default(),
+            None,
+            security.broker_user_id(),
+        )
+        .unwrap();
+
+        assert!(properties.user_id().is_none());
+    }
+
+    #[test]
+    fn user_id_carries_the_issuer_when_bound() {
+        let security = signed_security().bind_issuer_to_broker_user();
+        let envelope = order_placed(104);
+
+        let properties = envelope_to_properties(
+            &envelope,
+            AmqpMetadataLimits::default(),
+            None,
+            security.broker_user_id(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            properties.user_id().as_ref().map(ShortString::as_str),
+            Some("billing-service")
+        );
     }
 
     #[test]

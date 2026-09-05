@@ -19,10 +19,13 @@ use hexeract_bus::Exchange;
 use hexeract_bus::ExchangeKind;
 use hexeract_bus::Handler;
 use hexeract_bus::Issuer;
+use hexeract_bus::KeyId;
+use hexeract_bus::KeySourceError;
 use hexeract_bus::Message;
 use hexeract_bus::Queue;
 use hexeract_bus::RawBusPublish;
 use hexeract_bus::RoutingKey;
+use hexeract_bus::SigningKeyHandle;
 use hexeract_bus::SigningKeySource;
 use hexeract_bus::StaticKeySource;
 use hexeract_bus::Transport;
@@ -1766,6 +1769,105 @@ async fn publish_recovers_after_a_broker_blip() {
         published,
         "publisher must self-heal after a broker blip (#334)"
     );
+}
+
+/// Wraps a [`StaticKeySource`] to count every call to
+/// [`SigningKeySource::current_signing_key`], so a test can prove how many
+/// times a publish actually asked for a signature.
+struct CountingSigningKeySource {
+    inner: StaticKeySource,
+    calls: Arc<AtomicUsize>,
+}
+
+impl SigningKeySource for CountingSigningKeySource {
+    fn current_signing_key(&self) -> Result<(KeyId, &SigningKeyHandle), KeySourceError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.current_signing_key()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker"]
+async fn signing_happens_once_per_publication() {
+    let (container, uri) = start_rabbit().await;
+    let queue_name = "publish.signing-once";
+    declare_temporary_queue(&uri, queue_name).await;
+
+    let signing_calls = Arc::new(AtomicUsize::new(0));
+    let keys: Arc<dyn SigningKeySource> = Arc::new(CountingSigningKeySource {
+        inner: StaticKeySource::builder()
+            .with_signing_key(
+                KeyId::new("2026-09").expect("valid key id"),
+                SigningKeyHandle::from(ed25519_dalek::SigningKey::from_bytes(&[5; 32])),
+            )
+            .build(),
+        calls: Arc::clone(&signing_calls),
+    });
+    let security = Arc::new(OutboundEnvelopeSecurity::new(
+        Issuer::new("billing-service").expect("valid issuer"),
+        Audience::new("ledger-service").expect("valid audience"),
+        keys,
+    ));
+
+    let transport = RabbitMqTransport::new(&uri)
+        .await
+        .expect("transport connects")
+        .with_outbound_envelope_security(security);
+
+    // A healthy publish is one outer call, so exactly one signature.
+    transport
+        .publish(
+            queue_name,
+            &OrderPlaced {
+                order_id: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect("first publish succeeds");
+    assert_eq!(signing_calls.load(Ordering::SeqCst), 1);
+
+    // Freeze then resume the broker to force `publish_envelope`'s internal
+    // channel-recovery loop to retry, the same way as
+    // `publish_recovers_after_a_broker_blip` above.
+    container.pause().await.expect("broker pauses");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    container.unpause().await.expect("broker resumes");
+
+    let mut attempts: usize = 0;
+    loop {
+        attempts += 1;
+        let published = transport
+            .publish(
+                queue_name,
+                &OrderPlaced {
+                    order_id: Uuid::now_v7(),
+                },
+            )
+            .await
+            .is_ok();
+        if published {
+            break;
+        }
+        assert!(
+            attempts < 20,
+            "publisher must self-heal after a broker blip (#334)"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // One signature per outer call: one healthy publish plus however many
+    // attempts the blip required, never more.
+    //
+    // What this measures, and what it does not. Pausing the broker makes the
+    // internal recovery loop of `publish_with_recovery` likely to run twice
+    // within one outer call, but nothing here forces it to, so a run where
+    // every attempt succeeds on its first internal iteration would pass this
+    // assertion without having exercised a retry at all. It is therefore a
+    // check on the observable count, not the guarantee. The guarantee is that
+    // `publish_with_recovery` is a free function that never receives the
+    // transport or its envelope security, so a second signature cannot be
+    // requested from inside the retry: that line does not compile.
+    assert_eq!(signing_calls.load(Ordering::SeqCst), 1 + attempts);
 }
 
 #[derive(Debug)]
