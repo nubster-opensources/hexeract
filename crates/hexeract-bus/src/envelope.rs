@@ -248,6 +248,39 @@ impl BusEnvelope {
         }
         serde_json::from_slice(&self.payload).map_err(BusError::from)
     }
+
+    /// Every field of this envelope, borrowed for canonical serialization.
+    ///
+    /// Destructures `Self` without a rest pattern on purpose. Adding a field
+    /// to the envelope breaks this function, which forces whoever adds it to
+    /// decide explicitly whether the new field is covered by the envelope
+    /// signature. A field silently left out of the canonical representation
+    /// would be forgeable while every nominal test still passed.
+    pub(crate) fn security_parts(
+        &self,
+    ) -> crate::envelope_security::canonical::EnvelopeSecurityParts<'_> {
+        let Self {
+            message_id,
+            message_type,
+            payload,
+            correlation_id,
+            reply_to,
+            headers,
+            protocol_headers,
+            published_at,
+        } = self;
+
+        crate::envelope_security::canonical::EnvelopeSecurityParts {
+            message_id,
+            message_type,
+            payload,
+            correlation_id,
+            reply_to,
+            headers,
+            protocol_headers,
+            published_at,
+        }
+    }
 }
 
 #[cfg(test)]

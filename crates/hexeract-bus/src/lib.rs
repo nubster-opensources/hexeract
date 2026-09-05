@@ -23,6 +23,18 @@
 //! [`REPLY_ERROR_MESSAGE_TYPE`], [`RemoteErrorPayload`]) is documented in
 //! full in `docs/architecture/rpc-protocol.md` in the workspace.
 //!
+//! It also ships end-to-end envelope authentication: [`EnvelopeSigner`] binds
+//! a deterministic canonical representation of an envelope to its
+//! destination and intended [`Audience`] with an Ed25519 signature, and
+//! [`EnvelopeVerifier`] checks that binding before any typed decoding, using
+//! key material supplied by an application-wired [`VerificationKeySource`].
+//! Verification is required by default; an application that deliberately
+//! runs without it opts out with
+//! [`VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes`]. A
+//! successful verification yields a [`VerifiedPrincipal`], the only way to
+//! obtain one. TLS still protects a single connection hop: this protects the
+//! message itself, end to end.
+//!
 //! Backend implementations live in companion crates such as
 //! `hexeract-bus-rabbitmq`.
 
@@ -30,6 +42,8 @@
 pub mod deadline;
 /// In-flight representation of a message crossing the bus.
 pub mod envelope;
+/// End-to-end authenticity and integrity of envelopes crossing the bus.
+pub mod envelope_security;
 /// Errors raised by the bus primitives, transports and workers.
 pub mod error;
 /// Consumer-side dispatch primitives invoked by the bus worker.
@@ -83,6 +97,27 @@ pub use deadline::DeadlineReading;
 pub use deadline::DeadlineViolation;
 pub use deadline::LocalDeadline;
 pub use envelope::BusEnvelope;
+pub use envelope_security::error::EnvelopeSecurityError;
+pub use envelope_security::error::IdentityKind;
+pub use envelope_security::identity::Audience;
+pub use envelope_security::identity::Issuer;
+pub use envelope_security::identity::KeyId;
+pub use envelope_security::identity::SignatureAlgorithm;
+pub use envelope_security::key_source::KeySourceError;
+pub use envelope_security::key_source::SigningKeyHandle;
+pub use envelope_security::key_source::SigningKeySource;
+pub use envelope_security::key_source::StaticKeySource;
+pub use envelope_security::key_source::VerificationKey;
+pub use envelope_security::key_source::VerificationKeySource;
+pub use envelope_security::policy::DEFAULT_KEY_REFRESH_INTERVAL;
+pub use envelope_security::policy::EnvelopeSecurityConfig;
+pub use envelope_security::policy::VerificationPolicy;
+pub use envelope_security::principal::VerifiedPrincipal;
+pub use envelope_security::signer::EnvelopeSigner;
+pub use envelope_security::signer::SecurityHeaders;
+pub use envelope_security::signer::SigningContext;
+pub use envelope_security::verifier::EnvelopeVerifier;
+pub use envelope_security::verifier::VerificationContext;
 pub use error::BusError;
 pub use error::InvalidMetadataReason;
 pub use error::MetadataLimit;
