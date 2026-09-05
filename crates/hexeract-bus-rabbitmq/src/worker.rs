@@ -423,9 +423,11 @@ impl RabbitMqWorkerBuilder {
     /// The reply is published through a dedicated [`RabbitMqReplyPublisher`],
     /// built internally from `transport`'s connection, which ALWAYS targets
     /// the AMQP default exchange. `transport`'s own exchange is not used for
-    /// replies; it only sources the connection and pool size. This confines
-    /// a caller-supplied `reply_to` to the default exchange regardless of
-    /// how the responder's application transport is configured.
+    /// replies; it only sources the connection, the pool size and the
+    /// outbound envelope security. This confines a caller-supplied
+    /// `reply_to` to the default exchange regardless of how the responder's
+    /// application transport is configured, while still signing every reply
+    /// exactly as `transport` signs its own publishes.
     ///
     /// Registering twice for the same `R::MESSAGE_TYPE` silently replaces
     /// the previous entry, same as [`Self::register_handler`].
@@ -455,9 +457,11 @@ impl RabbitMqWorkerBuilder {
     /// The reply is published through a dedicated [`RabbitMqReplyPublisher`],
     /// built internally from `transport`'s connection, which ALWAYS targets
     /// the AMQP default exchange. `transport`'s own exchange is not used for
-    /// replies; it only sources the connection and pool size. This confines
-    /// a caller-supplied `reply_to` to the default exchange regardless of
-    /// how the responder's application transport is configured.
+    /// replies; it only sources the connection, the pool size and the
+    /// outbound envelope security. This confines a caller-supplied
+    /// `reply_to` to the default exchange regardless of how the responder's
+    /// application transport is configured, while still signing every reply
+    /// exactly as `transport` signs its own publishes.
     ///
     /// Registering twice for the same `R::MESSAGE_TYPE` silently replaces
     /// the previous entry, same as [`Self::register_handler`].
@@ -465,7 +469,7 @@ impl RabbitMqWorkerBuilder {
     #[allow(
         clippy::needless_pass_by_value,
         reason = "the Arc<RabbitMqTransport> mirrors register_request_handler and only its \
-                  connection and pool size are read here"
+                  connection, pool size and outbound envelope security are read here"
     )]
     pub fn register_request_handler_with_counters<R, H>(
         mut self,
@@ -480,6 +484,7 @@ impl RabbitMqWorkerBuilder {
         let replies = Arc::new(RabbitMqReplyPublisher::new(
             transport.pool().connection().clone(),
             transport.pool().max_size(),
+            transport.outbound_envelope_security(),
         ));
         let erased: Arc<dyn ErasedHandler> = Arc::new(
             RepliedHandler::<R, H, RabbitMqReplyPublisher>::with_counters(
@@ -1701,7 +1706,7 @@ pub(crate) enum RequiredEnvelopeFields {
 /// it at all: minting a fresh `message_id`, `correlation_id` or
 /// `published_at` for such a delivery is harmless, since there is no
 /// signature left for a minted value to invalidate.
-fn derive_required_envelope_fields(
+pub(crate) fn derive_required_envelope_fields(
     envelope_security: Option<&InboundEnvelopeSecurity>,
 ) -> RequiredEnvelopeFields {
     match envelope_security {

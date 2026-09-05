@@ -6,12 +6,15 @@
 //! server-named inbox, which the broker generates under the reserved
 //! `amq.gen-` prefix.
 
+use std::sync::Arc;
+
 use hexeract_bus::{
     BoxFuture, BusEnvelope, BusError, ReplyDestination, ReplyDestinationError, ReplyPublisher,
     Transport,
 };
 
 use crate::RabbitMqConnection;
+use crate::envelope_security::OutboundEnvelopeSecurity;
 use crate::transport::RabbitMqTransport;
 
 /// The prefix RabbitMQ reserves for server-generated queue names.
@@ -51,11 +54,26 @@ pub struct RabbitMqReplyPublisher {
 impl RabbitMqReplyPublisher {
     /// Build a reply publisher over `connection`, always targeting the AMQP
     /// default exchange.
+    ///
+    /// `outbound_envelope_security`, when set, signs every reply exactly as
+    /// [`RabbitMqTransport::publish_envelope`] signs an application publish:
+    /// the destination bound into the signature is the reply queue actually
+    /// observed at publication time, which [`Self::publish_reply`] passes
+    /// through unchanged. `None` preserves the historical behaviour: a
+    /// reply leaves unsigned, exactly as before this security surface
+    /// existed.
     #[must_use]
-    pub fn new(connection: RabbitMqConnection, pool_size: usize) -> Self {
-        Self {
-            transport: RabbitMqTransport::from_connection(connection, pool_size),
-        }
+    pub fn new(
+        connection: RabbitMqConnection,
+        pool_size: usize,
+        outbound_envelope_security: Option<Arc<OutboundEnvelopeSecurity>>,
+    ) -> Self {
+        let transport = RabbitMqTransport::from_connection(connection, pool_size);
+        let transport = match outbound_envelope_security {
+            Some(security) => transport.with_outbound_envelope_security(security),
+            None => transport,
+        };
+        Self { transport }
     }
 }
 

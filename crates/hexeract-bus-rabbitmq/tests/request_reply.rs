@@ -20,11 +20,15 @@ use std::time::Instant;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
+use ed25519_dalek::SigningKey;
+use hexeract_bus::Audience;
 use hexeract_bus::BusEnvelope;
 use hexeract_bus::BusError;
 use hexeract_bus::DEADLINE_HEADER;
 use hexeract_bus::Exchange;
 use hexeract_bus::ExchangeKind;
+use hexeract_bus::Issuer;
+use hexeract_bus::KeyId;
 use hexeract_bus::Message;
 use hexeract_bus::PROTOCOL_VERSION;
 use hexeract_bus::PROTOCOL_VERSION_HEADER;
@@ -43,8 +47,12 @@ use hexeract_bus::RequestHandler;
 use hexeract_bus::RequestOptions;
 use hexeract_bus::RequestRegistry;
 use hexeract_bus::ResponderCounters;
+use hexeract_bus::SigningKeyHandle;
+use hexeract_bus::SigningKeySource;
+use hexeract_bus::StaticKeySource;
 use hexeract_bus::Transport;
 use hexeract_bus_rabbitmq::AmqpMetadataLimits;
+use hexeract_bus_rabbitmq::OutboundEnvelopeSecurity;
 use hexeract_bus_rabbitmq::RabbitMqConnection;
 use hexeract_bus_rabbitmq::RabbitMqRequestClientConfigBuilder;
 use hexeract_bus_rabbitmq::RabbitMqTransport;
@@ -1135,6 +1143,187 @@ async fn a_registered_responder_counts_into_the_handle_the_caller_kept() {
         snapshot.unsupported_protocol_version, 0,
         "the request announced the current protocol version"
     );
+
+    cancel.cancel();
+    let _ = worker_handle.await;
+}
+
+/// Build the six-header AMQP field a signed reply must carry.
+const SECURITY_HEADER_NAMES: [&str; 6] = [
+    "x-hexeract-signature",
+    "x-hexeract-key-id",
+    "x-hexeract-issuer",
+    "x-hexeract-audience",
+    "x-hexeract-algorithm",
+    "x-hexeract-destination",
+];
+
+/// Declare a fresh exclusive, auto-delete, server-named queue and return its
+/// generated name, the same shape [`hexeract_bus_rabbitmq::RabbitMqReplyPublisher`]
+/// confines every reply to.
+async fn declare_probe_inbox(channel: &Channel) -> String {
+    channel
+        .queue_declare(
+            "".into(),
+            QueueDeclareOptions {
+                exclusive: true,
+                auto_delete: true,
+                durable: false,
+                ..QueueDeclareOptions::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .expect("probe inbox declare must succeed")
+        .name()
+        .as_str()
+        .to_owned()
+}
+
+/// Publish a bare `Ping` addressed to `queue`, replying to `inbox`, carrying
+/// the request id and protocol version a responder requires before it will
+/// dispatch to a handler at all.
+fn ping_request(inbox: &str, seq: u64) -> BusEnvelope {
+    let mut request = BusEnvelope::with_reply_to(Uuid::now_v7(), inbox.to_owned(), &Ping { seq })
+        .expect("ping must serialize");
+    request.headers.insert(
+        REQUEST_ID_HEADER.to_owned(),
+        hexeract_core::RequestId::new().to_string(),
+    );
+    request.headers.insert(
+        PROTOCOL_VERSION_HEADER.to_owned(),
+        PROTOCOL_VERSION.to_string(),
+    );
+    request
+}
+
+/// Task #444 lot B task 4bis: a responder built over a transport carrying
+/// outbound envelope security signs every reply it publishes, exactly as it
+/// signs any other publish through that same transport, because
+/// `RabbitMqReplyPublisher` shares the transport's security rather than
+/// publishing unauthenticated.
+///
+/// The reply is intercepted straight off an ordinary exclusive queue,
+/// bypassing `RequestClient` entirely, so this proves the headers exist on
+/// the wire as the broker actually stored them, not merely in a client's own
+/// decoded view of them.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn a_responder_signs_its_replies() {
+    let broker = harness::start_rabbitmq().await;
+    let cancel = CancellationToken::new();
+    declare_ping_queue(broker.uri(), "tests.ping.signed").await;
+
+    let signing_keys: Arc<dyn SigningKeySource> = Arc::new(
+        StaticKeySource::builder()
+            .with_signing_key(
+                KeyId::new("2026-09").expect("valid key id"),
+                SigningKeyHandle::from(SigningKey::from_bytes(&[11; 32])),
+            )
+            .build(),
+    );
+    let security = Arc::new(OutboundEnvelopeSecurity::new(
+        Issuer::new("tests-responder").expect("valid issuer"),
+        Audience::new("tests-caller").expect("valid audience"),
+        signing_keys,
+    ));
+    let responder_transport = Arc::new(
+        RabbitMqTransport::new(broker.uri())
+            .await
+            .unwrap()
+            .with_outbound_envelope_security(security),
+    );
+    let worker = RabbitMqWorkerBuilder::new(
+        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+            .await
+            .unwrap(),
+    )
+    .queue("tests.ping.signed")
+    .register_request_handler::<Ping, _>(Echo, Arc::clone(&responder_transport))
+    .build()
+    .unwrap();
+    let worker_cancel = cancel.clone();
+    let worker_handle = tokio::spawn(async move { worker.run(worker_cancel).await });
+
+    let publisher_connection = RabbitMqConnection::connect(broker.uri()).await.unwrap();
+    let publisher_channel = publisher_connection.create_channel().await.unwrap();
+    let inbox = declare_probe_inbox(&publisher_channel).await;
+
+    publish_request_to_queue(
+        &publisher_channel,
+        "tests.ping.signed",
+        &ping_request(&inbox, 9),
+    )
+    .await;
+
+    let reply = wait_for_request_on(&publisher_channel, &inbox).await;
+    let headers = reply
+        .properties
+        .headers()
+        .as_ref()
+        .expect("a signed reply must carry headers");
+    for name in SECURITY_HEADER_NAMES {
+        assert!(
+            headers.inner().contains_key(&ShortString::from(name)),
+            "missing security header {name} on a signed responder's reply"
+        );
+    }
+
+    cancel.cancel();
+    let _ = worker_handle.await;
+}
+
+/// Symmetric to [`a_responder_signs_its_replies`]: a responder built over a
+/// transport carrying no outbound envelope security publishes its reply
+/// exactly as it always has, with none of the six security headers.
+///
+/// Without this test, an implementation that unconditionally signed every
+/// reply, regardless of the responder's own configuration, would still pass
+/// the positive case above: only checking the negative proves signing is
+/// conditional on the responder actually carrying a security configuration.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn a_responder_without_security_publishes_no_security_header() {
+    let broker = harness::start_rabbitmq().await;
+    let cancel = CancellationToken::new();
+    declare_ping_queue(broker.uri(), "tests.ping.unsigned").await;
+
+    let responder_transport = Arc::new(RabbitMqTransport::new(broker.uri()).await.unwrap());
+    let worker = RabbitMqWorkerBuilder::new(
+        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+            .await
+            .unwrap(),
+    )
+    .queue("tests.ping.unsigned")
+    .register_request_handler::<Ping, _>(Echo, Arc::clone(&responder_transport))
+    .build()
+    .unwrap();
+    let worker_cancel = cancel.clone();
+    let worker_handle = tokio::spawn(async move { worker.run(worker_cancel).await });
+
+    let publisher_connection = RabbitMqConnection::connect(broker.uri()).await.unwrap();
+    let publisher_channel = publisher_connection.create_channel().await.unwrap();
+    let inbox = declare_probe_inbox(&publisher_channel).await;
+
+    publish_request_to_queue(
+        &publisher_channel,
+        "tests.ping.unsigned",
+        &ping_request(&inbox, 10),
+    )
+    .await;
+
+    let reply = wait_for_request_on(&publisher_channel, &inbox).await;
+    let headers = reply
+        .properties
+        .headers()
+        .as_ref()
+        .expect("the reply must carry headers");
+    for name in SECURITY_HEADER_NAMES {
+        assert!(
+            !headers.inner().contains_key(&ShortString::from(name)),
+            "unexpected security header {name} on an unsigned responder's reply"
+        );
+    }
 
     cancel.cancel();
     let _ = worker_handle.await;

@@ -42,10 +42,11 @@ use tokio_util::sync::CancellationToken;
 use crate::connection::{
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BASE_DELAY, RabbitMqConnection, RabbitMqConnectionConfig,
 };
+use crate::envelope_security::InboundEnvelopeSecurity;
 use crate::metadata::AmqpMetadataLimits;
 use crate::reply_inbox::{declare_reply_inbox, run_reply_inbox_with_limits};
 use crate::transport::RabbitMqTransport;
-use crate::worker::RequiredEnvelopeFields;
+use crate::worker::derive_required_envelope_fields;
 
 /// Maximum time spent closing a connection from a failed reply-inbox setup.
 ///
@@ -87,6 +88,26 @@ pub struct RabbitMqRequestClientConfig {
     /// running on weaker limits than the requests it answers would be the
     /// bypass: it is the path that feeds an RPC correlation slot.
     pub metadata_limits: AmqpMetadataLimits,
+    /// Verification material and policy applied to every reply this client
+    /// receives.
+    ///
+    /// `None` (the default) preserves the historical behaviour: a reply
+    /// resolves its correlation slot regardless of whether it carries a
+    /// signature, and a missing `message_id`, `correlation_id` or timestamp
+    /// is minted rather than rejected (the crate-private
+    /// `RequiredEnvelopeFields::Lenient`). Configuring this under
+    /// [`hexeract_bus::VerificationPolicy::Required`] additionally switches
+    /// an unsigned reply to the stricter mode, mirroring
+    /// [`crate::RabbitMqWorkerConfig::envelope_security`] on the responder's
+    /// side. The reply inbox rebuilt after every reconnect carries the same
+    /// value, never a weaker default.
+    ///
+    /// Held behind an [`Arc`] rather than by value for the same reason as
+    /// [`crate::RabbitMqWorkerConfig::envelope_security`]:
+    /// [`hexeract_bus::EnvelopeVerifier`] carries a `Mutex` for its
+    /// key-refresh rate limit and is therefore never [`Clone`], while this
+    /// config is.
+    pub envelope_security: Option<Arc<InboundEnvelopeSecurity>>,
 }
 
 impl Default for RabbitMqRequestClientConfig {
@@ -95,6 +116,7 @@ impl Default for RabbitMqRequestClientConfig {
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             connection_config: RabbitMqConnectionConfig::default(),
             metadata_limits: AmqpMetadataLimits::default(),
+            envelope_security: None,
         }
     }
 }
@@ -144,6 +166,17 @@ impl RabbitMqRequestClientConfigBuilder {
     #[must_use]
     pub fn metadata_limits(mut self, metadata_limits: AmqpMetadataLimits) -> Self {
         self.config.metadata_limits = metadata_limits;
+        self
+    }
+
+    /// Verify every reply this client receives against `security`.
+    ///
+    /// See [`RabbitMqRequestClientConfig::envelope_security`] for the effect
+    /// a [`hexeract_bus::VerificationPolicy::Required`] policy has on how
+    /// strictly an unsigned reply's AMQP properties must be present.
+    #[must_use]
+    pub fn envelope_security(mut self, security: Arc<InboundEnvelopeSecurity>) -> Self {
+        self.config.envelope_security = Some(security);
         self
     }
 
@@ -254,6 +287,7 @@ pub async fn connect_request_client_with_config(
         cancel,
         config.connection_config,
         config.metadata_limits,
+        config.envelope_security,
     );
 
     Ok(RequestClient::new(
@@ -280,6 +314,12 @@ pub async fn connect_request_client_with_config(
 /// `active_inbox` pairs the consuming channel with the exclusive inbox it
 /// declared, the same `ActiveInbox` value [`supervise_reply_inbox`] replaces
 /// wholesale on every reconnect.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every parameter is a distinct piece of configuration or state this private \
+              helper threads through to the supervised loop; grouping them behind a struct \
+              built for one call site would not make the wiring any clearer"
+)]
 fn spawn_reply_inbox_supervisor(
     uri: &str,
     active_inbox: (Channel, String),
@@ -288,10 +328,17 @@ fn spawn_reply_inbox_supervisor(
     cancel: CancellationToken,
     connection_config: RabbitMqConnectionConfig,
     metadata_limits: AmqpMetadataLimits,
+    envelope_security: Option<Arc<InboundEnvelopeSecurity>>,
 ) -> RequestClientSupervisor {
     let reconnect_uri = uri.to_owned();
     let reconnect_state = Arc::clone(&reply_inbox);
     let run_registry = Arc::clone(&registry);
+    // Derived once, outside the loop: an unsigned reply is held to the
+    // stricter decode rule for the lifetime of the client exactly when a
+    // `Required` policy was configured, never only for the run started
+    // before some later reconfiguration, since this client's configuration
+    // never changes after construction.
+    let required_fields = derive_required_envelope_fields(envelope_security.as_deref());
 
     RequestClientSupervisor::spawn(cancel, move |cancel| async move {
         supervise_reply_inbox(
@@ -299,10 +346,10 @@ fn spawn_reply_inbox_supervisor(
             registry,
             reply_inbox,
             cancel,
-            // `metadata_limits` is captured once and reused by every run the
-            // supervisor drives, so an inbox rebuilt after a reconnect keeps
-            // the configured bound instead of silently falling back to the
-            // defaults.
+            // `metadata_limits` and `envelope_security` are captured once and
+            // reused by every run the supervisor drives, so an inbox rebuilt
+            // after a reconnect keeps the configured bound and verification
+            // policy instead of silently falling back to the defaults.
             move |(channel, inbox), cancel| {
                 run_reply_inbox_with_limits(
                     channel,
@@ -310,7 +357,8 @@ fn spawn_reply_inbox_supervisor(
                     Arc::clone(&run_registry),
                     cancel,
                     metadata_limits,
-                    RequiredEnvelopeFields::default(),
+                    required_fields,
+                    envelope_security.clone(),
                 )
             },
             move |cancel| {
@@ -636,7 +684,9 @@ mod tests {
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
-    use hexeract_bus::ReplyExpectation;
+    use hexeract_bus::{
+        Audience, EnvelopeSecurityConfig, ReplyExpectation, StaticKeySource, VerificationPolicy,
+    };
     use hexeract_core::RequestId;
     use lapin::tcp::OwnedTLSConfig;
     use tokio::sync::Notify;
@@ -673,6 +723,43 @@ mod tests {
                 .metadata_limits,
             AmqpMetadataLimits::default()
         );
+    }
+
+    #[test]
+    fn an_untouched_builder_yields_no_envelope_security() {
+        assert!(
+            RabbitMqRequestClientConfigBuilder::new()
+                .build()
+                .envelope_security
+                .is_none()
+        );
+    }
+
+    /// The symmetric half of the test above. Without it, a setter that
+    /// dropped its argument on the floor would still leave an untouched
+    /// builder yielding `None`, and the pair is what pins the field down:
+    /// absent by default, and exactly the value the caller handed over once
+    /// set. `Arc::ptr_eq` rather than a value comparison, because what
+    /// matters is that the client verifies against the very key source the
+    /// caller configured, never against an equal-looking copy.
+    #[test]
+    fn the_builder_carries_the_configured_envelope_security_into_the_config() {
+        let security = Arc::new(InboundEnvelopeSecurity::new(
+            Arc::new(StaticKeySource::builder().build()),
+            EnvelopeSecurityConfig::builder()
+                .with_policy(VerificationPolicy::Required)
+                .with_accepted_audience(Audience::new("ledger-service").expect("valid audience"))
+                .build()
+                .expect("valid configuration"),
+        ));
+
+        let carried = RabbitMqRequestClientConfigBuilder::new()
+            .envelope_security(Arc::clone(&security))
+            .build()
+            .envelope_security
+            .expect("the builder was handed an envelope security");
+
+        assert!(Arc::ptr_eq(&security, &carried));
     }
 
     #[test]

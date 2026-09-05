@@ -29,6 +29,7 @@ use lapin::options::QueueDeclareOptions;
 use lapin::types::FieldTable;
 use tokio_util::sync::CancellationToken;
 
+use crate::envelope_security::InboundEnvelopeSecurity;
 use crate::metadata::AmqpMetadataLimits;
 use crate::transport::to_short_string;
 use crate::worker::DEFAULT_MAX_PAYLOAD_BYTES;
@@ -114,11 +115,13 @@ pub async fn run_reply_inbox(
         cancel,
         AmqpMetadataLimits::default(),
         RequiredEnvelopeFields::default(),
+        None,
     )
     .await
 }
 
-/// Consume the reply inbox under caller-selected metadata limits.
+/// Consume the reply inbox under caller-selected metadata limits and
+/// verification policy.
 ///
 /// The reply path applies exactly the same limits, through exactly the same
 /// decoder, as the normal worker: a reply inbox that accepted metadata the
@@ -127,6 +130,12 @@ pub async fn run_reply_inbox(
 /// policy the worker enforces on its own deliveries, for the same reason: a
 /// reply that is signed, or strictly required, must not decode here under a
 /// weaker rule than the worker applies to its own inbound deliveries.
+///
+/// `envelope_security`, when set, authenticates every decoded reply, on this
+/// exclusive inbox's own routing key, before [`RequestRegistry::resolve`]
+/// ever sees it: see [`verify_before_resolution`] for why that order is
+/// non-negotiable. `None` preserves the historical behaviour: a reply
+/// resolves its slot regardless of whether it carries a signature.
 ///
 /// # Errors
 ///
@@ -138,6 +147,7 @@ pub(crate) async fn run_reply_inbox_with_limits(
     cancel: CancellationToken,
     metadata_limits: AmqpMetadataLimits,
     required_fields: RequiredEnvelopeFields,
+    envelope_security: Option<Arc<InboundEnvelopeSecurity>>,
 ) -> Result<(), BusError> {
     let mut consumer = channel
         .basic_consume(
@@ -162,7 +172,15 @@ pub(crate) async fn run_reply_inbox_with_limits(
                     metadata_limits,
                     required_fields,
                 ) {
-                    Ok(envelope) => registry.resolve(envelope),
+                    Ok(envelope) => {
+                        verify_before_resolution(
+                            envelope_security.as_deref(),
+                            envelope,
+                            delivery.routing_key.as_str(),
+                            |envelope| registry.resolve(envelope),
+                        )
+                        .await;
+                    }
                     // The typed error carries a reason and sizes only, never a
                     // header key or value, and the delivery is dropped under
                     // the existing no_ack contract before it can take a
@@ -182,6 +200,56 @@ pub(crate) async fn run_reply_inbox_with_limits(
                 }
             }
         }
+    }
+}
+
+/// Verify `envelope`, delivered on `destination`, against `envelope_security`,
+/// then, only once verification passes, hand it to `resolve`.
+///
+/// Generic over the resolution operation, the same pattern
+/// [`crate::worker::RabbitMqWorker::verify_before_settlement`] uses for the
+/// symmetric ordering problem on the worker's dispatch path, so the ordering
+/// is unit-testable without a broker.
+///
+/// `destination` must be the routing key the delivery actually arrived on,
+/// never the `x-hexeract-destination` header read back from the envelope
+/// itself: the exclusive reply inbox's own name is the one fact a forged or
+/// replayed delivery cannot fake, and it is what lets a signature produced
+/// for one caller's inbox be rejected when replayed into another's, since
+/// each caller's inbox is a distinct, broker-generated name.
+///
+/// A verification failure is logged and the delivery is dropped without ever
+/// reaching `resolve`: the correlation slot the reply claims stays intact,
+/// so the legitimate reply, if one is still coming, can still resolve it.
+/// This is what makes the first *valid* reply win rather than the first
+/// delivery to arrive, exactly mirroring
+/// [`hexeract_bus::RequestRegistry::resolve`]'s own contract for a reply that
+/// fails its protocol-shape check.
+///
+/// No `envelope_security` configured is an unconditional pass: `verify` is
+/// never reached, so a verification key source configured elsewhere in the
+/// process is never consulted, and an unconfigured client resolves every
+/// reply exactly as it did before this security surface existed.
+async fn verify_before_resolution<Resolve>(
+    envelope_security: Option<&InboundEnvelopeSecurity>,
+    envelope: BusEnvelope,
+    destination: &str,
+    resolve: Resolve,
+) where
+    Resolve: FnOnce(BusEnvelope),
+{
+    match envelope_security {
+        None => resolve(envelope),
+        Some(security) => match security.verify(&envelope, destination).await {
+            Ok(_principal) => resolve(envelope),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "forged or misdirected reply rejected before it could resolve a \
+                     correlation slot, the slot is left pending"
+                );
+            }
+        },
     }
 }
 
@@ -261,5 +329,369 @@ mod tests {
             ),
             "expected EnvelopeSecurity(MissingRequiredField), got {err:?}"
         );
+    }
+
+    mod verify_before_resolution {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::SystemTime;
+
+        use async_trait::async_trait;
+        use ed25519_dalek::SigningKey;
+        use hexeract_bus::Audience;
+        use hexeract_bus::BusEnvelope;
+        use hexeract_bus::EnvelopeSecurityConfig;
+        use hexeract_bus::Issuer;
+        use hexeract_bus::KeyId;
+        use hexeract_bus::KeySourceError;
+        use hexeract_bus::PROTOCOL_VERSION;
+        use hexeract_bus::PROTOCOL_VERSION_HEADER;
+        use hexeract_bus::REPLY_STATUS_HEADER;
+        use hexeract_bus::REPLY_STATUS_OK;
+        use hexeract_bus::ReplyExpectation;
+        use hexeract_bus::RequestRegistry;
+        use hexeract_bus::SigningKeyHandle;
+        use hexeract_bus::SigningKeySource;
+        use hexeract_bus::StaticKeySource;
+        use hexeract_bus::VerificationKey;
+        use hexeract_bus::VerificationKeySource;
+        use hexeract_bus::VerificationPolicy;
+        use hexeract_core::RequestId;
+        use uuid::Uuid;
+
+        use super::*;
+        use crate::envelope_security::OutboundEnvelopeSecurity;
+
+        const CLIENT_INBOX: &str = "amq.gen-client-inbox";
+        const OTHER_INBOX: &str = "amq.gen-other-inbox";
+        const REPLY_MESSAGE_TYPE: &str = "tests.pong";
+
+        fn issuer() -> Issuer {
+            Issuer::new("billing-service").expect("valid issuer")
+        }
+
+        fn audience() -> Audience {
+            Audience::new("ledger-service").expect("valid audience")
+        }
+
+        fn key_id() -> KeyId {
+            KeyId::new("2026-09").expect("valid key id")
+        }
+
+        fn signing_key() -> SigningKey {
+            SigningKey::from_bytes(&[7; 32])
+        }
+
+        fn required_security_with_keys(
+            keys: Arc<dyn VerificationKeySource>,
+        ) -> InboundEnvelopeSecurity {
+            let config = EnvelopeSecurityConfig::builder()
+                .with_policy(VerificationPolicy::Required)
+                .with_accepted_audience(audience())
+                .build()
+                .expect("valid configuration");
+            InboundEnvelopeSecurity::new(keys, config)
+        }
+
+        fn required_security() -> InboundEnvelopeSecurity {
+            let keys: Arc<dyn VerificationKeySource> = Arc::new(
+                StaticKeySource::builder()
+                    .with_verification_key(
+                        issuer(),
+                        key_id(),
+                        VerificationKey::from(signing_key().verifying_key()),
+                    )
+                    .build(),
+            );
+            required_security_with_keys(keys)
+        }
+
+        fn outbound_security() -> OutboundEnvelopeSecurity {
+            let keys: Arc<dyn SigningKeySource> = Arc::new(
+                StaticKeySource::builder()
+                    .with_signing_key(key_id(), SigningKeyHandle::from(signing_key()))
+                    .build(),
+            );
+            OutboundEnvelopeSecurity::new(issuer(), audience(), keys)
+        }
+
+        fn reply_protocol_headers(request_id: RequestId) -> HashMap<String, String> {
+            let mut headers = HashMap::new();
+            headers.insert(
+                PROTOCOL_VERSION_HEADER.to_owned(),
+                PROTOCOL_VERSION.to_string(),
+            );
+            headers.insert(REPLY_STATUS_HEADER.to_owned(), REPLY_STATUS_OK.to_owned());
+            headers.insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
+            headers
+        }
+
+        /// An unsigned reply, otherwise shaped exactly as
+        /// [`hexeract_bus::RequestRegistry::resolve`] requires: the protocol
+        /// version, the reply status, and the request id of the slot it
+        /// targets.
+        fn unsigned_reply(request_id: RequestId) -> BusEnvelope {
+            BusEnvelope::restore_from_transport(
+                Uuid::from_u128(1),
+                REPLY_MESSAGE_TYPE.to_owned(),
+                b"{}".to_vec(),
+                Uuid::from_u128(2),
+                None,
+                HashMap::new(),
+                reply_protocol_headers(request_id),
+                SystemTime::now(),
+            )
+        }
+
+        /// Sign a fresh reply for `destination`, correctly, under `security`.
+        ///
+        /// Signs the envelope carrying its full set of protocol headers
+        /// first, since the canonical representation covers them, then
+        /// merges the resulting security headers alongside those protocol
+        /// headers rather than replacing them: a reply missing its request
+        /// id would never reach [`hexeract_bus::RequestRegistry::resolve`]
+        /// in the first place, which would make a test built on it prove
+        /// nothing about verification.
+        fn signed_reply_with(
+            security: &OutboundEnvelopeSecurity,
+            destination: &str,
+            request_id: RequestId,
+        ) -> BusEnvelope {
+            let envelope = unsigned_reply(request_id);
+            let security_headers = security
+                .sign(&envelope, destination)
+                .expect("signing must succeed");
+            let mut protocol_headers = reply_protocol_headers(request_id);
+            for (name, value) in &security_headers {
+                protocol_headers.insert(name.to_owned(), value.to_owned());
+            }
+            BusEnvelope::restore_from_transport(
+                envelope.message_id,
+                envelope.message_type.clone(),
+                envelope.payload.clone(),
+                envelope.correlation_id,
+                envelope.reply_to.clone(),
+                envelope.headers.clone(),
+                protocol_headers,
+                envelope.published_at,
+            )
+        }
+
+        fn signed_reply(destination: &str, request_id: RequestId) -> BusEnvelope {
+            signed_reply_with(&outbound_security(), destination, request_id)
+        }
+
+        fn register(
+            registry: &RequestRegistry,
+            request_id: RequestId,
+        ) -> hexeract_bus::PendingReply<'_> {
+            registry
+                .register(request_id, ReplyExpectation::new(REPLY_MESSAGE_TYPE))
+                .expect("registration must succeed")
+        }
+
+        #[tokio::test]
+        async fn a_forged_reply_never_resolves_the_correlation_slot() {
+            let registry = RequestRegistry::default();
+            let request_id = RequestId::new();
+            let _pending = register(&registry, request_id);
+            let security = required_security();
+
+            // Signed correctly, then tampered: the signature headers are
+            // present and well-formed, but no longer match the canonical
+            // representation.
+            let mut envelope = signed_reply(CLIENT_INBOX, request_id);
+            envelope.payload = b"{ \"tampered\": true }".to_vec();
+
+            verify_before_resolution(Some(&security), envelope, CLIENT_INBOX, |envelope| {
+                registry.resolve(envelope);
+            })
+            .await;
+
+            assert!(
+                !registry.is_empty(),
+                "a forged reply must never resolve the correlation slot"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_correctly_signed_reply_resolves_the_correlation_slot() {
+            // Symmetric to the forged-reply test above: an implementation
+            // that rejected every reply would also leave the slot pending,
+            // so this proves a validly signed reply, delivered to the inbox
+            // it was signed for, still resolves the caller waiting on it.
+            let registry = RequestRegistry::default();
+            let request_id = RequestId::new();
+            let mut pending = register(&registry, request_id);
+            let security = required_security();
+
+            let envelope = signed_reply(CLIENT_INBOX, request_id);
+
+            verify_before_resolution(Some(&security), envelope, CLIENT_INBOX, |envelope| {
+                registry.resolve(envelope);
+            })
+            .await;
+
+            assert!(
+                registry.is_empty(),
+                "a correctly signed reply must resolve the correlation slot"
+            );
+            let resolved = pending
+                .wait()
+                .await
+                .expect("the caller must receive its reply");
+            assert_eq!(resolved.message_type, REPLY_MESSAGE_TYPE);
+        }
+
+        #[tokio::test]
+        async fn a_reply_signed_for_another_inbox_is_rejected() {
+            // Signed for OTHER_INBOX, but delivered on CLIENT_INBOX: a valid
+            // signature captured off one caller's exclusive inbox and
+            // replayed onto another's. Each caller's inbox is a distinct,
+            // broker-generated name, so this is the cross-caller replay the
+            // destination binding exists to close.
+            let registry = RequestRegistry::default();
+            let request_id = RequestId::new();
+            let _pending = register(&registry, request_id);
+            let security = required_security();
+
+            let envelope = signed_reply(OTHER_INBOX, request_id);
+
+            verify_before_resolution(Some(&security), envelope, CLIENT_INBOX, |envelope| {
+                registry.resolve(envelope);
+            })
+            .await;
+
+            assert!(
+                !registry.is_empty(),
+                "a reply signed for another caller's inbox must never resolve this caller's slot"
+            );
+        }
+
+        /// Records every key lookup a verification performs, delegating to a
+        /// real [`StaticKeySource`] so the signature under test genuinely
+        /// verifies. The event log this produces is what lets a test observe
+        /// that a key lookup, and therefore the whole verification, happened
+        /// strictly before resolution, rather than merely trusting the
+        /// control flow to have run in the order the source reads.
+        struct SpyKeySource {
+            inner: StaticKeySource,
+            events: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        #[async_trait]
+        impl VerificationKeySource for SpyKeySource {
+            async fn verification_key(
+                &self,
+                issuer: &Issuer,
+                key_id: &KeyId,
+            ) -> Result<VerificationKey, KeySourceError> {
+                self.events.lock().unwrap().push("verify");
+                self.inner.verification_key(issuer, key_id).await
+            }
+
+            async fn refresh(&self) -> Result<(), KeySourceError> {
+                self.inner.refresh().await
+            }
+        }
+
+        #[tokio::test]
+        async fn verification_precedes_the_correlation_resolution() {
+            let events: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+            let inner = StaticKeySource::builder()
+                .with_verification_key(
+                    issuer(),
+                    key_id(),
+                    VerificationKey::from(signing_key().verifying_key()),
+                )
+                .build();
+            let spy: Arc<dyn VerificationKeySource> = Arc::new(SpyKeySource {
+                inner,
+                events: Arc::clone(&events),
+            });
+            let security = required_security_with_keys(spy);
+
+            let request_id = RequestId::new();
+            let envelope = signed_reply(CLIENT_INBOX, request_id);
+
+            verify_before_resolution(Some(&security), envelope, CLIENT_INBOX, |_envelope| {
+                events.lock().unwrap().push("resolve");
+            })
+            .await;
+
+            assert_eq!(
+                *events.lock().unwrap(),
+                vec!["verify", "resolve"],
+                "verification, key lookup included, must complete strictly before the \
+                 correlation slot is resolved"
+            );
+        }
+
+        /// Counts calls to [`VerificationKeySource::verification_key`] so a
+        /// test can prove a source was never consulted at all, rather than
+        /// merely that no error surfaced: a client that silently discarded a
+        /// verification error would still leave no visible symptom, but
+        /// would have paid for a key lookup an unconfigured client must
+        /// never make.
+        #[derive(Default)]
+        struct CountingKeySource {
+            lookups: Arc<AtomicUsize>,
+        }
+
+        impl CountingKeySource {
+            fn lookups(&self) -> Arc<AtomicUsize> {
+                Arc::clone(&self.lookups)
+            }
+        }
+
+        #[async_trait]
+        impl VerificationKeySource for CountingKeySource {
+            async fn verification_key(
+                &self,
+                _issuer: &Issuer,
+                _key_id: &KeyId,
+            ) -> Result<VerificationKey, KeySourceError> {
+                self.lookups.fetch_add(1, Ordering::Relaxed);
+                Err(KeySourceError::UnknownKey)
+            }
+
+            async fn refresh(&self) -> Result<(), KeySourceError> {
+                Ok(())
+            }
+        }
+
+        #[tokio::test]
+        async fn an_unconfigured_client_behaves_exactly_as_before() {
+            // No `InboundEnvelopeSecurity` is ever constructed for an
+            // unconfigured client, so there is no verification key source it
+            // could reach for; this counting source stands in for one that
+            // exists elsewhere in the process (shared across several
+            // clients) but was never wired into this one, and must stay
+            // untouched.
+            let counting = CountingKeySource::default();
+            let lookups = counting.lookups();
+            let registry = RequestRegistry::default();
+            let request_id = RequestId::new();
+            let mut pending = register(&registry, request_id);
+
+            let envelope = unsigned_reply(request_id);
+
+            verify_before_resolution(None, envelope, CLIENT_INBOX, |envelope| {
+                registry.resolve(envelope);
+            })
+            .await;
+
+            assert!(
+                registry.is_empty(),
+                "an unconfigured client must resolve the slot exactly as before"
+            );
+            assert!(pending.wait().await.is_ok());
+            assert_eq!(
+                lookups.load(Ordering::Relaxed),
+                0,
+                "an unconfigured client must never consult a verification key source"
+            );
+        }
     }
 }
