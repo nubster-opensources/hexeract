@@ -30,6 +30,8 @@
 pub mod deadline;
 /// In-flight representation of a message crossing the bus.
 pub mod envelope;
+/// End-to-end authenticity and integrity of envelopes crossing the bus.
+pub mod envelope_security;
 /// Errors raised by the bus primitives, transports and workers.
 pub mod error;
 /// Consumer-side dispatch primitives invoked by the bus worker.
