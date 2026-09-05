@@ -42,10 +42,7 @@ impl From<VerifyingKey> for VerificationKey {
 pub struct SigningKeyHandle(SigningKey);
 
 impl SigningKeyHandle {
-    #[expect(
-        dead_code,
-        reason = "consumed by the signer introduced in a later task"
-    )]
+    /// Borrow the underlying Ed25519 signing key.
     pub(crate) fn as_signing_key(&self) -> &SigningKey {
         &self.0
     }

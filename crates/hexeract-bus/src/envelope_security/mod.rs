@@ -25,3 +25,5 @@ pub mod policy;
 pub mod principal;
 /// Wire constants of the envelope security protocol.
 pub mod protocol;
+/// Production of the security headers carried by a signed envelope.
+pub mod signer;
