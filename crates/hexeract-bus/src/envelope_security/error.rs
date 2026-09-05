@@ -82,6 +82,13 @@ pub enum EnvelopeSecurityError {
         field: &'static str,
     },
 
+    /// A configuration value is present but not usable.
+    #[error("configuration value {field} is not usable")]
+    InvalidConfiguration {
+        /// Name of the offending setting.
+        field: &'static str,
+    },
+
     /// A covered field exceeds the length the canonical framing can encode.
     #[error("a covered field exceeds the maximum encodable length")]
     FieldTooLarge,
@@ -119,6 +126,10 @@ impl std::fmt::Debug for EnvelopeSecurityError {
             Self::SignatureMismatch => formatter.write_str("SignatureMismatch"),
             Self::MissingRequiredField { field } => formatter
                 .debug_struct("MissingRequiredField")
+                .field("field", field)
+                .finish(),
+            Self::InvalidConfiguration { field } => formatter
+                .debug_struct("InvalidConfiguration")
                 .field("field", field)
                 .finish(),
             Self::FieldTooLarge => formatter.write_str("FieldTooLarge"),
@@ -198,6 +209,9 @@ mod tests {
             EnvelopeSecurityError::SignatureMismatch,
             EnvelopeSecurityError::MissingRequiredField {
                 field: "published_at",
+            },
+            EnvelopeSecurityError::InvalidConfiguration {
+                field: "key_refresh_interval",
             },
             EnvelopeSecurityError::FieldTooLarge,
             EnvelopeSecurityError::InvalidIdentity {

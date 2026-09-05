@@ -19,6 +19,8 @@ pub mod error;
 pub mod identity;
 /// Sources of signing and verification key material.
 pub mod key_source;
+/// Whether an unauthenticated envelope may reach a handler.
+pub mod policy;
 /// Publisher identity established by a successful verification.
 pub mod principal;
 /// Wire constants of the envelope security protocol.
