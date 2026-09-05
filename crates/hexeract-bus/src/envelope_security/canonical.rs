@@ -4,7 +4,12 @@
 //!
 //! **Determinism.** The same envelope must always produce the same bytes, on
 //! any machine, in any order of header insertion. Headers therefore travel
-//! sorted by the bytes of their key, never by a locale-dependent collation.
+//! sorted by the bytes of their key and then of their value, never by a
+//! locale-dependent collation. Sorting on the key alone would not be a total
+//! order: the two header maps are merged, so the same key can appear twice,
+//! and the order of the pairs would then follow the iteration order of a
+//! `HashMap`, which differs between the signing process and the verifying
+//! one.
 //!
 //! **Unambiguous framing.** Every element is preceded by its length. Without
 //! it, the pairs `("ab", "c")` and `("a", "bc")` would concatenate to the same
@@ -123,7 +128,12 @@ fn push_headers(
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .filter(|(key, _)| !is_security_header(key))
         .collect();
-    pairs.sort_unstable_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    pairs.sort_unstable_by(|left, right| {
+        left.0
+            .as_bytes()
+            .cmp(right.0.as_bytes())
+            .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
+    });
 
     let count = u32::try_from(pairs.len()).map_err(|_| EnvelopeSecurityError::FieldTooLarge)?;
     bytes.extend_from_slice(&count.to_be_bytes());
@@ -190,11 +200,49 @@ mod tests {
         canonical_representation(envelope, &binding).expect("canonical representation")
     }
 
+    fn envelope_with_maps(
+        headers: HashMap<String, String>,
+        protocol_headers: HashMap<String, String>,
+    ) -> BusEnvelope {
+        BusEnvelope::restore_from_transport(
+            Uuid::from_u128(1),
+            "billing.invoice.issued".to_owned(),
+            b"{}".to_vec(),
+            Uuid::from_u128(2),
+            None,
+            headers,
+            protocol_headers,
+            UNIX_EPOCH + Duration::from_secs(1_757_000_000),
+        )
+    }
+
+    fn one_header(key: &str, value: &str) -> HashMap<String, String> {
+        let mut map = HashMap::new();
+        map.insert(key.to_owned(), value.to_owned());
+        map
+    }
+
     #[test]
     fn the_representation_is_stable_across_calls() {
         let envelope = envelope_with(HashMap::new(), None);
 
         assert_eq!(representation(&envelope), representation(&envelope));
+    }
+
+    #[test]
+    fn a_key_held_by_both_header_maps_orders_by_value() {
+        let application_first =
+            envelope_with_maps(one_header("tenant", "aaa"), one_header("tenant", "bbb"));
+        let protocol_first =
+            envelope_with_maps(one_header("tenant", "bbb"), one_header("tenant", "aaa"));
+
+        assert_eq!(
+            representation(&application_first),
+            representation(&protocol_first),
+            "sorting on the key alone leaves two pairs equal for the comparator, so their \
+             order would follow the iteration order of a HashMap and differ between the \
+             signing process and the verifying one"
+        );
     }
 
     #[test]
