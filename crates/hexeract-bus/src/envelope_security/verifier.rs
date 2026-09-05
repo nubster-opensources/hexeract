@@ -1,11 +1,10 @@
 //! Verification of an inbound envelope before any typed decoding.
 
-use std::time::Instant;
-
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, Verifier};
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 use super::canonical::{CanonicalBinding, canonical_representation};
 use super::error::EnvelopeSecurityError;
@@ -157,8 +156,11 @@ fn required_header<'a>(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, UNIX_EPOCH};
 
+    use async_trait::async_trait;
     use ed25519_dalek::SigningKey;
     use uuid::Uuid;
 
@@ -167,6 +169,39 @@ mod tests {
     use super::*;
 
     const DESTINATION: &str = "billing.invoice.issued";
+
+    #[derive(Debug, Default, Clone)]
+    struct CountingKeySource {
+        refreshes: Arc<AtomicUsize>,
+        lookups: Arc<AtomicUsize>,
+    }
+
+    impl CountingKeySource {
+        fn refreshes(&self) -> Arc<AtomicUsize> {
+            Arc::clone(&self.refreshes)
+        }
+
+        fn lookups(&self) -> Arc<AtomicUsize> {
+            Arc::clone(&self.lookups)
+        }
+    }
+
+    #[async_trait]
+    impl VerificationKeySource for CountingKeySource {
+        async fn verification_key(
+            &self,
+            _issuer: &Issuer,
+            _key_id: &KeyId,
+        ) -> Result<VerificationKey, KeySourceError> {
+            self.lookups.fetch_add(1, Ordering::Relaxed);
+            Err(KeySourceError::UnknownKey)
+        }
+
+        async fn refresh(&self) -> Result<(), KeySourceError> {
+            self.refreshes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
 
     fn issuer() -> Issuer {
         Issuer::new("billing-service").expect("valid issuer")
@@ -227,6 +262,35 @@ mod tests {
             correlation_id,
             reply_to,
             headers,
+            protocol_headers,
+            published_at,
+        )
+    }
+
+    fn with_replaced_security_header(
+        envelope: &BusEnvelope,
+        header: &'static str,
+        value: &str,
+    ) -> BusEnvelope {
+        let parts = envelope.security_parts();
+        let message_id = *parts.message_id;
+        let message_type = parts.message_type.clone();
+        let payload = parts.payload.clone();
+        let correlation_id = *parts.correlation_id;
+        let reply_to = parts.reply_to.clone();
+        let application_headers = parts.headers.clone();
+        let mut protocol_headers = parts.protocol_headers.clone();
+        let published_at = *parts.published_at;
+
+        protocol_headers.insert(header.to_owned(), value.to_owned());
+
+        BusEnvelope::restore_from_transport(
+            message_id,
+            message_type,
+            payload,
+            correlation_id,
+            reply_to,
+            application_headers,
             protocol_headers,
             published_at,
         )
@@ -463,5 +527,244 @@ mod tests {
             .expect_err("signed by a key the consumer does not trust");
 
         assert!(matches!(error, EnvelopeSecurityError::SignatureMismatch));
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_envelope_is_refused_when_verification_is_required() {
+        let envelope = BusEnvelope::restore_from_transport(
+            Uuid::from_u128(1),
+            DESTINATION.to_owned(),
+            b"{}".to_vec(),
+            Uuid::from_u128(2),
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            UNIX_EPOCH + Duration::from_secs(1_757_000_000),
+        );
+
+        let error = verifier()
+            .verify(
+                &envelope,
+                &VerificationContext {
+                    destination: DESTINATION,
+                },
+            )
+            .await
+            .expect_err("unsigned envelope");
+
+        assert!(matches!(error, EnvelopeSecurityError::MissingSignature));
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_envelope_is_accepted_without_a_principal_under_the_opt_out() {
+        let config = EnvelopeSecurityConfig::builder()
+            .with_policy(VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes)
+            .build()
+            .expect("opted out");
+        let verifier = EnvelopeVerifier::new(StaticKeySource::builder().build(), config);
+        let envelope = BusEnvelope::restore_from_transport(
+            Uuid::from_u128(1),
+            DESTINATION.to_owned(),
+            b"{}".to_vec(),
+            Uuid::from_u128(2),
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            UNIX_EPOCH + Duration::from_secs(1_757_000_000),
+        );
+
+        let principal = verifier
+            .verify(
+                &envelope,
+                &VerificationContext {
+                    destination: DESTINATION,
+                },
+            )
+            .await
+            .expect("accepted");
+
+        assert!(principal.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_broken_signature_is_still_rejected_under_the_opt_out() {
+        let keys = StaticKeySource::builder()
+            .with_verification_key(
+                issuer(),
+                key_id(),
+                VerificationKey::from(SigningKey::from_bytes(&[1; 32]).verifying_key()),
+            )
+            .build();
+        let config = EnvelopeSecurityConfig::builder()
+            .with_policy(VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes)
+            .with_accepted_audience(audience())
+            .build()
+            .expect("opted out");
+        let verifier = EnvelopeVerifier::new(keys, config);
+        let mut envelope = signed_envelope();
+        envelope.payload = b"{ }".to_vec();
+
+        let error = verifier
+            .verify(
+                &envelope,
+                &VerificationContext {
+                    destination: DESTINATION,
+                },
+            )
+            .await
+            .expect_err("a signed envelope with a broken signature is never silently downgraded");
+
+        assert!(matches!(error, EnvelopeSecurityError::SignatureMismatch));
+    }
+
+    #[tokio::test]
+    async fn an_envelope_for_another_audience_is_rejected() {
+        let keys = StaticKeySource::builder()
+            .with_verification_key(
+                issuer(),
+                key_id(),
+                VerificationKey::from(SigningKey::from_bytes(&[1; 32]).verifying_key()),
+            )
+            .build();
+        let config = EnvelopeSecurityConfig::builder()
+            .with_accepted_audience(Audience::new("audit-service").expect("valid audience"))
+            .build()
+            .expect("valid configuration");
+        let verifier = EnvelopeVerifier::new(keys, config);
+
+        let error = verifier
+            .verify(
+                &signed_envelope(),
+                &VerificationContext {
+                    destination: DESTINATION,
+                },
+            )
+            .await
+            .expect_err("wrong audience");
+
+        assert!(matches!(error, EnvelopeSecurityError::AudienceMismatch));
+    }
+
+    #[tokio::test]
+    async fn a_revoked_key_is_rejected_distinctly_from_an_unknown_one() {
+        let keys = StaticKeySource::builder()
+            .with_revoked_key(issuer(), key_id())
+            .build();
+        let config = EnvelopeSecurityConfig::builder()
+            .with_accepted_audience(audience())
+            .build()
+            .expect("valid configuration");
+        let verifier = EnvelopeVerifier::new(keys, config);
+
+        let error = verifier
+            .verify(
+                &signed_envelope(),
+                &VerificationContext {
+                    destination: DESTINATION,
+                },
+            )
+            .await
+            .expect_err("revoked key");
+
+        assert!(matches!(error, EnvelopeSecurityError::RevokedKey));
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_algorithm_is_rejected_before_any_key_lookup() {
+        let counting = CountingKeySource::default();
+        let lookups = counting.lookups();
+        let config = EnvelopeSecurityConfig::builder()
+            .with_accepted_audience(audience())
+            .build()
+            .expect("valid configuration");
+        let verifier = EnvelopeVerifier::new(counting, config);
+        let envelope =
+            with_replaced_security_header(&signed_envelope(), ALGORITHM_HEADER, "rsa-pkcs1");
+
+        let error = verifier
+            .verify(
+                &envelope,
+                &VerificationContext {
+                    destination: DESTINATION,
+                },
+            )
+            .await
+            .expect_err("unsupported algorithm");
+
+        assert!(matches!(error, EnvelopeSecurityError::UnsupportedAlgorithm));
+        assert_eq!(
+            lookups.load(Ordering::Relaxed),
+            0,
+            "an unsupported algorithm must be refused before the key source is asked anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_signature_is_reported_as_a_malformed_header() {
+        let envelope = with_replaced_security_header(&signed_envelope(), SIGNATURE_HEADER, "!!!");
+
+        let error = verifier()
+            .verify(
+                &envelope,
+                &VerificationContext {
+                    destination: DESTINATION,
+                },
+            )
+            .await
+            .expect_err("malformed signature");
+
+        assert!(matches!(
+            error,
+            EnvelopeSecurityError::MalformedSecurityHeader {
+                header: SIGNATURE_HEADER
+            }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_unknown_keys_trigger_a_single_refresh_within_the_interval() {
+        let counting = CountingKeySource::default();
+        let refreshes = counting.refreshes();
+        let config = EnvelopeSecurityConfig::builder()
+            .with_accepted_audience(audience())
+            .with_key_refresh_interval(Duration::from_secs(60))
+            .build()
+            .expect("valid configuration");
+        let verifier = EnvelopeVerifier::new(counting, config);
+
+        for _ in 0..10 {
+            let _ = verifier
+                .verify(
+                    &signed_envelope(),
+                    &VerificationContext {
+                        destination: DESTINATION,
+                    },
+                )
+                .await;
+        }
+
+        assert_eq!(refreshes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refresh_happens_again_once_the_interval_has_elapsed() {
+        let counting = CountingKeySource::default();
+        let refreshes = counting.refreshes();
+        let interval = Duration::from_secs(60);
+        let config = EnvelopeSecurityConfig::builder()
+            .with_accepted_audience(audience())
+            .with_key_refresh_interval(interval)
+            .build()
+            .expect("valid configuration");
+        let verifier = EnvelopeVerifier::new(counting, config);
+        let context = VerificationContext {
+            destination: DESTINATION,
+        };
+
+        let _ = verifier.verify(&signed_envelope(), &context).await;
+        tokio::time::advance(interval + Duration::from_secs(1)).await;
+        let _ = verifier.verify(&signed_envelope(), &context).await;
+
+        assert_eq!(refreshes.load(Ordering::Relaxed), 2);
     }
 }
