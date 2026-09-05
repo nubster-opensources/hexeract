@@ -22,19 +22,47 @@ pub struct SecurityHeaders {
 
 impl SecurityHeaders {
     /// Iterate over the header names and values to publish.
-    pub fn iter(&self) -> impl Iterator<Item = (&'static str, &str)> {
-        self.entries
-            .iter()
-            .map(|(name, value)| (*name, value.as_str()))
+    #[must_use]
+    pub fn iter(&self) -> SecurityHeadersIter<'_> {
+        SecurityHeadersIter {
+            inner: self.entries.iter(),
+        }
     }
 }
 
+/// Borrowing iterator over the headers of a [`SecurityHeaders`].
+///
+/// Named rather than boxed: this runs on every publication, and the
+/// associated type of an [`IntoIterator`] implementation is part of the
+/// public API, so a `Box<dyn Iterator>` would freeze both an allocation per
+/// publication and a type that cannot be changed without breaking callers.
+#[derive(Debug)]
+pub struct SecurityHeadersIter<'a> {
+    inner: std::slice::Iter<'a, (&'static str, String)>,
+}
+
+impl<'a> Iterator for SecurityHeadersIter<'a> {
+    type Item = (&'static str, &'a str);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner
+            .next()
+            .map(|(name, value)| (*name, value.as_str()))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl ExactSizeIterator for SecurityHeadersIter<'_> {}
+
 impl<'a> IntoIterator for &'a SecurityHeaders {
     type Item = (&'static str, &'a str);
-    type IntoIter = Box<dyn Iterator<Item = (&'static str, &'a str)> + 'a>;
+    type IntoIter = SecurityHeadersIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
-        Box::new(self.iter())
+        self.iter()
     }
 }
 
