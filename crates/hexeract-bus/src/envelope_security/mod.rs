@@ -27,3 +27,5 @@ pub mod principal;
 pub mod protocol;
 /// Production of the security headers carried by a signed envelope.
 pub mod signer;
+/// Verification of an inbound envelope against a key source and a policy.
+pub mod verifier;

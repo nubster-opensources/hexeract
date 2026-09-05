@@ -20,10 +20,6 @@ use super::identity::{Issuer, KeyId};
 pub struct VerificationKey(VerifyingKey);
 
 impl VerificationKey {
-    #[expect(
-        dead_code,
-        reason = "consumed by the verifier introduced in a later task"
-    )]
     pub(crate) fn as_verifying_key(&self) -> &VerifyingKey {
         &self.0
     }
