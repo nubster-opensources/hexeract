@@ -792,6 +792,7 @@ impl RabbitMqWorker {
             &delivery.data,
             self.config.max_payload_bytes,
             self.config.metadata_limits,
+            RequiredEnvelopeFields::default(),
         ) {
             Ok(env) => env,
             Err(err) => return self.handle_poison(channel, &delivery, &err).await,
@@ -1552,6 +1553,22 @@ pub(crate) fn death_count(props: &BasicProperties, wait_queue: &str) -> u32 {
     0
 }
 
+/// How strictly the AMQP properties covered by a signature must be present.
+///
+/// The policy only ever governs an *unsigned* delivery: a signed one always
+/// demands its covered fields regardless of this setting, because a
+/// derogation that let a present signature ride over a missing field would
+/// make the signature unverifiable rather than optional. See
+/// [`delivery_to_envelope`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum RequiredEnvelopeFields {
+    /// Mint a fresh identifier or timestamp when the wire omits one.
+    #[default]
+    Lenient,
+    /// Reject a delivery that omits any field a signature would cover.
+    Strict,
+}
+
 /// Rebuild a [`hexeract_bus::BusEnvelope`] from one AMQP delivery.
 ///
 /// Shared by the consumer worker and the reply inbox so both reconstruct a
@@ -1564,18 +1581,33 @@ pub(crate) fn death_count(props: &BasicProperties, wait_queue: &str) -> u32 {
 /// field table, which the payload cap does not cover, since a tiny payload can
 /// still carry a large table.
 ///
+/// `required_fields` governs only an unsigned delivery. A delivery carrying
+/// the security signature header is always held to
+/// [`RequiredEnvelopeFields::Strict`], because the signature covers
+/// `message_id`, `correlation_id` and `published_at`: minting a replacement
+/// for any of them would make the signature verify against values the
+/// consumer just invented rather than the ones the publisher signed.
+///
 /// # Errors
 ///
 /// Returns [`BusError::PayloadTooLarge`] when the body exceeds
 /// `max_payload_bytes`, [`BusError::MetadataLimitExceeded`] or
 /// [`BusError::InvalidMetadata`] when the field table violates
-/// `metadata_limits`, and [`BusError::InvalidTopology`] when the delivery
-/// carries no AMQP `type` property to derive a `message_type` from.
+/// `metadata_limits`, [`BusError::InvalidTopology`] when the delivery carries
+/// no AMQP `type` property to derive a `message_type` from, and
+/// [`BusError::EnvelopeSecurity`] with
+/// [`hexeract_bus::EnvelopeSecurityError::MissingRequiredField`] when a
+/// signed delivery, or an unsigned one under
+/// [`RequiredEnvelopeFields::Strict`], omits or carries an unparsable
+/// `message_id` or `correlation_id`, or omits its `timestamp` property
+/// (reported as `published_at`, the name of the field in the signature's
+/// canonical representation).
 pub(crate) fn delivery_to_envelope(
     props: &BasicProperties,
     payload: &[u8],
     max_payload_bytes: usize,
     metadata_limits: AmqpMetadataLimits,
+    required_fields: RequiredEnvelopeFields,
 ) -> Result<hexeract_bus::BusEnvelope, BusError> {
     use std::time::SystemTime;
 
@@ -1591,16 +1623,44 @@ pub(crate) fn delivery_to_envelope(
     // decoded rather than a second copy of it in an envelope.
     let (headers, protocol_headers) = decode_headers(props.headers().as_ref(), metadata_limits)?;
 
-    let message_id = props
+    // A signature covers `message_id`, `correlation_id` and `published_at`,
+    // so a signed delivery must never let a missing field through under a
+    // lenient policy: the policy only ever gets to decide the fate of an
+    // *unsigned* delivery.
+    let signature_present =
+        protocol_headers.contains_key(hexeract_bus::envelope_security::protocol::SIGNATURE_HEADER);
+    let strict = signature_present || required_fields == RequiredEnvelopeFields::Strict;
+
+    let message_id = match props
         .message_id()
         .as_ref()
         .and_then(|s| Uuid::parse_str(s.as_str()).ok())
-        .unwrap_or_else(Uuid::now_v7);
-    let correlation_id = props
+    {
+        Some(id) => id,
+        None if strict => {
+            return Err(BusError::EnvelopeSecurity(
+                hexeract_bus::EnvelopeSecurityError::MissingRequiredField {
+                    field: "message_id",
+                },
+            ));
+        }
+        None => Uuid::now_v7(),
+    };
+    let correlation_id = match props
         .correlation_id()
         .as_ref()
         .and_then(|s| Uuid::parse_str(s.as_str()).ok())
-        .unwrap_or_else(Uuid::now_v7);
+    {
+        Some(id) => id,
+        None if strict => {
+            return Err(BusError::EnvelopeSecurity(
+                hexeract_bus::EnvelopeSecurityError::MissingRequiredField {
+                    field: "correlation_id",
+                },
+            ));
+        }
+        None => Uuid::now_v7(),
+    };
     let message_type = props
         .kind()
         .as_ref()
@@ -1619,10 +1679,19 @@ pub(crate) fn delivery_to_envelope(
     // `published_at` is the publisher's creation instant, not the
     // consume time. The transport writes it into the AMQP `timestamp`
     // property; restore it from there and fall back to now only when the
-    // property is absent (foreign producer that did not stamp it).
-    let published_at = props.timestamp().map_or_else(SystemTime::now, |secs| {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
-    });
+    // property is absent (foreign producer that did not stamp it) and
+    // `strict` does not demand it.
+    let published_at = match props.timestamp() {
+        Some(secs) => SystemTime::UNIX_EPOCH + Duration::from_secs(*secs),
+        None if strict => {
+            return Err(BusError::EnvelopeSecurity(
+                hexeract_bus::EnvelopeSecurityError::MissingRequiredField {
+                    field: "published_at",
+                },
+            ));
+        }
+        None => SystemTime::now(),
+    };
 
     Ok(hexeract_bus::BusEnvelope::restore_from_transport(
         message_id,
@@ -1707,6 +1776,7 @@ mod tests {
             b"{}",
             DEFAULT_MAX_PAYLOAD_BYTES,
             AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
         )
         .expect("an ordinary application header must decode under the defaults");
         assert_eq!(
@@ -1722,6 +1792,7 @@ mod tests {
                 max_headers: 0,
                 ..AmqpMetadataLimits::default()
             },
+            RequiredEnvelopeFields::Lenient,
         )
         .expect_err("a deny-all header count must reject the delivery");
         assert!(
@@ -1861,6 +1932,7 @@ mod tests {
             b"{\"order_id\":\"x\"}",
             DEFAULT_MAX_PAYLOAD_BYTES,
             AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
         )
         .expect("must decode");
         assert_eq!(envelope.message_id, message_id);
@@ -1877,6 +1949,7 @@ mod tests {
             b"{}",
             DEFAULT_MAX_PAYLOAD_BYTES,
             AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
         )
         .expect("must decode");
         assert_ne!(envelope.message_id, Uuid::nil());
@@ -1892,6 +1965,7 @@ mod tests {
             b"{}",
             DEFAULT_MAX_PAYLOAD_BYTES,
             AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
         )
         .expect_err("missing `type` must surface as a non-Internal error");
         match err {
@@ -1913,6 +1987,7 @@ mod tests {
             b"{}",
             DEFAULT_MAX_PAYLOAD_BYTES,
             AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
         )
         .expect("must decode");
         let restored = envelope
@@ -1937,6 +2012,7 @@ mod tests {
             b"{}",
             DEFAULT_MAX_PAYLOAD_BYTES,
             AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
         )
         .expect("must decode");
         let ctx = build_handler_context(&envelope);
@@ -2026,6 +2102,7 @@ mod tests {
             b"{}",
             DEFAULT_MAX_PAYLOAD_BYTES,
             AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
         )
         .expect("must decode");
         assert_eq!(
@@ -2060,8 +2137,14 @@ mod tests {
         let props = BasicProperties::default().with_type("orders.placed".into());
         let payload = vec![b'x'; 9];
 
-        let err = delivery_to_envelope(&props, &payload, 8, AmqpMetadataLimits::default())
-            .expect_err("oversize payload must be rejected before the copy");
+        let err = delivery_to_envelope(
+            &props,
+            &payload,
+            8,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
+        )
+        .expect_err("oversize payload must be rejected before the copy");
         match err {
             BusError::PayloadTooLarge { size, max } => {
                 assert_eq!(size, 9);
@@ -2081,6 +2164,7 @@ mod tests {
             payload,
             payload.len(),
             AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
         )
         .expect("payload exactly at the limit must pass");
         assert_eq!(envelope.payload, payload);
@@ -2100,6 +2184,7 @@ mod tests {
             b"{}",
             DEFAULT_MAX_PAYLOAD_BYTES,
             AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
         )
         .expect("must decode");
         let ctx = build_handler_context(&envelope);
@@ -2115,11 +2200,176 @@ mod tests {
             b"{}",
             DEFAULT_MAX_PAYLOAD_BYTES,
             AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
         )
         .expect("must decode");
         let ctx = build_handler_context(&envelope);
         assert_ne!(*ctx.message_id.as_uuid(), Uuid::nil());
         assert_ne!(*ctx.correlation_id.as_uuid(), Uuid::nil());
+    }
+
+    #[test]
+    fn lenient_mode_still_mints_a_missing_message_id() {
+        let props = BasicProperties::default().with_type("orders.placed".into());
+
+        let envelope = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
+        )
+        .expect("lenient mode must still mint a missing message_id");
+        assert_ne!(envelope.message_id, Uuid::nil());
+    }
+
+    #[test]
+    fn strict_mode_rejects_a_missing_message_id() {
+        let props = BasicProperties::default().with_type("orders.placed".into());
+
+        let err = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Strict,
+        )
+        .expect_err("strict mode must reject a missing message_id");
+        match err {
+            BusError::EnvelopeSecurity(
+                hexeract_bus::EnvelopeSecurityError::MissingRequiredField { field },
+            ) => assert_eq!(field, "message_id"),
+            other => panic!("expected EnvelopeSecurity(MissingRequiredField), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_mode_rejects_a_missing_correlation_id() {
+        let props = BasicProperties::default()
+            .with_type("orders.placed".into())
+            .with_message_id(Uuid::from_u128(1).to_string().into());
+
+        let err = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Strict,
+        )
+        .expect_err("strict mode must reject a missing correlation_id");
+        match err {
+            BusError::EnvelopeSecurity(
+                hexeract_bus::EnvelopeSecurityError::MissingRequiredField { field },
+            ) => assert_eq!(field, "correlation_id"),
+            other => panic!("expected EnvelopeSecurity(MissingRequiredField), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_mode_rejects_a_missing_published_at() {
+        let props = BasicProperties::default()
+            .with_type("orders.placed".into())
+            .with_message_id(Uuid::from_u128(1).to_string().into())
+            .with_correlation_id(Uuid::from_u128(2).to_string().into());
+
+        let err = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Strict,
+        )
+        .expect_err("strict mode must reject a missing published_at");
+        match err {
+            BusError::EnvelopeSecurity(
+                hexeract_bus::EnvelopeSecurityError::MissingRequiredField { field },
+            ) => assert_eq!(field, "published_at"),
+            other => panic!("expected EnvelopeSecurity(MissingRequiredField), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_mode_rejects_an_unparsable_message_id() {
+        let props = BasicProperties::default()
+            .with_type("orders.placed".into())
+            .with_message_id("not-a-uuid".into());
+
+        let err = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Strict,
+        )
+        .expect_err("strict mode must reject an unparsable message_id rather than mint one");
+        match err {
+            BusError::EnvelopeSecurity(
+                hexeract_bus::EnvelopeSecurityError::MissingRequiredField { field },
+            ) => assert_eq!(field, "message_id"),
+            other => panic!("expected EnvelopeSecurity(MissingRequiredField), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_mode_rejects_an_unparsable_correlation_id() {
+        let props = BasicProperties::default()
+            .with_type("orders.placed".into())
+            .with_message_id(Uuid::from_u128(1).to_string().into())
+            .with_correlation_id("not-a-uuid".into());
+
+        let err = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Strict,
+        )
+        .expect_err("strict mode must reject an unparsable correlation_id rather than mint one");
+        match err {
+            BusError::EnvelopeSecurity(
+                hexeract_bus::EnvelopeSecurityError::MissingRequiredField { field },
+            ) => assert_eq!(field, "correlation_id"),
+            other => panic!("expected EnvelopeSecurity(MissingRequiredField), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_signed_envelope_requires_its_fields_even_in_lenient_mode() {
+        let props = properties_with_headers([(
+            hexeract_bus::envelope_security::protocol::SIGNATURE_HEADER,
+            "irrelevant-signature-value",
+        )]);
+
+        let err = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
+        )
+        .expect_err("a signed envelope must require its fields even under a lenient policy");
+        match err {
+            BusError::EnvelopeSecurity(
+                hexeract_bus::EnvelopeSecurityError::MissingRequiredField { field },
+            ) => assert_eq!(field, "message_id"),
+            other => panic!("expected EnvelopeSecurity(MissingRequiredField), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unsigned_envelope_is_untouched_in_lenient_mode() {
+        let props = BasicProperties::default().with_type("orders.placed".into());
+
+        let envelope = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
+        )
+        .expect("an unsigned envelope under a lenient policy must still mint missing fields");
+        assert_ne!(envelope.message_id, Uuid::nil());
+        assert_ne!(envelope.correlation_id, Uuid::nil());
     }
 
     #[test]
