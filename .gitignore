@@ -25,10 +25,11 @@ target
 .env.local
 .env.*.local
 
-# Local test scratch
+# Local scratch and tooling directories
 .hexeract/
 .scratch/
 .worktrees/
+.claude/
 
 # Coverage
 *.profraw
