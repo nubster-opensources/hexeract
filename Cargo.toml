@@ -58,6 +58,9 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 fastrand = "2"
 isochron = "0.1"
+base64 = { version = "0.22", default-features = false, features = ["std"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
+sha2 = { version = "0.10", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

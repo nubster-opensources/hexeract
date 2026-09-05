@@ -11,6 +11,8 @@
 //! runs without it opts out explicitly, the way plaintext transport is opted
 //! into.
 
+/// Canonical byte representation an envelope signature is computed over.
+pub mod canonical;
 /// Errors raised while signing or verifying an envelope.
 pub mod error;
 /// Identities carried by the envelope security protocol.
