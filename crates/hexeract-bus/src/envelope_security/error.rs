@@ -27,9 +27,17 @@ impl std::fmt::Display for IdentityKind {
 
 /// Failure raised while signing or verifying an envelope.
 ///
-/// No variant ever carries key material, a signature, a payload or a header
+/// No variant ever renders key material, a signature, a payload or a header
 /// value: a rejection is diagnosed from identifiers and reason codes alone.
-#[derive(Debug, Error)]
+///
+/// [`Debug`] is written by hand rather than derived, because the derived
+/// implementation would unfold the cause boxed inside
+/// [`EnvelopeSecurityError::KeySource`], and that cause routinely names a
+/// vault endpoint, a key file path or a token. A caller that deliberately
+/// wants the cause reaches it through [`std::error::Error::source`], which
+/// makes the disclosure a decision rather than a side effect of logging with
+/// `?error`.
+#[derive(Error)]
 #[non_exhaustive]
 pub enum EnvelopeSecurityError {
     /// The envelope carries no security headers at all.
@@ -90,6 +98,39 @@ pub enum EnvelopeSecurityError {
     KeySource(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
+impl std::fmt::Debug for EnvelopeSecurityError {
+    /// Renders the variant without ever unfolding a boxed cause.
+    ///
+    /// The match below is exhaustive on purpose and carries no wildcard arm:
+    /// a variant added later stops compiling here until someone decides what
+    /// it is allowed to disclose.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingSignature => formatter.write_str("MissingSignature"),
+            Self::MalformedSecurityHeader { header } => formatter
+                .debug_struct("MalformedSecurityHeader")
+                .field("header", header)
+                .finish(),
+            Self::UnsupportedAlgorithm => formatter.write_str("UnsupportedAlgorithm"),
+            Self::UnknownKey => formatter.write_str("UnknownKey"),
+            Self::RevokedKey => formatter.write_str("RevokedKey"),
+            Self::AudienceMismatch => formatter.write_str("AudienceMismatch"),
+            Self::DestinationMismatch => formatter.write_str("DestinationMismatch"),
+            Self::SignatureMismatch => formatter.write_str("SignatureMismatch"),
+            Self::MissingRequiredField { field } => formatter
+                .debug_struct("MissingRequiredField")
+                .field("field", field)
+                .finish(),
+            Self::FieldTooLarge => formatter.write_str("FieldTooLarge"),
+            Self::InvalidIdentity { kind } => formatter
+                .debug_struct("InvalidIdentity")
+                .field("kind", kind)
+                .finish(),
+            Self::KeySource(_) => formatter.write_str("KeySource(..)"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,6 +146,41 @@ mod tests {
             !rendered.contains("SUPER_SECRET_KEY_MATERIAL"),
             "rendered as {rendered}"
         );
+    }
+
+    #[test]
+    fn the_key_source_error_debug_hides_its_source() {
+        let inner = std::io::Error::other("SUPER_SECRET_KEY_MATERIAL");
+        let error = EnvelopeSecurityError::KeySource(Box::new(inner));
+
+        let rendered = format!("{error:?}");
+
+        assert!(
+            !rendered.contains("SUPER_SECRET_KEY_MATERIAL"),
+            "rendered as {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_key_source_error_debug_still_names_the_variant() {
+        let inner = std::io::Error::other("unreachable vault");
+        let error = EnvelopeSecurityError::KeySource(Box::new(inner));
+
+        let rendered = format!("{error:?}");
+
+        assert!(rendered.contains("KeySource"), "rendered as {rendered}");
+    }
+
+    #[test]
+    fn the_key_source_cause_stays_reachable_through_source() {
+        use std::error::Error;
+
+        let inner = std::io::Error::other("SUPER_SECRET_KEY_MATERIAL");
+        let error = EnvelopeSecurityError::KeySource(Box::new(inner));
+
+        let cause = error.source().map(ToString::to_string);
+
+        assert_eq!(cause.as_deref(), Some("SUPER_SECRET_KEY_MATERIAL"));
     }
 
     #[test]
