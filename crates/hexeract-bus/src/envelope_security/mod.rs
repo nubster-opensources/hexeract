@@ -13,5 +13,9 @@
 
 /// Errors raised while signing or verifying an envelope.
 pub mod error;
+/// Identities carried by the envelope security protocol.
+pub mod identity;
+/// Publisher identity established by a successful verification.
+pub mod principal;
 /// Wire constants of the envelope security protocol.
 pub mod protocol;
