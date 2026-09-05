@@ -1,10 +1,12 @@
 //! Identities carried by the envelope security protocol.
 //!
 //! All three identity types share one validation rule: a non-empty run of
-//! printable ASCII characters, at most [`MAX_IDENTITY_BYTES`] long. The rule
-//! is deliberately narrow. These values travel in AMQP headers, appear in
-//! logs and in traces, and are compared byte by byte during verification, so
-//! anything that could be rendered ambiguously is refused at construction.
+//! printable ASCII characters, no longer than
+//! [`MAX_IDENTITY_BYTES`](crate::envelope_security::identity::MAX_IDENTITY_BYTES).
+//! The rule is deliberately narrow. These values travel in AMQP headers,
+//! appear in logs and in traces, and are compared byte by byte during
+//! verification, so anything that could be rendered ambiguously is refused at
+//! construction.
 
 use super::error::{EnvelopeSecurityError, IdentityKind};
 

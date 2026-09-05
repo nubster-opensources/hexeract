@@ -51,6 +51,13 @@ impl VerifiedPrincipal {
     /// verification. Only the verifier is allowed to call this: it is the
     /// sole caller in the crate that has checked a signature before reaching
     /// for it.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the verifier that calls this lands in a later commit of the same delivery"
+        )
+    )]
     pub(crate) fn new(
         issuer: Issuer,
         audience: Audience,
