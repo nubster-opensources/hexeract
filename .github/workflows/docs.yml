@@ -3,6 +3,7 @@ name: Documentation
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -12,10 +13,6 @@ env:
   CARGO_TERM_COLOR: always
   RUSTDOCFLAGS: "--cfg docsrs"
   RUSTUP_TOOLCHAIN: nightly
-
-concurrency:
-  group: "pages"
-  cancel-in-progress: false
 
 jobs:
   build:
@@ -33,6 +30,12 @@ jobs:
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           key: docs-nightly
+
+      # The restored cache leaves an inconsistent target/doc tree, on which the
+      # stale output collector of rustdoc fails with ENOENT. Discarding it costs
+      # a few seconds and keeps the dependency cache.
+      - name: Discard the stale doc tree
+        run: cargo clean --doc
 
       - name: Build workspace rustdoc
         run: cargo doc --workspace --all-features --no-deps
@@ -52,6 +55,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     if: github.ref == 'refs/heads/main'
+    concurrency:
+      group: "pages"
+      cancel-in-progress: false
     permissions:
       contents: read
       pages: write
