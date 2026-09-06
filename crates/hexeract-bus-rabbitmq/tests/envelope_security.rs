@@ -395,6 +395,15 @@ async fn wait_for_dead_letter(
 
 /// Drain up to `expected` messages already parked on `dead_letter_queue`,
 /// polling until they all arrive or `attempts` polls have passed.
+///
+/// A fresh channel per attempt, and a failed `basic_get` treated as "not yet"
+/// rather than as an error, for one reason: the worker declares its
+/// dead-letter queue as it starts, so a probe that reaches the broker first
+/// gets `NOT_FOUND`, and AMQP closes the channel that asked. Holding one
+/// channel across the whole poll would therefore turn a startup race into a
+/// permanent failure, and treating the first miss as fatal would report a
+/// timing artefact as a rejection that never happened. Mirrors
+/// [`wait_for_dead_letter`], which polls the same queue under the same race.
 async fn count_dead_letters(
     uri: &str,
     dead_letter_queue: &str,
@@ -404,20 +413,24 @@ async fn count_dead_letters(
     let probe = Connection::connect(uri, ConnectionProperties::default())
         .await
         .expect("probe connection must open");
-    let channel = probe
-        .create_channel()
-        .await
-        .expect("probe channel must open");
     let mut drained = 0usize;
     for _ in 0..attempts {
-        while drained < expected
-            && channel
+        let channel = probe
+            .create_channel()
+            .await
+            .expect("probe channel must open");
+        // Anything but a message ends this attempt: either the queue is empty
+        // for now, or it does not exist yet and the refusal closed this
+        // channel. Both cases are answered the same way, by opening a fresh
+        // channel on the next attempt.
+        while drained < expected {
+            match channel
                 .basic_get(dead_letter_queue.into(), BasicGetOptions::default())
                 .await
-                .expect("basic_get must succeed")
-                .is_some()
-        {
-            drained += 1;
+            {
+                Ok(Some(_)) => drained += 1,
+                _ => break,
+            }
         }
         if drained >= expected {
             return drained;
@@ -425,6 +438,27 @@ async fn count_dead_letters(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     drained
+}
+
+/// The probe helper above must survive a queue that does not exist yet, which
+/// is the state every dead-letter queue passes through while its worker is
+/// still starting. Held by a test of its own because the failure it prevents
+/// is a race: it surfaced once in twenty runs, on a merge commit, after three
+/// green runs of the same code, and it turned a timing artefact into a red
+/// pipeline on `main`. A helper that only works when it wins a race is a
+/// helper that reports other people's tests as broken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn the_dead_letter_probe_survives_a_queue_that_does_not_exist_yet() {
+    let broker = harness::start_rabbitmq().await;
+
+    let drained = count_dead_letters(broker.uri(), "no-such-queue-anywhere", 1, 2).await;
+
+    assert_eq!(
+        drained, 0,
+        "probing a queue that has not been declared yet must report nothing parked, \
+         never fail the test that is only waiting for a worker to finish starting"
+    );
 }
 
 // -------------------------------------------------- 1. precision symmetry
