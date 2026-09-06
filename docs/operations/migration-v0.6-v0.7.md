@@ -108,3 +108,59 @@ lowest-configured path is not the one that applies. A delivery above the bound
 never reaches a handler: the worker routes it through its existing poison path,
 and its dead-letter copy is republished with an empty field table, so any
 downstream consumer that routes on a header must tolerate its absence.
+
+## Envelope authenticity on the RabbitMQ transport
+
+Signing and verification are now wired into the transport. Nothing changes for
+a deployment that configures neither: publishing stays unsigned, delivery stays
+unverified, and the worker keeps minting a fresh `message_id`, `correlation_id`
+or `published_at` when a producer omits one.
+
+Enabling it changes three things you must plan for.
+
+**Header budget.** The six signature headers travel on the same AMQP field
+table as your own and count against the same bounds, so an application's
+header budget drops from 64 to 58 while a signature is attached. Count what
+your services actually send before turning signing on, or raise
+`AmqpMetadataLimits::max_headers` accordingly.
+
+**Required wire fields.** A signed envelope must carry `message_id`,
+`correlation_id` and `timestamp`. The signature covers them, so the worker can
+no longer mint a replacement for an absent one: doing so would invalidate every
+signature it touched. Under a verifying worker, an absent field is a rejection.
+A producer that publishes through this crate always sets all three; a foreign
+producer may not.
+
+**Order of rollout.** Verification is what breaks a deployment, not signing.
+Roll out in two steps, never one:
+
+```rust,ignore
+// Step 1: every publisher signs. Consumers still accept everything.
+let transport = RabbitMqTransport::new("amqps://broker.internal")
+    .await?
+    .with_outbound_envelope_security(Arc::clone(&outbound));
+
+// Step 2, once every producer is signing: consumers start verifying.
+let worker = RabbitMqWorkerBuilder::new(connection)
+    .queue("orders.work")
+    .envelope_security(Arc::clone(&inbound))
+    .build()?;
+```
+
+Between the two steps, a worker configured with
+`VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes` accepts an envelope
+carrying **no** signature while still rejecting one whose signature is present
+and wrong. That is the migration setting, and it is deliberately not a way to
+ignore a bad signature.
+
+**What a rejection does.** A rejected delivery is never requeued. Its
+dead-letter copy is republished with an empty field table, so a downstream
+consumer that routes on a header must tolerate its absence, and without the
+AMQP `user-id` property, which the broker validates against the republishing
+connection rather than treating as descriptive metadata.
+
+**What this does not give you.** The payload is not encrypted: a hostile broker
+still reads every message. Replaying an authentic, unmodified message is not
+prevented. And a handler still cannot learn who signed the message it received,
+because the verified principal is not yet exposed to `HandlerContext`. Envelope
+security decides what reaches a handler, not what the handler knows.
