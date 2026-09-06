@@ -1583,6 +1583,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "tracing-test",
  "uuid",
 ]
 

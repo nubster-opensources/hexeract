@@ -8,13 +8,19 @@
 
 use std::collections::HashMap;
 use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use ed25519_dalek::SigningKey;
 use hexeract_bus::Audience;
 use hexeract_bus::Binding;
+use hexeract_bus::BusEnvelope;
 use hexeract_bus::BusError;
+use hexeract_bus::EnvelopeSecurityConfig;
+use hexeract_bus::EnvelopeSigner;
 use hexeract_bus::Exchange;
 use hexeract_bus::ExchangeKind;
 use hexeract_bus::Handler;
@@ -25,13 +31,17 @@ use hexeract_bus::Message;
 use hexeract_bus::Queue;
 use hexeract_bus::RawBusPublish;
 use hexeract_bus::RoutingKey;
+use hexeract_bus::SigningContext;
 use hexeract_bus::SigningKeyHandle;
 use hexeract_bus::SigningKeySource;
 use hexeract_bus::StaticKeySource;
 use hexeract_bus::Transport;
+use hexeract_bus::VerificationKey;
+use hexeract_bus::VerificationKeySource;
 use hexeract_bus_rabbitmq::AckMode;
 use hexeract_bus_rabbitmq::AmqpMetadataLimits;
 use hexeract_bus_rabbitmq::ChannelPool;
+use hexeract_bus_rabbitmq::InboundEnvelopeSecurity;
 use hexeract_bus_rabbitmq::OutboundEnvelopeSecurity;
 use hexeract_bus_rabbitmq::RabbitMqConnection;
 use hexeract_bus_rabbitmq::RabbitMqTransport;
@@ -432,6 +442,303 @@ impl Handler<OrderPlaced> for AlwaysFailingHandler {
             "deliberate test failure".to_owned(),
         ))
     }
+}
+
+// -------------------------------------------------- envelope security fixtures
+
+fn security_issuer() -> Issuer {
+    Issuer::new("billing-service").expect("valid issuer")
+}
+
+fn security_audience() -> Audience {
+    Audience::new("ledger-service").expect("valid audience")
+}
+
+fn security_key_id() -> KeyId {
+    KeyId::new("2026-09").expect("valid key id")
+}
+
+fn security_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[7; 32])
+}
+
+/// A worker-side [`InboundEnvelopeSecurity`] trusting the same key
+/// [`security_signing_key`] signs with, requiring a valid signature on
+/// every delivery.
+fn required_inbound_security() -> InboundEnvelopeSecurity {
+    let keys: Arc<dyn VerificationKeySource> = Arc::new(
+        StaticKeySource::builder()
+            .with_verification_key(
+                security_issuer(),
+                security_key_id(),
+                VerificationKey::from(security_signing_key().verifying_key()),
+            )
+            .build(),
+    );
+    let config = EnvelopeSecurityConfig::builder()
+        .with_accepted_audience(security_audience())
+        .build()
+        .expect("valid configuration");
+    InboundEnvelopeSecurity::new(keys, config)
+}
+
+/// AMQP properties and payload for a delivery signed for `destination`, then
+/// tampered with after signing so its signature no longer matches: stands in
+/// for a forged delivery reaching a worker configured with
+/// [`required_inbound_security`].
+///
+/// `application_headers` is folded into both the signed canonical
+/// representation and the published field table, exactly like a real
+/// application header would be, so a test can prove such a header never
+/// survives quarantine.
+fn forged_signed_properties_and_payload(
+    destination: &str,
+    message_id: uuid::Uuid,
+    correlation_id: uuid::Uuid,
+    application_headers: &[(&str, &str)],
+) -> (BasicProperties, Vec<u8>) {
+    let signed_payload = b"{\"order_id\":\"00000000-0000-0000-0000-000000000001\"}".to_vec();
+    let mut headers = HashMap::new();
+    for (key, value) in application_headers {
+        headers.insert((*key).to_owned(), (*value).to_owned());
+    }
+    let published_at = SystemTime::now();
+    let envelope = BusEnvelope::restore_from_transport(
+        message_id,
+        "orders.placed".to_owned(),
+        signed_payload,
+        correlation_id,
+        None,
+        headers.clone(),
+        HashMap::new(),
+        published_at,
+    );
+
+    let signing_keys: Arc<dyn SigningKeySource> = Arc::new(
+        StaticKeySource::builder()
+            .with_signing_key(
+                security_key_id(),
+                SigningKeyHandle::from(security_signing_key()),
+            )
+            .build(),
+    );
+    let signer = EnvelopeSigner::new(security_issuer(), signing_keys);
+    let security_headers = signer
+        .sign(
+            &envelope,
+            &SigningContext {
+                destination,
+                audience: &security_audience(),
+            },
+        )
+        .expect("signing must succeed");
+
+    let mut fields = FieldTable::default();
+    for (key, value) in &headers {
+        fields.insert(
+            key.as_str().into(),
+            AMQPValue::LongString(value.as_str().into()),
+        );
+    }
+    for (name, value) in &security_headers {
+        fields.insert(name.into(), AMQPValue::LongString(value.into()));
+    }
+
+    let published_at_secs = published_at
+        .duration_since(UNIX_EPOCH)
+        .expect("after epoch")
+        .as_secs();
+    let properties = BasicProperties::default()
+        .with_type("orders.placed".into())
+        .with_message_id(message_id.to_string().into())
+        .with_correlation_id(correlation_id.to_string().into())
+        .with_timestamp(published_at_secs)
+        .with_headers(fields);
+
+    // Tamper the published payload so it no longer matches what was signed:
+    // the security headers and properties are otherwise entirely valid.
+    let tampered_payload = b"{\"order_id\":\"11111111-1111-1111-1111-111111111111\"}".to_vec();
+    (properties, tampered_payload)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn a_security_rejection_never_requeues() {
+    let (_container, uri) = start_rabbit().await;
+
+    for ack_mode in [
+        AckMode::Manual,
+        AckMode::AckOnReceive,
+        AckMode::Unacknowledged,
+    ] {
+        let queue_name = format!("worker.security.requeue.{ack_mode:?}");
+        declare_temporary_queue(&uri, &queue_name).await;
+
+        let (properties, payload) =
+            forged_signed_properties_and_payload(&queue_name, Uuid::now_v7(), Uuid::now_v7(), &[]);
+
+        let publisher = Connection::connect(&uri, ConnectionProperties::default())
+            .await
+            .unwrap();
+        let publish_channel = publisher.create_channel().await.unwrap();
+        publish_channel
+            .basic_publish(
+                ShortString::from(""),
+                ShortString::from(queue_name.as_str()),
+                BasicPublishOptions::default(),
+                &payload,
+                properties,
+            )
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+        let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+            .queue(queue_name.as_str())
+            .ack_mode(ack_mode)
+            .envelope_security(Arc::new(required_inbound_security()))
+            .register_handler::<OrderPlaced, _>(AlwaysFailingHandler {
+                attempts: Arc::clone(&attempts),
+            })
+            .build()
+            .unwrap();
+
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+        let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
+
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            0,
+            "handler must never run for a security rejection ({ack_mode:?})"
+        );
+
+        let probe = Connection::connect(&uri, ConnectionProperties::default())
+            .await
+            .unwrap();
+        let probe_channel = probe.create_channel().await.unwrap();
+        let remaining = probe_channel
+            .basic_get(queue_name.as_str().into(), BasicGetOptions::default())
+            .await
+            .unwrap();
+        assert!(
+            remaining.is_none(),
+            "a security rejection must never leave the delivery queued for redelivery \
+             ({ack_mode:?})"
+        );
+
+        cancel.cancel();
+        handle.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn a_security_rejection_is_dead_lettered_without_its_headers() {
+    let (_container, uri) = start_rabbit().await;
+    let queue_name = "worker.security.source";
+    let dlr_queue = "worker.security.parked";
+    declare_temporary_queue(&uri, queue_name).await;
+
+    let message_id = Uuid::from_u128(0x5555_5555_5555_5555_5555_5555_5555_5555);
+    let correlation_id = Uuid::from_u128(0x6666_6666_6666_6666_6666_6666_6666_6666);
+    let (properties, payload) = forged_signed_properties_and_payload(
+        queue_name,
+        message_id,
+        correlation_id,
+        &[("tenant", "acme-confidential")],
+    );
+
+    let publisher = Connection::connect(&uri, ConnectionProperties::default())
+        .await
+        .unwrap();
+    let publish_channel = publisher.create_channel().await.unwrap();
+    publish_channel
+        .basic_publish(
+            ShortString::from(""),
+            ShortString::from(queue_name),
+            BasicPublishOptions::default(),
+            &payload,
+            properties,
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .dead_letter_routing_key(dlr_queue)
+        .envelope_security(Arc::new(required_inbound_security()))
+        .register_handler::<OrderPlaced, _>(AlwaysFailingHandler {
+            attempts: Arc::clone(&attempts),
+        })
+        .build()
+        .unwrap();
+
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
+
+    let parked = wait_for_dead_letter(&uri, dlr_queue)
+        .await
+        .expect("a security rejection must be routed to the dead-letter queue");
+
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        0,
+        "handler must never run for a delivery whose signature fails verification"
+    );
+
+    let quarantined_headers = parked
+        .delivery
+        .properties
+        .headers()
+        .as_ref()
+        .expect("the quarantine copy must carry an explicit empty table");
+    assert!(
+        quarantined_headers.inner().is_empty(),
+        "neither the application header nor the unauthenticated security headers may be \
+         republished"
+    );
+    assert_eq!(
+        parked
+            .delivery
+            .properties
+            .message_id()
+            .as_ref()
+            .map(ShortString::as_str),
+        Some(message_id.to_string()).as_deref(),
+        "the quarantine copy must stay diagnosable"
+    );
+    assert_eq!(
+        parked
+            .delivery
+            .properties
+            .correlation_id()
+            .as_ref()
+            .map(ShortString::as_str),
+        Some(correlation_id.to_string()).as_deref(),
+    );
+    assert_eq!(
+        parked
+            .delivery
+            .properties
+            .kind()
+            .as_ref()
+            .map(ShortString::as_str),
+        Some("orders.placed"),
+    );
+
+    cancel.cancel();
+    handle.await.unwrap().unwrap();
 }
 
 #[derive(Debug)]

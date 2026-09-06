@@ -75,6 +75,17 @@ pub enum EnvelopeSecurityError {
     #[error("signature does not match the envelope")]
     SignatureMismatch,
 
+    /// The transport-level publisher identity does not match the verified
+    /// issuer.
+    ///
+    /// Raised only when both are present: an inbound delivery's AMQP
+    /// `user-id` property, and a principal a signature was actually
+    /// verified against. Neither value is ever named in this message, so a
+    /// log line reporting this variant discloses that the two disagreed,
+    /// never what either of them was.
+    #[error("transport-level identity does not match the verified issuer")]
+    BrokerUserMismatch,
+
     /// A field covered by the signature is absent and has no default.
     #[error("required field {field} is missing")]
     MissingRequiredField {
@@ -138,6 +149,7 @@ impl std::fmt::Debug for EnvelopeSecurityError {
             Self::AudienceMismatch => formatter.write_str("AudienceMismatch"),
             Self::DestinationMismatch => formatter.write_str("DestinationMismatch"),
             Self::SignatureMismatch => formatter.write_str("SignatureMismatch"),
+            Self::BrokerUserMismatch => formatter.write_str("BrokerUserMismatch"),
             Self::MissingRequiredField { field } => formatter
                 .debug_struct("MissingRequiredField")
                 .field("field", field)
@@ -225,6 +237,7 @@ mod tests {
             EnvelopeSecurityError::AudienceMismatch,
             EnvelopeSecurityError::DestinationMismatch,
             EnvelopeSecurityError::SignatureMismatch,
+            EnvelopeSecurityError::BrokerUserMismatch,
             EnvelopeSecurityError::MissingRequiredField {
                 field: "published_at",
             },

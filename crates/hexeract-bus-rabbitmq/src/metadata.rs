@@ -85,17 +85,25 @@ fn invalid_metadata(reason: InvalidMetadataReason) -> BusError {
 /// Application headers and framework protocol headers read from one delivery.
 type DecodedMetadata = (HashMap<String, String>, HashMap<String, String>);
 
-/// Whether `error` reports rejected metadata rather than another failure.
+/// Whether a dead-letter copy of a delivery rejected with `error` must have
+/// its field table rebuilt empty rather than cloned from the original.
 ///
-/// The worker uses this to route a metadata violation through the sanitized
-/// quarantine path: a dead-letter copy that clones the rejected field table
-/// would carry the very metadata the worker just refused.
-pub(crate) fn is_metadata_error(error: &BusError) -> bool {
+/// Two distinct failures share this answer, for the same reason: the field
+/// table the worker just refused to trust must never be the field table it
+/// republishes. A metadata violation means the table itself broke a bound or
+/// the reserved namespace; a [`BusError::EnvelopeSecurity`] rejection means
+/// the table's own headers include the security ones, and none of them are
+/// authenticated once the signature covering them failed to verify. Both
+/// cases fail the same test: the header values are attacker-controlled and
+/// unverified, so a dead-letter copy that cloned them would hand a
+/// downstream consumer exactly what this worker just refused.
+pub(crate) fn needs_sanitized_quarantine(error: &BusError) -> bool {
     matches!(
         error,
         BusError::ReservedHeaderNamespace
             | BusError::MetadataLimitExceeded { .. }
             | BusError::InvalidMetadata { .. }
+            | BusError::EnvelopeSecurity(_)
     )
 }
 
