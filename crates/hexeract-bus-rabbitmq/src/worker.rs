@@ -10,6 +10,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
+use std::ops::ControlFlow;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,6 +26,8 @@ use hexeract_bus::Request;
 use hexeract_bus::RequestHandler;
 use hexeract_bus::ResponderCounters;
 use hexeract_bus::TypedHandler;
+#[cfg(test)]
+use hexeract_bus::VerificationPolicy;
 use hexeract_core::CorrelationId;
 use hexeract_core::HandlerContext;
 use hexeract_core::MessageId;
@@ -48,6 +51,7 @@ use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
 use crate::connection::RabbitMqConnection;
+use crate::envelope_security::InboundEnvelopeSecurity;
 use crate::metadata::AmqpMetadataLimits;
 use crate::metadata::decode_headers;
 use crate::metadata::is_metadata_error;
@@ -336,6 +340,21 @@ pub struct RabbitMqWorkerConfig {
     /// and follows the poison path with a quarantine copy whose field table is
     /// rebuilt empty rather than cloned.
     pub metadata_limits: AmqpMetadataLimits,
+    /// Verification material and policy applied to every inbound delivery.
+    ///
+    /// `None` (the default) preserves the historical behaviour: deliveries
+    /// are dispatched regardless of whether they carry a signature, and a
+    /// missing `message_id`, `correlation_id` or timestamp is minted rather
+    /// than rejected (the crate-private `RequiredEnvelopeFields::Lenient`).
+    /// Configuring this under [`hexeract_bus::VerificationPolicy::Required`]
+    /// additionally switches unsigned deliveries to the stricter mode: see
+    /// [`RabbitMqWorkerBuilder::envelope_security`].
+    ///
+    /// Held behind an [`Arc`] rather than by value because
+    /// [`hexeract_bus::EnvelopeVerifier`] carries a `Mutex` for its
+    /// key-refresh rate limit and is therefore never [`Clone`], while this
+    /// config is.
+    pub envelope_security: Option<Arc<InboundEnvelopeSecurity>>,
 }
 
 impl Default for RabbitMqWorkerConfig {
@@ -349,6 +368,7 @@ impl Default for RabbitMqWorkerConfig {
             max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
             max_buffered: None,
             metadata_limits: AmqpMetadataLimits::default(),
+            envelope_security: None,
         }
     }
 }
@@ -533,6 +553,17 @@ impl RabbitMqWorkerBuilder {
     #[must_use]
     pub fn metadata_limits(mut self, limits: AmqpMetadataLimits) -> Self {
         self.config.metadata_limits = limits;
+        self
+    }
+
+    /// Verify every inbound delivery against `security`.
+    ///
+    /// See [`RabbitMqWorkerConfig::envelope_security`] for the effect a
+    /// [`hexeract_bus::VerificationPolicy::Required`] policy has on how
+    /// strictly an unsigned delivery's AMQP properties must be present.
+    #[must_use]
+    pub fn envelope_security(mut self, security: Arc<InboundEnvelopeSecurity>) -> Self {
+        self.config.envelope_security = Some(security);
         self
     }
 
@@ -785,6 +816,61 @@ impl RabbitMqWorker {
         Ok(())
     }
 
+    /// Verify `envelope`, delivered to `destination`, against `envelope_security`,
+    /// then, only once verification passes, apply [`AckMode::AckOnReceive`]'s
+    /// settle-before-handler behaviour.
+    ///
+    /// Generic over the broker operations (`ack`, `reject`) so the ordering,
+    /// verification always strictly before any settlement, is unit-testable
+    /// without a broker, the same pattern [`Self::retry_core`] and
+    /// [`Self::exhausted_core`] already use for the retry and poison paths.
+    /// [`Self::dispatch`] is the only real caller, and its `Channel` cannot
+    /// be constructed outside a live connection.
+    ///
+    /// No `envelope_security` configured is an unconditional pass: `verify`
+    /// is never even reached, so a key source such a worker might otherwise
+    /// carry elsewhere in the process is never touched, and the worker's
+    /// behaviour is exactly what it was before an envelope's producer could
+    /// be authenticated at all.
+    ///
+    /// A verification failure is handed to `reject`, the same poison path a
+    /// decode failure already uses, and `ack` is never called for it: an
+    /// [`AckMode::AckOnReceive`] worker must not settle a forged or
+    /// rerouted envelope as a success. `ack` runs only once verification has
+    /// passed, and its own failure still stops [`Self::dispatch`] short of
+    /// the handler, matching the settle-before-handler contract.
+    async fn verify_before_settlement<A, AF, R, RF>(
+        envelope_security: Option<&InboundEnvelopeSecurity>,
+        envelope: &hexeract_bus::BusEnvelope,
+        destination: &str,
+        ack_on_receive: bool,
+        ack: A,
+        reject: R,
+    ) -> ControlFlow<DeliveryDisposition, Option<hexeract_bus::VerifiedPrincipal>>
+    where
+        A: FnOnce() -> AF,
+        AF: Future<Output = DeliveryDisposition>,
+        R: FnOnce(hexeract_bus::EnvelopeSecurityError) -> RF,
+        RF: Future<Output = DeliveryDisposition>,
+    {
+        let principal = match envelope_security {
+            None => None,
+            Some(security) => match security.verify(envelope, destination).await {
+                Ok(principal) => principal,
+                Err(err) => return ControlFlow::Break(reject(err).await),
+            },
+        };
+
+        if ack_on_receive {
+            let disposition = ack().await;
+            if !matches!(disposition, DeliveryDisposition::Settled) {
+                return ControlFlow::Break(disposition);
+            }
+        }
+
+        ControlFlow::Continue(principal)
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn dispatch(&self, channel: &Channel, delivery: Delivery) -> DeliveryDisposition {
         let envelope = match delivery_to_envelope(
@@ -792,26 +878,53 @@ impl RabbitMqWorker {
             &delivery.data,
             self.config.max_payload_bytes,
             self.config.metadata_limits,
+            derive_required_envelope_fields(self.config.envelope_security.as_deref()),
         ) {
             Ok(env) => env,
             Err(err) => return self.handle_poison(channel, &delivery, &err).await,
         };
 
-        // AckOnReceive settles the delivery before the handler runs, so a
-        // handler failure is never retried (at-most-once).
-        if matches!(self.config.ack_mode, AckMode::AckOnReceive) {
-            let ack = channel
-                .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
-                .await
-                .map_err(|err| BusError::Transport(Box::new(err)));
-            if let Err(err) = &ack {
-                tracing::warn!(
-                    delivery_tag = delivery.delivery_tag,
-                    error = %err,
-                    "rabbitmq ack-on-receive failed; consumer continues, broker will redeliver"
+        // The producer's identity is established before any settlement, so a
+        // forged or rerouted envelope is never acknowledged as a success
+        // under AckMode::AckOnReceive; see Self::verify_before_settlement.
+        let ack_on_receive = matches!(self.config.ack_mode, AckMode::AckOnReceive);
+        let verification = Self::verify_before_settlement(
+            self.config.envelope_security.as_deref(),
+            &envelope,
+            delivery.routing_key.as_str(),
+            ack_on_receive,
+            || async {
+                let ack = channel
+                    .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
+                    .await
+                    .map_err(|err| BusError::Transport(Box::new(err)));
+                if let Err(err) = &ack {
+                    tracing::warn!(
+                        delivery_tag = delivery.delivery_tag,
+                        error = %err,
+                        "rabbitmq ack-on-receive failed; consumer continues, broker will redeliver"
+                    );
+                }
+                DeliveryDisposition::from_settle_result(&ack)
+            },
+            |err| {
+                let error = BusError::EnvelopeSecurity(err);
+                let delivery = &delivery;
+                async move { self.handle_poison(channel, delivery, &error).await }
+            },
+        )
+        .await;
+
+        match verification {
+            ControlFlow::Break(disposition) => return disposition,
+            ControlFlow::Continue(Some(principal)) => {
+                tracing::debug!(
+                    issuer = %principal.issuer(),
+                    key_id = %principal.key_id(),
+                    "inbound envelope verified"
                 );
-                return DeliveryDisposition::from_settle_result(&ack);
             }
+            ControlFlow::Continue(None) => {}
         }
 
         let ctx = build_handler_context(&envelope);
@@ -1552,6 +1665,54 @@ pub(crate) fn death_count(props: &BasicProperties, wait_queue: &str) -> u32 {
     0
 }
 
+/// How strictly the AMQP properties covered by a signature must be present.
+///
+/// The policy only ever governs an *unsigned* delivery: a signed one always
+/// demands its covered fields regardless of this setting, because a
+/// derogation that let a present signature ride over a missing field would
+/// make the signature unverifiable rather than optional. See
+/// [`delivery_to_envelope`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum RequiredEnvelopeFields {
+    /// Mint a fresh identifier or timestamp when the wire omits one.
+    #[default]
+    Lenient,
+    /// Reject a delivery that omits any field a signature would cover.
+    Strict,
+}
+
+/// Derive how strictly an *unsigned* delivery's AMQP properties must be
+/// present, from the worker's configured inbound envelope security.
+///
+/// No configured security derives [`RequiredEnvelopeFields::Lenient`]: a
+/// worker that never opted into envelope security keeps exactly its
+/// behaviour from before this configuration existed. Once security is
+/// configured, the policy's own
+/// [`hexeract_bus::VerificationPolicy::allows_unauthenticated_envelopes`]
+/// decides: this crate cannot even name a policy
+/// [`hexeract_bus::VerificationPolicy`] does not yet expose, since the type
+/// is `#[non_exhaustive]`, so the strict-by-default
+/// reasoning for a future variant has to live where the enum is exhaustive,
+/// with the type itself, not here as a catch-all this crate would have to
+/// guess the side of. A signed delivery is already held to `Strict`
+/// regardless of this value (see [`delivery_to_envelope`]), so this choice
+/// only ever governs an unsigned one, and a policy that allows
+/// unauthenticated envelopes accepts an unsigned delivery without verifying
+/// it at all: minting a fresh `message_id`, `correlation_id` or
+/// `published_at` for such a delivery is harmless, since there is no
+/// signature left for a minted value to invalidate.
+fn derive_required_envelope_fields(
+    envelope_security: Option<&InboundEnvelopeSecurity>,
+) -> RequiredEnvelopeFields {
+    match envelope_security {
+        None => RequiredEnvelopeFields::Lenient,
+        Some(security) if security.policy().allows_unauthenticated_envelopes() => {
+            RequiredEnvelopeFields::Lenient
+        }
+        Some(_) => RequiredEnvelopeFields::Strict,
+    }
+}
+
 /// Rebuild a [`hexeract_bus::BusEnvelope`] from one AMQP delivery.
 ///
 /// Shared by the consumer worker and the reply inbox so both reconstruct a
@@ -1564,18 +1725,36 @@ pub(crate) fn death_count(props: &BasicProperties, wait_queue: &str) -> u32 {
 /// field table, which the payload cap does not cover, since a tiny payload can
 /// still carry a large table.
 ///
+/// `required_fields` governs only an unsigned delivery. A delivery carrying
+/// the security signature header is always held to
+/// [`RequiredEnvelopeFields::Strict`], because the signature covers
+/// `message_id`, `correlation_id` and `published_at`: minting a replacement
+/// for any of them would make the signature verify against values the
+/// consumer just invented rather than the ones the publisher signed.
+///
 /// # Errors
 ///
 /// Returns [`BusError::PayloadTooLarge`] when the body exceeds
 /// `max_payload_bytes`, [`BusError::MetadataLimitExceeded`] or
 /// [`BusError::InvalidMetadata`] when the field table violates
-/// `metadata_limits`, and [`BusError::InvalidTopology`] when the delivery
-/// carries no AMQP `type` property to derive a `message_type` from.
+/// `metadata_limits`, [`BusError::InvalidTopology`] when the delivery carries
+/// no AMQP `type` property to derive a `message_type` from, and
+/// [`BusError::EnvelopeSecurity`] when a signed delivery, or an unsigned one
+/// under [`RequiredEnvelopeFields::Strict`], has a problem with
+/// `message_id`, `correlation_id` or its `timestamp` property (reported as
+/// `published_at`, the name of the field in the signature's canonical
+/// representation): [`hexeract_bus::EnvelopeSecurityError::MissingRequiredField`]
+/// when the property is absent, or
+/// [`hexeract_bus::EnvelopeSecurityError::MalformedRequiredField`] when
+/// `message_id` or `correlation_id` is present but does not parse as a
+/// UUID. `published_at` has no malformed case: the AMQP `timestamp`
+/// property is a typed integer, so it can only be absent, never unparsable.
 pub(crate) fn delivery_to_envelope(
     props: &BasicProperties,
     payload: &[u8],
     max_payload_bytes: usize,
     metadata_limits: AmqpMetadataLimits,
+    required_fields: RequiredEnvelopeFields,
 ) -> Result<hexeract_bus::BusEnvelope, BusError> {
     use std::time::SystemTime;
 
@@ -1591,16 +1770,56 @@ pub(crate) fn delivery_to_envelope(
     // decoded rather than a second copy of it in an envelope.
     let (headers, protocol_headers) = decode_headers(props.headers().as_ref(), metadata_limits)?;
 
-    let message_id = props
-        .message_id()
-        .as_ref()
-        .and_then(|s| Uuid::parse_str(s.as_str()).ok())
-        .unwrap_or_else(Uuid::now_v7);
-    let correlation_id = props
-        .correlation_id()
-        .as_ref()
-        .and_then(|s| Uuid::parse_str(s.as_str()).ok())
-        .unwrap_or_else(Uuid::now_v7);
+    // A signature covers `message_id`, `correlation_id` and `published_at`,
+    // so a signed delivery must never let a missing field through under a
+    // lenient policy: the policy only ever gets to decide the fate of an
+    // *unsigned* delivery.
+    let signature_present =
+        protocol_headers.contains_key(hexeract_bus::envelope_security::protocol::SIGNATURE_HEADER);
+    let strict = signature_present || required_fields == RequiredEnvelopeFields::Strict;
+
+    let message_id = match props.message_id().as_ref() {
+        Some(raw) => match Uuid::parse_str(raw.as_str()) {
+            Ok(id) => id,
+            Err(_) if strict => {
+                return Err(BusError::EnvelopeSecurity(
+                    hexeract_bus::EnvelopeSecurityError::MalformedRequiredField {
+                        field: "message_id",
+                    },
+                ));
+            }
+            Err(_) => Uuid::now_v7(),
+        },
+        None if strict => {
+            return Err(BusError::EnvelopeSecurity(
+                hexeract_bus::EnvelopeSecurityError::MissingRequiredField {
+                    field: "message_id",
+                },
+            ));
+        }
+        None => Uuid::now_v7(),
+    };
+    let correlation_id = match props.correlation_id().as_ref() {
+        Some(raw) => match Uuid::parse_str(raw.as_str()) {
+            Ok(id) => id,
+            Err(_) if strict => {
+                return Err(BusError::EnvelopeSecurity(
+                    hexeract_bus::EnvelopeSecurityError::MalformedRequiredField {
+                        field: "correlation_id",
+                    },
+                ));
+            }
+            Err(_) => Uuid::now_v7(),
+        },
+        None if strict => {
+            return Err(BusError::EnvelopeSecurity(
+                hexeract_bus::EnvelopeSecurityError::MissingRequiredField {
+                    field: "correlation_id",
+                },
+            ));
+        }
+        None => Uuid::now_v7(),
+    };
     let message_type = props
         .kind()
         .as_ref()
@@ -1619,10 +1838,19 @@ pub(crate) fn delivery_to_envelope(
     // `published_at` is the publisher's creation instant, not the
     // consume time. The transport writes it into the AMQP `timestamp`
     // property; restore it from there and fall back to now only when the
-    // property is absent (foreign producer that did not stamp it).
-    let published_at = props.timestamp().map_or_else(SystemTime::now, |secs| {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
-    });
+    // property is absent (foreign producer that did not stamp it) and
+    // `strict` does not demand it.
+    let published_at = match props.timestamp() {
+        Some(secs) => SystemTime::UNIX_EPOCH + Duration::from_secs(*secs),
+        None if strict => {
+            return Err(BusError::EnvelopeSecurity(
+                hexeract_bus::EnvelopeSecurityError::MissingRequiredField {
+                    field: "published_at",
+                },
+            ));
+        }
+        None => SystemTime::now(),
+    };
 
     Ok(hexeract_bus::BusEnvelope::restore_from_transport(
         message_id,
@@ -1682,6 +1910,89 @@ mod tests {
         assert_eq!(cfg.retry_delay, DEFAULT_RETRY_DELAY);
         assert_eq!(cfg.max_payload_bytes, DEFAULT_MAX_PAYLOAD_BYTES);
         assert_eq!(cfg.metadata_limits, AmqpMetadataLimits::default());
+        assert!(cfg.envelope_security.is_none());
+    }
+
+    fn inbound_security_with_policy(policy: VerificationPolicy) -> InboundEnvelopeSecurity {
+        let keys: Arc<dyn hexeract_bus::VerificationKeySource> =
+            Arc::new(hexeract_bus::StaticKeySource::builder().build());
+        let mut builder = hexeract_bus::EnvelopeSecurityConfig::builder().with_policy(policy);
+        if policy == VerificationPolicy::Required {
+            builder = builder.with_accepted_audience(
+                hexeract_bus::Audience::new("ledger-service").expect("valid audience"),
+            );
+        }
+        InboundEnvelopeSecurity::new(keys, builder.build().expect("valid configuration"))
+    }
+
+    #[test]
+    fn the_worker_derives_strict_fields_from_a_required_policy() {
+        let security = inbound_security_with_policy(VerificationPolicy::Required);
+
+        assert_eq!(
+            derive_required_envelope_fields(Some(&security)),
+            RequiredEnvelopeFields::Strict
+        );
+    }
+
+    #[test]
+    fn the_worker_stays_lenient_without_configured_security() {
+        assert_eq!(
+            derive_required_envelope_fields(None),
+            RequiredEnvelopeFields::Lenient
+        );
+    }
+
+    #[test]
+    fn the_worker_stays_lenient_under_the_insecure_opt_out() {
+        let security =
+            inbound_security_with_policy(VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes);
+
+        // A signed envelope is already forced to `Strict` by
+        // `delivery_to_envelope` regardless of this derivation (its own
+        // `signature_present` check), so the opt-out only ever changes the
+        // fate of an *unsigned* one. Under the opt-out an unsigned delivery
+        // is accepted without any verification at all, so there is no
+        // signature a minted `message_id`/`correlation_id`/`published_at`
+        // could invalidate: `Lenient` is correct here, not `Strict`.
+        assert_eq!(
+            derive_required_envelope_fields(Some(&security)),
+            RequiredEnvelopeFields::Lenient
+        );
+    }
+
+    #[test]
+    fn only_the_named_insecure_opt_out_derives_lenient_under_configured_security() {
+        // `derive_required_envelope_fields` no longer matches on
+        // `VerificationPolicy` itself: it asks
+        // `VerificationPolicy::allows_unauthenticated_envelopes`, whose match
+        // lives in `hexeract-bus`, the crate that owns the enum and can
+        // therefore write it without a catch-all. A third variant added
+        // there fails that match's compilation, not a guess made from here.
+        // This crate still cannot name, let alone construct, such a variant,
+        // since the type is `#[non_exhaustive]`, so what this test *can*
+        // lock in is only the two variants it can name today, asserting the
+        // complement directly rather than only the positive case for
+        // `Required` as a special value.
+        let known_variants = [
+            VerificationPolicy::Required,
+            VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes,
+        ];
+
+        for policy in known_variants {
+            let security = inbound_security_with_policy(policy);
+            let expected = if policy == VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes {
+                RequiredEnvelopeFields::Lenient
+            } else {
+                RequiredEnvelopeFields::Strict
+            };
+
+            assert_eq!(
+                derive_required_envelope_fields(Some(&security)),
+                expected,
+                "policy {policy:?} must derive {expected:?}"
+            );
+        }
     }
 
     /// Build AMQP properties carrying `headers` and the minimum a delivery
@@ -1707,6 +2018,7 @@ mod tests {
             b"{}",
             DEFAULT_MAX_PAYLOAD_BYTES,
             AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
         )
         .expect("an ordinary application header must decode under the defaults");
         assert_eq!(
@@ -1722,6 +2034,7 @@ mod tests {
                 max_headers: 0,
                 ..AmqpMetadataLimits::default()
             },
+            RequiredEnvelopeFields::Lenient,
         )
         .expect_err("a deny-all header count must reject the delivery");
         assert!(
@@ -1861,6 +2174,7 @@ mod tests {
             b"{\"order_id\":\"x\"}",
             DEFAULT_MAX_PAYLOAD_BYTES,
             AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
         )
         .expect("must decode");
         assert_eq!(envelope.message_id, message_id);
@@ -1877,6 +2191,7 @@ mod tests {
             b"{}",
             DEFAULT_MAX_PAYLOAD_BYTES,
             AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
         )
         .expect("must decode");
         assert_ne!(envelope.message_id, Uuid::nil());
@@ -1892,6 +2207,7 @@ mod tests {
             b"{}",
             DEFAULT_MAX_PAYLOAD_BYTES,
             AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
         )
         .expect_err("missing `type` must surface as a non-Internal error");
         match err {
@@ -1913,6 +2229,7 @@ mod tests {
             b"{}",
             DEFAULT_MAX_PAYLOAD_BYTES,
             AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
         )
         .expect("must decode");
         let restored = envelope
@@ -1937,6 +2254,7 @@ mod tests {
             b"{}",
             DEFAULT_MAX_PAYLOAD_BYTES,
             AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
         )
         .expect("must decode");
         let ctx = build_handler_context(&envelope);
@@ -2026,6 +2344,7 @@ mod tests {
             b"{}",
             DEFAULT_MAX_PAYLOAD_BYTES,
             AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
         )
         .expect("must decode");
         assert_eq!(
@@ -2060,8 +2379,14 @@ mod tests {
         let props = BasicProperties::default().with_type("orders.placed".into());
         let payload = vec![b'x'; 9];
 
-        let err = delivery_to_envelope(&props, &payload, 8, AmqpMetadataLimits::default())
-            .expect_err("oversize payload must be rejected before the copy");
+        let err = delivery_to_envelope(
+            &props,
+            &payload,
+            8,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
+        )
+        .expect_err("oversize payload must be rejected before the copy");
         match err {
             BusError::PayloadTooLarge { size, max } => {
                 assert_eq!(size, 9);
@@ -2081,6 +2406,7 @@ mod tests {
             payload,
             payload.len(),
             AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
         )
         .expect("payload exactly at the limit must pass");
         assert_eq!(envelope.payload, payload);
@@ -2100,6 +2426,7 @@ mod tests {
             b"{}",
             DEFAULT_MAX_PAYLOAD_BYTES,
             AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
         )
         .expect("must decode");
         let ctx = build_handler_context(&envelope);
@@ -2115,11 +2442,193 @@ mod tests {
             b"{}",
             DEFAULT_MAX_PAYLOAD_BYTES,
             AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
         )
         .expect("must decode");
         let ctx = build_handler_context(&envelope);
         assert_ne!(*ctx.message_id.as_uuid(), Uuid::nil());
         assert_ne!(*ctx.correlation_id.as_uuid(), Uuid::nil());
+    }
+
+    #[test]
+    fn lenient_mode_still_mints_a_missing_message_id() {
+        let props = BasicProperties::default().with_type("orders.placed".into());
+
+        let envelope = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
+        )
+        .expect("lenient mode must still mint a missing message_id");
+        assert_ne!(envelope.message_id, Uuid::nil());
+    }
+
+    #[test]
+    fn strict_mode_rejects_a_missing_message_id() {
+        let props = BasicProperties::default().with_type("orders.placed".into());
+
+        let err = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Strict,
+        )
+        .expect_err("strict mode must reject a missing message_id");
+        match err {
+            BusError::EnvelopeSecurity(
+                hexeract_bus::EnvelopeSecurityError::MissingRequiredField { field },
+            ) => assert_eq!(field, "message_id"),
+            other => panic!("expected EnvelopeSecurity(MissingRequiredField), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_mode_rejects_a_missing_correlation_id() {
+        let props = BasicProperties::default()
+            .with_type("orders.placed".into())
+            .with_message_id(Uuid::from_u128(1).to_string().into());
+
+        let err = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Strict,
+        )
+        .expect_err("strict mode must reject a missing correlation_id");
+        match err {
+            BusError::EnvelopeSecurity(
+                hexeract_bus::EnvelopeSecurityError::MissingRequiredField { field },
+            ) => assert_eq!(field, "correlation_id"),
+            other => panic!("expected EnvelopeSecurity(MissingRequiredField), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_mode_rejects_a_missing_published_at() {
+        let props = BasicProperties::default()
+            .with_type("orders.placed".into())
+            .with_message_id(Uuid::from_u128(1).to_string().into())
+            .with_correlation_id(Uuid::from_u128(2).to_string().into());
+
+        let err = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Strict,
+        )
+        .expect_err("strict mode must reject a missing published_at");
+        match err {
+            BusError::EnvelopeSecurity(
+                hexeract_bus::EnvelopeSecurityError::MissingRequiredField { field },
+            ) => assert_eq!(field, "published_at"),
+            other => panic!("expected EnvelopeSecurity(MissingRequiredField), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_mode_rejects_an_unparsable_message_id() {
+        let props = BasicProperties::default()
+            .with_type("orders.placed".into())
+            .with_message_id("not-a-uuid".into());
+
+        let err = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Strict,
+        )
+        .expect_err("strict mode must reject an unparsable message_id rather than mint one");
+        match err {
+            BusError::EnvelopeSecurity(
+                hexeract_bus::EnvelopeSecurityError::MalformedRequiredField { field },
+            ) => assert_eq!(field, "message_id"),
+            other => panic!("expected EnvelopeSecurity(MalformedRequiredField), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_mode_rejects_an_unparsable_correlation_id() {
+        let props = BasicProperties::default()
+            .with_type("orders.placed".into())
+            .with_message_id(Uuid::from_u128(1).to_string().into())
+            .with_correlation_id("not-a-uuid".into());
+
+        let err = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Strict,
+        )
+        .expect_err("strict mode must reject an unparsable correlation_id rather than mint one");
+        match err {
+            BusError::EnvelopeSecurity(
+                hexeract_bus::EnvelopeSecurityError::MalformedRequiredField { field },
+            ) => assert_eq!(field, "correlation_id"),
+            other => panic!("expected EnvelopeSecurity(MalformedRequiredField), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lenient_mode_mints_an_unparsable_message_id() {
+        let props = BasicProperties::default()
+            .with_type("orders.placed".into())
+            .with_message_id("not-a-uuid".into());
+
+        let envelope = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
+        )
+        .expect("lenient mode must mint a fresh id rather than reject an unparsable one");
+        assert_ne!(envelope.message_id, Uuid::nil());
+    }
+
+    #[test]
+    fn a_signed_envelope_requires_its_fields_even_in_lenient_mode() {
+        let props = properties_with_headers([(
+            hexeract_bus::envelope_security::protocol::SIGNATURE_HEADER,
+            "irrelevant-signature-value",
+        )]);
+
+        let err = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
+        )
+        .expect_err("a signed envelope must require its fields even under a lenient policy");
+        match err {
+            BusError::EnvelopeSecurity(
+                hexeract_bus::EnvelopeSecurityError::MissingRequiredField { field },
+            ) => assert_eq!(field, "message_id"),
+            other => panic!("expected EnvelopeSecurity(MissingRequiredField), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unsigned_envelope_is_untouched_in_lenient_mode() {
+        let props = BasicProperties::default().with_type("orders.placed".into());
+
+        let envelope = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
+        )
+        .expect("an unsigned envelope under a lenient policy must still mint missing fields");
+        assert_ne!(envelope.message_id, Uuid::nil());
+        assert_ne!(envelope.correlation_id, Uuid::nil());
     }
 
     #[test]
@@ -2436,5 +2945,457 @@ mod tests {
             x_death_entry("orders.retry", "expired", 3),
         ]);
         assert_eq!(death_count(&props, "orders.retry"), 3);
+    }
+
+    mod verify_before_settlement {
+        //! `RabbitMqWorker::verify_before_settlement` establishes the
+        //! producer's identity before any settlement, without a broker: the
+        //! `ack` and `reject` operations are closures a test can observe
+        //! instead of a live `Channel`, the same pattern already used by
+        //! `Self::retry_core` and `Self::exhausted_core` above.
+
+        use std::sync::atomic::AtomicUsize;
+
+        use async_trait::async_trait;
+        use ed25519_dalek::SigningKey;
+        use hexeract_bus::Audience;
+        use hexeract_bus::BusEnvelope;
+        use hexeract_bus::EnvelopeSecurityConfig;
+        use hexeract_bus::EnvelopeSecurityError;
+        use hexeract_bus::Issuer;
+        use hexeract_bus::KeyId;
+        use hexeract_bus::KeySourceError;
+        use hexeract_bus::SecurityHeaders;
+        use hexeract_bus::SigningKeyHandle;
+        use hexeract_bus::SigningKeySource;
+        use hexeract_bus::StaticKeySource;
+        use hexeract_bus::VerificationKey;
+        use hexeract_bus::VerificationKeySource;
+
+        use super::*;
+        use crate::envelope_security::OutboundEnvelopeSecurity;
+
+        const ANNOUNCED_DESTINATION: &str = "orders.placed";
+        const REROUTED_DESTINATION: &str = "orders.placed.eu";
+
+        fn issuer() -> Issuer {
+            Issuer::new("billing-service").expect("valid issuer")
+        }
+
+        fn audience() -> Audience {
+            Audience::new("ledger-service").expect("valid audience")
+        }
+
+        fn key_id() -> KeyId {
+            KeyId::new("2026-09").expect("valid key id")
+        }
+
+        fn signing_key() -> SigningKey {
+            SigningKey::from_bytes(&[7; 32])
+        }
+
+        fn security_with_policy(policy: VerificationPolicy) -> InboundEnvelopeSecurity {
+            let keys: Arc<dyn VerificationKeySource> = Arc::new(
+                StaticKeySource::builder()
+                    .with_verification_key(
+                        issuer(),
+                        key_id(),
+                        VerificationKey::from(signing_key().verifying_key()),
+                    )
+                    .build(),
+            );
+            let config = EnvelopeSecurityConfig::builder()
+                .with_policy(policy)
+                .with_accepted_audience(audience())
+                .build()
+                .expect("valid configuration");
+            InboundEnvelopeSecurity::new(keys, config)
+        }
+
+        fn required_security() -> InboundEnvelopeSecurity {
+            security_with_policy(VerificationPolicy::Required)
+        }
+
+        fn derogation_security() -> InboundEnvelopeSecurity {
+            security_with_policy(VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes)
+        }
+
+        fn unsigned_envelope() -> BusEnvelope {
+            BusEnvelope::restore_from_transport(
+                Uuid::from_u128(1),
+                "orders.placed.v1".to_owned(),
+                b"{}".to_vec(),
+                Uuid::from_u128(2),
+                None,
+                HashMap::new(),
+                HashMap::new(),
+                std::time::SystemTime::now(),
+            )
+        }
+
+        fn apply_security_headers(
+            envelope: &BusEnvelope,
+            headers: &SecurityHeaders,
+        ) -> BusEnvelope {
+            let mut protocol_headers = HashMap::new();
+            for (name, value) in headers {
+                protocol_headers.insert(name.to_owned(), value.to_owned());
+            }
+            BusEnvelope::restore_from_transport(
+                envelope.message_id,
+                envelope.message_type.clone(),
+                envelope.payload.clone(),
+                envelope.correlation_id,
+                envelope.reply_to.clone(),
+                envelope.headers.clone(),
+                protocol_headers,
+                envelope.published_at,
+            )
+        }
+
+        /// Sign a fresh envelope for `destination`, correctly, with the same
+        /// key `required_security`/`derogation_security` trust.
+        fn signed_envelope(destination: &str) -> BusEnvelope {
+            let envelope = unsigned_envelope();
+            let signing_keys: Arc<dyn SigningKeySource> = Arc::new(
+                StaticKeySource::builder()
+                    .with_signing_key(key_id(), SigningKeyHandle::from(signing_key()))
+                    .build(),
+            );
+            let outbound = OutboundEnvelopeSecurity::new(issuer(), audience(), signing_keys);
+            let headers = outbound
+                .sign(&envelope, destination)
+                .expect("signing must succeed");
+            apply_security_headers(&envelope, &headers)
+        }
+
+        /// A signed envelope whose payload was altered after signing: the
+        /// signature headers are present and well-formed, but no longer
+        /// match the canonical representation. Stands in for a forged
+        /// delivery, distinct from one delivered to the wrong destination.
+        fn forged_envelope(destination: &str) -> BusEnvelope {
+            let mut envelope = signed_envelope(destination);
+            envelope.payload = b"{ \"tampered\": true }".to_vec();
+            envelope
+        }
+
+        #[derive(Debug, Default, Clone)]
+        struct CountingKeySource {
+            lookups: Arc<AtomicUsize>,
+        }
+
+        impl CountingKeySource {
+            fn lookups(&self) -> Arc<AtomicUsize> {
+                Arc::clone(&self.lookups)
+            }
+        }
+
+        #[async_trait]
+        impl VerificationKeySource for CountingKeySource {
+            async fn verification_key(
+                &self,
+                _issuer: &Issuer,
+                _key_id: &KeyId,
+            ) -> Result<VerificationKey, KeySourceError> {
+                self.lookups.fetch_add(1, Ordering::Relaxed);
+                Err(KeySourceError::UnknownKey)
+            }
+
+            async fn refresh(&self) -> Result<(), KeySourceError> {
+                Ok(())
+            }
+        }
+
+        /// Stand-in for `Self::dispatch`'s handler invocation: reached only
+        /// when `verify_before_settlement` resolves to `ControlFlow::Continue`,
+        /// exactly as `Self::dispatch` only reaches `self.handlers.get(...)`
+        /// in that case.
+        async fn dispatch_like<A, AF, R, RF>(
+            envelope_security: Option<&InboundEnvelopeSecurity>,
+            envelope: &BusEnvelope,
+            destination: &str,
+            ack_on_receive: bool,
+            ack: A,
+            reject: R,
+            handler_calls: &AtomicUsize,
+        ) -> DeliveryDisposition
+        where
+            A: FnOnce() -> AF,
+            AF: Future<Output = DeliveryDisposition>,
+            R: FnOnce(EnvelopeSecurityError) -> RF,
+            RF: Future<Output = DeliveryDisposition>,
+        {
+            match RabbitMqWorker::verify_before_settlement(
+                envelope_security,
+                envelope,
+                destination,
+                ack_on_receive,
+                ack,
+                reject,
+            )
+            .await
+            {
+                ControlFlow::Break(disposition) => disposition,
+                ControlFlow::Continue(_) => {
+                    handler_calls.fetch_add(1, Ordering::SeqCst);
+                    DeliveryDisposition::Settled
+                }
+            }
+        }
+
+        fn noop_ack() -> DeliveryDisposition {
+            DeliveryDisposition::Settled
+        }
+
+        #[tokio::test]
+        async fn a_forged_envelope_never_reaches_the_handler() {
+            let security = required_security();
+            let envelope = forged_envelope(ANNOUNCED_DESTINATION);
+            let handler_calls = AtomicUsize::new(0);
+            let reject_error = std::sync::Mutex::new(None);
+
+            let disposition = dispatch_like(
+                Some(&security),
+                &envelope,
+                ANNOUNCED_DESTINATION,
+                true,
+                || async { noop_ack() },
+                |err| {
+                    *reject_error.lock().expect("lock") = Some(err);
+                    async { DeliveryDisposition::LeftForRedelivery }
+                },
+                &handler_calls,
+            )
+            .await;
+
+            assert_eq!(disposition, DeliveryDisposition::LeftForRedelivery);
+            assert_eq!(
+                handler_calls.load(Ordering::SeqCst),
+                0,
+                "a forged envelope must never reach the handler"
+            );
+            assert!(matches!(
+                *reject_error.lock().expect("lock"),
+                Some(EnvelopeSecurityError::SignatureMismatch)
+            ));
+        }
+
+        #[tokio::test]
+        async fn a_rerouted_envelope_is_rejected_as_a_destination_mismatch() {
+            let security = required_security();
+            // Signed for ANNOUNCED_DESTINATION, but the delivery actually
+            // arrived on REROUTED_DESTINATION: a valid signature produced
+            // for one queue replayed onto another.
+            let envelope = signed_envelope(ANNOUNCED_DESTINATION);
+            let handler_calls = AtomicUsize::new(0);
+            let reject_error = std::sync::Mutex::new(None);
+
+            let disposition = dispatch_like(
+                Some(&security),
+                &envelope,
+                REROUTED_DESTINATION,
+                true,
+                || async { noop_ack() },
+                |err| {
+                    *reject_error.lock().expect("lock") = Some(err);
+                    async { DeliveryDisposition::LeftForRedelivery }
+                },
+                &handler_calls,
+            )
+            .await;
+
+            assert_eq!(disposition, DeliveryDisposition::LeftForRedelivery);
+            assert_eq!(
+                handler_calls.load(Ordering::SeqCst),
+                0,
+                "a rerouted envelope must never reach the handler"
+            );
+            // Distinct from a forged envelope's rejection reason: a caller
+            // reading this error (or the log line it feeds) can tell a
+            // destination mismatch apart from a broken signature.
+            assert!(matches!(
+                *reject_error.lock().expect("lock"),
+                Some(EnvelopeSecurityError::DestinationMismatch)
+            ));
+        }
+
+        #[tokio::test]
+        async fn a_correctly_signed_envelope_reaches_the_handler() {
+            // Symmetric to the two rejection tests above: a worker that
+            // rejected every envelope would also satisfy them, so this
+            // proves a validly signed one, delivered to the destination it
+            // was signed for, still reaches the handler under the same
+            // `Required` policy.
+            let security = required_security();
+            let envelope = signed_envelope(ANNOUNCED_DESTINATION);
+            let handler_calls = AtomicUsize::new(0);
+            let ack_called = AtomicBool::new(false);
+
+            let disposition = dispatch_like(
+                Some(&security),
+                &envelope,
+                ANNOUNCED_DESTINATION,
+                true,
+                || async {
+                    ack_called.store(true, Ordering::SeqCst);
+                    noop_ack()
+                },
+                |_err| async { DeliveryDisposition::LeftForRedelivery },
+                &handler_calls,
+            )
+            .await;
+
+            assert_eq!(disposition, DeliveryDisposition::Settled);
+            assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+            assert!(ack_called.load(Ordering::SeqCst));
+        }
+
+        #[tokio::test]
+        async fn verification_precedes_the_ack_on_receive_settlement() {
+            // A worker under AckMode::AckOnReceive settles before the
+            // handler runs, but must never settle a delivery whose producer
+            // failed verification as a success: proved here by asserting
+            // `ack` is never called, not merely that the final disposition
+            // happens to look right.
+            let security = required_security();
+            let envelope = forged_envelope(ANNOUNCED_DESTINATION);
+            let ack_called = AtomicBool::new(false);
+            let reject_called = AtomicBool::new(false);
+
+            let outcome = RabbitMqWorker::verify_before_settlement(
+                Some(&security),
+                &envelope,
+                ANNOUNCED_DESTINATION,
+                true,
+                || async {
+                    ack_called.store(true, Ordering::SeqCst);
+                    noop_ack()
+                },
+                |_err| async {
+                    reject_called.store(true, Ordering::SeqCst);
+                    DeliveryDisposition::LeftForRedelivery
+                },
+            )
+            .await;
+
+            assert!(matches!(
+                outcome,
+                ControlFlow::Break(DeliveryDisposition::LeftForRedelivery)
+            ));
+            assert!(
+                reject_called.load(Ordering::SeqCst),
+                "a rejected envelope must be settled through the poison path"
+            );
+            assert!(
+                !ack_called.load(Ordering::SeqCst),
+                "ack-on-receive must never settle a delivery whose producer failed \
+                 verification as a success"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_unsigned_envelope_passes_under_the_named_derogation() {
+            let security = derogation_security();
+            let envelope = unsigned_envelope();
+            let handler_calls = AtomicUsize::new(0);
+            let ack_called = AtomicBool::new(false);
+
+            let disposition = dispatch_like(
+                Some(&security),
+                &envelope,
+                ANNOUNCED_DESTINATION,
+                true,
+                || async {
+                    ack_called.store(true, Ordering::SeqCst);
+                    noop_ack()
+                },
+                |_err| async { DeliveryDisposition::LeftForRedelivery },
+                &handler_calls,
+            )
+            .await;
+
+            assert_eq!(disposition, DeliveryDisposition::Settled);
+            assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+            assert!(ack_called.load(Ordering::SeqCst));
+        }
+
+        #[tokio::test]
+        async fn a_signed_envelope_is_still_verified_under_the_derogation() {
+            // The derogation tolerates the *absence* of a signature; it must
+            // never skip verification of one that is present. A worker that
+            // short-circuits to "always accept" once the derogation is
+            // configured would pass the previous test but fail this one.
+            let security = derogation_security();
+            let envelope = forged_envelope(ANNOUNCED_DESTINATION);
+            let handler_calls = AtomicUsize::new(0);
+            let ack_called = AtomicBool::new(false);
+            let reject_error = std::sync::Mutex::new(None);
+
+            let disposition = dispatch_like(
+                Some(&security),
+                &envelope,
+                ANNOUNCED_DESTINATION,
+                true,
+                || async {
+                    ack_called.store(true, Ordering::SeqCst);
+                    noop_ack()
+                },
+                |err| {
+                    *reject_error.lock().expect("lock") = Some(err);
+                    async { DeliveryDisposition::LeftForRedelivery }
+                },
+                &handler_calls,
+            )
+            .await;
+
+            assert_eq!(disposition, DeliveryDisposition::LeftForRedelivery);
+            assert_eq!(
+                handler_calls.load(Ordering::SeqCst),
+                0,
+                "a broken signature must still be rejected under the derogation"
+            );
+            assert!(!ack_called.load(Ordering::SeqCst));
+            assert!(matches!(
+                *reject_error.lock().expect("lock"),
+                Some(EnvelopeSecurityError::SignatureMismatch)
+            ));
+        }
+
+        #[tokio::test]
+        async fn an_unconfigured_worker_behaves_exactly_as_before() {
+            // No `InboundEnvelopeSecurity` is ever constructed for an
+            // unconfigured worker, so there is no verification key source it
+            // could reach for; this counting source stands in for one that
+            // exists elsewhere in the process (shared across workers) but
+            // was never wired into this one, and must stay untouched.
+            let counting = CountingKeySource::default();
+            let lookups = counting.lookups();
+            let envelope = unsigned_envelope();
+            let handler_calls = AtomicUsize::new(0);
+            let ack_called = AtomicBool::new(false);
+
+            let disposition = dispatch_like(
+                None,
+                &envelope,
+                ANNOUNCED_DESTINATION,
+                true,
+                || async {
+                    ack_called.store(true, Ordering::SeqCst);
+                    noop_ack()
+                },
+                |_err| async { DeliveryDisposition::LeftForRedelivery },
+                &handler_calls,
+            )
+            .await;
+
+            assert_eq!(disposition, DeliveryDisposition::Settled);
+            assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+            assert!(ack_called.load(Ordering::SeqCst));
+            assert_eq!(
+                lookups.load(Ordering::Relaxed),
+                0,
+                "an unconfigured worker must never consult a verification key source"
+            );
+        }
     }
 }

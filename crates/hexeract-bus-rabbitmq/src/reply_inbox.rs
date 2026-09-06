@@ -32,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 use crate::metadata::AmqpMetadataLimits;
 use crate::transport::to_short_string;
 use crate::worker::DEFAULT_MAX_PAYLOAD_BYTES;
+use crate::worker::RequiredEnvelopeFields;
 use crate::worker::delivery_to_envelope;
 
 /// Declare an exclusive, auto-delete, server-named reply inbox and
@@ -68,17 +69,21 @@ pub async fn declare_reply_inbox(channel: &Channel) -> Result<String, BusError> 
 /// inbox and the regular consumer worker share exactly the same
 /// AMQP-property-to-envelope reconstruction: `message_type` from the
 /// `type` property, `correlation_id` and `reply_to` from their
-/// respective properties, and free-form headers.
+/// respective properties, and free-form headers. `required_fields` is the
+/// same policy the worker enforces, so a signed or strictly-required reply
+/// is rejected on this path exactly as it would be on the worker's.
 fn decode_delivery(
     properties: &BasicProperties,
     payload: &[u8],
     metadata_limits: AmqpMetadataLimits,
+    required_fields: RequiredEnvelopeFields,
 ) -> Result<BusEnvelope, BusError> {
     delivery_to_envelope(
         properties,
         payload,
         DEFAULT_MAX_PAYLOAD_BYTES,
         metadata_limits,
+        required_fields,
     )
 }
 
@@ -108,6 +113,7 @@ pub async fn run_reply_inbox(
         registry,
         cancel,
         AmqpMetadataLimits::default(),
+        RequiredEnvelopeFields::default(),
     )
     .await
 }
@@ -117,7 +123,10 @@ pub async fn run_reply_inbox(
 /// The reply path applies exactly the same limits, through exactly the same
 /// decoder, as the normal worker: a reply inbox that accepted metadata the
 /// worker refuses would be a complete bypass of the worker's bound, and it is
-/// the path that feeds an RPC correlation slot.
+/// the path that feeds an RPC correlation slot. `required_fields` is the same
+/// policy the worker enforces on its own deliveries, for the same reason: a
+/// reply that is signed, or strictly required, must not decode here under a
+/// weaker rule than the worker applies to its own inbound deliveries.
 ///
 /// # Errors
 ///
@@ -128,6 +137,7 @@ pub(crate) async fn run_reply_inbox_with_limits(
     registry: Arc<RequestRegistry>,
     cancel: CancellationToken,
     metadata_limits: AmqpMetadataLimits,
+    required_fields: RequiredEnvelopeFields,
 ) -> Result<(), BusError> {
     let mut consumer = channel
         .basic_consume(
@@ -150,6 +160,7 @@ pub(crate) async fn run_reply_inbox_with_limits(
                     &delivery.properties,
                     &delivery.data,
                     metadata_limits,
+                    required_fields,
                 ) {
                     Ok(envelope) => registry.resolve(envelope),
                     // The typed error carries a reason and sizes only, never a
@@ -198,8 +209,13 @@ mod tests {
     #[test]
     fn a_bounded_reply_decodes_and_keeps_its_protocol_header() {
         let properties = reply_properties([(REQUEST_ID_HEADER, "request-1")]);
-        let envelope = decode_delivery(&properties, b"{}", AmqpMetadataLimits::default())
-            .expect("a bounded reply must decode");
+        let envelope = decode_delivery(
+            &properties,
+            b"{}",
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
+        )
+        .expect("a bounded reply must decode");
         assert_eq!(envelope.header(REQUEST_ID_HEADER), Some("request-1"));
     }
 
@@ -212,7 +228,7 @@ mod tests {
         };
         assert!(
             matches!(
-                decode_delivery(&properties, b"{}", limits),
+                decode_delivery(&properties, b"{}", limits, RequiredEnvelopeFields::Lenient),
                 Err(BusError::MetadataLimitExceeded {
                     limit: hexeract_bus::MetadataLimit::HeaderCount,
                     actual: 1,
@@ -220,6 +236,30 @@ mod tests {
                 })
             ),
             "an oversized reply must fail decoding, never reach RequestRegistry::resolve"
+        );
+    }
+
+    #[test]
+    fn the_reply_inbox_inherits_the_configured_mode() {
+        let properties = reply_properties([(REQUEST_ID_HEADER, "request-1")]);
+
+        let err = decode_delivery(
+            &properties,
+            b"{}",
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Strict,
+        )
+        .expect_err("a strict policy must reach the reply inbox decoder too");
+        assert!(
+            matches!(
+                err,
+                BusError::EnvelopeSecurity(
+                    hexeract_bus::EnvelopeSecurityError::MissingRequiredField {
+                        field: "message_id"
+                    }
+                )
+            ),
+            "expected EnvelopeSecurity(MissingRequiredField), got {err:?}"
         );
     }
 }

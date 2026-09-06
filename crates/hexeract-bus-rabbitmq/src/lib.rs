@@ -28,6 +28,8 @@
 pub(crate) mod confirm;
 /// Bounded reconnect loop around a `lapin` connection.
 pub mod connection;
+/// Application-facing surface for envelope signing and verification material.
+pub mod envelope_security;
 /// Bounded AMQP metadata codec shared by the transport, worker and reply inbox.
 pub mod metadata;
 /// Per-publisher pool of `lapin` channels.
@@ -49,6 +51,8 @@ pub mod worker;
 pub use connection::RabbitMqConnection;
 pub use connection::RabbitMqConnectionConfig;
 pub use connection::redact_uri;
+pub use envelope_security::InboundEnvelopeSecurity;
+pub use envelope_security::OutboundEnvelopeSecurity;
 pub use lapin::tcp::OwnedIdentity;
 pub use lapin::tcp::OwnedTLSConfig;
 pub use metadata::AmqpMetadataLimits;
@@ -68,6 +72,7 @@ pub use topology::declare_exchange;
 pub use topology::declare_queue;
 pub use topology::ensure_topology;
 pub use transport::RabbitMqTransport;
+pub use transport::RabbitMqTransportConfig;
 pub use worker::AckMode;
 pub use worker::RabbitMqWorker;
 pub use worker::RabbitMqWorkerBuilder;

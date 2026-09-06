@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -139,6 +140,50 @@ pub trait SigningKeySource: Send + Sync {
     fn current_signing_key(&self) -> Result<(KeyId, &SigningKeyHandle), KeySourceError>;
 }
 
+/// Shares one verification key source across several transports without a
+/// type parameter contagious to their public API.
+///
+/// A transport that stores its key source directly as `S: VerificationKeySource`
+/// forces every struct that holds it, and every struct that holds *that*
+/// struct, to carry `S` as a generic parameter. Erasing the source behind
+/// `Arc<dyn VerificationKeySource>` stops the propagation, and this impl is
+/// what lets an `Arc` stand in for the source itself: `?Sized` is required
+/// because `dyn VerificationKeySource` is unsized, so a bound of plain `T:
+/// VerificationKeySource` would silently exclude trait objects and only
+/// forward for a concrete, sized source.
+#[async_trait]
+impl<T> VerificationKeySource for Arc<T>
+where
+    T: VerificationKeySource + ?Sized,
+{
+    async fn verification_key(
+        &self,
+        issuer: &Issuer,
+        key_id: &KeyId,
+    ) -> Result<VerificationKey, KeySourceError> {
+        (**self).verification_key(issuer, key_id).await
+    }
+
+    async fn refresh(&self) -> Result<(), KeySourceError> {
+        (**self).refresh().await
+    }
+}
+
+/// Shares one signing key source across several transports without a type
+/// parameter contagious to their public API.
+///
+/// Mirrors the `Arc<T>` implementation of [`VerificationKeySource`] above,
+/// for the same reason: `?Sized` lets `Arc<dyn SigningKeySource>` satisfy
+/// this trait, not only `Arc` of a concrete, sized source.
+impl<T> SigningKeySource for Arc<T>
+where
+    T: SigningKeySource + ?Sized,
+{
+    fn current_signing_key(&self) -> Result<(KeyId, &SigningKeyHandle), KeySourceError> {
+        (**self).current_signing_key()
+    }
+}
+
 #[derive(Debug)]
 enum KeyState {
     Active(VerificationKey),
@@ -240,6 +285,8 @@ impl StaticKeySourceBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use ed25519_dalek::SigningKey;
 
     use super::*;
@@ -374,6 +421,93 @@ mod tests {
             .expect("a signing key is configured");
 
         assert_eq!(announced, key_id);
+    }
+
+    #[tokio::test]
+    async fn arc_of_static_key_source_resolves_the_same_key() {
+        let issuer = Issuer::new("billing-service").expect("valid issuer");
+        let key_id = KeyId::new("2026-09").expect("valid key id");
+        let shared = Arc::new(source());
+
+        let key = shared
+            .verification_key(&issuer, &key_id)
+            .await
+            .expect("the arc must resolve the same key as the bare source");
+
+        assert_eq!(
+            key.as_verifying_key(),
+            source()
+                .verification_key(&issuer, &key_id)
+                .await
+                .expect("bare source resolves too")
+                .as_verifying_key()
+        );
+    }
+
+    /// Accepts any [`VerificationKeySource`], including a trait object
+    /// wrapped in an [`Arc`]. Compiling this call is the assertion: without
+    /// `?Sized` on `impl<T> VerificationKeySource for Arc<T>`,
+    /// `Arc<dyn VerificationKeySource>` does not satisfy the bound `S:
+    /// VerificationKeySource` and this file fails to compile.
+    fn accepts<S: VerificationKeySource>(_source: S) {}
+
+    #[test]
+    fn arc_of_trait_object_is_a_verification_key_source() {
+        let boxed: Arc<dyn VerificationKeySource> = Arc::new(source());
+
+        accepts(boxed);
+    }
+
+    #[test]
+    fn arc_of_signing_source_hands_back_the_same_key_id() {
+        fn accepts_signing<S: SigningKeySource>(_source: S) {}
+
+        let key_id = KeyId::new("2026-09").expect("valid key id");
+        let source = StaticKeySource::builder()
+            .with_signing_key(key_id.clone(), SigningKeyHandle::from(signing_key(1)))
+            .build();
+        let shared: Arc<dyn SigningKeySource> = Arc::new(source);
+
+        let (announced, _handle) = shared
+            .current_signing_key()
+            .expect("the arc must hand back the configured signing key");
+
+        assert_eq!(announced, key_id);
+        accepts_signing(shared);
+    }
+
+    /// Counts calls to [`VerificationKeySource::refresh`] so a test can prove
+    /// the call actually reached the wrapped source, rather than an
+    /// implementation of `Arc<T>`'s impl that returns `Ok(())` without
+    /// delegating to `T`.
+    #[derive(Default)]
+    struct CountingRefreshSource {
+        refresh_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl VerificationKeySource for CountingRefreshSource {
+        async fn verification_key(
+            &self,
+            _issuer: &Issuer,
+            _key_id: &KeyId,
+        ) -> Result<VerificationKey, KeySourceError> {
+            Err(KeySourceError::UnknownKey)
+        }
+
+        async fn refresh(&self) -> Result<(), KeySourceError> {
+            self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn arc_refresh_reaches_the_inner_source() {
+        let shared = Arc::new(CountingRefreshSource::default());
+
+        shared.refresh().await.expect("refresh must succeed");
+
+        assert_eq!(shared.refresh_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

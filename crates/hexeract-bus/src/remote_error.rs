@@ -16,7 +16,8 @@ use crate::BusError;
 pub enum RemoteErrorType {
     /// The responder failed while handling the request.
     Internal,
-    /// The request could not be decoded, or its payload was rejected.
+    /// The request could not be decoded, its payload was rejected, or its
+    /// envelope failed signature verification.
     Malformed,
     /// A connection or transport failure occurred, or the request could
     /// not be routed to any queue.
@@ -37,7 +38,8 @@ impl RemoteErrorType {
             | BusError::InvalidMetadata { .. }
             | BusError::Serialization(_)
             | BusError::TypeMismatch { .. }
-            | BusError::PayloadTooLarge { .. } => Self::Malformed,
+            | BusError::PayloadTooLarge { .. }
+            | BusError::EnvelopeSecurity(_) => Self::Malformed,
             BusError::Connection { .. } | BusError::Transport(_) | BusError::Unroutable { .. } => {
                 Self::Unavailable
             }

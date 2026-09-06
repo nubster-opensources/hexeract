@@ -24,6 +24,27 @@ pub enum VerificationPolicy {
     AllowInsecureUnauthenticatedEnvelopes,
 }
 
+impl VerificationPolicy {
+    /// Whether this policy accepts an envelope that carries no signature.
+    ///
+    /// The match below carries no wildcard arm on purpose: this type is
+    /// `#[non_exhaustive]`, so only this crate, the owner of the enum, can
+    /// ever make the match exhaustive. A consumer crate matching on
+    /// [`VerificationPolicy`] cannot do the same and is forced into a
+    /// catch-all whose side it must guess; deciding that side here, once,
+    /// removes the guess. Adding a variant to this enum therefore breaks
+    /// this function's compilation until someone states explicitly whether
+    /// the new policy lets an unauthenticated envelope through, which is the
+    /// property this method exists to pin down.
+    #[must_use]
+    pub fn allows_unauthenticated_envelopes(self) -> bool {
+        match self {
+            Self::Required => false,
+            Self::AllowInsecureUnauthenticatedEnvelopes => true,
+        }
+    }
+}
+
 /// Envelope security settings of one consumer.
 #[derive(Debug, Clone)]
 pub struct EnvelopeSecurityConfig {
@@ -150,6 +171,19 @@ mod tests {
     #[test]
     fn verification_is_required_by_default() {
         assert_eq!(VerificationPolicy::default(), VerificationPolicy::Required);
+    }
+
+    #[test]
+    fn a_required_policy_refuses_unauthenticated_envelopes() {
+        assert!(!VerificationPolicy::Required.allows_unauthenticated_envelopes());
+    }
+
+    #[test]
+    fn the_named_opt_out_allows_unauthenticated_envelopes() {
+        assert!(
+            VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes
+                .allows_unauthenticated_envelopes()
+        );
     }
 
     #[test]

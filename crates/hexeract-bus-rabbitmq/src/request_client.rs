@@ -45,6 +45,7 @@ use crate::connection::{
 use crate::metadata::AmqpMetadataLimits;
 use crate::reply_inbox::{declare_reply_inbox, run_reply_inbox_with_limits};
 use crate::transport::RabbitMqTransport;
+use crate::worker::RequiredEnvelopeFields;
 
 /// Maximum time spent closing a connection from a failed reply-inbox setup.
 ///
@@ -309,6 +310,7 @@ fn spawn_reply_inbox_supervisor(
                     Arc::clone(&run_registry),
                     cancel,
                     metadata_limits,
+                    RequiredEnvelopeFields::default(),
                 )
             },
             move |cancel| {
