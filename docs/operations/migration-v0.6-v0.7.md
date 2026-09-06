@@ -111,10 +111,10 @@ downstream consumer that routes on a header must tolerate its absence.
 
 ## Envelope authenticity on the RabbitMQ transport
 
-Signing and verification are now wired into the publish and consume paths.
-Nothing changes for a deployment that configures neither: publishing stays
-unsigned, delivery stays unverified, and the worker keeps minting a fresh
-`message_id`, `correlation_id` or `published_at` when a producer omits one.
+Signing and verification are now wired into the transport. Nothing changes for
+a deployment that configures neither: publishing stays unsigned, delivery stays
+unverified, and the worker keeps minting a fresh `message_id`, `correlation_id`
+or `published_at` when a producer omits one.
 
 Enabling it changes three things you must plan for.
 
@@ -153,9 +153,14 @@ carrying **no** signature while still rejecting one whose signature is present
 and wrong. That is the migration setting, and it is deliberately not a way to
 ignore a bad signature.
 
+**What a rejection does.** A rejected delivery is never requeued. Its
+dead-letter copy is republished with an empty field table, so a downstream
+consumer that routes on a header must tolerate its absence, and without the
+AMQP `user-id` property, which the broker validates against the republishing
+connection rather than treating as descriptive metadata.
+
 **What this does not give you.** The payload is not encrypted: a hostile broker
 still reads every message. Replaying an authentic, unmodified message is not
-prevented. A handler cannot yet learn who signed the message it received,
-because the verified principal is not exposed to `HandlerContext`. And the
-request-reply path is not covered here: a reply still travels unsigned and
-unverified.
+prevented. And a handler still cannot learn who signed the message it received,
+because the verified principal is not yet exposed to `HandlerContext`. Envelope
+security decides what reaches a handler, not what the handler knows.

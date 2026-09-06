@@ -54,7 +54,7 @@ use crate::connection::RabbitMqConnection;
 use crate::envelope_security::InboundEnvelopeSecurity;
 use crate::metadata::AmqpMetadataLimits;
 use crate::metadata::decode_headers;
-use crate::metadata::is_metadata_error;
+use crate::metadata::needs_sanitized_quarantine;
 use crate::reply_publisher::RabbitMqReplyPublisher;
 use crate::transport::RabbitMqTransport;
 use crate::transport::to_short_string;
@@ -423,9 +423,11 @@ impl RabbitMqWorkerBuilder {
     /// The reply is published through a dedicated [`RabbitMqReplyPublisher`],
     /// built internally from `transport`'s connection, which ALWAYS targets
     /// the AMQP default exchange. `transport`'s own exchange is not used for
-    /// replies; it only sources the connection and pool size. This confines
-    /// a caller-supplied `reply_to` to the default exchange regardless of
-    /// how the responder's application transport is configured.
+    /// replies; it only sources the connection, the pool size and the
+    /// outbound envelope security. This confines a caller-supplied
+    /// `reply_to` to the default exchange regardless of how the responder's
+    /// application transport is configured, while still signing every reply
+    /// exactly as `transport` signs its own publishes.
     ///
     /// Registering twice for the same `R::MESSAGE_TYPE` silently replaces
     /// the previous entry, same as [`Self::register_handler`].
@@ -455,9 +457,11 @@ impl RabbitMqWorkerBuilder {
     /// The reply is published through a dedicated [`RabbitMqReplyPublisher`],
     /// built internally from `transport`'s connection, which ALWAYS targets
     /// the AMQP default exchange. `transport`'s own exchange is not used for
-    /// replies; it only sources the connection and pool size. This confines
-    /// a caller-supplied `reply_to` to the default exchange regardless of
-    /// how the responder's application transport is configured.
+    /// replies; it only sources the connection, the pool size and the
+    /// outbound envelope security. This confines a caller-supplied
+    /// `reply_to` to the default exchange regardless of how the responder's
+    /// application transport is configured, while still signing every reply
+    /// exactly as `transport` signs its own publishes.
     ///
     /// Registering twice for the same `R::MESSAGE_TYPE` silently replaces
     /// the previous entry, same as [`Self::register_handler`].
@@ -465,7 +469,7 @@ impl RabbitMqWorkerBuilder {
     #[allow(
         clippy::needless_pass_by_value,
         reason = "the Arc<RabbitMqTransport> mirrors register_request_handler and only its \
-                  connection and pool size are read here"
+                  connection, pool size and outbound envelope security are read here"
     )]
     pub fn register_request_handler_with_counters<R, H>(
         mut self,
@@ -480,6 +484,7 @@ impl RabbitMqWorkerBuilder {
         let replies = Arc::new(RabbitMqReplyPublisher::new(
             transport.pool().connection().clone(),
             transport.pool().max_size(),
+            transport.outbound_envelope_security(),
         ));
         let erased: Arc<dyn ErasedHandler> = Arc::new(
             RepliedHandler::<R, H, RabbitMqReplyPublisher>::with_counters(
@@ -839,10 +844,29 @@ impl RabbitMqWorker {
     /// rerouted envelope as a success. `ack` runs only once verification has
     /// passed, and its own failure still stops [`Self::dispatch`] short of
     /// the handler, matching the settle-before-handler contract.
+    ///
+    /// `observed_user_id` is the delivery's AMQP `user-id` property, read by
+    /// the caller before this call: this function is deliberately never
+    /// handed the `Delivery` itself, only the one property it needs, so a
+    /// reviewer can see from the signature alone that nothing else about the
+    /// delivery feeds this decision. When a principal was actually verified
+    /// (`Some`, never true when `envelope_security` is `None` or the policy
+    /// accepted an unsigned envelope) and `observed_user_id` is present, the
+    /// two identities must agree, or the delivery is rejected exactly like a
+    /// signature failure: a broker-authenticated connection publishing as one
+    /// user while presenting a signature from another is not a case this
+    /// worker can tell apart from a forgery. An absent `user-id` is never a
+    /// rejection; the property is optional, and a producer that never sets it
+    /// is unaffected. This check runs here, before the [`AckMode::AckOnReceive`]
+    /// settle-before-handler branch below, for the same reason the signature
+    /// check itself does: it is still establishing the producer's identity,
+    /// and nothing that settles a delivery as a success may run before that
+    /// identity is established.
     async fn verify_before_settlement<A, AF, R, RF>(
         envelope_security: Option<&InboundEnvelopeSecurity>,
         envelope: &hexeract_bus::BusEnvelope,
         destination: &str,
+        observed_user_id: Option<&str>,
         ack_on_receive: bool,
         ack: A,
         reject: R,
@@ -860,6 +884,14 @@ impl RabbitMqWorker {
                 Err(err) => return ControlFlow::Break(reject(err).await),
             },
         };
+
+        if let (Some(principal), Some(user_id)) = (&principal, observed_user_id)
+            && principal.issuer().as_str() != user_id
+        {
+            return ControlFlow::Break(
+                reject(hexeract_bus::EnvelopeSecurityError::BrokerUserMismatch).await,
+            );
+        }
 
         if ack_on_receive {
             let disposition = ack().await;
@@ -888,10 +920,16 @@ impl RabbitMqWorker {
         // forged or rerouted envelope is never acknowledged as a success
         // under AckMode::AckOnReceive; see Self::verify_before_settlement.
         let ack_on_receive = matches!(self.config.ack_mode, AckMode::AckOnReceive);
+        let observed_user_id = delivery
+            .properties
+            .user_id()
+            .as_ref()
+            .map(ShortString::as_str);
         let verification = Self::verify_before_settlement(
             self.config.envelope_security.as_deref(),
             &envelope,
             delivery.routing_key.as_str(),
+            observed_user_id,
             ack_on_receive,
             || async {
                 let ack = channel
@@ -1256,8 +1294,8 @@ impl RabbitMqWorker {
     }
 
     /// Settle a delivery that failed to decode into an envelope: an
-    /// oversize payload, a missing AMQP `type` property, or any other
-    /// decode failure.
+    /// oversize payload, a missing AMQP `type` property, a rejected
+    /// envelope signature, or any other decode or verification failure.
     ///
     /// When `dead_letter_routing_key` is configured the raw delivery is
     /// routed to the dead-letter queue through the same mandatory,
@@ -1276,20 +1314,21 @@ impl RabbitMqWorker {
     ) -> DeliveryDisposition {
         let dead_letter = self.config.dead_letter_routing_key.as_deref();
         // The error itself carries only a reason and sizes, never a header key
-        // or value, so logging it cannot echo the metadata that was refused.
-        let sanitize_metadata = is_metadata_error(err);
-        tracing::warn!(
-            delivery_tag = delivery.delivery_tag,
-            error = %err,
-            dead_letter = dead_letter.is_some(),
-            sanitized_metadata = sanitize_metadata,
-            "rabbitmq delivery failed to decode before dispatch"
+        // or value, a signature or a payload, so logging it cannot echo
+        // whatever the worker just refused.
+        let needs_sanitized_copy = needs_sanitized_quarantine(err);
+        log_poison_rejection(
+            delivery.delivery_tag,
+            err,
+            dead_letter.is_some(),
+            needs_sanitized_copy,
         );
 
-        // A metadata violation is quarantined with rebuilt properties; every
-        // other poison delivery keeps its original properties as before.
+        // A metadata violation or an envelope-security rejection is
+        // quarantined with rebuilt properties; every other poison delivery
+        // keeps its original properties as before.
         let quarantine_properties = || {
-            if sanitize_metadata {
+            if needs_sanitized_copy {
                 properties_without_headers(&delivery.properties)
             } else {
                 delivery.properties.clone()
@@ -1546,14 +1585,56 @@ impl RabbitMqWorker {
     }
 }
 
+/// Log a poison delivery's rejection at the point it is settled.
+///
+/// Split out of [`RabbitMqWorker::handle_poison`] so the log line's field set
+/// is unit-testable without a live `Channel`: `err` is the only field whose
+/// content this worker did not choose itself, and every
+/// [`BusError`] variant that reaches here (in particular
+/// [`BusError::EnvelopeSecurity`]) renders a reason and, at most, bounded
+/// sizes or identifiers, never a header key, a header value, a signature, a
+/// signing key or a payload. Everything else logged is a size or a
+/// caller-controlled flag, not data read from the delivery.
+fn log_poison_rejection(
+    delivery_tag: u64,
+    err: &BusError,
+    dead_letter: bool,
+    needs_sanitized_copy: bool,
+) {
+    tracing::warn!(
+        delivery_tag,
+        error = %err,
+        dead_letter,
+        sanitized_metadata = needs_sanitized_copy,
+        "rabbitmq delivery failed to decode before dispatch"
+    );
+}
+
 /// Rebuild `properties` with an empty field table, keeping the bounded core
 /// AMQP fields a quarantined message still needs to be diagnosed and routed.
 ///
-/// Used for the dead-letter copy of a delivery rejected for its metadata.
-/// Cloning the original properties would republish the very field table the
-/// worker just refused, handing the sender a way to place unbounded metadata
-/// in the dead-letter queue and in whatever consumes it. Every field copied
-/// here is a bounded scalar the AMQP frame itself constrains.
+/// Used for the dead-letter copy of a delivery rejected for its metadata or
+/// its envelope signature (see [`needs_sanitized_quarantine`]). Cloning the
+/// original properties would republish the very field table the worker just
+/// refused, handing the sender a way to place unbounded or unauthenticated
+/// metadata in the dead-letter queue and in whatever consumes it. Every field
+/// copied here is a bounded scalar the AMQP frame itself constrains.
+///
+/// `user-id` is deliberately never copied, unlike every other field here.
+/// The test for inclusion in this function is not only "is this field
+/// bounded in size", it is also "does republishing this field commit this
+/// worker's own connection to anything the broker will enforce". Every field
+/// above is descriptive: a broker never rejects a republish because
+/// `message-id` or `content-type` has a particular value. `user-id` is not
+/// descriptive, it is an assertion the broker checks on every `basic.publish`:
+/// the connecting client must be authenticated as exactly that user, or the
+/// broker closes the channel with `PRECONDITION_FAILED`. The worker
+/// republishing a quarantine copy authenticates as itself, not as whatever
+/// issuer signed (or claimed to sign) the original envelope, so carrying
+/// `user-id` forward would make the dead-letter publish fail precisely when
+/// this function exists to handle it: a delivery whose signed issuer does not
+/// match its `user-id` is exactly what the envelope-security rejection this
+/// function serves is for.
 ///
 /// The broker's own `x-death` history goes with the rest of the table, so a
 /// quarantined copy replayed from the dead-letter queue starts its retry count
@@ -1592,9 +1673,6 @@ fn properties_without_headers(properties: &BasicProperties) -> BasicProperties {
     }
     if let Some(kind) = properties.kind() {
         rebuilt = rebuilt.with_type(kind.clone());
-    }
-    if let Some(user_id) = properties.user_id() {
-        rebuilt = rebuilt.with_user_id(user_id.clone());
     }
     if let Some(app_id) = properties.app_id() {
         rebuilt = rebuilt.with_app_id(app_id.clone());
@@ -1701,7 +1779,7 @@ pub(crate) enum RequiredEnvelopeFields {
 /// it at all: minting a fresh `message_id`, `correlation_id` or
 /// `published_at` for such a delivery is harmless, since there is no
 /// signature left for a minted value to invalidate.
-fn derive_required_envelope_fields(
+pub(crate) fn derive_required_envelope_fields(
     envelope_security: Option<&InboundEnvelopeSecurity>,
 ) -> RequiredEnvelopeFields {
     match envelope_security {
@@ -1898,6 +1976,8 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
 
+    use tracing_test::traced_test;
+
     use super::*;
 
     #[test]
@@ -2050,20 +2130,27 @@ mod tests {
     }
 
     #[test]
-    fn metadata_errors_are_recognized_and_others_are_not() {
-        assert!(is_metadata_error(&BusError::ReservedHeaderNamespace));
-        assert!(is_metadata_error(&BusError::MetadataLimitExceeded {
-            limit: hexeract_bus::MetadataLimit::TotalBytes,
-            actual: 1,
-            max: 0,
-        }));
-        assert!(is_metadata_error(&BusError::InvalidMetadata {
+    fn deliveries_needing_sanitized_quarantine_are_recognized_and_others_are_not() {
+        assert!(needs_sanitized_quarantine(
+            &BusError::ReservedHeaderNamespace
+        ));
+        assert!(needs_sanitized_quarantine(
+            &BusError::MetadataLimitExceeded {
+                limit: hexeract_bus::MetadataLimit::TotalBytes,
+                actual: 1,
+                max: 0,
+            }
+        ));
+        assert!(needs_sanitized_quarantine(&BusError::InvalidMetadata {
             reason: hexeract_bus::InvalidMetadataReason::NonUtf8LongString,
         }));
-        assert!(!is_metadata_error(&BusError::InvalidTopology {
+        assert!(needs_sanitized_quarantine(&BusError::EnvelopeSecurity(
+            hexeract_bus::EnvelopeSecurityError::SignatureMismatch
+        )));
+        assert!(!needs_sanitized_quarantine(&BusError::InvalidTopology {
             reason: "unrelated".to_owned(),
         }));
-        assert!(!is_metadata_error(&BusError::PayloadTooLarge {
+        assert!(!needs_sanitized_quarantine(&BusError::PayloadTooLarge {
             size: 2,
             max: 1
         }));
@@ -2097,6 +2184,56 @@ mod tests {
             headers.inner().is_empty(),
             "the rejected field table must be rebuilt, never cloned"
         );
+    }
+
+    #[test]
+    fn a_quarantined_copy_carries_no_user_id() {
+        // An implementation that copies `user_id` like every other core
+        // field would pass every assertion above: none of them look at it.
+        // This is the field the broker itself enforces on republish, so it
+        // is the one core field a quarantine copy must never carry forward.
+        let original = properties_with_headers([("tenant", "acme")])
+            .with_user_id("billing-service".into())
+            .with_message_id("11111111-1111-1111-1111-111111111111".into());
+
+        let sanitized = properties_without_headers(&original);
+
+        assert_eq!(
+            sanitized.user_id(),
+            &None,
+            "the worker republishes a quarantine copy under its own broker \
+             identity; forwarding the original `user-id` would make that \
+             republish fail with PRECONDITION_FAILED whenever it disagrees"
+        );
+        assert_eq!(
+            sanitized.message_id(),
+            original.message_id(),
+            "removing user_id must not disturb the other preserved fields"
+        );
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_rejection_log_carries_no_key_no_signature_no_payload_no_header_value() {
+        // Stand-ins for the four kinds of content a rejection log must never
+        // carry. None of them is ever passed to `log_poison_rejection`, so
+        // this test also guards the call site in `handle_poison`: a future
+        // edit that started forwarding `delivery.data` or
+        // `delivery.properties.headers()` into the log would be caught here
+        // even though this function's own signature never changed.
+        const SIGNING_KEY_MARKER: &str = "ed25519-signing-key-3f9a";
+        const SIGNATURE_MARKER: &str = "MEUCIQDsomeBase64UrlSafeSignatureValue";
+        const PAYLOAD_MARKER: &str = "{\"card_number\":\"4111111111111111\"}";
+        const HEADER_VALUE_MARKER: &str = "tenant-confidential-value";
+
+        let err =
+            BusError::EnvelopeSecurity(hexeract_bus::EnvelopeSecurityError::SignatureMismatch);
+        log_poison_rejection(7, &err, false, true);
+
+        assert!(!logs_contain(SIGNING_KEY_MARKER));
+        assert!(!logs_contain(SIGNATURE_MARKER));
+        assert!(!logs_contain(PAYLOAD_MARKER));
+        assert!(!logs_contain(HEADER_VALUE_MARKER));
     }
 
     #[test]
@@ -3110,10 +3247,16 @@ mod tests {
         /// when `verify_before_settlement` resolves to `ControlFlow::Continue`,
         /// exactly as `Self::dispatch` only reaches `self.handlers.get(...)`
         /// in that case.
+        #[expect(
+            clippy::too_many_arguments,
+            reason = "mirrors verify_before_settlement's own parameter list plus the test's \
+                      handler-call counter; splitting it would not make either side clearer"
+        )]
         async fn dispatch_like<A, AF, R, RF>(
             envelope_security: Option<&InboundEnvelopeSecurity>,
             envelope: &BusEnvelope,
             destination: &str,
+            observed_user_id: Option<&str>,
             ack_on_receive: bool,
             ack: A,
             reject: R,
@@ -3129,6 +3272,7 @@ mod tests {
                 envelope_security,
                 envelope,
                 destination,
+                observed_user_id,
                 ack_on_receive,
                 ack,
                 reject,
@@ -3158,6 +3302,7 @@ mod tests {
                 Some(&security),
                 &envelope,
                 ANNOUNCED_DESTINATION,
+                None,
                 true,
                 || async { noop_ack() },
                 |err| {
@@ -3194,6 +3339,7 @@ mod tests {
                 Some(&security),
                 &envelope,
                 REROUTED_DESTINATION,
+                None,
                 true,
                 || async { noop_ack() },
                 |err| {
@@ -3235,6 +3381,7 @@ mod tests {
                 Some(&security),
                 &envelope,
                 ANNOUNCED_DESTINATION,
+                None,
                 true,
                 || async {
                     ack_called.store(true, Ordering::SeqCst);
@@ -3266,6 +3413,7 @@ mod tests {
                 Some(&security),
                 &envelope,
                 ANNOUNCED_DESTINATION,
+                None,
                 true,
                 || async {
                     ack_called.store(true, Ordering::SeqCst);
@@ -3304,6 +3452,7 @@ mod tests {
                 Some(&security),
                 &envelope,
                 ANNOUNCED_DESTINATION,
+                None,
                 true,
                 || async {
                     ack_called.store(true, Ordering::SeqCst);
@@ -3335,6 +3484,7 @@ mod tests {
                 Some(&security),
                 &envelope,
                 ANNOUNCED_DESTINATION,
+                None,
                 true,
                 || async {
                     ack_called.store(true, Ordering::SeqCst);
@@ -3378,6 +3528,7 @@ mod tests {
                 None,
                 &envelope,
                 ANNOUNCED_DESTINATION,
+                None,
                 true,
                 || async {
                     ack_called.store(true, Ordering::SeqCst);
@@ -3396,6 +3547,148 @@ mod tests {
                 0,
                 "an unconfigured worker must never consult a verification key source"
             );
+        }
+
+        // ----------------------------------------------------- user-id checks
+
+        #[tokio::test]
+        async fn a_mismatched_user_id_is_rejected() {
+            // An implementation that never looks at `observed_user_id` would
+            // pass every test above and this one would catch it: the
+            // envelope is validly signed, so only the user-id comparison can
+            // explain a rejection here.
+            let security = required_security();
+            let envelope = signed_envelope(ANNOUNCED_DESTINATION);
+            let handler_calls = AtomicUsize::new(0);
+            let ack_called = AtomicBool::new(false);
+            let reject_error = std::sync::Mutex::new(None);
+
+            let disposition = dispatch_like(
+                Some(&security),
+                &envelope,
+                ANNOUNCED_DESTINATION,
+                Some("someone-else"),
+                true,
+                || async {
+                    ack_called.store(true, Ordering::SeqCst);
+                    noop_ack()
+                },
+                |err| {
+                    *reject_error.lock().expect("lock") = Some(err);
+                    async { DeliveryDisposition::LeftForRedelivery }
+                },
+                &handler_calls,
+            )
+            .await;
+
+            assert_eq!(disposition, DeliveryDisposition::LeftForRedelivery);
+            assert_eq!(
+                handler_calls.load(Ordering::SeqCst),
+                0,
+                "a delivery whose user-id disagrees with the verified issuer must never \
+                 reach the handler"
+            );
+            assert!(
+                !ack_called.load(Ordering::SeqCst),
+                "the mismatch must be caught before the ack-on-receive settle"
+            );
+            assert!(matches!(
+                *reject_error.lock().expect("lock"),
+                Some(EnvelopeSecurityError::BrokerUserMismatch)
+            ));
+        }
+
+        #[tokio::test]
+        async fn an_absent_user_id_is_not_a_rejection() {
+            // The symmetric case: an implementation that rejected as soon as
+            // a principal exists, regardless of whether `user-id` was even
+            // present, would fail here while passing the mismatch test above.
+            let security = required_security();
+            let envelope = signed_envelope(ANNOUNCED_DESTINATION);
+            let handler_calls = AtomicUsize::new(0);
+            let ack_called = AtomicBool::new(false);
+
+            let disposition = dispatch_like(
+                Some(&security),
+                &envelope,
+                ANNOUNCED_DESTINATION,
+                None,
+                true,
+                || async {
+                    ack_called.store(true, Ordering::SeqCst);
+                    noop_ack()
+                },
+                |_err| async { DeliveryDisposition::LeftForRedelivery },
+                &handler_calls,
+            )
+            .await;
+
+            assert_eq!(disposition, DeliveryDisposition::Settled);
+            assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+            assert!(ack_called.load(Ordering::SeqCst));
+        }
+
+        #[tokio::test]
+        async fn a_matching_user_id_passes() {
+            // Without this test, an implementation that rejected every
+            // present `user-id` (matching or not) would still pass the two
+            // tests above.
+            let security = required_security();
+            let envelope = signed_envelope(ANNOUNCED_DESTINATION);
+            let handler_calls = AtomicUsize::new(0);
+            let ack_called = AtomicBool::new(false);
+
+            let disposition = dispatch_like(
+                Some(&security),
+                &envelope,
+                ANNOUNCED_DESTINATION,
+                Some(issuer().as_str()),
+                true,
+                || async {
+                    ack_called.store(true, Ordering::SeqCst);
+                    noop_ack()
+                },
+                |_err| async { DeliveryDisposition::LeftForRedelivery },
+                &handler_calls,
+            )
+            .await;
+
+            assert_eq!(disposition, DeliveryDisposition::Settled);
+            assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+            assert!(ack_called.load(Ordering::SeqCst));
+        }
+
+        #[tokio::test]
+        async fn a_user_id_is_ignored_without_a_verified_principal() {
+            // The check only ever compares against a principal a signature
+            // was actually checked against. An unsigned envelope accepted
+            // under the derogation never establishes one, so a `user-id`
+            // that would mismatch any real issuer must still pass here: an
+            // implementation that compared against, say, an empty issuer
+            // would reject this and fail the derogation's own contract.
+            let security = derogation_security();
+            let envelope = unsigned_envelope();
+            let handler_calls = AtomicUsize::new(0);
+            let ack_called = AtomicBool::new(false);
+
+            let disposition = dispatch_like(
+                Some(&security),
+                &envelope,
+                ANNOUNCED_DESTINATION,
+                Some("someone-else"),
+                true,
+                || async {
+                    ack_called.store(true, Ordering::SeqCst);
+                    noop_ack()
+                },
+                |_err| async { DeliveryDisposition::LeftForRedelivery },
+                &handler_calls,
+            )
+            .await;
+
+            assert_eq!(disposition, DeliveryDisposition::Settled);
+            assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+            assert!(ack_called.load(Ordering::SeqCst));
         }
     }
 }
