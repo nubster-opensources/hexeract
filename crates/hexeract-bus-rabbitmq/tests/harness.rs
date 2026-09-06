@@ -275,3 +275,34 @@ pub(crate) async fn publish_to_default_exchange(
         .await
         .expect("publish confirmation must resolve");
 }
+
+/// Publish `payload` to `routing_key` on the default exchange, using
+/// `properties` exactly as given.
+///
+/// Lower-level than [`publish_to_default_exchange`]: that helper always
+/// derives the AMQP properties from a [`BusEnvelope`]'s own fields, which
+/// cannot represent a foreign producer that signs for one destination and
+/// publishes on another, omits the signature headers entirely, or tampers
+/// with the payload after signing it. This is the extension point for
+/// exactly that: the caller builds `properties` by hand, security headers
+/// forged, mismatched or omitted at will, and picks `routing_key`
+/// independently of whatever destination those headers, if any, claim.
+pub(crate) async fn publish_with_properties(
+    channel: &Channel,
+    routing_key: &str,
+    properties: BasicProperties,
+    payload: &[u8],
+) {
+    channel
+        .basic_publish(
+            ShortString::from(""),
+            ShortString::from(routing_key),
+            BasicPublishOptions::default(),
+            payload,
+            properties,
+        )
+        .await
+        .expect("publish must succeed")
+        .await
+        .expect("publish confirmation must resolve");
+}
