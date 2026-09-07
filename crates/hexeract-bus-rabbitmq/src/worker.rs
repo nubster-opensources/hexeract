@@ -1956,6 +1956,14 @@ pub(crate) fn delivery_to_envelope(
 /// accepted by an explicit exception is not the same posture as a consumer that
 /// asks no question at all, and a handler that refuses the first should be able
 /// to say so.
+///
+/// A principal always wins, including in the combination that cannot happen
+/// today: with no configured security no verification runs, so no principal is
+/// ever produced. That branch honours the principal instead of asserting the
+/// impossibility, because a dispatch path must not abort a delivery over an
+/// inconsistency it can survive. Should a later change to
+/// `verify_before_settlement` ever yield one, the message is authenticated on
+/// the strength of a signature that was genuinely checked.
 pub(crate) fn authentication_from_verification(
     envelope_security: Option<&InboundEnvelopeSecurity>,
     principal: Option<&VerifiedPrincipal>,
