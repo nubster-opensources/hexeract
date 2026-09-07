@@ -6,8 +6,9 @@ use crate::ids::{CorrelationId, MessageId};
 /// Contextual information injected into every handler invocation.
 ///
 /// The context carries the identifiers of the in-flight message, a
-/// [`CancellationToken`] for cooperative cancellation, and the active
-/// [`tracing::Span`] for distributed tracing propagation.
+/// [`CancellationToken`] for cooperative cancellation, the active
+/// [`tracing::Span`] for distributed tracing propagation, and what the
+/// transport established about the publisher the message came from.
 ///
 /// This structure is marked as `#[non_exhaustive]`, a breaking change
 /// introduced in this version. Literal struct construction is no longer
