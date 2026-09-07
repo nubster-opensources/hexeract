@@ -1234,6 +1234,62 @@ async fn a_waived_unsigned_envelope_is_reported_as_waived_not_unenforced() {
     let _ = handle.await;
 }
 
+/// A worker with no envelope security configured at all: the handler still
+/// runs, and must observe [`PublisherAuthentication::NotEnforced`].
+///
+/// Distinct from [`a_waived_unsigned_envelope_is_reported_as_waived_not_unenforced`]
+/// in the one detail that matters here: this worker's builder never calls
+/// `.envelope_security(...)`, so the observed value must come from the
+/// wiring's own default rather than from anything a test wrote in as an
+/// argument. Whether the published envelope carries a signature is
+/// irrelevant, since nothing on the receiving side ever looks at it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn a_worker_without_envelope_security_reports_nothing_enforced() {
+    let broker = harness::start_rabbitmq().await;
+    let queue_name = "envelope-security.publisher-identity.not-enforced";
+    declare_temporary_queue(broker.uri(), queue_name).await;
+
+    let seen = Arc::new(AtomicUsize::new(0));
+    let observed_authentication = Arc::new(Mutex::new(None));
+    let worker =
+        RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
+            .queue(queue_name)
+            .register_handler::<OrderPlaced, _>(AuthenticationRecordingHandler {
+                seen: Arc::clone(&seen),
+                observed_authentication: Arc::clone(&observed_authentication),
+            })
+            .build()
+            .unwrap();
+    let cancel = CancellationToken::new();
+    let worker_cancel = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(worker_cancel).await });
+
+    let publisher = RabbitMqConnection::connect(broker.uri()).await.unwrap();
+    let publisher_channel = publisher.create_channel().await.unwrap();
+
+    let message_id = Uuid::now_v7();
+    let correlation_id = Uuid::now_v7();
+    let published_at = SystemTime::now();
+    let properties = properties_for(message_id, correlation_id, published_at, None);
+    harness::publish_with_properties(&publisher_channel, queue_name, properties, FIXTURE_PAYLOAD)
+        .await;
+
+    wait_until_at_least(&seen, 1, 60).await;
+    assert_eq!(
+        observed_authentication
+            .lock()
+            .expect("not poisoned")
+            .as_ref(),
+        Some(&PublisherAuthentication::NotEnforced),
+        "a worker with no envelope security configured at all must report that nothing is \
+         enforced, not the waiver a derogation would produce"
+    );
+
+    cancel.cancel();
+    let _ = handle.await;
+}
+
 // -------------------------------------------------- 10. authenticated RPC
 
 #[derive(Debug, Serialize, Deserialize)]
