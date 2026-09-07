@@ -9,10 +9,13 @@ use crate::ids::{CorrelationId, MessageId};
 /// [`CancellationToken`] for cooperative cancellation, and the active
 /// [`tracing::Span`] for distributed tracing propagation.
 ///
-/// This structure is marked as `#[non_exhaustive]` to allow adding new
-/// fields without breaking existing code. Direct struct construction
-/// is not possible from outside this crate; use [`HandlerContext::new`]
+/// This structure is marked as `#[non_exhaustive]`, a breaking change
+/// introduced in this version. Direct struct construction from literal
+/// is not possible from outside this crate: use [`HandlerContext::new`]
 /// and builder methods like [`HandlerContext::with_authentication`] instead.
+/// Exhaustive pattern matching is also closed: destructuring patterns
+/// must use a trailing `..` wildcard to remain forward compatible with
+/// future fields.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct HandlerContext {
@@ -28,6 +31,10 @@ pub struct HandlerContext {
     ///
     /// `NotEnforced` on a context the framework did not fill in, which
     /// includes every context an application builds in its own unit tests.
+    /// The value is only valid as a claim when set by code that has
+    /// actually verified the identity; setting `Authenticated` without
+    /// cryptographic proof creates a false assertion that downstream
+    /// handlers may rely upon.
     pub authentication: PublisherAuthentication,
 }
 
@@ -85,7 +92,7 @@ impl HandlerContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::authentication::{PublisherAuthentication, PublisherIdentity};
+    use crate::authentication::PublisherIdentity;
 
     #[test]
     fn new_context_is_not_cancelled() {
