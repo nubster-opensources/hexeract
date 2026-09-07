@@ -10,10 +10,12 @@ use crate::deadline::LocalDeadline;
 /// application code never constructs one except in its own unit tests,
 /// through [`RequestContext::new`].
 ///
-/// Derives `Debug` because every field does today. The day a field carrying
-/// a secret is added (`#444`'s authenticated principal is the expected
-/// first one), it must not fall into the derived output unexamined: switch
-/// to a manual `impl Debug` that redacts that field instead.
+/// Derives `Debug` because every field does today, including the borrowed
+/// [`HandlerContext`]. `#444`'s authenticated principal did not land as a
+/// field of this struct: a handler reads it on that borrowed context, as
+/// `ctx.handler.authentication`. The derive stays justified there too,
+/// since what it exposes is an issuer, the kind of identity logs already
+/// carry, not a secret.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct RequestContext<'a> {
