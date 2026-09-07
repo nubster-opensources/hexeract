@@ -26,6 +26,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -44,9 +45,13 @@ use hexeract_bus::Issuer;
 use hexeract_bus::KeyId;
 use hexeract_bus::KeySourceError;
 use hexeract_bus::Message;
+use hexeract_bus::ReplyInboxState;
 use hexeract_bus::Request;
+use hexeract_bus::RequestClient;
+use hexeract_bus::RequestClientSupervisor;
 use hexeract_bus::RequestContext;
 use hexeract_bus::RequestHandler;
+use hexeract_bus::RequestRegistry;
 use hexeract_bus::SecurityHeaders;
 use hexeract_bus::SigningContext;
 use hexeract_bus::SigningKeyHandle;
@@ -63,7 +68,10 @@ use hexeract_bus_rabbitmq::RabbitMqRequestClientConfigBuilder;
 use hexeract_bus_rabbitmq::RabbitMqTransport;
 use hexeract_bus_rabbitmq::RabbitMqWorkerBuilder;
 use hexeract_bus_rabbitmq::connect_request_client_with_config;
+use hexeract_bus_rabbitmq::declare_reply_inbox_for_test;
+use hexeract_bus_rabbitmq::run_reply_inbox_for_test;
 use hexeract_core::HandlerContext;
+use hexeract_core::PublisherAuthentication;
 use lapin::BasicProperties;
 use lapin::Channel;
 use lapin::Connection;
@@ -95,24 +103,54 @@ impl Message for OrderPlaced {
 /// the routing key it is published on, never this payload.
 const FIXTURE_PAYLOAD: &[u8] = b"{\"order_id\":\"00000000-0000-0000-0000-000000000001\"}";
 
-/// Handler that counts how many envelopes actually reached it.
+/// Handler that counts how many envelopes actually reached it, and records
+/// the issuer of whichever signature the transport actually verified.
 ///
 /// Every negative scenario in this file needs a way to observe that a
-/// forged delivery never reached a typed handler at all; this is that
-/// observation point, shared by every worker built below.
+/// forged delivery never reached a typed handler at all; the counter is
+/// that observation point, shared by every worker built below. The recorded
+/// issuer serves a different purpose, exercised only by the tests further
+/// down that prove a handler learns the publisher identity a real signature
+/// established, never a value the test itself wrote on both sides.
 #[derive(Debug, Default)]
 struct RecordingHandler {
     seen: Arc<AtomicUsize>,
+    observed_issuer: Arc<Mutex<Option<String>>>,
 }
 
 impl Handler<OrderPlaced> for RecordingHandler {
     type Error = BusError;
 
-    async fn handle(
-        &self,
-        _message: OrderPlaced,
-        _ctx: &HandlerContext,
-    ) -> Result<(), Self::Error> {
+    async fn handle(&self, _message: OrderPlaced, ctx: &HandlerContext) -> Result<(), Self::Error> {
+        if let PublisherAuthentication::Authenticated(identity) = &ctx.authentication {
+            *self.observed_issuer.lock().expect("not poisoned") =
+                Some(identity.issuer().to_owned());
+        }
+        self.seen.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Handler that records the exact [`PublisherAuthentication`] variant a
+/// delivery carried, whichever one it turns out to be.
+///
+/// Distinct from [`RecordingHandler`], which only cares about the issuer
+/// behind [`PublisherAuthentication::Authenticated`]: the derogation test
+/// below must also tell [`PublisherAuthentication::WaivedUnsigned`] apart
+/// from [`PublisherAuthentication::NotEnforced`], a distinction no
+/// issuer-only observation could make.
+#[derive(Debug, Default)]
+struct AuthenticationRecordingHandler {
+    seen: Arc<AtomicUsize>,
+    observed_authentication: Arc<Mutex<Option<PublisherAuthentication>>>,
+}
+
+impl Handler<OrderPlaced> for AuthenticationRecordingHandler {
+    type Error = BusError;
+
+    async fn handle(&self, _message: OrderPlaced, ctx: &HandlerContext) -> Result<(), Self::Error> {
+        *self.observed_authentication.lock().expect("not poisoned") =
+            Some(ctx.authentication.clone());
         self.seen.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -182,6 +220,65 @@ fn inbound_security_allowing_unsigned() -> Arc<InboundEnvelopeSecurity> {
     );
     let config = EnvelopeSecurityConfig::builder()
         .with_policy(VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes)
+        .with_accepted_audience(audience())
+        .build()
+        .expect("valid configuration");
+    Arc::new(InboundEnvelopeSecurity::new(keys, config))
+}
+
+/// A second issuer, distinct from [`issuer`], signing with its own key.
+///
+/// Exists so [`a_handler_learns_the_second_issuer_that_signed_a_message`] can
+/// prove the observed issuer tracks whichever signature was actually
+/// verified: an implementation that always reported [`issuer`]'s name would
+/// still pass every other test in this file, since none of them publish
+/// under any other issuer.
+fn other_issuer() -> Issuer {
+    Issuer::new("shipping-service").expect("valid issuer")
+}
+
+/// Signing key for [`other_issuer`], distinct from [`signing_key`].
+fn other_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[9; 32])
+}
+
+/// Outbound security signing as [`other_issuer`], for the same [`audience`]
+/// as [`outbound_security`].
+fn other_outbound_security() -> Arc<OutboundEnvelopeSecurity> {
+    let keys: Arc<dyn SigningKeySource> = Arc::new(
+        StaticKeySource::builder()
+            .with_signing_key(key_id(), SigningKeyHandle::from(other_signing_key()))
+            .build(),
+    );
+    Arc::new(OutboundEnvelopeSecurity::new(
+        other_issuer(),
+        audience(),
+        keys,
+    ))
+}
+
+/// Worker-side verification trusting both [`issuer`] and [`other_issuer`].
+///
+/// A dedicated fixture rather than widening [`inbound_security`] itself:
+/// seven other tests in this file build a worker against [`inbound_security`],
+/// and growing the trust of that shared fixture would silently change what
+/// every one of them exercises.
+fn inbound_security_trusting_both_issuers() -> Arc<InboundEnvelopeSecurity> {
+    let keys: Arc<dyn VerificationKeySource> = Arc::new(
+        StaticKeySource::builder()
+            .with_verification_key(
+                issuer(),
+                key_id(),
+                VerificationKey::from(signing_key().verifying_key()),
+            )
+            .with_verification_key(
+                other_issuer(),
+                key_id(),
+                VerificationKey::from(other_signing_key().verifying_key()),
+            )
+            .build(),
+    );
+    let config = EnvelopeSecurityConfig::builder()
         .with_accepted_audience(audience())
         .build()
         .expect("valid configuration");
@@ -503,6 +600,7 @@ async fn a_signed_envelope_survives_a_real_broker_round_trip() {
             .envelope_security(inbound_security())
             .register_handler::<OrderPlaced, _>(RecordingHandler {
                 seen: Arc::clone(&seen),
+                observed_issuer: Arc::new(Mutex::new(None)),
             })
             .build()
             .unwrap();
@@ -538,6 +636,7 @@ async fn a_tampered_payload_never_reaches_the_handler() {
             .envelope_security(inbound_security())
             .register_handler::<OrderPlaced, _>(RecordingHandler {
                 seen: Arc::clone(&seen),
+                observed_issuer: Arc::new(Mutex::new(None)),
             })
             .build()
             .unwrap();
@@ -599,6 +698,7 @@ async fn an_envelope_signed_for_another_audience_is_rejected() {
             .envelope_security(inbound_security())
             .register_handler::<OrderPlaced, _>(RecordingHandler {
                 seen: Arc::clone(&seen),
+                observed_issuer: Arc::new(Mutex::new(None)),
             })
             .build()
             .unwrap();
@@ -644,6 +744,7 @@ async fn an_envelope_published_on_another_routing_key_is_rejected() {
             .envelope_security(inbound_security())
             .register_handler::<OrderPlaced, _>(RecordingHandler {
                 seen: Arc::clone(&seen),
+                observed_issuer: Arc::new(Mutex::new(None)),
             })
             .build()
             .unwrap();
@@ -702,6 +803,7 @@ async fn an_unsigned_envelope_is_rejected_when_the_policy_requires_one() {
             .envelope_security(inbound_security())
             .register_handler::<OrderPlaced, _>(RecordingHandler {
                 seen: Arc::clone(&seen),
+                observed_issuer: Arc::new(Mutex::new(None)),
             })
             .build()
             .unwrap();
@@ -748,6 +850,7 @@ async fn an_unsigned_envelope_is_accepted_under_the_named_derogation() {
             .envelope_security(inbound_security_allowing_unsigned())
             .register_handler::<OrderPlaced, _>(RecordingHandler {
                 seen: Arc::clone(&seen),
+                observed_issuer: Arc::new(Mutex::new(None)),
             })
             .build()
             .unwrap();
@@ -854,6 +957,7 @@ async fn an_unknown_key_triggers_exactly_one_refresh_for_twenty_envelopes() {
             .envelope_security(security)
             .register_handler::<OrderPlaced, _>(RecordingHandler {
                 seen: Arc::clone(&attempts),
+                observed_issuer: Arc::new(Mutex::new(None)),
             })
             .build()
             .unwrap();
@@ -900,6 +1004,7 @@ async fn a_rejected_envelope_lands_in_the_dead_letter_queue_without_its_headers(
             .envelope_security(inbound_security())
             .register_handler::<OrderPlaced, _>(RecordingHandler {
                 seen: Arc::clone(&seen),
+                observed_issuer: Arc::new(Mutex::new(None)),
             })
             .build()
             .unwrap();
@@ -975,7 +1080,161 @@ async fn a_rejected_envelope_lands_in_the_dead_letter_queue_without_its_headers(
     let _ = handle.await;
 }
 
-// -------------------------------------------------- 9. authenticated RPC
+// -------------------------------------------------- 9. handler-observed publisher identity
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn a_handler_learns_which_issuer_signed_the_message_it_received() {
+    let broker = harness::start_rabbitmq().await;
+    let queue_name = "envelope-security.publisher-identity";
+    declare_temporary_queue(broker.uri(), queue_name).await;
+
+    let transport = RabbitMqTransport::new(broker.uri())
+        .await
+        .expect("transport must connect")
+        .with_outbound_envelope_security(outbound_security());
+
+    let envelope = fixture_envelope(Uuid::now_v7(), Uuid::now_v7(), SystemTime::now());
+    transport
+        .publish_envelope(queue_name, &envelope)
+        .await
+        .expect("publish must succeed");
+
+    let seen = Arc::new(AtomicUsize::new(0));
+    let observed_issuer = Arc::new(Mutex::new(None));
+    let worker =
+        RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
+            .queue(queue_name)
+            .envelope_security(inbound_security())
+            .register_handler::<OrderPlaced, _>(RecordingHandler {
+                seen: Arc::clone(&seen),
+                observed_issuer: Arc::clone(&observed_issuer),
+            })
+            .build()
+            .unwrap();
+    let cancel = CancellationToken::new();
+    let worker_cancel = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(worker_cancel).await });
+
+    wait_until_at_least(&seen, 1, 60).await;
+    assert_eq!(
+        observed_issuer.lock().expect("not poisoned").as_deref(),
+        Some("billing-service"),
+        "the handler must learn the issuer the signature was actually checked against, and \
+         nothing in this test writes that value on the handler side"
+    );
+
+    cancel.cancel();
+    let _ = handle.await;
+}
+
+/// Symmetric to [`a_handler_learns_which_issuer_signed_the_message_it_received`]:
+/// without a second issuer signing with its own key, an implementation that
+/// always reported `billing-service` regardless of who actually signed would
+/// still pass the test above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn a_handler_learns_the_second_issuer_that_signed_a_message() {
+    let broker = harness::start_rabbitmq().await;
+    let queue_name = "envelope-security.publisher-identity.second-issuer";
+    declare_temporary_queue(broker.uri(), queue_name).await;
+
+    let transport = RabbitMqTransport::new(broker.uri())
+        .await
+        .expect("transport must connect")
+        .with_outbound_envelope_security(other_outbound_security());
+
+    let envelope = fixture_envelope(Uuid::now_v7(), Uuid::now_v7(), SystemTime::now());
+    transport
+        .publish_envelope(queue_name, &envelope)
+        .await
+        .expect("publish must succeed");
+
+    let seen = Arc::new(AtomicUsize::new(0));
+    let observed_issuer = Arc::new(Mutex::new(None));
+    let worker =
+        RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
+            .queue(queue_name)
+            .envelope_security(inbound_security_trusting_both_issuers())
+            .register_handler::<OrderPlaced, _>(RecordingHandler {
+                seen: Arc::clone(&seen),
+                observed_issuer: Arc::clone(&observed_issuer),
+            })
+            .build()
+            .unwrap();
+    let cancel = CancellationToken::new();
+    let worker_cancel = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(worker_cancel).await });
+
+    wait_until_at_least(&seen, 1, 60).await;
+    assert_eq!(
+        observed_issuer.lock().expect("not poisoned").as_deref(),
+        Some("shipping-service"),
+        "the handler must learn the issuer that actually signed this delivery, not the issuer \
+         some other test in this file happens to sign with"
+    );
+
+    cancel.cancel();
+    let _ = handle.await;
+}
+
+/// A worker under [`VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes`]
+/// receiving an unsigned envelope: the handler still runs, and must observe
+/// [`PublisherAuthentication::WaivedUnsigned`], never
+/// [`PublisherAuthentication::NotEnforced`]. The two look identical from a
+/// handler that only checks "was this signed", yet mean opposite things
+/// operationally: one is a deliberate, logged exception, the other is the
+/// absence of any security configuration at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn a_waived_unsigned_envelope_is_reported_as_waived_not_unenforced() {
+    let broker = harness::start_rabbitmq().await;
+    let queue_name = "envelope-security.publisher-identity.waived";
+    declare_temporary_queue(broker.uri(), queue_name).await;
+
+    let seen = Arc::new(AtomicUsize::new(0));
+    let observed_authentication = Arc::new(Mutex::new(None));
+    let worker =
+        RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
+            .queue(queue_name)
+            .envelope_security(inbound_security_allowing_unsigned())
+            .register_handler::<OrderPlaced, _>(AuthenticationRecordingHandler {
+                seen: Arc::clone(&seen),
+                observed_authentication: Arc::clone(&observed_authentication),
+            })
+            .build()
+            .unwrap();
+    let cancel = CancellationToken::new();
+    let worker_cancel = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(worker_cancel).await });
+
+    let publisher = RabbitMqConnection::connect(broker.uri()).await.unwrap();
+    let publisher_channel = publisher.create_channel().await.unwrap();
+
+    // No signature at all: the derogation accepts the absence of one.
+    let message_id = Uuid::now_v7();
+    let correlation_id = Uuid::now_v7();
+    let published_at = SystemTime::now();
+    let properties = properties_for(message_id, correlation_id, published_at, None);
+    harness::publish_with_properties(&publisher_channel, queue_name, properties, FIXTURE_PAYLOAD)
+        .await;
+
+    wait_until_at_least(&seen, 1, 60).await;
+    assert_eq!(
+        observed_authentication
+            .lock()
+            .expect("not poisoned")
+            .as_ref(),
+        Some(&PublisherAuthentication::WaivedUnsigned),
+        "an unsigned envelope accepted under the named derogation must report the waiver, not \
+         the absence of any security configuration"
+    );
+
+    cancel.cancel();
+    let _ = handle.await;
+}
+
+// -------------------------------------------------- 10. authenticated RPC
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Ping {
@@ -999,13 +1258,21 @@ impl Message for Pong {
     const MESSAGE_TYPE: &'static str = "envelope-security.rpc.pong";
 }
 
-/// Responder that echoes the request's `seq` back in the reply.
-struct Echo;
+/// Responder that echoes the request's `seq` back in the reply, and records
+/// the issuer of whichever signature the transport actually verified on the
+/// inbound request.
+struct Echo {
+    observed_issuer: Arc<Mutex<Option<String>>>,
+}
 
 impl RequestHandler<Ping> for Echo {
     type Error = BusError;
 
-    async fn handle(&self, request: Ping, _ctx: &RequestContext<'_>) -> Result<Pong, BusError> {
+    async fn handle(&self, request: Ping, ctx: &RequestContext<'_>) -> Result<Pong, BusError> {
+        if let PublisherAuthentication::Authenticated(identity) = &ctx.handler.authentication {
+            *self.observed_issuer.lock().expect("not poisoned") =
+                Some(identity.issuer().to_owned());
+        }
         Ok(Pong { seq: request.seq })
     }
 }
@@ -1044,7 +1311,12 @@ async fn a_signed_reply_survives_the_request_reply_path() {
     let worker =
         RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
             .queue(queue_name)
-            .register_request_handler::<Ping, _>(Echo, Arc::clone(&responder_transport))
+            .register_request_handler::<Ping, _>(
+                Echo {
+                    observed_issuer: Arc::new(Mutex::new(None)),
+                },
+                Arc::clone(&responder_transport),
+            )
             .build()
             .unwrap();
     let worker_cancel = cancel.clone();
@@ -1085,4 +1357,87 @@ async fn a_signed_reply_survives_the_request_reply_path() {
 
     cancel.cancel();
     let _ = worker_handle.await;
+}
+
+/// The request/reply mirror of
+/// [`a_handler_learns_which_issuer_signed_the_message_it_received`].
+///
+/// `RepliedHandler` builds its `RequestContext` by borrowing the very
+/// `HandlerContext` the worker already verified the inbound request
+/// against, rather than reconstructing one, so this path carries the
+/// verified publisher identity without a single line of `hexeract-bus`
+/// having changed for it. This test would fail if a future change ever
+/// rebuilt that context instead of borrowing it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn a_request_handler_learns_which_issuer_signed_the_request_it_received() {
+    let broker = harness::start_rabbitmq().await;
+    let cancel = CancellationToken::new();
+    let queue_name = "envelope-security.rpc.ping";
+    declare_temporary_queue(broker.uri(), queue_name).await;
+
+    let observed_issuer = Arc::new(Mutex::new(None));
+    let responder_transport = Arc::new(
+        RabbitMqTransport::new(broker.uri())
+            .await
+            .expect("responder transport must connect"),
+    );
+    let worker =
+        RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
+            .queue(queue_name)
+            .envelope_security(inbound_security())
+            .register_request_handler::<Ping, _>(
+                Echo {
+                    observed_issuer: Arc::clone(&observed_issuer),
+                },
+                Arc::clone(&responder_transport),
+            )
+            .build()
+            .unwrap();
+    let worker_cancel = cancel.clone();
+    let worker_handle = tokio::spawn(async move { worker.run(worker_cancel).await });
+
+    let registry = Arc::new(RequestRegistry::default());
+    let inbox_connection = RabbitMqConnection::connect(broker.uri()).await.unwrap();
+    let inbox_channel = inbox_connection.create_channel().await.unwrap();
+    let inbox = declare_reply_inbox_for_test(&inbox_channel).await.unwrap();
+    let reply_inbox = Arc::new(Mutex::new(ReplyInboxState::Ready(inbox.clone())));
+    let inbox_cancel = cancel.clone();
+    let inbox_registry = Arc::clone(&registry);
+    let inbox_name = inbox.clone();
+    let inbox_handle = tokio::spawn(async move {
+        let _ =
+            run_reply_inbox_for_test(inbox_channel, inbox_name, inbox_registry, inbox_cancel).await;
+    });
+
+    let publisher_transport = Arc::new(
+        RabbitMqTransport::new(broker.uri())
+            .await
+            .expect("publisher transport must connect")
+            .with_outbound_envelope_security(outbound_security()),
+    );
+    let client = RequestClient::new(
+        publisher_transport,
+        registry,
+        reply_inbox,
+        Duration::from_secs(10),
+        RequestClientSupervisor::detached(cancel.clone()),
+    );
+
+    let pong = client
+        .request(Ping { seq: 77 })
+        .await
+        .expect("the signed request must reach the handler and its reply must resolve");
+    assert_eq!(pong.seq, 77);
+
+    assert_eq!(
+        observed_issuer.lock().expect("not poisoned").as_deref(),
+        Some("billing-service"),
+        "the responder must learn the issuer whose signature it actually verified on the \
+         inbound request, and nothing in this test writes that value on the responder side"
+    );
+
+    cancel.cancel();
+    let _ = worker_handle.await;
+    let _ = inbox_handle.await;
 }
