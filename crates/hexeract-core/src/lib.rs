@@ -9,6 +9,8 @@
 //! primitives, the unified [`HexeractError`] type, and the
 //! [`HandlerRegistration`] metadata collected by the `#[handler]` macro.
 
+/// Publisher identity as established by the transport.
+pub mod authentication;
 /// Marker trait for messages expressing the intent to mutate state.
 pub mod command;
 /// Contextual information propagated into every handler invocation.
@@ -32,6 +34,7 @@ pub mod query;
 /// `#[handler]` macro.
 pub mod registration;
 
+pub use authentication::{PublisherAuthentication, PublisherIdentity};
 pub use command::Command;
 pub use context::HandlerContext;
 pub use envelope::MessageEnvelope;

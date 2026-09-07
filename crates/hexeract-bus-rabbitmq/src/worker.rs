@@ -28,9 +28,12 @@ use hexeract_bus::ResponderCounters;
 use hexeract_bus::TypedHandler;
 #[cfg(test)]
 use hexeract_bus::VerificationPolicy;
+use hexeract_bus::VerifiedPrincipal;
 use hexeract_core::CorrelationId;
 use hexeract_core::HandlerContext;
 use hexeract_core::MessageId;
+use hexeract_core::PublisherAuthentication;
+use hexeract_core::PublisherIdentity;
 use lapin::BasicProperties;
 use lapin::Channel;
 use lapin::message::Delivery;
@@ -953,19 +956,24 @@ impl RabbitMqWorker {
         )
         .await;
 
-        match verification {
+        let authentication = match verification {
             ControlFlow::Break(disposition) => return disposition,
-            ControlFlow::Continue(Some(principal)) => {
-                tracing::debug!(
-                    issuer = %principal.issuer(),
-                    key_id = %principal.key_id(),
-                    "inbound envelope verified"
-                );
+            ControlFlow::Continue(principal) => {
+                if let Some(principal) = &principal {
+                    tracing::debug!(
+                        issuer = %principal.issuer(),
+                        key_id = %principal.key_id(),
+                        "inbound envelope verified"
+                    );
+                }
+                authentication_from_verification(
+                    self.config.envelope_security.as_deref(),
+                    principal.as_ref(),
+                )
             }
-            ControlFlow::Continue(None) => {}
-        }
+        };
 
-        let ctx = build_handler_context(&envelope);
+        let ctx = build_handler_context(&envelope, authentication);
         let outcome = match self.handlers.get(envelope.message_type.as_str()) {
             Some(handler) => AssertUnwindSafe(handler.handle(&envelope, &ctx))
                 .catch_unwind()
@@ -1942,6 +1950,33 @@ pub(crate) fn delivery_to_envelope(
     ))
 }
 
+/// Turn the outcome of a verification into what a handler will read.
+///
+/// The waiver and the absence of security are kept apart: an unsigned envelope
+/// accepted by an explicit exception is not the same posture as a consumer that
+/// asks no question at all, and a handler that refuses the first should be able
+/// to say so.
+///
+/// A principal always wins, including in the combination that cannot happen
+/// today: with no configured security no verification runs, so no principal is
+/// ever produced. That branch honours the principal instead of asserting the
+/// impossibility, because a dispatch path must not abort a delivery over an
+/// inconsistency it can survive. Should a later change to
+/// `verify_before_settlement` ever yield one, the message is authenticated on
+/// the strength of a signature that was genuinely checked.
+pub(crate) fn authentication_from_verification(
+    envelope_security: Option<&InboundEnvelopeSecurity>,
+    principal: Option<&VerifiedPrincipal>,
+) -> PublisherAuthentication {
+    match (envelope_security, principal) {
+        (_, Some(principal)) => {
+            PublisherAuthentication::Authenticated(PublisherIdentity::from(principal))
+        }
+        (Some(_), None) => PublisherAuthentication::WaivedUnsigned,
+        (None, None) => PublisherAuthentication::NotEnforced,
+    }
+}
+
 /// Build the handler context from an already-decoded envelope.
 ///
 /// Deriving the IDs from the envelope (rather than re-parsing the AMQP
@@ -1950,11 +1985,15 @@ pub(crate) fn delivery_to_envelope(
 /// delivery: re-parsing minted a second, different random UUID whenever
 /// a property was absent, breaking correlation between handler logs and
 /// envelope-derived logs.
-pub(crate) fn build_handler_context(envelope: &hexeract_bus::BusEnvelope) -> HandlerContext {
+pub(crate) fn build_handler_context(
+    envelope: &hexeract_bus::BusEnvelope,
+    authentication: PublisherAuthentication,
+) -> HandlerContext {
     HandlerContext::new(
         MessageId::from(envelope.message_id),
         CorrelationId::from(envelope.correlation_id),
     )
+    .with_authentication(authentication)
 }
 
 fn panic_message(payload: &Box<dyn Any + Send>) -> String {
@@ -2394,7 +2433,7 @@ mod tests {
             RequiredEnvelopeFields::Lenient,
         )
         .expect("must decode");
-        let ctx = build_handler_context(&envelope);
+        let ctx = build_handler_context(&envelope, PublisherAuthentication::NotEnforced);
         assert_eq!(*ctx.message_id.as_uuid(), envelope.message_id);
         assert_eq!(*ctx.correlation_id.as_uuid(), envelope.correlation_id);
     }
@@ -2566,7 +2605,7 @@ mod tests {
             RequiredEnvelopeFields::Lenient,
         )
         .expect("must decode");
-        let ctx = build_handler_context(&envelope);
+        let ctx = build_handler_context(&envelope, PublisherAuthentication::NotEnforced);
         assert_eq!(*ctx.message_id.as_uuid(), message_id);
         assert_eq!(*ctx.correlation_id.as_uuid(), correlation_id);
     }
@@ -2582,7 +2621,7 @@ mod tests {
             RequiredEnvelopeFields::Lenient,
         )
         .expect("must decode");
-        let ctx = build_handler_context(&envelope);
+        let ctx = build_handler_context(&envelope, PublisherAuthentication::NotEnforced);
         assert_ne!(*ctx.message_id.as_uuid(), Uuid::nil());
         assert_ne!(*ctx.correlation_id.as_uuid(), Uuid::nil());
     }
@@ -3689,6 +3728,40 @@ mod tests {
             assert_eq!(disposition, DeliveryDisposition::Settled);
             assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
             assert!(ack_called.load(Ordering::SeqCst));
+        }
+
+        #[test]
+        fn no_configured_security_enforces_nothing() {
+            assert_eq!(
+                authentication_from_verification(None, None),
+                PublisherAuthentication::NotEnforced
+            );
+        }
+
+        #[test]
+        fn configured_security_without_a_principal_is_a_waiver() {
+            let security = derogation_security();
+            assert_eq!(
+                authentication_from_verification(Some(&security), None),
+                PublisherAuthentication::WaivedUnsigned
+            );
+        }
+
+        #[tokio::test]
+        async fn a_principal_becomes_an_authenticated_publisher() {
+            let security = required_security();
+            let envelope = signed_envelope(ANNOUNCED_DESTINATION);
+            let principal = security
+                .verify(&envelope, ANNOUNCED_DESTINATION)
+                .await
+                .expect("a correctly signed envelope must verify")
+                .expect("a signed envelope must yield a principal");
+            match authentication_from_verification(Some(&security), Some(&principal)) {
+                PublisherAuthentication::Authenticated(identity) => {
+                    assert_eq!(identity.issuer(), "billing-service");
+                }
+                other => panic!("expected an authenticated publisher, got {other:?}"),
+            }
         }
     }
 }
