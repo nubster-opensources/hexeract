@@ -1,7 +1,8 @@
 //! Publisher identity established by a successful verification.
 
-use super::identity::{Audience, Issuer, KeyId, SignatureAlgorithm};
 use hexeract_core::PublisherIdentity;
+
+use super::identity::{Audience, Issuer, KeyId, SignatureAlgorithm};
 
 /// Identity of the publisher of a verified envelope.
 ///
