@@ -685,11 +685,14 @@ mod tests {
     use std::time::Duration;
 
     use hexeract_bus::{
-        Audience, EnvelopeSecurityConfig, ReplyExpectation, StaticKeySource, VerificationPolicy,
+        Audience, EnvelopeSecurityConfig, Issuer, ReplyExpectation, SigningKeySource,
+        StaticKeySource, VerificationPolicy,
     };
     use hexeract_core::RequestId;
     use lapin::tcp::OwnedTLSConfig;
     use tokio::sync::Notify;
+
+    use crate::envelope_security::OutboundEnvelopeSecurity;
 
     use super::*;
 
@@ -758,6 +761,40 @@ mod tests {
             .build()
             .envelope_security
             .expect("the builder was handed an envelope security");
+
+        assert!(Arc::ptr_eq(&security, &carried));
+    }
+
+    #[test]
+    fn an_untouched_builder_yields_no_outbound_envelope_security() {
+        assert!(
+            RabbitMqRequestClientConfigBuilder::new()
+                .build()
+                .outbound_envelope_security
+                .is_none()
+        );
+    }
+
+    /// The symmetric half of the test above. Without it, a setter that
+    /// dropped its argument on the floor would still leave an untouched
+    /// builder yielding `None`, and the pair is what pins the field down:
+    /// absent by default, and exactly the value the caller handed over once
+    /// set. `Arc::ptr_eq` rather than a value comparison, because what
+    /// matters is that the client signs with the very key source the caller
+    /// configured, never with an equal-looking copy.
+    #[test]
+    fn the_builder_carries_the_configured_outbound_envelope_security_into_the_config() {
+        let security = Arc::new(OutboundEnvelopeSecurity::new(
+            Issuer::new("billing-service").expect("valid issuer"),
+            Audience::new("ledger-service").expect("valid audience"),
+            Arc::new(StaticKeySource::builder().build()) as Arc<dyn SigningKeySource>,
+        ));
+
+        let carried = RabbitMqRequestClientConfigBuilder::new()
+            .outbound_envelope_security(Arc::clone(&security))
+            .build()
+            .outbound_envelope_security
+            .expect("the builder was handed an outbound envelope security");
 
         assert!(Arc::ptr_eq(&security, &carried));
     }
