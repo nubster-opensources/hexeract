@@ -1,5 +1,6 @@
 use tokio_util::sync::CancellationToken;
 
+use crate::authentication::PublisherAuthentication;
 use crate::ids::{CorrelationId, MessageId};
 
 /// Contextual information injected into every handler invocation.
@@ -7,7 +8,13 @@ use crate::ids::{CorrelationId, MessageId};
 /// The context carries the identifiers of the in-flight message, a
 /// [`CancellationToken`] for cooperative cancellation, and the active
 /// [`tracing::Span`] for distributed tracing propagation.
+///
+/// This structure is marked as `#[non_exhaustive]` to allow adding new
+/// fields without breaking existing code. Direct struct construction
+/// is not possible from outside this crate; use [`HandlerContext::new`]
+/// and builder methods like [`HandlerContext::with_authentication`] instead.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct HandlerContext {
     /// Unique identifier of this specific message instance.
     pub message_id: MessageId,
@@ -17,13 +24,19 @@ pub struct HandlerContext {
     pub cancellation: CancellationToken,
     /// Active tracing span at the time of dispatch.
     pub span: tracing::Span,
+    /// What the transport established about the publisher of this message.
+    ///
+    /// `NotEnforced` on a context the framework did not fill in, which
+    /// includes every context an application builds in its own unit tests.
+    pub authentication: PublisherAuthentication,
 }
 
 impl HandlerContext {
     /// Creates a new context for the given message identifiers.
     ///
     /// The [`CancellationToken`] is fresh (not yet cancelled) and the span is
-    /// captured from the current tracing context.
+    /// captured from the current tracing context. The authentication is
+    /// initialized to [`PublisherAuthentication::NotEnforced`].
     #[must_use]
     pub fn new(message_id: MessageId, correlation_id: CorrelationId) -> Self {
         Self {
@@ -31,6 +44,7 @@ impl HandlerContext {
             correlation_id,
             cancellation: CancellationToken::new(),
             span: tracing::Span::current(),
+            authentication: PublisherAuthentication::NotEnforced,
         }
     }
 
@@ -50,6 +64,17 @@ impl HandlerContext {
         self
     }
 
+    /// Attaches what the transport established about the publisher.
+    ///
+    /// Separate from [`HandlerContext::new`] so that adding it breaks no
+    /// existing caller. Only the code that has just verified a signature has
+    /// any business calling this on the dispatch path.
+    #[must_use]
+    pub fn with_authentication(mut self, authentication: PublisherAuthentication) -> Self {
+        self.authentication = authentication;
+        self
+    }
+
     /// Returns `true` if the cancellation token has been cancelled.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
@@ -60,6 +85,7 @@ impl HandlerContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authentication::{PublisherAuthentication, PublisherIdentity};
 
     #[test]
     fn new_context_is_not_cancelled() {
@@ -85,5 +111,37 @@ mod tests {
         let cloned = ctx.clone();
         assert_eq!(ctx.message_id, cloned.message_id);
         assert_eq!(ctx.correlation_id, cloned.correlation_id);
+    }
+
+    #[test]
+    fn a_fresh_context_enforces_nothing() {
+        let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new());
+        assert_eq!(ctx.authentication, PublisherAuthentication::NotEnforced);
+    }
+
+    #[test]
+    fn with_authentication_carries_the_established_identity() {
+        let ctx = HandlerContext::new(MessageId::new(), CorrelationId::new()).with_authentication(
+            PublisherAuthentication::Authenticated(PublisherIdentity::from_verified_issuer(
+                "billing-service",
+            )),
+        );
+        match &ctx.authentication {
+            PublisherAuthentication::Authenticated(identity) => {
+                assert_eq!(identity.issuer(), "billing-service");
+            }
+            other => panic!("expected an authenticated publisher, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_authentication_leaves_the_identifiers_alone() {
+        let message_id = MessageId::new();
+        let correlation_id = CorrelationId::new();
+        let ctx = HandlerContext::new(message_id, correlation_id)
+            .with_authentication(PublisherAuthentication::WaivedUnsigned);
+        assert_eq!(ctx.message_id, message_id);
+        assert_eq!(ctx.correlation_id, correlation_id);
+        assert!(!ctx.is_cancelled());
     }
 }
