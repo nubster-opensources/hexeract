@@ -10,8 +10,8 @@ use crate::ids::{CorrelationId, MessageId};
 /// [`tracing::Span`] for distributed tracing propagation.
 ///
 /// This structure is marked as `#[non_exhaustive]`, a breaking change
-/// introduced in this version. Direct struct construction from literal
-/// is not possible from outside this crate: use [`HandlerContext::new`]
+/// introduced in this version. Literal struct construction is no longer
+/// possible from outside this crate: use [`HandlerContext::new`]
 /// and builder methods like [`HandlerContext::with_authentication`] instead.
 /// Exhaustive pattern matching is also closed: destructuring patterns
 /// must use a trailing `..` wildcard to remain forward compatible with
