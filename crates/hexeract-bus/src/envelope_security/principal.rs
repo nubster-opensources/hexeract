@@ -1,6 +1,7 @@
 //! Publisher identity established by a successful verification.
 
 use super::identity::{Audience, Issuer, KeyId, SignatureAlgorithm};
+use hexeract_core::PublisherIdentity;
 
 /// Identity of the publisher of a verified envelope.
 ///
@@ -90,6 +91,18 @@ impl VerifiedPrincipal {
     }
 }
 
+/// Narrow a verified principal down to what a handler needs to authorize.
+///
+/// Only the issuer crosses into `hexeract-core`. The audience is already
+/// checked by the transport before a handler exists, and the key identifier
+/// and algorithm are signature details the business layer has no reason to
+/// know; the transport logs them.
+impl From<&VerifiedPrincipal> for PublisherIdentity {
+    fn from(principal: &VerifiedPrincipal) -> Self {
+        Self::from_verified_issuer(principal.issuer().as_str())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +124,41 @@ mod tests {
         assert_eq!(principal.audience().as_str(), "ledger-service");
         assert_eq!(principal.key_id().as_str(), "2026-09");
         assert_eq!(principal.algorithm(), SignatureAlgorithm::Ed25519);
+    }
+
+    #[test]
+    fn the_translation_carries_the_issuer() {
+        let principal = VerifiedPrincipal::new(
+            Issuer::new("billing-service").expect("valid issuer"),
+            Audience::new("ledger-service").expect("valid audience"),
+            KeyId::new("2026-09").expect("valid key id"),
+            SignatureAlgorithm::Ed25519,
+        );
+        let identity = PublisherIdentity::from(&principal);
+        assert_eq!(identity.issuer(), "billing-service");
+    }
+
+    #[test]
+    fn the_translation_follows_the_principal_it_is_given() {
+        let billing = VerifiedPrincipal::new(
+            Issuer::new("billing-service").expect("valid issuer"),
+            Audience::new("ledger-service").expect("valid audience"),
+            KeyId::new("2026-09").expect("valid key id"),
+            SignatureAlgorithm::Ed25519,
+        );
+        let shipping = VerifiedPrincipal::new(
+            Issuer::new("shipping-service").expect("valid issuer"),
+            Audience::new("ledger-service").expect("valid audience"),
+            KeyId::new("2026-09").expect("valid key id"),
+            SignatureAlgorithm::Ed25519,
+        );
+        assert_eq!(
+            PublisherIdentity::from(&billing).issuer(),
+            "billing-service"
+        );
+        assert_eq!(
+            PublisherIdentity::from(&shipping).issuer(),
+            "shipping-service"
+        );
     }
 }
