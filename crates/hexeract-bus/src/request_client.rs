@@ -666,7 +666,10 @@ mod tests {
     use super::*;
     use crate::BusError;
     use crate::deadline::{Deadline, DeadlineReading};
+    use crate::envelope_security::identity::{Audience, Issuer, KeyId, SignatureAlgorithm};
+    use crate::envelope_security::principal::VerifiedPrincipal;
     use crate::remote_error::RemoteErrorType;
+    use crate::reply_authentication::ReplyAuthentication;
     use crate::request_options::RequestOptions;
     use crate::request_registry::ReplyCountersSnapshot;
     use crate::rpc_protocol::DEADLINE_HEADER;
@@ -2699,5 +2702,88 @@ mod tests {
             registry.is_closed(),
             "dropping the last remaining handle must close the registry"
         );
+    }
+
+    /// A principal built the same way every authenticated-reply test in this
+    /// module needs one, so the exact identity carried never matters, only
+    /// that it round-trips unchanged from `registry.resolve` to
+    /// `AuthenticatedReply::authentication`.
+    fn principal() -> VerifiedPrincipal {
+        VerifiedPrincipal::new(
+            Issuer::new("billing-service").expect("valid issuer"),
+            Audience::new("ledger-service").expect("valid audience"),
+            KeyId::new("2026-09").expect("valid key id"),
+            SignatureAlgorithm::Ed25519,
+        )
+    }
+
+    /// `RequestClient::request_authenticated` must hand back the exact
+    /// [`ReplyAuthentication`] the resolved reply was given, not merely
+    /// decode its typed payload. Reuses `nominal_round_trip_returns_typed_reply`'s
+    /// setup, publish through a [`CapturingTransport`] client, then
+    /// `registry.resolve(...)` on the identity that call published: a
+    /// degenerate `request_authenticated` that decoded the reply correctly
+    /// but always reported [`ReplyAuthentication::NotEnforced`] regardless
+    /// of what `resolve` was given would still pass every other test in
+    /// this module, since none of them inspect anything beyond the typed
+    /// reply.
+    #[tokio::test(start_paused = true)]
+    async fn request_authenticated_returns_the_authentication_the_resolved_reply_carried() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = client(Arc::clone(&transport), Arc::clone(&registry));
+
+        let request_fut = client.request_authenticated(Ping { seq: 3 });
+        tokio::pin!(request_fut);
+        tokio::select! {
+            _ = &mut request_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let published = transport.last_published().expect("a request was published");
+        let principal = principal();
+
+        registry.resolve(
+            ok_reply(published_request_id(&published), 3),
+            ReplyAuthentication::Authenticated(principal.clone()),
+        );
+
+        let authenticated = request_fut.await.expect("reply");
+        assert_eq!(authenticated.reply(), &Pong { seq: 3 });
+        assert_eq!(
+            authenticated.authentication(),
+            &ReplyAuthentication::Authenticated(principal)
+        );
+    }
+
+    /// `RequestClient::request` still returns the bare typed reply, with the
+    /// exact same signature it had before `request_authenticated` existed.
+    /// This is the non-regression fence for the crate's most-used call:
+    /// without it, nothing in this module would catch a change that widened
+    /// `request`'s return type to also carry a [`ReplyAuthentication`],
+    /// breaking every existing caller of the crate.
+    #[tokio::test(start_paused = true)]
+    async fn request_still_returns_the_bare_reply_with_its_signature_unchanged() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = client(Arc::clone(&transport), Arc::clone(&registry));
+
+        let request_fut = client.request(Ping { seq: 5 });
+        tokio::pin!(request_fut);
+        tokio::select! {
+            _ = &mut request_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let published = transport.last_published().expect("a request was published");
+
+        registry.resolve(
+            ok_reply(published_request_id(&published), 5),
+            ReplyAuthentication::NotEnforced,
+        );
+
+        // The type ascription below is the assertion: `request` must still
+        // resolve to a bare `Pong`, never to a wrapper carrying the
+        // authentication alongside it.
+        let pong: Pong = request_fut.await.expect("reply");
+        assert_eq!(pong, Pong { seq: 5 });
     }
 }

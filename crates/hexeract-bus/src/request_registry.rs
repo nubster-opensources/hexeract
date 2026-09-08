@@ -349,8 +349,25 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::envelope_security::identity::{Audience, Issuer, KeyId, SignatureAlgorithm};
+    use crate::envelope_security::principal::VerifiedPrincipal;
+    use crate::reply_authentication::ReplyAuthentication;
     use crate::rpc_protocol::REQUEST_ID_HEADER;
     use crate::{BusEnvelope, Message};
+
+    /// A verified principal built the same way every test in this module
+    /// needs one: an issuer, an audience and a key that a real verification
+    /// would have established. The exact values never matter here, only
+    /// that the same principal handed to `resolve` is the one observed
+    /// through `wait()`.
+    fn principal() -> VerifiedPrincipal {
+        VerifiedPrincipal::new(
+            Issuer::new("billing-service").expect("valid issuer"),
+            Audience::new("ledger-service").expect("valid audience"),
+            KeyId::new("2026-09").expect("valid key id"),
+            SignatureAlgorithm::Ed25519,
+        )
+    }
 
     #[derive(Debug, Serialize, Deserialize)]
     struct Pong {
@@ -876,6 +893,137 @@ mod tests {
         assert!(
             registry.is_empty(),
             "the registry must return to zero once every call has completed"
+        );
+    }
+
+    /// A reply resolved with [`ReplyAuthentication::Authenticated`] hands
+    /// that exact principal to the caller waiting on [`PendingReply::wait`].
+    /// A degenerate `resolve` that dropped the authentication and always
+    /// handed back [`ReplyAuthentication::NotEnforced`] would still let
+    /// every reply-routing test above pass, since none of them inspect
+    /// anything beyond the envelope; this is the one that would catch it.
+    #[tokio::test]
+    async fn a_reply_resolved_as_authenticated_hands_the_verified_principal_to_the_waiting_caller()
+    {
+        let registry = Arc::new(RequestRegistry::default());
+        let mut pending = registry
+            .register(RequestId::new(), expectation())
+            .expect("registration succeeds");
+        let request_id = pending.request_id();
+        let principal = principal();
+
+        registry.resolve(
+            tagged(ok_reply(EXPECTED_REPLY), request_id),
+            ReplyAuthentication::Authenticated(principal.clone()),
+        );
+
+        let (envelope, authentication) = pending
+            .wait()
+            .await
+            .expect("the resolved reply must be delivered");
+        assert_eq!(envelope.message_type, EXPECTED_REPLY);
+        assert_eq!(
+            authentication,
+            ReplyAuthentication::Authenticated(principal)
+        );
+    }
+
+    /// A reply resolved with [`ReplyAuthentication::NotEnforced`] hands back
+    /// exactly `NotEnforced`, never [`ReplyAuthentication::WaivedUnsigned`].
+    /// Paired with
+    /// [`a_reply_resolved_as_waived_unsigned_hands_back_waived_unsigned_never_not_enforced`]:
+    /// each asserts exact equality with its own variant rather than merely
+    /// rejecting the other one, because a `resolve` that always handed back
+    /// `NotEnforced` regardless of what it was given would satisfy that
+    /// negative assertion in its twin just as well as this one.
+    #[tokio::test]
+    async fn a_reply_resolved_as_not_enforced_hands_back_not_enforced_never_waived_unsigned() {
+        let registry = Arc::new(RequestRegistry::default());
+        let mut pending = registry
+            .register(RequestId::new(), expectation())
+            .expect("registration succeeds");
+        let request_id = pending.request_id();
+
+        registry.resolve(
+            tagged(ok_reply(EXPECTED_REPLY), request_id),
+            ReplyAuthentication::NotEnforced,
+        );
+
+        let (_envelope, authentication) = pending
+            .wait()
+            .await
+            .expect("the resolved reply must be delivered");
+        assert_eq!(authentication, ReplyAuthentication::NotEnforced);
+    }
+
+    /// A reply resolved with [`ReplyAuthentication::WaivedUnsigned`] hands
+    /// back exactly `WaivedUnsigned`, never
+    /// [`ReplyAuthentication::NotEnforced`]. The symmetric half of
+    /// [`a_reply_resolved_as_not_enforced_hands_back_not_enforced_never_waived_unsigned`]:
+    /// without this test, a `resolve` that always handed back
+    /// `WaivedUnsigned` regardless of what it was given would pass its
+    /// twin's assertion trivially, since that test never checks this
+    /// variant is reachable at all.
+    #[tokio::test]
+    async fn a_reply_resolved_as_waived_unsigned_hands_back_waived_unsigned_never_not_enforced() {
+        let registry = Arc::new(RequestRegistry::default());
+        let mut pending = registry
+            .register(RequestId::new(), expectation())
+            .expect("registration succeeds");
+        let request_id = pending.request_id();
+
+        registry.resolve(
+            tagged(ok_reply(EXPECTED_REPLY), request_id),
+            ReplyAuthentication::WaivedUnsigned,
+        );
+
+        let (_envelope, authentication) = pending
+            .wait()
+            .await
+            .expect("the resolved reply must be delivered");
+        assert_eq!(authentication, ReplyAuthentication::WaivedUnsigned);
+    }
+
+    /// A reply refused by `reply_acceptance` must leave the slot pending and
+    /// emit nothing, exactly as it does today: the authentication passed
+    /// alongside the rejected reply is abandoned with it, never surfacing
+    /// through a later `wait()`. Only the legitimate reply that eventually
+    /// wins may hand its own authentication to the caller.
+    #[tokio::test]
+    async fn a_reply_rejected_by_reply_acceptance_leaves_the_slot_pending_and_drops_its_authentication()
+     {
+        let registry = Arc::new(RequestRegistry::default());
+        let mut pending = registry
+            .register(RequestId::new(), expectation())
+            .expect("registration succeeds");
+        let request_id = pending.request_id();
+
+        registry.resolve(
+            tagged(ok_reply("attacker.reply"), request_id),
+            ReplyAuthentication::Authenticated(principal()),
+        );
+
+        assert_eq!(
+            registry.len(),
+            1,
+            "an invalid reply must leave the slot pending"
+        );
+        assert_eq!(registry.counters().invalid, 1);
+
+        registry.resolve(
+            tagged(ok_reply(EXPECTED_REPLY), request_id),
+            ReplyAuthentication::NotEnforced,
+        );
+
+        let (envelope, authentication) = pending
+            .wait()
+            .await
+            .expect("the legitimate reply must still resolve the slot");
+        assert_eq!(envelope.message_type, EXPECTED_REPLY);
+        assert_eq!(
+            authentication,
+            ReplyAuthentication::NotEnforced,
+            "the legitimate reply's own authentication must win, never the rejected one"
         );
     }
 }
