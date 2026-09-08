@@ -24,6 +24,14 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   `RabbitMqRequestClientConfigBuilder::metadata_limits`; the request-client
   setting reaches the publisher and every reply inbox the supervisor rebuilds
   after a reconnect. (#448)
+- `RabbitMqRequestClientConfigBuilder::outbound_envelope_security`, signing
+  every request the client publishes: the outbound counterpart of
+  `envelope_security`, which only verifies the replies that come back. The
+  value reaches the publisher transport `connect_request_client_with_config`
+  builds internally, so a client signs its requests without giving up the
+  supervised reply inbox that reconnects and re-declares a fresh inbox after
+  a broker loss. Absent by default, in which case a request leaves unsigned
+  exactly as before. (#551)
 
 ### Changed
 

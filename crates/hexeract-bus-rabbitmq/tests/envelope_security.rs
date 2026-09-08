@@ -45,13 +45,10 @@ use hexeract_bus::Issuer;
 use hexeract_bus::KeyId;
 use hexeract_bus::KeySourceError;
 use hexeract_bus::Message;
-use hexeract_bus::ReplyInboxState;
 use hexeract_bus::Request;
-use hexeract_bus::RequestClient;
-use hexeract_bus::RequestClientSupervisor;
 use hexeract_bus::RequestContext;
+use hexeract_bus::RequestError;
 use hexeract_bus::RequestHandler;
-use hexeract_bus::RequestRegistry;
 use hexeract_bus::SecurityHeaders;
 use hexeract_bus::SigningContext;
 use hexeract_bus::SigningKeyHandle;
@@ -68,8 +65,6 @@ use hexeract_bus_rabbitmq::RabbitMqRequestClientConfigBuilder;
 use hexeract_bus_rabbitmq::RabbitMqTransport;
 use hexeract_bus_rabbitmq::RabbitMqWorkerBuilder;
 use hexeract_bus_rabbitmq::connect_request_client_with_config;
-use hexeract_bus_rabbitmq::declare_reply_inbox_for_test;
-use hexeract_bus_rabbitmq::run_reply_inbox_for_test;
 use hexeract_core::HandlerContext;
 use hexeract_core::PublisherAuthentication;
 use lapin::BasicProperties;
@@ -1424,6 +1419,14 @@ async fn a_signed_reply_survives_the_request_reply_path() {
 /// verified publisher identity without a single line of `hexeract-bus`
 /// having changed for it. This test would fail if a future change ever
 /// rebuilt that context instead of borrowing it.
+///
+/// It also proves the other half of the story: the only outbound security
+/// setting reaching this client is
+/// `RabbitMqRequestClientConfigBuilder::outbound_envelope_security`, and the
+/// request the responder receives still verifies. That is only possible if
+/// `connect_request_client_with_config` wires the configured security onto
+/// the transport it builds internally, since this test never touches a
+/// `RabbitMqTransport` directly to attach it by hand.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn a_request_handler_learns_which_issuer_signed_the_request_it_received() {
@@ -1453,32 +1456,17 @@ async fn a_request_handler_learns_which_issuer_signed_the_request_it_received() 
     let worker_cancel = cancel.clone();
     let worker_handle = tokio::spawn(async move { worker.run(worker_cancel).await });
 
-    let registry = Arc::new(RequestRegistry::default());
-    let inbox_connection = RabbitMqConnection::connect(broker.uri()).await.unwrap();
-    let inbox_channel = inbox_connection.create_channel().await.unwrap();
-    let inbox = declare_reply_inbox_for_test(&inbox_channel).await.unwrap();
-    let reply_inbox = Arc::new(Mutex::new(ReplyInboxState::Ready(inbox.clone())));
-    let inbox_cancel = cancel.clone();
-    let inbox_registry = Arc::clone(&registry);
-    let inbox_name = inbox.clone();
-    let inbox_handle = tokio::spawn(async move {
-        let _ =
-            run_reply_inbox_for_test(inbox_channel, inbox_name, inbox_registry, inbox_cancel).await;
-    });
-
-    let publisher_transport = Arc::new(
-        RabbitMqTransport::new(broker.uri())
-            .await
-            .expect("publisher transport must connect")
-            .with_outbound_envelope_security(outbound_security()),
-    );
-    let client = RequestClient::new(
-        publisher_transport,
-        registry,
-        reply_inbox,
+    let client_config = RabbitMqRequestClientConfigBuilder::new()
+        .outbound_envelope_security(outbound_security())
+        .build();
+    let client = connect_request_client_with_config(
+        broker.uri(),
         Duration::from_secs(10),
-        RequestClientSupervisor::detached(cancel.clone()),
-    );
+        cancel.clone(),
+        client_config,
+    )
+    .await
+    .expect("the request client must connect");
 
     let pong = client
         .request(Ping { seq: 77 })
@@ -1495,5 +1483,69 @@ async fn a_request_handler_learns_which_issuer_signed_the_request_it_received() 
 
     cancel.cancel();
     let _ = worker_handle.await;
-    let _ = inbox_handle.await;
+}
+
+/// The symmetric half of
+/// [`a_request_handler_learns_which_issuer_signed_the_request_it_received`].
+///
+/// Without it, that test would be equally satisfied by a permissive
+/// responder accepting every request regardless of any signature, and would
+/// therefore not establish that the signature the responder verified came
+/// from `RabbitMqRequestClientConfigBuilder::outbound_envelope_security`.
+/// This test builds the same client through the same builder, against the
+/// same responder, differing in that one call alone, so that call is
+/// exactly, and only, what the pair measures.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn a_client_built_without_outbound_security_sends_a_request_the_responder_refuses() {
+    let broker = harness::start_rabbitmq().await;
+    let cancel = CancellationToken::new();
+    let queue_name = "envelope-security.rpc.ping";
+    declare_temporary_queue(broker.uri(), queue_name).await;
+
+    let observed_issuer = Arc::new(Mutex::new(None));
+    let responder_transport = Arc::new(
+        RabbitMqTransport::new(broker.uri())
+            .await
+            .expect("responder transport must connect"),
+    );
+    let worker =
+        RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
+            .queue(queue_name)
+            .envelope_security(inbound_security())
+            .register_request_handler::<Ping, _>(
+                Echo {
+                    observed_issuer: Arc::clone(&observed_issuer),
+                },
+                Arc::clone(&responder_transport),
+            )
+            .build()
+            .unwrap();
+    let worker_cancel = cancel.clone();
+    let worker_handle = tokio::spawn(async move { worker.run(worker_cancel).await });
+
+    let client_config = RabbitMqRequestClientConfigBuilder::new().build();
+    let client = connect_request_client_with_config(
+        broker.uri(),
+        Duration::from_secs(3),
+        cancel.clone(),
+        client_config,
+    )
+    .await
+    .expect("the request client must connect");
+
+    let outcome = client.request(Ping { seq: 77 }).await;
+    assert!(
+        matches!(&outcome, Err(RequestError::Timeout(_))),
+        "the responder must refuse an unsigned request before the handler ever runs, leaving \
+         the caller's correlation slot to expire instead of resolve: got {outcome:?}"
+    );
+
+    assert!(
+        observed_issuer.lock().expect("not poisoned").is_none(),
+        "the handler must never run against a request the responder refused"
+    );
+
+    cancel.cancel();
+    let _ = worker_handle.await;
 }

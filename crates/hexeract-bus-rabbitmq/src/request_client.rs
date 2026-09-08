@@ -42,7 +42,7 @@ use tokio_util::sync::CancellationToken;
 use crate::connection::{
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BASE_DELAY, RabbitMqConnection, RabbitMqConnectionConfig,
 };
-use crate::envelope_security::InboundEnvelopeSecurity;
+use crate::envelope_security::{InboundEnvelopeSecurity, OutboundEnvelopeSecurity};
 use crate::metadata::AmqpMetadataLimits;
 use crate::reply_inbox::{declare_reply_inbox, run_reply_inbox_with_limits};
 use crate::transport::RabbitMqTransport;
@@ -108,6 +108,28 @@ pub struct RabbitMqRequestClientConfig {
     /// key-refresh rate limit and is therefore never [`Clone`], while this
     /// config is.
     pub envelope_security: Option<Arc<InboundEnvelopeSecurity>>,
+
+    /// Signing material applied to every request this client publishes.
+    ///
+    /// Covers the outbound leg alone: the request as it travels to the
+    /// responder, its signature bound to the routing key actually targeted
+    /// at publication time. The inbound leg is a separate setting,
+    /// [`Self::envelope_security`], which verifies the reply the responder
+    /// signs. Neither implies the other, so a client may sign without
+    /// verifying, verify without signing, or do both.
+    ///
+    /// `None` (the default) preserves the historical behaviour word for
+    /// word: a request leaves unsigned. A responder configured under
+    /// [`hexeract_bus::VerificationPolicy::Required`] then refuses that
+    /// request before any handler runs and publishes no reply, so the call
+    /// ends in [`hexeract_bus::RequestError::Timeout`] rather than in an
+    /// error naming the signature: the caller learns that nothing answered,
+    /// never why.
+    ///
+    /// Held behind an [`Arc`] because [`OutboundEnvelopeSecurity`] is not
+    /// [`Clone`] while this config is, and so the same signing material can
+    /// back several transports without being duplicated once per key.
+    pub outbound_envelope_security: Option<Arc<OutboundEnvelopeSecurity>>,
 }
 
 impl Default for RabbitMqRequestClientConfig {
@@ -117,6 +139,7 @@ impl Default for RabbitMqRequestClientConfig {
             connection_config: RabbitMqConnectionConfig::default(),
             metadata_limits: AmqpMetadataLimits::default(),
             envelope_security: None,
+            outbound_envelope_security: None,
         }
     }
 }
@@ -177,6 +200,17 @@ impl RabbitMqRequestClientConfigBuilder {
     #[must_use]
     pub fn envelope_security(mut self, security: Arc<InboundEnvelopeSecurity>) -> Self {
         self.config.envelope_security = Some(security);
+        self
+    }
+
+    /// Sign every request this client publishes with `security`.
+    ///
+    /// See [`RabbitMqRequestClientConfig::outbound_envelope_security`] for
+    /// what the signature covers, and for what an unsigned request costs
+    /// against a responder that requires one.
+    #[must_use]
+    pub fn outbound_envelope_security(mut self, security: Arc<OutboundEnvelopeSecurity>) -> Self {
+        self.config.outbound_envelope_security = Some(security);
         self
     }
 
@@ -246,11 +280,13 @@ pub async fn connect_request_client_with_config(
     cancel: CancellationToken,
     config: RabbitMqRequestClientConfig,
 ) -> Result<RequestClient<RabbitMqTransport>, BusError> {
-    let transport = Arc::new(
-        RabbitMqTransport::new_with_config(uri, &config.connection_config)
-            .await?
-            .with_metadata_limits(config.metadata_limits),
-    );
+    let transport = RabbitMqTransport::new_with_config(uri, &config.connection_config)
+        .await?
+        .with_metadata_limits(config.metadata_limits);
+    let transport = Arc::new(match config.outbound_envelope_security {
+        Some(security) => transport.with_outbound_envelope_security(security),
+        None => transport,
+    });
     let registry = Arc::new(RequestRegistry::new(config.max_in_flight));
 
     // Supervised connection for the inbox consumer: NOT the recovering
@@ -685,11 +721,14 @@ mod tests {
     use std::time::Duration;
 
     use hexeract_bus::{
-        Audience, EnvelopeSecurityConfig, ReplyExpectation, StaticKeySource, VerificationPolicy,
+        Audience, EnvelopeSecurityConfig, Issuer, ReplyExpectation, SigningKeySource,
+        StaticKeySource, VerificationPolicy,
     };
     use hexeract_core::RequestId;
     use lapin::tcp::OwnedTLSConfig;
     use tokio::sync::Notify;
+
+    use crate::envelope_security::OutboundEnvelopeSecurity;
 
     use super::*;
 
@@ -758,6 +797,40 @@ mod tests {
             .build()
             .envelope_security
             .expect("the builder was handed an envelope security");
+
+        assert!(Arc::ptr_eq(&security, &carried));
+    }
+
+    #[test]
+    fn an_untouched_builder_yields_no_outbound_envelope_security() {
+        assert!(
+            RabbitMqRequestClientConfigBuilder::new()
+                .build()
+                .outbound_envelope_security
+                .is_none()
+        );
+    }
+
+    /// The symmetric half of the test above. Without it, a setter that
+    /// dropped its argument on the floor would still leave an untouched
+    /// builder yielding `None`, and the pair is what pins the field down:
+    /// absent by default, and exactly the value the caller handed over once
+    /// set. `Arc::ptr_eq` rather than a value comparison, because what
+    /// matters is that the client signs with the very key source the caller
+    /// configured, never with an equal-looking copy.
+    #[test]
+    fn the_builder_carries_the_configured_outbound_envelope_security_into_the_config() {
+        let security = Arc::new(OutboundEnvelopeSecurity::new(
+            Issuer::new("billing-service").expect("valid issuer"),
+            Audience::new("ledger-service").expect("valid audience"),
+            Arc::new(StaticKeySource::builder().build()) as Arc<dyn SigningKeySource>,
+        ));
+
+        let carried = RabbitMqRequestClientConfigBuilder::new()
+            .outbound_envelope_security(Arc::clone(&security))
+            .build()
+            .outbound_envelope_security
+            .expect("the builder was handed an outbound envelope security");
 
         assert!(Arc::ptr_eq(&security, &carried));
     }
