@@ -528,7 +528,7 @@ impl<T: Transport> RequestClient<T> {
         request: R,
         options: RequestOptions,
     ) -> Result<R::Reply, RequestError> {
-        self.request_with_options(request, options)
+        self.request_with_authenticated(request, options)
             .await
             .map(|authenticated| authenticated.into_parts().0)
     }
@@ -558,11 +558,31 @@ impl<T: Transport> RequestClient<T> {
         &self,
         request: R,
     ) -> Result<AuthenticatedReply<R::Reply>, RequestError> {
-        self.request_with_options(request, RequestOptions::default())
+        self.request_with_authenticated(request, RequestOptions::default())
             .await
     }
 
-    async fn request_with_options<R: Request>(
+    /// Send `request` applying `options`, and return the reply alongside
+    /// what this client's transport established about the identity that
+    /// signed it.
+    ///
+    /// The one call that carries both halves. [`Self::request_with`] applies
+    /// `options` but discards the authentication;
+    /// [`Self::request_authenticated`] reports the authentication but always
+    /// on a fresh causal chain, this client's default timeout and
+    /// `R::DESTINATION`. Both are this method with one half thrown away, so a
+    /// caller needing an override *and* the signer's identity, a call to a
+    /// dedicated queue whose reply must be attributed, say, reaches for this
+    /// one.
+    ///
+    /// See [`Self::request_with`] for how `options` resolve against this
+    /// client's defaults, and [`Self::request_authenticated`] for what the
+    /// authentication does and does not establish.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::request_with`].
+    pub async fn request_with_authenticated<R: Request>(
         &self,
         request: R,
         options: RequestOptions,
@@ -2880,5 +2900,89 @@ mod tests {
         // authentication alongside it.
         let pong: Pong = request_fut.await.expect("reply");
         assert_eq!(pong, Pong { seq: 5 });
+    }
+
+    /// `request_with_authenticated` must apply its `RequestOptions` *and*
+    /// report the authentication, not one or the other.
+    ///
+    /// The two halves are asserted in the same test on purpose: the method
+    /// exists only because neither `request_with` (options, no
+    /// authentication) nor `request_authenticated` (authentication, no
+    /// options) can serve a caller that needs both. A version delegating to
+    /// either of those would satisfy half of this test and fail the other,
+    /// which is exactly the failure worth catching.
+    #[tokio::test(start_paused = true)]
+    async fn request_with_authenticated_honours_its_options_and_reports_the_authentication() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = client(Arc::clone(&transport), Arc::clone(&registry));
+
+        let correlation_id = CorrelationId::new();
+        let options = RequestOptions::new()
+            .with_destination("accounts.priority")
+            .with_correlation_id(correlation_id);
+        let request_fut = client.request_with_authenticated(Ping { seq: 9 }, options);
+        tokio::pin!(request_fut);
+        tokio::select! {
+            _ = &mut request_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        assert_eq!(
+            transport.last_routing_key().as_deref(),
+            Some("accounts.priority"),
+            "the destination override must reach the transport, not `Ping::DESTINATION`"
+        );
+        let published = transport.last_published().expect("a request was published");
+        assert_eq!(
+            published.correlation_id,
+            *correlation_id.as_uuid(),
+            "the call must join the causal chain the options named, never mint a fresh one"
+        );
+
+        let principal = principal();
+        registry.resolve(
+            ok_reply(published_request_id(&published), 9),
+            ReplyAuthentication::Authenticated(principal.clone()),
+        );
+
+        let authenticated = request_fut.await.expect("reply");
+        assert_eq!(authenticated.reply(), &Pong { seq: 9 });
+        assert_eq!(
+            authenticated.authentication(),
+            &ReplyAuthentication::Authenticated(principal)
+        );
+    }
+
+    /// The timeout carried by the options must win over this client's own
+    /// default.
+    ///
+    /// `client` is built with a 200 ms default, so an implementation that
+    /// dropped the options and fell back to `request_authenticated` would
+    /// report `Timeout(200ms)` here, and the equality below names the
+    /// override instead. Without this test, that fallback would pass the
+    /// test above untouched: it never lets the call reach its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn request_with_authenticated_applies_the_timeout_carried_by_its_options() {
+        const OVERRIDE: Duration = Duration::from_millis(30);
+
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = client(Arc::clone(&transport), Arc::clone(&registry));
+
+        let started_at = tokio::time::Instant::now();
+        let error = client
+            .request_with_authenticated(
+                Ping { seq: 4 },
+                RequestOptions::new().with_timeout(OVERRIDE),
+            )
+            .await
+            .expect_err("nothing ever resolves this call");
+
+        assert!(
+            matches!(error, RequestError::Timeout(elapsed) if elapsed == OVERRIDE),
+            "expected the timeout the options carried, got {error:?}"
+        );
+        assert_eq!(tokio::time::Instant::now() - started_at, OVERRIDE);
     }
 }
