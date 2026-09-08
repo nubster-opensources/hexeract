@@ -1568,7 +1568,12 @@ async fn a_client_built_without_outbound_security_sends_a_request_the_responder_
 async fn a_caller_learns_which_issuer_signed_the_reply_it_received() {
     let broker = harness::start_rabbitmq().await;
     let cancel = CancellationToken::new();
-    let queue_name = "envelope-security.rpc.ping.caller-identity";
+    // Must be `Ping`'s own `Request::DESTINATION`, which defaults to its
+    // `MESSAGE_TYPE`: the client publishes on the default exchange, where the
+    // routing key is the queue name, and `request_authenticated` takes no
+    // `RequestOptions` to override the destination. Each test starts its own
+    // broker, so sharing the name with its neighbours costs no isolation.
+    let queue_name = "envelope-security.rpc.ping";
     declare_temporary_queue(broker.uri(), queue_name).await;
 
     let responder_issuer = Issuer::new("envelope-security-responder").expect("valid issuer");
@@ -1670,7 +1675,9 @@ async fn a_caller_learns_which_issuer_signed_the_reply_it_received() {
 async fn a_caller_without_envelope_security_reports_nothing_enforced() {
     let broker = harness::start_rabbitmq().await;
     let cancel = CancellationToken::new();
-    let queue_name = "envelope-security.rpc.ping.caller-not-enforced";
+    // Same constraint as its twin above: the queue name is `Ping`'s routing
+    // key, not a label this test is free to choose.
+    let queue_name = "envelope-security.rpc.ping";
     declare_temporary_queue(broker.uri(), queue_name).await;
 
     let responder_transport = Arc::new(

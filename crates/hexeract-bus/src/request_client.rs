@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::deadline::Deadline;
 use crate::remote_error::RemoteErrorPayload;
 use crate::reply_acceptance::ReplyExpectation;
+use crate::reply_authentication::ReplyAuthentication;
 use crate::reply_inbox_state::ReplyInboxState;
 use crate::request_client_supervisor::RequestClientSupervisor;
 use crate::request_error::ProtocolViolation;
@@ -20,6 +21,39 @@ use crate::rpc_protocol::{
     read_protocol_version,
 };
 use crate::{BusEnvelope, Message, Request, RequestError, Transport};
+
+/// A typed reply, alongside what this client's transport established about
+/// the identity that signed it.
+///
+/// Returned by [`RequestClient::request_authenticated`]. Its fields are
+/// private: a caller reads what the transport established, it never
+/// fabricates an authentication of its own.
+#[derive(Debug)]
+pub struct AuthenticatedReply<T> {
+    reply: T,
+    authentication: ReplyAuthentication,
+}
+
+impl<T> AuthenticatedReply<T> {
+    /// The typed reply itself.
+    #[must_use]
+    pub fn reply(&self) -> &T {
+        &self.reply
+    }
+
+    /// What the transport established about the identity that signed this
+    /// reply.
+    #[must_use]
+    pub fn authentication(&self) -> &ReplyAuthentication {
+        &self.authentication
+    }
+
+    /// Consume this value into its typed reply and its authentication.
+    #[must_use]
+    pub fn into_parts(self) -> (T, ReplyAuthentication) {
+        (self.reply, self.authentication)
+    }
+}
 
 /// Synchronous-over-async RPC client: send a [`Request`], await its reply.
 ///
@@ -494,6 +528,45 @@ impl<T: Transport> RequestClient<T> {
         request: R,
         options: RequestOptions,
     ) -> Result<R::Reply, RequestError> {
+        self.request_with_options(request, options)
+            .await
+            .map(|authenticated| authenticated.into_parts().0)
+    }
+
+    /// Send `request` on a fresh causal chain, using this client's default
+    /// timeout and `R::DESTINATION`, and return the reply alongside what
+    /// this client's transport established about the identity that signed
+    /// it.
+    ///
+    /// See [`Self::request_with`] for the full error contract: it applies
+    /// unchanged here, since the two share the same underlying call and
+    /// differ only in whether the authentication travels alongside the
+    /// typed reply.
+    ///
+    /// The authentication is established by the transport at the moment it
+    /// verifies the reply, never read back from a header the reply itself
+    /// carries: a forged header could claim anything, while this value
+    /// reflects only what was actually checked against a known key. No
+    /// variant of [`ReplyAuthentication`] is by itself an authorization:
+    /// [`ReplyAuthentication::NotEnforced`] means nothing was verified, not
+    /// that the reply is safe to trust.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::request_with`].
+    pub async fn request_authenticated<R: Request>(
+        &self,
+        request: R,
+    ) -> Result<AuthenticatedReply<R::Reply>, RequestError> {
+        self.request_with_options(request, RequestOptions::default())
+            .await
+    }
+
+    async fn request_with_options<R: Request>(
+        &self,
+        request: R,
+        options: RequestOptions,
+    ) -> Result<AuthenticatedReply<R::Reply>, RequestError> {
         let timeout = options.timeout.unwrap_or(self.inner.default_timeout);
         let destination = options.destination.as_deref().unwrap_or(R::DESTINATION);
         let correlation_id = options.correlation_id.unwrap_or_default();
@@ -507,7 +580,7 @@ impl<T: Transport> RequestClient<T> {
         destination: &str,
         timeout: Duration,
         correlation_id: CorrelationId,
-    ) -> Result<R::Reply, RequestError> {
+    ) -> Result<AuthenticatedReply<R::Reply>, RequestError> {
         let deadline = tokio::time::Instant::now() + timeout;
         let request_id = RequestId::new();
         // Registering first, and only then reading the inbox state, is
@@ -557,7 +630,8 @@ impl<T: Transport> RequestClient<T> {
         }
         drop(publication);
 
-        let reply = match tokio::time::timeout_at(deadline, pending.wait()).await {
+        let (reply, authentication) = match tokio::time::timeout_at(deadline, pending.wait()).await
+        {
             Err(_elapsed) => return Err(RequestError::Timeout(timeout)),
             Ok(Err(_closed)) => {
                 // The registry drops every sender on both `close` (permanent)
@@ -575,10 +649,13 @@ impl<T: Transport> RequestClient<T> {
                     },
                 );
             }
-            Ok(Ok(envelope)) => envelope,
+            Ok(Ok((envelope, authentication))) => (envelope, authentication),
         };
 
-        decode_reply::<R>(reply)
+        decode_reply::<R>(reply).map(|reply| AuthenticatedReply {
+            reply,
+            authentication,
+        })
     }
 }
 
@@ -1127,7 +1204,10 @@ mod tests {
         assert_eq!(tokio::time::Instant::now() - started_at, timeout);
         assert!(registry.is_empty(), "the timed-out slot must be released");
 
-        registry.resolve(ok_reply(published_request_id(&published), 1));
+        registry.resolve(
+            ok_reply(published_request_id(&published), 1),
+            ReplyAuthentication::NotEnforced,
+        );
         assert_eq!(
             registry.counters().orphaned,
             1,
@@ -1162,7 +1242,10 @@ mod tests {
             .expect("the transport crossed its acceptance boundary");
 
         tokio::time::advance(Duration::from_millis(9)).await;
-        registry.resolve(ok_reply(published_request_id(&published), 7));
+        registry.resolve(
+            ok_reply(published_request_id(&published), 7),
+            ReplyAuthentication::NotEnforced,
+        );
 
         assert_eq!(
             request.await.expect("reply is inside the deadline"),
@@ -1227,7 +1310,10 @@ mod tests {
         );
         assert!(published.header(REQUEST_ID_HEADER).is_some());
         assert_eq!(published.header(PROTOCOL_VERSION_HEADER), Some("1"));
-        registry.resolve(ok_reply(published_request_id(&published), 3));
+        registry.resolve(
+            ok_reply(published_request_id(&published), 3),
+            ReplyAuthentication::NotEnforced,
+        );
         let pong = request_fut.await.expect("reply");
         assert_eq!(pong, Pong { seq: 3 });
     }
@@ -1437,7 +1523,7 @@ mod tests {
             Some(request_id.to_string()).as_deref()
         );
         assert_eq!(err_env.header(PROTOCOL_VERSION_HEADER), Some("1"));
-        registry.resolve(err_env);
+        registry.resolve(err_env, ReplyAuthentication::NotEnforced);
         let err = request_fut.await.expect_err("remote error");
         assert!(matches!(
             err,
@@ -1955,8 +2041,14 @@ mod tests {
         // Resolve the second call's reply before the first call's, so a slot
         // keyed on the shared correlation_id (rather than on request_id)
         // would deliver the wrong Pong to the wrong caller.
-        registry.resolve(ok_reply(second_request_id, 2));
-        registry.resolve(ok_reply(first_request_id, 1));
+        registry.resolve(
+            ok_reply(second_request_id, 2),
+            ReplyAuthentication::NotEnforced,
+        );
+        registry.resolve(
+            ok_reply(first_request_id, 1),
+            ReplyAuthentication::NotEnforced,
+        );
 
         let first_reply = first_fut.await.expect("first reply");
         let second_reply = second_fut.await.expect("second reply");
@@ -2022,8 +2114,11 @@ mod tests {
         tokio::task::yield_now().await;
 
         let request_id = registry_single_request_id(&registry);
-        registry.resolve(forged_reply("attacker.reply", request_id));
-        registry.resolve(pong_reply(request_id, 7));
+        registry.resolve(
+            forged_reply("attacker.reply", request_id),
+            ReplyAuthentication::NotEnforced,
+        );
+        registry.resolve(pong_reply(request_id, 7), ReplyAuthentication::NotEnforced);
 
         let reply = call
             .await
@@ -2085,7 +2180,7 @@ mod tests {
         reply.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
         reply.insert_protocol_header(REPLY_STATUS_HEADER, REPLY_STATUS_OK.to_owned());
         mutate(request_id, &mut reply);
-        registry.resolve(reply);
+        registry.resolve(reply, ReplyAuthentication::NotEnforced);
 
         let error = request_fut
             .await
