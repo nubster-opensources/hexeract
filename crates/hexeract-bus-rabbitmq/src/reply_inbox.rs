@@ -21,6 +21,7 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use hexeract_bus::BusEnvelope;
 use hexeract_bus::BusError;
+use hexeract_bus::ReplyAuthentication;
 use hexeract_bus::RequestRegistry;
 use lapin::BasicProperties;
 use lapin::Channel;
@@ -177,7 +178,7 @@ pub(crate) async fn run_reply_inbox_with_limits(
                             envelope_security.as_deref(),
                             envelope,
                             delivery.routing_key.as_str(),
-                            |envelope| registry.resolve(envelope),
+                            |envelope, authentication| registry.resolve(envelope, authentication),
                         )
                         .await;
                     }
@@ -204,7 +205,8 @@ pub(crate) async fn run_reply_inbox_with_limits(
 }
 
 /// Verify `envelope`, delivered on `destination`, against `envelope_security`,
-/// then, only once verification passes, hand it to `resolve`.
+/// then, only once verification passes, hand it, alongside what that
+/// verification established about its signer, to `resolve`.
 ///
 /// Generic over the resolution operation, the same pattern
 /// [`crate::worker::RabbitMqWorker::verify_before_settlement`] uses for the
@@ -226,22 +228,26 @@ pub(crate) async fn run_reply_inbox_with_limits(
 /// [`hexeract_bus::RequestRegistry::resolve`]'s own contract for a reply that
 /// fails its protocol-shape check.
 ///
-/// No `envelope_security` configured is an unconditional pass: `verify` is
-/// never reached, so a verification key source configured elsewhere in the
-/// process is never consulted, and an unconfigured client resolves every
-/// reply exactly as it did before this security surface existed.
+/// No `envelope_security` configured is an unconditional pass, reported as
+/// [`ReplyAuthentication::NotEnforced`]: `verify` is never reached, so a
+/// verification key source configured elsewhere in the process is never
+/// consulted, and an unconfigured client resolves every reply exactly as it
+/// did before this security surface existed. When `envelope_security` is
+/// configured, [`ReplyAuthentication::from_verification`] turns the
+/// verification's outcome into [`ReplyAuthentication::Authenticated`] or, under
+/// an explicit waiver, [`ReplyAuthentication::WaivedUnsigned`].
 async fn verify_before_resolution<Resolve>(
     envelope_security: Option<&InboundEnvelopeSecurity>,
     envelope: BusEnvelope,
     destination: &str,
     resolve: Resolve,
 ) where
-    Resolve: FnOnce(BusEnvelope),
+    Resolve: FnOnce(BusEnvelope, ReplyAuthentication),
 {
     match envelope_security {
-        None => resolve(envelope),
+        None => resolve(envelope, ReplyAuthentication::NotEnforced),
         Some(security) => match security.verify(&envelope, destination).await {
-            Ok(_principal) => resolve(envelope),
+            Ok(principal) => resolve(envelope, ReplyAuthentication::from_verification(principal)),
             Err(error) => {
                 tracing::warn!(
                     %error,
@@ -407,6 +413,27 @@ mod tests {
             required_security_with_keys(keys)
         }
 
+        /// A configured security that permits an envelope carrying *no*
+        /// signature. It never ignores a signature that is present: the
+        /// waiver covers absence alone.
+        fn waiving_security() -> InboundEnvelopeSecurity {
+            let keys: Arc<dyn VerificationKeySource> = Arc::new(
+                StaticKeySource::builder()
+                    .with_verification_key(
+                        issuer(),
+                        key_id(),
+                        VerificationKey::from(signing_key().verifying_key()),
+                    )
+                    .build(),
+            );
+            let config = EnvelopeSecurityConfig::builder()
+                .with_policy(VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes)
+                .with_accepted_audience(audience())
+                .build()
+                .expect("valid configuration");
+            InboundEnvelopeSecurity::new(keys, config)
+        }
+
         fn outbound_security() -> OutboundEnvelopeSecurity {
             let keys: Arc<dyn SigningKeySource> = Arc::new(
                 StaticKeySource::builder()
@@ -504,9 +531,12 @@ mod tests {
             let mut envelope = signed_reply(CLIENT_INBOX, request_id);
             envelope.payload = b"{ \"tampered\": true }".to_vec();
 
-            verify_before_resolution(Some(&security), envelope, CLIENT_INBOX, |envelope| {
-                registry.resolve(envelope);
-            })
+            verify_before_resolution(
+                Some(&security),
+                envelope,
+                CLIENT_INBOX,
+                |envelope, authentication| registry.resolve(envelope, authentication),
+            )
             .await;
 
             assert!(
@@ -528,16 +558,19 @@ mod tests {
 
             let envelope = signed_reply(CLIENT_INBOX, request_id);
 
-            verify_before_resolution(Some(&security), envelope, CLIENT_INBOX, |envelope| {
-                registry.resolve(envelope);
-            })
+            verify_before_resolution(
+                Some(&security),
+                envelope,
+                CLIENT_INBOX,
+                |envelope, authentication| registry.resolve(envelope, authentication),
+            )
             .await;
 
             assert!(
                 registry.is_empty(),
                 "a correctly signed reply must resolve the correlation slot"
             );
-            let resolved = pending
+            let (resolved, _authentication) = pending
                 .wait()
                 .await
                 .expect("the caller must receive its reply");
@@ -558,9 +591,12 @@ mod tests {
 
             let envelope = signed_reply(OTHER_INBOX, request_id);
 
-            verify_before_resolution(Some(&security), envelope, CLIENT_INBOX, |envelope| {
-                registry.resolve(envelope);
-            })
+            verify_before_resolution(
+                Some(&security),
+                envelope,
+                CLIENT_INBOX,
+                |envelope, authentication| registry.resolve(envelope, authentication),
+            )
             .await;
 
             assert!(
@@ -615,9 +651,14 @@ mod tests {
             let request_id = RequestId::new();
             let envelope = signed_reply(CLIENT_INBOX, request_id);
 
-            verify_before_resolution(Some(&security), envelope, CLIENT_INBOX, |_envelope| {
-                events.lock().unwrap().push("resolve");
-            })
+            verify_before_resolution(
+                Some(&security),
+                envelope,
+                CLIENT_INBOX,
+                |_envelope, _authentication| {
+                    events.lock().unwrap().push("resolve");
+                },
+            )
             .await;
 
             assert_eq!(
@@ -677,8 +718,14 @@ mod tests {
 
             let envelope = unsigned_reply(request_id);
 
-            verify_before_resolution(None, envelope, CLIENT_INBOX, |envelope| {
-                registry.resolve(envelope);
+            verify_before_resolution(None, envelope, CLIENT_INBOX, |envelope, authentication| {
+                assert_eq!(
+                    authentication,
+                    ReplyAuthentication::NotEnforced,
+                    "an unconfigured client must report nothing enforced, never fabricate an \
+                     authenticated or waived reply"
+                );
+                registry.resolve(envelope, authentication);
             })
             .await;
 
@@ -692,6 +739,49 @@ mod tests {
                 0,
                 "an unconfigured client must never consult a verification key source"
             );
+        }
+
+        /// A waived unsigned reply must be reported as such, never as
+        /// nothing enforced.
+        ///
+        /// The two look identical from the caller's side, an unsigned reply
+        /// that resolved its slot, and they mean opposite things: nothing
+        /// enforced says this client checks no signature at all, while a
+        /// waiver says it does check them and an operator deliberately
+        /// suspended the requirement, usually for the length of a
+        /// migration. Collapsing the two would let a caller running under a
+        /// temporary waiver read its own configuration as if security had
+        /// never been switched on.
+        #[tokio::test]
+        async fn a_waived_unsigned_reply_is_reported_as_waived_never_as_nothing_enforced() {
+            let security = waiving_security();
+            let registry = RequestRegistry::default();
+            let request_id = RequestId::new();
+            let mut pending = register(&registry, request_id);
+
+            let envelope = unsigned_reply(request_id);
+
+            verify_before_resolution(
+                Some(&security),
+                envelope,
+                CLIENT_INBOX,
+                |envelope, authentication| {
+                    assert_eq!(
+                        authentication,
+                        ReplyAuthentication::WaivedUnsigned,
+                        "a configured security that waived the signature requirement must \
+                         report the waiver, never the absence of any security"
+                    );
+                    registry.resolve(envelope, authentication);
+                },
+            )
+            .await;
+
+            assert!(
+                registry.is_empty(),
+                "a waived unsigned reply must still resolve the correlation slot"
+            );
+            assert!(pending.wait().await.is_ok());
         }
     }
 }

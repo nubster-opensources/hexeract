@@ -142,7 +142,7 @@ async fn reply_published_to_inbox_is_resolved() {
     );
     harness::publish_to_default_exchange(&publish_channel, &inbox, &reply).await;
 
-    let received = tokio::time::timeout(Duration::from_secs(5), pending.wait())
+    let (received, _authentication) = tokio::time::timeout(Duration::from_secs(5), pending.wait())
         .await
         .expect("no timeout")
         .expect("resolved");

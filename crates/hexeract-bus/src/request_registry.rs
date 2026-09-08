@@ -25,12 +25,13 @@ use uuid::Uuid;
 
 use crate::BusEnvelope;
 use crate::reply_acceptance::{self, ReplyExpectation};
+use crate::reply_authentication::ReplyAuthentication;
 use crate::rpc_protocol::REQUEST_ID_HEADER;
 
 #[derive(Debug)]
 struct Slot {
     expectation: ReplyExpectation,
-    sender: oneshot::Sender<BusEnvelope>,
+    sender: oneshot::Sender<(BusEnvelope, ReplyAuthentication)>,
 }
 
 type Slots = HashMap<RequestId, Slot>;
@@ -187,12 +188,23 @@ impl RequestRegistry {
     }
 
     /// Route `envelope` to its waiting caller, by request identity, if and
-    /// only if it is an acceptable reply for that caller.
+    /// only if it is an acceptable reply for that caller, alongside
+    /// `authentication`, whatever this transport was able to establish about
+    /// the identity that signed it.
     ///
     /// A delivery that fails validation leaves the slot **intact**: the
     /// legitimate reply can still arrive and win. This is what makes the
-    /// first valid reply win rather than the first delivery.
-    pub fn resolve(&self, envelope: BusEnvelope) {
+    /// first valid reply win rather than the first delivery. `authentication`
+    /// is abandoned along with a rejected delivery: only the reply that
+    /// eventually wins hands its own authentication to the waiting caller.
+    ///
+    /// This registry never verifies anything itself; it only carries what its
+    /// caller declares. The caller states what it established, and the
+    /// registry never second-guesses it: a transport that ran no verification
+    /// at all must write [`ReplyAuthentication::NotEnforced`] itself, since
+    /// writing that variant is itself a claim, and a transport that never
+    /// asked the question is the one making it.
+    pub fn resolve(&self, envelope: BusEnvelope, authentication: ReplyAuthentication) {
         let Some(raw) = envelope.header(REQUEST_ID_HEADER) else {
             self.counters.orphaned.fetch_add(1, Ordering::Relaxed);
             tracing::debug!("reply without a request id header, dropping");
@@ -223,7 +235,7 @@ impl RequestRegistry {
         let slot = state.slots.remove(&request_id);
         drop(state);
         if let Some(slot) = slot {
-            let _ = slot.sender.send(envelope);
+            let _ = slot.sender.send((envelope, authentication));
         }
     }
 
@@ -307,7 +319,7 @@ impl RequestRegistry {
 #[derive(Debug)]
 pub struct PendingReply<'a> {
     request_id: RequestId,
-    receiver: oneshot::Receiver<BusEnvelope>,
+    receiver: oneshot::Receiver<(BusEnvelope, ReplyAuthentication)>,
     registry: &'a RequestRegistry,
 }
 
@@ -318,8 +330,10 @@ impl PendingReply<'_> {
         self.request_id
     }
 
-    /// Await the reply envelope. Borrows `self` so the RAII guard stays live
-    /// and cleans the slot when the caller drops the [`PendingReply`].
+    /// Await the reply envelope, alongside what this transport established
+    /// about the identity that signed it. Borrows `self` so the RAII guard
+    /// stays live and cleans the slot when the caller drops the
+    /// [`PendingReply`].
     ///
     /// Call at most once to completion: the underlying channel is consumed
     /// on the first resolved call (`Ok` or `Err`), and awaiting it again
@@ -330,7 +344,9 @@ impl PendingReply<'_> {
     /// Returns [`tokio::sync::oneshot::error::RecvError`] if the reply channel
     /// was closed before a reply arrived, for example after `drain()` on
     /// connection loss.
-    pub async fn wait(&mut self) -> Result<BusEnvelope, oneshot::error::RecvError> {
+    pub async fn wait(
+        &mut self,
+    ) -> Result<(BusEnvelope, ReplyAuthentication), oneshot::error::RecvError> {
         (&mut self.receiver).await
     }
 }
@@ -349,8 +365,25 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::envelope_security::identity::{Audience, Issuer, KeyId, SignatureAlgorithm};
+    use crate::envelope_security::principal::VerifiedPrincipal;
+    use crate::reply_authentication::ReplyAuthentication;
     use crate::rpc_protocol::REQUEST_ID_HEADER;
     use crate::{BusEnvelope, Message};
+
+    /// A verified principal built the same way every test in this module
+    /// needs one: an issuer, an audience and a key that a real verification
+    /// would have established. The exact values never matter here, only
+    /// that the same principal handed to `resolve` is the one observed
+    /// through `wait()`.
+    fn principal() -> VerifiedPrincipal {
+        VerifiedPrincipal::new(
+            Issuer::new("billing-service").expect("valid issuer"),
+            Audience::new("ledger-service").expect("valid audience"),
+            KeyId::new("2026-09").expect("valid key id"),
+            SignatureAlgorithm::Ed25519,
+        )
+    }
 
     #[derive(Debug, Serialize, Deserialize)]
     struct Pong {
@@ -424,21 +457,19 @@ mod tests {
             .expect("second registration succeeds");
         assert_ne!(first.request_id(), second.request_id());
 
-        registry.resolve(reply_for(second.request_id(), shared_chain, 2));
-        registry.resolve(reply_for(first.request_id(), shared_chain, 1));
+        registry.resolve(
+            reply_for(second.request_id(), shared_chain, 2),
+            ReplyAuthentication::NotEnforced,
+        );
+        registry.resolve(
+            reply_for(first.request_id(), shared_chain, 1),
+            ReplyAuthentication::NotEnforced,
+        );
 
-        let first_reply: Pong = first
-            .wait()
-            .await
-            .expect("first reply")
-            .decode()
-            .expect("decode");
-        let second_reply: Pong = second
-            .wait()
-            .await
-            .expect("second reply")
-            .decode()
-            .expect("decode");
+        let (first_envelope, _first_authentication) = first.wait().await.expect("first reply");
+        let (second_envelope, _second_authentication) = second.wait().await.expect("second reply");
+        let first_reply: Pong = first_envelope.decode().expect("decode");
+        let second_reply: Pong = second_envelope.decode().expect("decode");
         assert_eq!(first_reply.seq, 1);
         assert_eq!(second_reply.seq, 2);
     }
@@ -462,7 +493,7 @@ mod tests {
             .expect("registration succeeds");
         let envelope =
             BusEnvelope::new(Uuid::now_v7(), &Pong { seq: 7 }).expect("pong must serialize");
-        registry.resolve(envelope);
+        registry.resolve(envelope, ReplyAuthentication::NotEnforced);
         assert_eq!(registry.len(), 1, "the slot must stay in flight");
     }
 
@@ -475,7 +506,7 @@ mod tests {
         let mut envelope =
             BusEnvelope::new(Uuid::now_v7(), &Pong { seq: 7 }).expect("pong must serialize");
         envelope.insert_protocol_header(REQUEST_ID_HEADER, "not-a-uuid".to_owned());
-        registry.resolve(envelope);
+        registry.resolve(envelope, ReplyAuthentication::NotEnforced);
         assert_eq!(registry.len(), 1, "the slot must stay in flight");
         assert_eq!(registry.counters().orphaned, 1);
     }
@@ -494,7 +525,7 @@ mod tests {
             RequestId::new().to_string(),
         );
 
-        registry.resolve(envelope);
+        registry.resolve(envelope, ReplyAuthentication::NotEnforced);
 
         assert!(
             registry.is_empty(),
@@ -511,15 +542,17 @@ mod tests {
         let request_id = pending.request_id();
         let chain = Uuid::now_v7();
 
-        registry.resolve(reply_for(request_id, chain, 1));
-        registry.resolve(reply_for(request_id, chain, 2));
+        registry.resolve(
+            reply_for(request_id, chain, 1),
+            ReplyAuthentication::NotEnforced,
+        );
+        registry.resolve(
+            reply_for(request_id, chain, 2),
+            ReplyAuthentication::NotEnforced,
+        );
 
-        let reply: Pong = pending
-            .wait()
-            .await
-            .expect("reply")
-            .decode()
-            .expect("decode");
+        let (envelope, _authentication) = pending.wait().await.expect("reply");
+        let reply: Pong = envelope.decode().expect("decode");
         assert_eq!(reply.seq, 1);
         assert_eq!(
             registry.counters().orphaned,
@@ -568,16 +601,20 @@ mod tests {
             for i in 0..SLOT_COUNT {
                 let resolve_index = (i * 7) % SLOT_COUNT;
                 let seq = u64::try_from(resolve_index).expect("seq fits in u64");
-                resolver.resolve(reply_for(resolver_ids[resolve_index], chain, seq));
+                resolver.resolve(
+                    reply_for(resolver_ids[resolve_index], chain, seq),
+                    ReplyAuthentication::NotEnforced,
+                );
             }
         });
 
         for (index, pending) in pendings.iter_mut().enumerate() {
             let expected_seq = u64::try_from(index).expect("seq fits in u64");
-            let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), pending.wait())
-                .await
-                .unwrap_or_else(|_| panic!("caller at index {index} never received a reply"))
-                .expect("each caller gets a reply");
+            let (envelope, _authentication) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), pending.wait())
+                    .await
+                    .unwrap_or_else(|_| panic!("caller at index {index} never received a reply"))
+                    .expect("each caller gets a reply");
             let reply: Pong = envelope.decode().expect("decode");
             assert_eq!(reply.seq, expected_seq, "reply routed to the wrong caller");
         }
@@ -592,14 +629,20 @@ mod tests {
             .expect("registration succeeds");
         let request_id = pending.request_id();
 
-        registry.resolve(tagged(ok_reply("attacker.reply"), request_id));
+        registry.resolve(
+            tagged(ok_reply("attacker.reply"), request_id),
+            ReplyAuthentication::NotEnforced,
+        );
 
         assert_eq!(registry.len(), 1, "the slot must survive an invalid reply");
         assert_eq!(registry.counters().invalid, 1);
 
-        registry.resolve(tagged(ok_reply(EXPECTED_REPLY), request_id));
+        registry.resolve(
+            tagged(ok_reply(EXPECTED_REPLY), request_id),
+            ReplyAuthentication::NotEnforced,
+        );
 
-        let reply = pending.wait().await.expect("the legitimate reply must win");
+        let (reply, _authentication) = pending.wait().await.expect("the legitimate reply must win");
         assert_eq!(reply.message_type, EXPECTED_REPLY);
         assert_eq!(registry.len(), 0);
     }
@@ -611,7 +654,10 @@ mod tests {
             .register(RequestId::new(), expectation())
             .expect("registration succeeds");
 
-        registry.resolve(tagged(ok_reply(EXPECTED_REPLY), RequestId::new()));
+        registry.resolve(
+            tagged(ok_reply(EXPECTED_REPLY), RequestId::new()),
+            ReplyAuthentication::NotEnforced,
+        );
 
         assert_eq!(registry.len(), 1);
         assert_eq!(registry.counters().orphaned, 1);
@@ -625,7 +671,7 @@ mod tests {
             .register(RequestId::new(), expectation())
             .expect("registration succeeds");
 
-        registry.resolve(ok_reply(EXPECTED_REPLY));
+        registry.resolve(ok_reply(EXPECTED_REPLY), ReplyAuthentication::NotEnforced);
 
         assert_eq!(registry.counters().orphaned, 1);
     }
@@ -681,14 +727,16 @@ mod tests {
         assert_eq!(registry.len(), 1, "only the first caller's slot exists");
 
         let chain = Uuid::now_v7();
-        registry.resolve(reply_for(request_id, chain, 11));
+        registry.resolve(
+            reply_for(request_id, chain, 11),
+            ReplyAuthentication::NotEnforced,
+        );
 
-        let reply: Pong = first
+        let (envelope, _authentication) = first
             .wait()
             .await
-            .expect("the first caller still receives its reply")
-            .decode()
-            .expect("decode");
+            .expect("the first caller still receives its reply");
+        let reply: Pong = envelope.decode().expect("decode");
         assert_eq!(reply.seq, 11);
     }
 
@@ -713,7 +761,10 @@ mod tests {
             .register(RequestId::new(), expectation())
             .expect("first slot fits");
         let request_id = pending.request_id();
-        registry.resolve(tagged(ok_reply(EXPECTED_REPLY), request_id));
+        registry.resolve(
+            tagged(ok_reply(EXPECTED_REPLY), request_id),
+            ReplyAuthentication::NotEnforced,
+        );
         assert!(
             registry.is_empty(),
             "a resolved reply must free its slot immediately"
@@ -857,16 +908,20 @@ mod tests {
             for i in 0..SLOT_COUNT {
                 let resolve_index = (i * 7) % SLOT_COUNT;
                 let seq = u64::try_from(resolve_index).expect("seq fits in u64");
-                resolver.resolve(reply_for(resolver_ids[resolve_index], chain, seq));
+                resolver.resolve(
+                    reply_for(resolver_ids[resolve_index], chain, seq),
+                    ReplyAuthentication::NotEnforced,
+                );
             }
         });
 
         for (index, pending) in pendings.iter_mut().enumerate() {
             let expected_seq = u64::try_from(index).expect("seq fits in u64");
-            let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), pending.wait())
-                .await
-                .unwrap_or_else(|_| panic!("caller at index {index} never received a reply"))
-                .expect("each caller gets a reply");
+            let (envelope, _authentication) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), pending.wait())
+                    .await
+                    .unwrap_or_else(|_| panic!("caller at index {index} never received a reply"))
+                    .expect("each caller gets a reply");
             let reply: Pong = envelope.decode().expect("decode");
             assert_eq!(reply.seq, expected_seq, "reply routed to the wrong caller");
         }
@@ -876,6 +931,137 @@ mod tests {
         assert!(
             registry.is_empty(),
             "the registry must return to zero once every call has completed"
+        );
+    }
+
+    /// A reply resolved with [`ReplyAuthentication::Authenticated`] hands
+    /// that exact principal to the caller waiting on [`PendingReply::wait`].
+    /// A degenerate `resolve` that dropped the authentication and always
+    /// handed back [`ReplyAuthentication::NotEnforced`] would still let
+    /// every reply-routing test above pass, since none of them inspect
+    /// anything beyond the envelope; this is the one that would catch it.
+    #[tokio::test]
+    async fn a_reply_resolved_as_authenticated_hands_the_verified_principal_to_the_waiting_caller()
+    {
+        let registry = Arc::new(RequestRegistry::default());
+        let mut pending = registry
+            .register(RequestId::new(), expectation())
+            .expect("registration succeeds");
+        let request_id = pending.request_id();
+        let principal = principal();
+
+        registry.resolve(
+            tagged(ok_reply(EXPECTED_REPLY), request_id),
+            ReplyAuthentication::Authenticated(principal.clone()),
+        );
+
+        let (envelope, authentication) = pending
+            .wait()
+            .await
+            .expect("the resolved reply must be delivered");
+        assert_eq!(envelope.message_type, EXPECTED_REPLY);
+        assert_eq!(
+            authentication,
+            ReplyAuthentication::Authenticated(principal)
+        );
+    }
+
+    /// A reply resolved with [`ReplyAuthentication::NotEnforced`] hands back
+    /// exactly `NotEnforced`, never [`ReplyAuthentication::WaivedUnsigned`].
+    /// Paired with
+    /// [`a_reply_resolved_as_waived_unsigned_hands_back_waived_unsigned_never_not_enforced`]:
+    /// each asserts exact equality with its own variant rather than merely
+    /// rejecting the other one, because a `resolve` that always handed back
+    /// `NotEnforced` regardless of what it was given would satisfy that
+    /// negative assertion in its twin just as well as this one.
+    #[tokio::test]
+    async fn a_reply_resolved_as_not_enforced_hands_back_not_enforced_never_waived_unsigned() {
+        let registry = Arc::new(RequestRegistry::default());
+        let mut pending = registry
+            .register(RequestId::new(), expectation())
+            .expect("registration succeeds");
+        let request_id = pending.request_id();
+
+        registry.resolve(
+            tagged(ok_reply(EXPECTED_REPLY), request_id),
+            ReplyAuthentication::NotEnforced,
+        );
+
+        let (_envelope, authentication) = pending
+            .wait()
+            .await
+            .expect("the resolved reply must be delivered");
+        assert_eq!(authentication, ReplyAuthentication::NotEnforced);
+    }
+
+    /// A reply resolved with [`ReplyAuthentication::WaivedUnsigned`] hands
+    /// back exactly `WaivedUnsigned`, never
+    /// [`ReplyAuthentication::NotEnforced`]. The symmetric half of
+    /// [`a_reply_resolved_as_not_enforced_hands_back_not_enforced_never_waived_unsigned`]:
+    /// without this test, a `resolve` that always handed back
+    /// `WaivedUnsigned` regardless of what it was given would pass its
+    /// twin's assertion trivially, since that test never checks this
+    /// variant is reachable at all.
+    #[tokio::test]
+    async fn a_reply_resolved_as_waived_unsigned_hands_back_waived_unsigned_never_not_enforced() {
+        let registry = Arc::new(RequestRegistry::default());
+        let mut pending = registry
+            .register(RequestId::new(), expectation())
+            .expect("registration succeeds");
+        let request_id = pending.request_id();
+
+        registry.resolve(
+            tagged(ok_reply(EXPECTED_REPLY), request_id),
+            ReplyAuthentication::WaivedUnsigned,
+        );
+
+        let (_envelope, authentication) = pending
+            .wait()
+            .await
+            .expect("the resolved reply must be delivered");
+        assert_eq!(authentication, ReplyAuthentication::WaivedUnsigned);
+    }
+
+    /// A reply refused by `reply_acceptance` must leave the slot pending and
+    /// emit nothing, exactly as it does today: the authentication passed
+    /// alongside the rejected reply is abandoned with it, never surfacing
+    /// through a later `wait()`. Only the legitimate reply that eventually
+    /// wins may hand its own authentication to the caller.
+    #[tokio::test]
+    async fn a_reply_rejected_by_reply_acceptance_leaves_the_slot_pending_and_drops_its_authentication()
+     {
+        let registry = Arc::new(RequestRegistry::default());
+        let mut pending = registry
+            .register(RequestId::new(), expectation())
+            .expect("registration succeeds");
+        let request_id = pending.request_id();
+
+        registry.resolve(
+            tagged(ok_reply("attacker.reply"), request_id),
+            ReplyAuthentication::Authenticated(principal()),
+        );
+
+        assert_eq!(
+            registry.len(),
+            1,
+            "an invalid reply must leave the slot pending"
+        );
+        assert_eq!(registry.counters().invalid, 1);
+
+        registry.resolve(
+            tagged(ok_reply(EXPECTED_REPLY), request_id),
+            ReplyAuthentication::NotEnforced,
+        );
+
+        let (envelope, authentication) = pending
+            .wait()
+            .await
+            .expect("the legitimate reply must still resolve the slot");
+        assert_eq!(envelope.message_type, EXPECTED_REPLY);
+        assert_eq!(
+            authentication,
+            ReplyAuthentication::NotEnforced,
+            "the legitimate reply's own authentication must win, never the rejected one"
         );
     }
 }

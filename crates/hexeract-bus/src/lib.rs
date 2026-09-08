@@ -33,7 +33,8 @@
 //! [`VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes`]. A
 //! successful verification yields a [`VerifiedPrincipal`], the only way to
 //! obtain one. TLS still protects a single connection hop: this protects the
-//! message itself, end to end.
+//! message itself, end to end. A request caller reads that same proof for
+//! the reply it receives through [`RequestClient::request_authenticated`].
 //!
 //! Backend implementations live in companion crates such as
 //! `hexeract-bus-rabbitmq`.
@@ -58,6 +59,8 @@ pub mod remote_error;
 pub mod replied_handler;
 /// Whether an inbound delivery is an acceptable reply for a pending slot.
 pub mod reply_acceptance;
+/// What a request caller learns about the identity that signed its reply.
+pub mod reply_authentication;
 /// The destination a reply is published to, validated at construction.
 pub mod reply_destination;
 /// Shared state of the reply inbox a [`RequestClient`] publishes its
@@ -132,11 +135,13 @@ pub use remote_error::RemoteErrorType;
 pub use replied_handler::RepliedHandler;
 pub use reply_acceptance::ReplyExpectation;
 pub use reply_acceptance::ReplyRejection;
+pub use reply_authentication::ReplyAuthentication;
 pub use reply_destination::ReplyDestination;
 pub use reply_destination::ReplyDestinationError;
 pub use reply_inbox_state::ReplyInboxState;
 pub use reply_publisher::ReplyPublisher;
 pub use request::Request;
+pub use request_client::AuthenticatedReply;
 pub use request_client::RequestClient;
 pub use request_client_supervisor::RequestClientSupervisor;
 pub use request_context::RequestContext;

@@ -45,6 +45,7 @@ use hexeract_bus::Issuer;
 use hexeract_bus::KeyId;
 use hexeract_bus::KeySourceError;
 use hexeract_bus::Message;
+use hexeract_bus::ReplyAuthentication;
 use hexeract_bus::Request;
 use hexeract_bus::RequestContext;
 use hexeract_bus::RequestError;
@@ -1544,6 +1545,180 @@ async fn a_client_built_without_outbound_security_sends_a_request_the_responder_
     assert!(
         observed_issuer.lock().expect("not poisoned").is_none(),
         "the handler must never run against a request the responder refused"
+    );
+
+    cancel.cancel();
+    let _ = worker_handle.await;
+}
+
+// -------------------------------------------------- 11. caller-observed reply authentication
+
+/// The caller-side mirror of
+/// [`a_request_handler_learns_which_issuer_signed_the_request_it_received`]:
+/// this time the identity under observation is the one that signed the
+/// *reply*, learned by the caller that verified it, never by the responder.
+/// Reuses [`a_signed_reply_survives_the_request_reply_path`]'s setup, a
+/// responder signing its reply and a client verifying it, but calls
+/// [`hexeract_bus::RequestClient::request_authenticated`] instead of
+/// `request` so the observed issuer comes from the
+/// [`ReplyAuthentication`] the reply actually carried, never a value this
+/// test writes on the caller side itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn a_caller_learns_which_issuer_signed_the_reply_it_received() {
+    let broker = harness::start_rabbitmq().await;
+    let cancel = CancellationToken::new();
+    // Must be `Ping`'s own `Request::DESTINATION`, which defaults to its
+    // `MESSAGE_TYPE`: the client publishes on the default exchange, where the
+    // routing key is the queue name, and `request_authenticated` takes no
+    // `RequestOptions` to override the destination. Each test starts its own
+    // broker, so sharing the name with its neighbours costs no isolation.
+    let queue_name = "envelope-security.rpc.ping";
+    declare_temporary_queue(broker.uri(), queue_name).await;
+
+    let responder_issuer = Issuer::new("envelope-security-responder").expect("valid issuer");
+    let caller_audience = Audience::new("envelope-security-caller").expect("valid audience");
+    let responder_key_id = KeyId::new("2026-09").expect("valid key id");
+
+    let responder_signing_keys: Arc<dyn SigningKeySource> = Arc::new(
+        StaticKeySource::builder()
+            .with_signing_key(
+                responder_key_id.clone(),
+                SigningKeyHandle::from(SigningKey::from_bytes(&[21; 32])),
+            )
+            .build(),
+    );
+    let outbound = Arc::new(OutboundEnvelopeSecurity::new(
+        responder_issuer.clone(),
+        caller_audience.clone(),
+        responder_signing_keys,
+    ));
+    let responder_transport = Arc::new(
+        RabbitMqTransport::new(broker.uri())
+            .await
+            .expect("responder transport must connect")
+            .with_outbound_envelope_security(outbound),
+    );
+    let worker =
+        RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
+            .queue(queue_name)
+            .register_request_handler::<Ping, _>(
+                Echo {
+                    observed_issuer: Arc::new(Mutex::new(None)),
+                },
+                Arc::clone(&responder_transport),
+            )
+            .build()
+            .unwrap();
+    let worker_cancel = cancel.clone();
+    let worker_handle = tokio::spawn(async move { worker.run(worker_cancel).await });
+
+    let caller_keys: Arc<dyn VerificationKeySource> = Arc::new(
+        StaticKeySource::builder()
+            .with_verification_key(
+                responder_issuer,
+                responder_key_id,
+                VerificationKey::from(SigningKey::from_bytes(&[21; 32]).verifying_key()),
+            )
+            .build(),
+    );
+    let caller_config = EnvelopeSecurityConfig::builder()
+        .with_accepted_audience(caller_audience)
+        .build()
+        .expect("valid configuration");
+    let caller_security = Arc::new(InboundEnvelopeSecurity::new(caller_keys, caller_config));
+
+    let client_config = RabbitMqRequestClientConfigBuilder::new()
+        .envelope_security(caller_security)
+        .build();
+    let client = connect_request_client_with_config(
+        broker.uri(),
+        Duration::from_secs(10),
+        cancel.clone(),
+        client_config,
+    )
+    .await
+    .expect("the request client must connect");
+
+    let authenticated = client
+        .request_authenticated(Ping { seq: 77 })
+        .await
+        .expect("a correctly signed reply must verify and resolve the request");
+    assert_eq!(authenticated.reply().seq, 77);
+
+    match authenticated.authentication() {
+        ReplyAuthentication::Authenticated(principal) => {
+            assert_eq!(
+                principal.issuer().as_str(),
+                "envelope-security-responder",
+                "the caller must learn the issuer whose signature it actually verified on the \
+                 reply, and nothing in this test writes that value on the caller side"
+            );
+        }
+        other => panic!("expected an authenticated reply, got {other:?}"),
+    }
+
+    cancel.cancel();
+    let _ = worker_handle.await;
+}
+
+/// Symmetric to [`a_caller_learns_which_issuer_signed_the_reply_it_received`]:
+/// without it, that test could be satisfied by an implementation that
+/// always reports [`ReplyAuthentication::Authenticated`] on the reply
+/// side, since nothing would then prove a caller with no envelope security
+/// at all reports anything different. Same broker, same responder, a
+/// client built through the same
+/// [`hexeract_bus_rabbitmq::RabbitMqRequestClientConfigBuilder`], differing
+/// only in that this one never calls `.envelope_security(...)`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn a_caller_without_envelope_security_reports_nothing_enforced() {
+    let broker = harness::start_rabbitmq().await;
+    let cancel = CancellationToken::new();
+    // Same constraint as its twin above: the queue name is `Ping`'s routing
+    // key, not a label this test is free to choose.
+    let queue_name = "envelope-security.rpc.ping";
+    declare_temporary_queue(broker.uri(), queue_name).await;
+
+    let responder_transport = Arc::new(
+        RabbitMqTransport::new(broker.uri())
+            .await
+            .expect("responder transport must connect"),
+    );
+    let worker =
+        RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
+            .queue(queue_name)
+            .register_request_handler::<Ping, _>(
+                Echo {
+                    observed_issuer: Arc::new(Mutex::new(None)),
+                },
+                Arc::clone(&responder_transport),
+            )
+            .build()
+            .unwrap();
+    let worker_cancel = cancel.clone();
+    let worker_handle = tokio::spawn(async move { worker.run(worker_cancel).await });
+
+    let client_config = RabbitMqRequestClientConfigBuilder::new().build();
+    let client = connect_request_client_with_config(
+        broker.uri(),
+        Duration::from_secs(10),
+        cancel.clone(),
+        client_config,
+    )
+    .await
+    .expect("the request client must connect");
+
+    let authenticated = client
+        .request_authenticated(Ping { seq: 77 })
+        .await
+        .expect("an unsigned reply must still resolve the request when nothing enforces it");
+    assert_eq!(authenticated.reply().seq, 77);
+    assert_eq!(
+        authenticated.authentication(),
+        &ReplyAuthentication::NotEnforced,
+        "a caller with no envelope security configured at all must report that nothing is \
+         enforced on the reply it received"
     );
 
     cancel.cancel();
