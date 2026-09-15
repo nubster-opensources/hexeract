@@ -767,4 +767,91 @@ mod tests {
 
         assert_eq!(refreshes.load(Ordering::Relaxed), 2);
     }
+
+    /// Seed bytes 0x00..=0x1f, matching the signer's known-answer vector so
+    /// the two crate boundaries are exercised against the same external key.
+    const SEED: [u8; 32] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f,
+    ];
+
+    /// Render bytes as lowercase hex. No new dependency is pulled in for
+    /// this: it only serves the known-answer test below.
+    fn hex_encode(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+
+        bytes.iter().fold(String::new(), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+    }
+
+    /// The verification key and the signature below were computed once
+    /// outside this crate (Python for the canonical framing and digest,
+    /// openssl for the Ed25519 keypair and the signature over it) and frozen
+    /// as literals; the signature is applied as a header directly, never
+    /// produced by this crate's own signer. A sign/verify round trip cannot
+    /// catch a change in how these bytes are produced, for example a
+    /// version bump of the hashing or base64 library, because both sides of
+    /// the round trip would drift together; verifying a signature this
+    /// crate never produced can.
+    #[tokio::test]
+    async fn the_externally_computed_signature_verifies() {
+        let public_key = SigningKey::from_bytes(&SEED).verifying_key();
+        assert_eq!(
+            hex_encode(public_key.as_bytes()),
+            "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8"
+        );
+
+        let mut headers = HashMap::new();
+        headers.insert("tenant".to_owned(), "acme".to_owned());
+        let mut protocol_headers = HashMap::new();
+        protocol_headers.insert("x-hexeract-protocol-version".to_owned(), "1".to_owned());
+
+        let envelope = BusEnvelope::restore_from_transport(
+            Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef),
+            "billing.invoice.issued".to_owned(),
+            br#"{"invoice":42}"#.to_vec(),
+            Uuid::from_u128(0xfedc_ba98_7654_3210_fedc_ba98_7654_3210),
+            Some("amq.gen-known-answer".to_owned()),
+            headers,
+            protocol_headers,
+            UNIX_EPOCH + Duration::from_secs(1_757_000_000),
+        );
+
+        let signed =
+            with_replaced_security_header(&envelope, DESTINATION_HEADER, "billing.invoices");
+        let signed = with_replaced_security_header(&signed, ISSUER_HEADER, "billing-service");
+        let signed = with_replaced_security_header(&signed, AUDIENCE_HEADER, "ledger-service");
+        let signed = with_replaced_security_header(&signed, KEY_ID_HEADER, "2026-09");
+        let signed = with_replaced_security_header(&signed, ALGORITHM_HEADER, "ed25519");
+        let signed = with_replaced_security_header(
+            &signed,
+            SIGNATURE_HEADER,
+            "8jYSF3-bb39EEgXJlwbR7W69Z8N_WbdEN7oRBO0G-W0VpAhobexYPL1N2wiRSh2o5TR1xDuVX8HcpTLFQM57CQ",
+        );
+
+        let keys = StaticKeySource::builder()
+            .with_verification_key(issuer(), key_id(), VerificationKey::from(public_key))
+            .build();
+        let config = EnvelopeSecurityConfig::builder()
+            .with_accepted_audience(audience())
+            .build()
+            .expect("valid configuration");
+        let verifier = EnvelopeVerifier::new(keys, config);
+
+        let principal = verifier
+            .verify(
+                &signed,
+                &VerificationContext {
+                    destination: "billing.invoices",
+                },
+            )
+            .await
+            .expect("verified")
+            .expect("authenticated");
+
+        assert_eq!(principal.issuer().as_str(), "billing-service");
+    }
 }

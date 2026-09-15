@@ -420,4 +420,102 @@ mod tests {
 
         assert_eq!(baseline, representation(&envelope));
     }
+
+    /// Decode a hex literal into bytes. No new dependency is pulled in for
+    /// this: it only serves the known-answer test below.
+    fn decode_hex(hex: &str) -> Vec<u8> {
+        assert_eq!(hex.len() % 2, 0, "hex literal has an odd length");
+        (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("valid hex byte"))
+            .collect()
+    }
+
+    /// Every byte below was computed once outside this crate (Python
+    /// `hashlib` for the payload digest, plain arithmetic for the length
+    /// framing) and frozen as a literal. A sign/verify round trip cannot
+    /// catch a change in how these bytes are produced, because both sides of
+    /// the round trip would drift together, for example a version bump of
+    /// the hashing library; comparing against bytes this crate never
+    /// computed can. The vector is split by field so a failure names the
+    /// field that moved instead of an opaque byte offset.
+    #[test]
+    fn the_representation_matches_an_externally_computed_vector() {
+        let mut headers = HashMap::new();
+        headers.insert("tenant".to_owned(), "acme".to_owned());
+        let mut protocol_headers = HashMap::new();
+        protocol_headers.insert("x-hexeract-protocol-version".to_owned(), "1".to_owned());
+
+        let envelope = BusEnvelope::restore_from_transport(
+            Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef),
+            "billing.invoice.issued".to_owned(),
+            br#"{"invoice":42}"#.to_vec(),
+            Uuid::from_u128(0xfedc_ba98_7654_3210_fedc_ba98_7654_3210),
+            Some("amq.gen-known-answer".to_owned()),
+            headers,
+            protocol_headers,
+            UNIX_EPOCH + Duration::from_secs(1_757_000_000),
+        );
+
+        let issuer = Issuer::new("billing-service").expect("valid issuer");
+        let audience = Audience::new("ledger-service").expect("valid audience");
+        let key_id = KeyId::new("2026-09").expect("valid key id");
+        let binding = CanonicalBinding {
+            destination: "billing.invoices",
+            issuer: &issuer,
+            audience: &audience,
+            key_id: &key_id,
+            algorithm: SignatureAlgorithm::Ed25519,
+        };
+
+        let actual =
+            canonical_representation(&envelope, &binding).expect("canonical representation");
+
+        // One entry per field of the canonical stream, in wire order.
+        let fields: [(&str, &str); 15] = [
+            ("domain", "0000001468657865726163742d656e76656c6f70652d7631"),
+            ("message_id", "000000100123456789abcdef0123456789abcdef"),
+            (
+                "message_type",
+                "0000001662696c6c696e672e696e766f6963652e697373756564",
+            ),
+            ("correlation_id", "00000010fedcba9876543210fedcba9876543210"),
+            (
+                "reply_to",
+                "0100000014616d712e67656e2d6b6e6f776e2d616e73776572",
+            ),
+            ("published_at", "000000080000000068b9b140"),
+            ("destination", "0000001062696c6c696e672e696e766f69636573"),
+            ("issuer", "0000000f62696c6c696e672d73657276696365"),
+            ("audience", "0000000e6c65646765722d73657276696365"),
+            ("key_id", "00000007323032362d3039"),
+            ("algorithm", "0000000765643235353139"),
+            ("headers_count", "00000002"),
+            ("tenant_header_pair", "0000000674656e616e740000000461636d65"),
+            (
+                "protocol_header_pair",
+                "0000001b782d68657865726163742d70726f746f636f6c2d76657273696f6e0000000131",
+            ),
+            (
+                "payload_sha256",
+                "00000020f400fa30851e2b9fedeb680400ed02e3a4ef0d4415b50b951143c7ebc581e447",
+            ),
+        ];
+
+        let mut expected = Vec::new();
+        let mut offset = 0usize;
+        for (name, hex) in fields {
+            let field_bytes = decode_hex(hex);
+            let end = offset + field_bytes.len();
+            assert_eq!(
+                actual.get(offset..end),
+                Some(field_bytes.as_slice()),
+                "field `{name}` does not match the externally computed vector"
+            );
+            expected.extend_from_slice(&field_bytes);
+            offset = end;
+        }
+
+        assert_eq!(actual, expected);
+    }
 }
