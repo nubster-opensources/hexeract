@@ -417,7 +417,7 @@ fn error_reply(
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime};
 
     use hexeract_core::{CorrelationId, MessageId, RequestId};
@@ -468,6 +468,19 @@ mod tests {
         }
     }
 
+    /// Shared destination policy for every test double in this module:
+    /// accept a server-named reply inbox, refuse anything else.
+    fn accept_reply_namespace_destination(
+        raw: &str,
+    ) -> Result<ReplyDestination, ReplyDestinationError> {
+        let destination = ReplyDestination::parse(raw)?;
+        if destination.as_str().starts_with("amq.gen-") {
+            Ok(destination)
+        } else {
+            Err(ReplyDestinationError::OutsideReplyNamespace)
+        }
+    }
+
     #[derive(Default)]
     struct RecordingReplyPublisher {
         published: StdMutex<Vec<(String, BusEnvelope)>>,
@@ -487,12 +500,56 @@ mod tests {
         }
 
         fn accept_destination(&self, raw: &str) -> Result<ReplyDestination, ReplyDestinationError> {
-            let destination = ReplyDestination::parse(raw)?;
-            if destination.as_str().starts_with("amq.gen-") {
-                Ok(destination)
-            } else {
-                Err(ReplyDestinationError::OutsideReplyNamespace)
+            accept_reply_namespace_destination(raw)
+        }
+    }
+
+    /// Accepts the same destinations as `RecordingReplyPublisher`, then
+    /// refuses every publication with the error it was built with.
+    ///
+    /// `attempts` exists to distinguish a publication that was tried and
+    /// failed from one that was never tried at all: without it, a code path
+    /// that returned before ever calling `publish_reply` would look
+    /// identical, from the test's viewpoint, to one whose publication failed
+    /// and correctly propagated that failure.
+    struct FailingReplyPublisher {
+        error: fn() -> BusError,
+        attempts: AtomicUsize,
+    }
+
+    impl FailingReplyPublisher {
+        fn new(error: fn() -> BusError) -> Self {
+            Self {
+                error,
+                attempts: AtomicUsize::new(0),
             }
+        }
+    }
+
+    impl ReplyPublisher for FailingReplyPublisher {
+        fn publish_reply<'a>(
+            &'a self,
+            _destination: &'a ReplyDestination,
+            _envelope: &'a BusEnvelope,
+        ) -> BoxFuture<'a, Result<(), BusError>> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            let error = (self.error)();
+            Box::pin(async move { Err(error) })
+        }
+
+        fn accept_destination(&self, raw: &str) -> Result<ReplyDestination, ReplyDestinationError> {
+            accept_reply_namespace_destination(raw)
+        }
+    }
+
+    /// The reply-publication failure every `FailingReplyPublisher` test in
+    /// this module injects: a mandatory publish the broker returned as
+    /// unroutable, the real failure mode a vanished reply inbox produces.
+    fn unroutable_reply_publication_error() -> BusError {
+        BusError::Unroutable {
+            routing_key: "amq.gen-inbox".to_owned(),
+            reply_text: "NO_ROUTE".to_owned(),
+            reply_code: 312,
         }
     }
 
@@ -1539,6 +1596,139 @@ mod tests {
             counters.snapshot().expired_deadline,
             0,
             "the deadline guard must never run once the version guard already rejected"
+        );
+    }
+
+    /// The nominal reply is the last of the four publication sites: when it
+    /// fails, `handle` must propagate the failure rather than swallow it:
+    /// an `Ok` here would let the worker acknowledge a request whose reply
+    /// was never delivered.
+    #[tokio::test]
+    async fn a_failed_nominal_reply_publication_fails_the_request() {
+        let publisher = Arc::new(FailingReplyPublisher::new(
+            unroutable_reply_publication_error,
+        ));
+        let handler = RepliedHandler::new(Echo, Arc::clone(&publisher));
+        let request = request_envelope(Some("amq.gen-inbox"));
+
+        let result = handler.handle(&request, &ctx()).await;
+
+        assert!(
+            matches!(result, Err(BusError::Unroutable { .. })),
+            "a failed nominal reply publication must fail the request, got {result:?}"
+        );
+        assert_eq!(publisher.attempts.load(Ordering::SeqCst), 1);
+    }
+
+    /// The handler-error reply shares the same publication site as the
+    /// nominal reply, and must fail the request the same way.
+    #[tokio::test]
+    async fn a_failed_handler_error_reply_publication_fails_the_request() {
+        let publisher = Arc::new(FailingReplyPublisher::new(
+            unroutable_reply_publication_error,
+        ));
+        let handler = RepliedHandler::new(Boom, Arc::clone(&publisher));
+        let request = request_envelope(Some("amq.gen-inbox"));
+
+        let result = handler.handle(&request, &ctx()).await;
+
+        assert!(
+            matches!(result, Err(BusError::Unroutable { .. })),
+            "a failed handler-error reply publication must fail the request, got {result:?}"
+        );
+        assert_eq!(publisher.attempts.load(Ordering::SeqCst), 1);
+    }
+
+    /// The unsupported-version guard publishes its own error reply before
+    /// the handler ever runs; a failure on that publication must fail the
+    /// request without having run the handler.
+    #[tokio::test]
+    async fn a_failed_unsupported_version_reply_publication_fails_the_request() {
+        let publisher = Arc::new(FailingReplyPublisher::new(
+            unroutable_reply_publication_error,
+        ));
+        let ran = Arc::new(AtomicBool::new(false));
+        let handler = RepliedHandler::new(
+            RecordingHandler {
+                ran: Arc::clone(&ran),
+            },
+            Arc::clone(&publisher),
+        );
+        let mut request = request_envelope(Some("amq.gen-inbox"));
+        request.insert_protocol_header(PROTOCOL_VERSION_HEADER, "99".to_owned());
+
+        let result = handler.handle(&request, &ctx()).await;
+
+        assert!(
+            matches!(result, Err(BusError::Unroutable { .. })),
+            "a failed unsupported-version reply publication must fail the request, got {result:?}"
+        );
+        assert_eq!(publisher.attempts.load(Ordering::SeqCst), 1);
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "the handler must not run when the version reply itself fails to publish"
+        );
+    }
+
+    /// The malformed-payload guard publishes its own error reply before the
+    /// handler ever runs; a failure on that publication must fail the
+    /// request without having run the handler.
+    #[tokio::test]
+    async fn a_failed_malformed_reply_publication_fails_the_request() {
+        let publisher = Arc::new(FailingReplyPublisher::new(
+            unroutable_reply_publication_error,
+        ));
+        let ran = Arc::new(AtomicBool::new(false));
+        let handler = RepliedHandler::new(
+            RecordingHandler {
+                ran: Arc::clone(&ran),
+            },
+            Arc::clone(&publisher),
+        );
+        let mut request = request_envelope(Some("amq.gen-inbox"));
+        request.payload = b"{ not json".to_vec();
+
+        let result = handler.handle(&request, &ctx()).await;
+
+        assert!(
+            matches!(result, Err(BusError::Unroutable { .. })),
+            "a failed malformed-reply publication must fail the request, got {result:?}"
+        );
+        assert_eq!(publisher.attempts.load(Ordering::SeqCst), 1);
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "the handler must not run when the malformed-request reply fails to publish"
+        );
+    }
+
+    /// The invalid-deadline guard publishes its own error reply before the
+    /// handler ever runs; a failure on that publication must fail the
+    /// request without having run the handler.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_invalid_deadline_reply_publication_fails_the_request() {
+        let publisher = Arc::new(FailingReplyPublisher::new(
+            unroutable_reply_publication_error,
+        ));
+        let ran = Arc::new(AtomicBool::new(false));
+        let handler = RepliedHandler::new(
+            RecordingHandler {
+                ran: Arc::clone(&ran),
+            },
+            Arc::clone(&publisher),
+        );
+        let mut request = request_envelope(Some("amq.gen-inbox"));
+        request.insert_protocol_header(DEADLINE_HEADER, "soon".to_owned());
+
+        let result = handler.handle(&request, &ctx()).await;
+
+        assert!(
+            matches!(result, Err(BusError::Unroutable { .. })),
+            "a failed invalid-deadline reply publication must fail the request, got {result:?}"
+        );
+        assert_eq!(publisher.attempts.load(Ordering::SeqCst), 1);
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "the handler must not run when the invalid-deadline reply fails to publish"
         );
     }
 }

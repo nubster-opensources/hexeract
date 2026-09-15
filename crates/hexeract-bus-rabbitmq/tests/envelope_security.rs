@@ -45,6 +45,9 @@ use hexeract_bus::Issuer;
 use hexeract_bus::KeyId;
 use hexeract_bus::KeySourceError;
 use hexeract_bus::Message;
+use hexeract_bus::PROTOCOL_VERSION;
+use hexeract_bus::PROTOCOL_VERSION_HEADER;
+use hexeract_bus::REQUEST_ID_HEADER;
 use hexeract_bus::ReplyAuthentication;
 use hexeract_bus::Request;
 use hexeract_bus::RequestContext;
@@ -1329,6 +1332,87 @@ impl RequestHandler<Ping> for Echo {
     }
 }
 
+/// Responder that echoes the request's `seq` back, counting every actual
+/// execution of its body.
+///
+/// Used where the assertion of interest is not the reply itself but how
+/// many times the handler ran before the request settled, for instance
+/// under `max_attempts(1)`, where exactly one execution is the whole
+/// point of the setting.
+struct CountingEcho {
+    calls: Arc<AtomicUsize>,
+}
+
+impl RequestHandler<Ping> for CountingEcho {
+    type Error = BusError;
+
+    async fn handle(&self, request: Ping, _ctx: &RequestContext<'_>) -> Result<Pong, BusError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Pong { seq: request.seq })
+    }
+}
+
+/// Sign a `Ping` request as [`issuer`] for `queue`, carrying `reply_to` and
+/// the request-reply protocol headers, then publish it straight to `queue`,
+/// bypassing the request client so the forged `reply_to` reaches the
+/// responder untouched.
+///
+/// `reply_to` is covered by the signature (see
+/// `hexeract_bus::envelope_security::canonical`), so it must be set on the
+/// envelope before [`sign_as`] runs, not only on the AMQP properties
+/// afterward: signing one value and publishing another would make the
+/// signature meaningless, not merely inconvenient.
+async fn publish_signed_ping_with_unroutable_reply(
+    channel: &Channel,
+    queue: &str,
+    seq: u64,
+    reply_to: &str,
+) {
+    let correlation_id = Uuid::now_v7();
+    let mut envelope =
+        BusEnvelope::with_reply_to(correlation_id, reply_to.to_owned(), &Ping { seq })
+            .expect("request encodes");
+    let request_id = Uuid::now_v7();
+    envelope
+        .headers
+        .insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
+    envelope.headers.insert(
+        PROTOCOL_VERSION_HEADER.to_owned(),
+        PROTOCOL_VERSION.to_string(),
+    );
+
+    let security_headers = sign_as(&envelope, queue, &audience());
+
+    let mut fields = FieldTable::default();
+    fields.insert(
+        ShortString::from(REQUEST_ID_HEADER),
+        AMQPValue::LongString(request_id.to_string().into()),
+    );
+    fields.insert(
+        ShortString::from(PROTOCOL_VERSION_HEADER),
+        AMQPValue::LongString(PROTOCOL_VERSION.to_string().into()),
+    );
+    for (name, value) in &security_headers {
+        fields.insert(ShortString::from(name), AMQPValue::LongString(value.into()));
+    }
+
+    let published_at_secs = envelope
+        .published_at
+        .duration_since(UNIX_EPOCH)
+        .expect("after epoch")
+        .as_secs();
+
+    let properties = BasicProperties::default()
+        .with_type(Ping::MESSAGE_TYPE.into())
+        .with_message_id(envelope.message_id.to_string().into())
+        .with_correlation_id(envelope.correlation_id.to_string().into())
+        .with_timestamp(published_at_secs)
+        .with_reply_to(reply_to.into())
+        .with_headers(fields);
+
+    harness::publish_with_properties(channel, queue, properties, &envelope.payload).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn a_signed_reply_survives_the_request_reply_path() {
@@ -1719,6 +1803,96 @@ async fn a_caller_without_envelope_security_reports_nothing_enforced() {
         &ReplyAuthentication::NotEnforced,
         "a caller with no envelope security configured at all must report that nothing is \
          enforced on the reply it received"
+    );
+
+    cancel.cancel();
+    let _ = worker_handle.await;
+}
+
+// -------------------------------------------------- unroutable reply, required policy
+
+/// The required-policy counterpart of
+/// `request_reply::an_unroutable_reply_is_retried_under_the_default_retry_policy`.
+///
+/// The request here is properly signed for the queue it is delivered on, so
+/// it passes verification and reaches the handler; the only way it can then
+/// fail is a real, uninjected reply publication failure: a
+/// `reply_to` of the form `amq.gen-<uuid>` names no queue, so the
+/// responder's mandatory reply publication comes back
+/// `BusError::Unroutable`. `#514` already refuses `max_attempts` above `1`
+/// once the inbound policy is [`hexeract_bus::VerificationPolicy::Required`],
+/// so a single failure exhausts the retry budget immediately, and the
+/// handler must have run exactly once.
+///
+/// This proves that the retry-exhaustion path dead-letters an authenticated
+/// request whose reply publication failed, under the required policy. It is
+/// distinct from the poison path, which settles a delivery that never
+/// verifies or never decodes: this request verifies and reaches the handler,
+/// so its failure is a handler failure, settled by exhaustion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn an_unroutable_reply_is_dead_lettered_under_required_envelope_security() {
+    let broker = harness::start_rabbitmq().await;
+    let cancel = CancellationToken::new();
+    let queue_name = "envelope-security.rpc.ping.unroutable-reply";
+    let dead_letter_queue = "envelope-security.rpc.ping.unroutable-reply.parked";
+    declare_temporary_queue(broker.uri(), queue_name).await;
+    // `dead_letter_queue` is deliberately left undeclared: the worker
+    // declares it itself, durable, the first time it needs it, and
+    // pre-declaring it here with different arguments would make that
+    // declaration fail with PRECONDITION_FAILED, ending the worker task
+    // before it ever consumes anything.
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let responder_transport = Arc::new(
+        RabbitMqTransport::new(broker.uri())
+            .await
+            .expect("responder transport must connect"),
+    );
+    let worker =
+        RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
+            .queue(queue_name)
+            .max_attempts(1)
+            .dead_letter_routing_key(dead_letter_queue)
+            .envelope_security(inbound_security())
+            .register_request_handler::<Ping, _>(
+                CountingEcho {
+                    calls: Arc::clone(&calls),
+                },
+                Arc::clone(&responder_transport),
+            )
+            .build()
+            .unwrap();
+    let worker_cancel = cancel.clone();
+    let worker_handle = tokio::spawn(async move { worker.run(worker_cancel).await });
+
+    let publisher = RabbitMqConnection::connect(broker.uri()).await.unwrap();
+    let publisher_channel = publisher.create_channel().await.unwrap();
+    let fake_reply_to = format!("amq.gen-{}", Uuid::now_v7());
+    publish_signed_ping_with_unroutable_reply(&publisher_channel, queue_name, 1, &fake_reply_to)
+        .await;
+
+    wait_for_dead_letter(broker.uri(), dead_letter_queue)
+        .await
+        .expect(
+            "an authenticated request whose reply cannot be published must still be \
+             dead-lettered under a required envelope security policy",
+        );
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "max_attempts(1) means the handler must have run exactly once before the request \
+         was dead-lettered"
+    );
+
+    let remaining = publisher_channel
+        .basic_get(queue_name.into(), BasicGetOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        remaining.is_none(),
+        "the consumed queue must be empty once the request has been dead-lettered"
     );
 
     cancel.cancel();

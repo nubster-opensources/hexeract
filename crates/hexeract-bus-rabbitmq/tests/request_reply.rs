@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -61,6 +61,7 @@ use hexeract_bus_rabbitmq::connect_request_client;
 use hexeract_bus_rabbitmq::connect_request_client_with_config;
 use hexeract_bus_rabbitmq::declare_reply_inbox_for_test;
 use hexeract_bus_rabbitmq::run_reply_inbox_for_test;
+use hexeract_bus_rabbitmq::worker::DEFAULT_MAX_ATTEMPTS;
 use lapin::BasicProperties;
 use lapin::Channel;
 use lapin::Confirmation;
@@ -1499,6 +1500,184 @@ async fn a_request_whose_deadline_expired_in_the_queue_never_reaches_the_handler
         counters.snapshot().expired_deadline,
         1,
         "the live control must not itself be counted as an expired deadline"
+    );
+
+    cancel.cancel();
+    let _ = worker_handle.await;
+}
+
+// -------------------------------------------------- unroutable reply, default retry policy
+
+/// Responder that echoes the request's `seq` back, counting every actual
+/// execution of its body.
+///
+/// The count is the whole point of the test below: it distinguishes "the
+/// worker retried the delivery" from "the worker retried without ever
+/// touching the business handler again", which a green test alone cannot
+/// tell apart.
+struct CountingEcho {
+    calls: Arc<AtomicUsize>,
+}
+impl RequestHandler<Ping> for CountingEcho {
+    type Error = BusError;
+    async fn handle(&self, request: Ping, _ctx: &RequestContext<'_>) -> Result<Pong, BusError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Pong { seq: request.seq })
+    }
+}
+
+/// Poll `dead_letter_queue` with a bounded number of attempts, so a slow
+/// agent gets more wall time rather than a flaky false failure, instead of
+/// a fixed sleep.
+///
+/// The worker declares `dead_letter_queue` itself, lazily, the first time it
+/// needs it, so this must never pre-declare it: a fresh channel is opened
+/// for every attempt because a `basic_get` against a queue that does not
+/// exist yet closes the channel it was issued on, and treating that as
+/// "not parked yet" rather than an error is exactly what survives the race
+/// with the worker's own declaration.
+async fn wait_for_dead_letter(uri: &str, dead_letter_queue: &str) -> bool {
+    let connection = RabbitMqConnection::connect(uri)
+        .await
+        .expect("probe connection must open");
+    for _ in 0..100 {
+        let channel = connection
+            .create_channel()
+            .await
+            .expect("probe channel must open");
+        if let Ok(Some(_)) = channel
+            .basic_get(dead_letter_queue.into(), BasicGetOptions::default())
+            .await
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// Publish a forged ping request straight to `queue`, carrying a fresh
+/// request id, the current protocol version, and a `reply_to` naming an
+/// `amq.gen-` inbox that was never declared, so the responder's mandatory
+/// reply publication is bound to fail with `BusError::Unroutable`.
+///
+/// Every other property is what a well-formed request carries: the forged
+/// `reply_to` is the only defect, and the failure it causes is produced by
+/// the broker itself, not injected.
+async fn publish_ping_with_unroutable_reply(channel: &Channel, queue: &str, reply_to: &str) {
+    let mut headers = FieldTable::default();
+    headers.insert(
+        ShortString::from(REQUEST_ID_HEADER),
+        AMQPValue::LongString(Uuid::now_v7().to_string().into()),
+    );
+    headers.insert(
+        ShortString::from(PROTOCOL_VERSION_HEADER),
+        AMQPValue::LongString(PROTOCOL_VERSION.to_string().into()),
+    );
+
+    let envelope = BusEnvelope::new(Uuid::now_v7(), &Ping { seq: 1 }).expect("request encodes");
+
+    channel
+        .basic_publish(
+            "".into(),
+            queue.into(),
+            BasicPublishOptions::default(),
+            &envelope.payload,
+            BasicProperties::default()
+                .with_headers(headers)
+                .with_message_id(envelope.message_id.to_string().into())
+                .with_correlation_id(envelope.correlation_id.to_string().into())
+                .with_type(Ping::MESSAGE_TYPE.into())
+                .with_reply_to(reply_to.into()),
+        )
+        .await
+        .expect("publish must succeed");
+}
+
+/// Pins how many times the business handler runs when only the reply
+/// publication keeps failing.
+///
+/// The failure is real, not injected: a `reply_to` of the form
+/// `amq.gen-<uuid>` names no queue at all, so the responder's `mandatory`
+/// reply publication comes back `BusError::Unroutable`, `RepliedHandler`
+/// propagates it with `?`, and the worker treats the request itself as a
+/// failed delivery under `AckMode::Manual`. Under the default retry
+/// policy that request is redelivered, through the wait queue, up to
+/// `DEFAULT_MAX_ATTEMPTS` times before landing in the configured
+/// dead-letter queue. The request is never silently acknowledged away, and
+/// it ends up parked rather than lost.
+///
+/// The execution count pins current behavior, not the desired one: none of
+/// those retries can succeed, since a server-named inbox never comes back
+/// once gone, so the handler runs `DEFAULT_MAX_ATTEMPTS` times for a reply
+/// nobody can receive. Making an undeliverable reply terminal is tracked in
+/// nubster-opensources/hexeract#557, which rewrites this assertion to a
+/// single execution.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn an_unroutable_reply_is_retried_under_the_default_retry_policy() {
+    let broker = harness::start_rabbitmq().await;
+    let cancel = CancellationToken::new();
+    let queue = "tests.ping.unroutable-reply.default";
+    let dead_letter_queue = "tests.ping.unroutable-reply.default.parked";
+
+    // Only the consumed queue is pre-declared. `dead_letter_queue` must be
+    // left for the worker to declare on its own, durable, the first time it
+    // is needed: pre-declaring it here with different arguments would make
+    // the worker's own declaration fail with PRECONDITION_FAILED and the
+    // whole worker task exit before it ever consumes anything, which looks
+    // exactly like the request vanishing, for an entirely unrelated reason.
+    declare_ping_queue(broker.uri(), queue).await;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let responder_transport = Arc::new(RabbitMqTransport::new(broker.uri()).await.unwrap());
+    let worker = RabbitMqWorkerBuilder::new(
+        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+            .await
+            .unwrap(),
+    )
+    .queue(queue)
+    .retry_delay(Duration::from_millis(50))
+    .dead_letter_routing_key(dead_letter_queue)
+    .register_request_handler::<Ping, _>(
+        CountingEcho {
+            calls: Arc::clone(&calls),
+        },
+        Arc::clone(&responder_transport),
+    )
+    .build()
+    .unwrap();
+    let worker_cancel = cancel.clone();
+    let worker_handle = tokio::spawn(async move { worker.run(worker_cancel).await });
+
+    let publish_connection = RabbitMqConnection::connect(broker.uri()).await.unwrap();
+    let publish_channel = publish_connection.create_channel().await.unwrap();
+    let fake_reply_to = format!("amq.gen-{}", Uuid::now_v7());
+    publish_ping_with_unroutable_reply(&publish_channel, queue, &fake_reply_to).await;
+
+    let parked = wait_for_dead_letter(broker.uri(), dead_letter_queue).await;
+    assert!(
+        parked,
+        "a request whose reply can never be published must eventually be dead-lettered, \
+         never vanish silently"
+    );
+
+    // The handler counts its execution before the reply publication fails,
+    // and the worker dead-letters only after that failure, so by the time
+    // the request is parked every execution has already been counted.
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        usize::try_from(DEFAULT_MAX_ATTEMPTS).unwrap(),
+        "the handler runs once per attempt of the default retry policy"
+    );
+
+    let remaining = publish_channel
+        .basic_get(queue.into(), BasicGetOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        remaining.is_none(),
+        "the consumed queue must be empty once the request has been dead-lettered"
     );
 
     cancel.cancel();
