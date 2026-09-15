@@ -303,4 +303,63 @@ mod tests {
 
         assert!(public_key.verify(&representation, &signature).is_ok());
     }
+
+    /// Seed bytes 0x00..=0x1f, used by every known-answer test in this
+    /// module so the signing key stays traceable to one external oracle run.
+    const SEED: [u8; 32] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f,
+    ];
+
+    /// The expected signature below was produced once outside this crate
+    /// (Python for the canonical framing and digest, openssl for the
+    /// Ed25519 signature over it) and frozen as a literal. A sign/verify
+    /// round trip through this crate's own code cannot catch a change in
+    /// how these bytes are produced, for example a version bump of the
+    /// hashing or base64 library, because both sides of the round trip
+    /// would drift together; comparing against a signature this crate never
+    /// produced can.
+    #[test]
+    fn signing_the_vector_yields_the_externally_computed_signature() {
+        let keys = StaticKeySource::builder()
+            .with_signing_key(
+                KeyId::new("2026-09").expect("valid key id"),
+                SigningKeyHandle::from(SigningKey::from_bytes(&SEED)),
+            )
+            .build();
+        let issuer = Issuer::new("billing-service").expect("valid issuer");
+        let known_answer_signer = EnvelopeSigner::new(issuer, keys);
+
+        let mut headers = HashMap::new();
+        headers.insert("tenant".to_owned(), "acme".to_owned());
+        let mut protocol_headers = HashMap::new();
+        protocol_headers.insert("x-hexeract-protocol-version".to_owned(), "1".to_owned());
+
+        let envelope = BusEnvelope::restore_from_transport(
+            Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef),
+            "billing.invoice.issued".to_owned(),
+            br#"{"invoice":42}"#.to_vec(),
+            Uuid::from_u128(0xfedc_ba98_7654_3210_fedc_ba98_7654_3210),
+            Some("amq.gen-known-answer".to_owned()),
+            headers,
+            protocol_headers,
+            UNIX_EPOCH + Duration::from_secs(1_757_000_000),
+        );
+
+        let audience = Audience::new("ledger-service").expect("valid audience");
+        let context = SigningContext {
+            destination: "billing.invoices",
+            audience: &audience,
+        };
+
+        let security_headers = known_answer_signer
+            .sign(&envelope, &context)
+            .expect("signed");
+
+        assert_eq!(
+            signature_of(&security_headers),
+            "8jYSF3-bb39EEgXJlwbR7W69Z8N_WbdEN7oRBO0G-W0VpAhobexYPL1N2wiRSh2o5TR1xDuVX8HcpTLFQM57CQ"
+        );
+    }
 }
