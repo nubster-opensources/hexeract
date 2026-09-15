@@ -1812,7 +1812,7 @@ async fn a_caller_without_envelope_security_reports_nothing_enforced() {
 // -------------------------------------------------- unroutable reply, required policy
 
 /// The required-policy counterpart of
-/// `request_reply::an_unroutable_reply_is_retried_under_the_default_retry_policy`.
+/// `request_reply::an_unroutable_reply_is_dead_lettered_without_retry`.
 ///
 /// The request here is properly signed for the queue it is delivered on, so
 /// it passes verification and reaches the handler; the only way it can then
