@@ -40,9 +40,10 @@ impl RemoteErrorType {
             | BusError::TypeMismatch { .. }
             | BusError::PayloadTooLarge { .. }
             | BusError::EnvelopeSecurity(_) => Self::Malformed,
-            BusError::Connection { .. } | BusError::Transport(_) | BusError::Unroutable { .. } => {
-                Self::Unavailable
-            }
+            BusError::Connection { .. }
+            | BusError::Transport(_)
+            | BusError::Unroutable { .. }
+            | BusError::ReplyUndeliverable { .. } => Self::Unavailable,
             BusError::Internal(_)
             | BusError::MissingHandler { .. }
             | BusError::InvalidTopology { .. } => Self::Internal,
@@ -130,6 +131,22 @@ mod tests {
         assert_eq!(
             RemoteErrorType::from_bus_error(&error),
             RemoteErrorType::Internal
+        );
+    }
+
+    /// An undeliverable reply is a connection/routing-shaped failure from the
+    /// caller's perspective, exactly like `Unroutable` and `Connection`: it
+    /// must be reported as `Unavailable`, not `Malformed`.
+    #[test]
+    fn an_undeliverable_reply_is_reported_as_unavailable() {
+        let error = BusError::ReplyUndeliverable {
+            destination: "amq.gen-inbox".to_owned(),
+            reply_text: "NO_ROUTE".to_owned(),
+            reply_code: 312,
+        };
+        assert_eq!(
+            RemoteErrorType::from_bus_error(&error),
+            RemoteErrorType::Unavailable
         );
     }
 }

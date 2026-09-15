@@ -1044,38 +1044,43 @@ impl RabbitMqWorker {
                 DeliveryDisposition::from_settle_result(&ack)
             }
             Err(err) => {
-                // A delivery whose message type has no registered handler
-                // is a permanent failure: retrying it through the wait
-                // queue only burns the retry budget and adds broker
-                // traffic. Route it straight to the exhausted path.
-                if let BusError::MissingHandler { .. } = &err {
-                    tracing::warn!(
-                        message_type = %envelope.message_type,
-                        message_id = %envelope.message_id,
-                        error = %err,
-                        "no handler registered; routing delivery straight to dead-letter without retry"
-                    );
-                    return self.handle_exhausted(channel, delivery, envelope, 0).await;
-                }
                 let wait_queue = wait_queue_name(&self.queue);
                 // `x-death` is attacker-influenced; clamp the saturating
                 // add so a forged count near `u32::MAX` cannot overflow
                 // (panic in debug, wrap to 0 then retry forever in release).
                 let current = death_count(&delivery.properties, &wait_queue).saturating_add(1);
-                tracing::warn!(
-                    message_type = %envelope.message_type,
-                    message_id = %envelope.message_id,
-                    attempt = current,
-                    max_attempts = self.config.max_attempts,
-                    error = %err,
-                    "handler failed"
-                );
-                if current < self.config.max_attempts {
-                    self.schedule_retry(channel, delivery, envelope, &wait_queue)
-                        .await
+                // A permanent delivery failure (no handler registered, or a
+                // reply the broker could never deliver) can never succeed on
+                // redelivery: retrying it through the wait queue only burns
+                // the retry budget and adds broker traffic. Route it
+                // straight to the exhausted path instead.
+                let route = route_failure(&err, current, self.config.max_attempts);
+                if err.is_permanent_delivery_failure() {
+                    tracing::warn!(
+                        message_type = %envelope.message_type,
+                        message_id = %envelope.message_id,
+                        error = %err,
+                        "permanent delivery failure; routing delivery straight to dead-letter without retry"
+                    );
                 } else {
-                    self.handle_exhausted(channel, delivery, envelope, current)
-                        .await
+                    tracing::warn!(
+                        message_type = %envelope.message_type,
+                        message_id = %envelope.message_id,
+                        attempt = current,
+                        max_attempts = self.config.max_attempts,
+                        error = %err,
+                        "handler failed"
+                    );
+                }
+                match route {
+                    FailureRoute::Retry => {
+                        self.schedule_retry(channel, delivery, envelope, &wait_queue)
+                            .await
+                    }
+                    FailureRoute::DeadLetter { attempts } => {
+                        self.handle_exhausted(channel, delivery, envelope, attempts)
+                            .await
+                    }
                 }
             }
         }
@@ -1618,6 +1623,34 @@ fn log_poison_rejection(
     );
 }
 
+/// Where a failed manual-acknowledgement delivery goes next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureRoute {
+    /// Republish through the wait queue for another attempt.
+    Retry,
+    /// Settle through the exhausted path after `attempts` attempts.
+    DeadLetter {
+        /// Number of attempts already spent, forwarded to `handle_exhausted`.
+        attempts: u32,
+    },
+}
+
+/// Decide the route of a failed delivery from its error and attempt count.
+///
+/// A permanent delivery failure (see [`BusError::is_permanent_delivery_failure`])
+/// is routed straight to dead-letter with `attempts: 0`, regardless of
+/// `attempt`: no retry could ever have succeeded, so none was spent.
+/// Otherwise the ordinary retry budget applies.
+fn route_failure(error: &BusError, attempt: u32, max_attempts: u32) -> FailureRoute {
+    if error.is_permanent_delivery_failure() {
+        FailureRoute::DeadLetter { attempts: 0 }
+    } else if attempt < max_attempts {
+        FailureRoute::Retry
+    } else {
+        FailureRoute::DeadLetter { attempts: attempt }
+    }
+}
+
 /// Rebuild `properties` with an empty field table, keeping the bounded core
 /// AMQP fields a quarantined message still needs to be diagnosed and routed.
 ///
@@ -2030,6 +2063,55 @@ mod tests {
         assert_eq!(cfg.max_payload_bytes, DEFAULT_MAX_PAYLOAD_BYTES);
         assert_eq!(cfg.metadata_limits, AmqpMetadataLimits::default());
         assert!(cfg.envelope_security.is_none());
+    }
+
+    /// A missing handler can never succeed on redelivery, so it must be
+    /// dead-lettered on its very first attempt, with no attempts recorded:
+    /// this reproduces the short-circuit `handle_manual_outcome` already
+    /// takes for `BusError::MissingHandler`, now proven independently of it.
+    #[test]
+    fn a_missing_handler_is_dead_lettered_without_retry() {
+        let error = BusError::MissingHandler {
+            message_type: "orders.placed".to_owned(),
+        };
+        assert_eq!(
+            route_failure(&error, 1, 5),
+            FailureRoute::DeadLetter { attempts: 0 }
+        );
+    }
+
+    /// An undeliverable reply can never succeed on redelivery either, and
+    /// must be dead-lettered the same way as a missing handler.
+    #[test]
+    fn an_undeliverable_reply_is_dead_lettered_without_retry() {
+        let error = BusError::ReplyUndeliverable {
+            destination: "amq.gen-inbox".to_owned(),
+            reply_text: "NO_ROUTE".to_owned(),
+            reply_code: 312,
+        };
+        assert_eq!(
+            route_failure(&error, 1, 5),
+            FailureRoute::DeadLetter { attempts: 0 }
+        );
+    }
+
+    /// A transient failure still has retry budget left, so it must be
+    /// retried rather than dead-lettered.
+    #[test]
+    fn a_transient_failure_is_retried_below_the_budget() {
+        let error = BusError::Transport(Box::new(std::io::Error::other("channel closed")));
+        assert_eq!(route_failure(&error, 1, 5), FailureRoute::Retry);
+    }
+
+    /// Once a transient failure has spent its whole retry budget, it must be
+    /// dead-lettered, carrying the spent attempt count forward.
+    #[test]
+    fn a_transient_failure_is_dead_lettered_once_the_budget_is_spent() {
+        let error = BusError::Transport(Box::new(std::io::Error::other("channel closed")));
+        assert_eq!(
+            route_failure(&error, 5, 5),
+            FailureRoute::DeadLetter { attempts: 5 }
+        );
     }
 
     fn inbound_security_with_policy(policy: VerificationPolicy) -> InboundEnvelopeSecurity {

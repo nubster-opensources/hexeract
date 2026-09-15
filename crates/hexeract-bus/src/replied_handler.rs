@@ -132,7 +132,7 @@ where
                     "request carries an unusable deadline, rejecting"
                 );
                 let reply = error_reply(RemoteErrorType::Malformed, correlation_id, request_id)?;
-                self.replies.publish_reply(reply_to, &reply).await?;
+                self.deliver_reply(reply_to, &reply).await?;
                 Ok(ControlFlow::Break(()))
             }
         }
@@ -182,6 +182,37 @@ where
             correlation_id,
             request_id,
         )
+    }
+
+    /// Publish `envelope` to `reply_to`, reporting a reply the broker returned
+    /// as unroutable as [`BusError::ReplyUndeliverable`].
+    ///
+    /// Only [`BusError::Unroutable`] is translated: it is the one failure
+    /// mode that means the reply destination itself is gone, and a
+    /// server-named reply inbox never comes back once gone, so redelivering
+    /// the request cannot help. Every other error (a transport hiccup, a
+    /// dropped connection) can still succeed once the publish is retried, so
+    /// it is propagated unchanged and keeps its normal retry treatment.
+    async fn deliver_reply(
+        &self,
+        reply_to: &ReplyDestination,
+        envelope: &BusEnvelope,
+    ) -> Result<(), BusError> {
+        self.replies
+            .publish_reply(reply_to, envelope)
+            .await
+            .map_err(|error| match error {
+                BusError::Unroutable {
+                    routing_key,
+                    reply_text,
+                    reply_code,
+                } => BusError::ReplyUndeliverable {
+                    destination: routing_key,
+                    reply_text,
+                    reply_code,
+                },
+                other => other,
+            })
     }
 }
 
@@ -326,7 +357,7 @@ where
                     );
                     let reply =
                         error_reply(RemoteErrorType::Unsupported, correlation_id, request_id)?;
-                    self.replies.publish_reply(&reply_to, &reply).await?;
+                    self.deliver_reply(&reply_to, &reply).await?;
                     return Ok(());
                 }
             };
@@ -349,7 +380,7 @@ where
                     );
                     let reply =
                         error_reply(RemoteErrorType::Malformed, correlation_id, request_id)?;
-                    self.replies.publish_reply(&reply_to, &reply).await?;
+                    self.deliver_reply(&reply_to, &reply).await?;
                     return Ok(());
                 }
             };
@@ -371,9 +402,7 @@ where
                 );
                 return Ok(());
             }
-            self.replies
-                .publish_reply(&reply_to, &reply_envelope)
-                .await?;
+            self.deliver_reply(&reply_to, &reply_envelope).await?;
             Ok(())
         })
     }
@@ -1614,7 +1643,7 @@ mod tests {
         let result = handler.handle(&request, &ctx()).await;
 
         assert!(
-            matches!(result, Err(BusError::Unroutable { .. })),
+            matches!(result, Err(BusError::ReplyUndeliverable { .. })),
             "a failed nominal reply publication must fail the request, got {result:?}"
         );
         assert_eq!(publisher.attempts.load(Ordering::SeqCst), 1);
@@ -1633,7 +1662,7 @@ mod tests {
         let result = handler.handle(&request, &ctx()).await;
 
         assert!(
-            matches!(result, Err(BusError::Unroutable { .. })),
+            matches!(result, Err(BusError::ReplyUndeliverable { .. })),
             "a failed handler-error reply publication must fail the request, got {result:?}"
         );
         assert_eq!(publisher.attempts.load(Ordering::SeqCst), 1);
@@ -1660,7 +1689,7 @@ mod tests {
         let result = handler.handle(&request, &ctx()).await;
 
         assert!(
-            matches!(result, Err(BusError::Unroutable { .. })),
+            matches!(result, Err(BusError::ReplyUndeliverable { .. })),
             "a failed unsupported-version reply publication must fail the request, got {result:?}"
         );
         assert_eq!(publisher.attempts.load(Ordering::SeqCst), 1);
@@ -1691,7 +1720,7 @@ mod tests {
         let result = handler.handle(&request, &ctx()).await;
 
         assert!(
-            matches!(result, Err(BusError::Unroutable { .. })),
+            matches!(result, Err(BusError::ReplyUndeliverable { .. })),
             "a failed malformed-reply publication must fail the request, got {result:?}"
         );
         assert_eq!(publisher.attempts.load(Ordering::SeqCst), 1);
@@ -1722,13 +1751,59 @@ mod tests {
         let result = handler.handle(&request, &ctx()).await;
 
         assert!(
-            matches!(result, Err(BusError::Unroutable { .. })),
+            matches!(result, Err(BusError::ReplyUndeliverable { .. })),
             "a failed invalid-deadline reply publication must fail the request, got {result:?}"
         );
         assert_eq!(publisher.attempts.load(Ordering::SeqCst), 1);
         assert!(
             !ran.load(Ordering::SeqCst),
             "the handler must not run when the invalid-deadline reply fails to publish"
+        );
+    }
+
+    /// `deliver_reply` must translate a broker-reported `Unroutable` failure
+    /// into `BusError::ReplyUndeliverable`, carrying the destination the
+    /// publication targeted and the broker's own reply code, so a worker can
+    /// classify it as a permanent delivery failure instead of retrying it.
+    #[tokio::test]
+    async fn an_unroutable_reply_publication_is_reported_as_undeliverable() {
+        let publisher = Arc::new(FailingReplyPublisher::new(
+            unroutable_reply_publication_error,
+        ));
+        let handler = RepliedHandler::new(Echo, Arc::clone(&publisher));
+        let request = request_envelope(Some("amq.gen-inbox"));
+
+        let result = handler.handle(&request, &ctx()).await;
+
+        let Err(BusError::ReplyUndeliverable {
+            destination,
+            reply_code,
+            ..
+        }) = result
+        else {
+            panic!("expected ReplyUndeliverable, got {result:?}");
+        };
+        assert_eq!(destination, "amq.gen-inbox");
+        assert_eq!(reply_code, 312);
+        assert_eq!(publisher.attempts.load(Ordering::SeqCst), 1);
+    }
+
+    /// A transient reply-publication failure is out of scope for this lot: it
+    /// keeps the reprise it already had, so `deliver_reply` must leave it
+    /// untranslated rather than folding it into `ReplyUndeliverable`.
+    #[tokio::test]
+    async fn a_transient_reply_publication_failure_keeps_its_error() {
+        let publisher = Arc::new(FailingReplyPublisher::new(|| {
+            BusError::Transport(Box::new(std::io::Error::other("channel closed")))
+        }));
+        let handler = RepliedHandler::new(Echo, Arc::clone(&publisher));
+        let request = request_envelope(Some("amq.gen-inbox"));
+
+        let result = handler.handle(&request, &ctx()).await;
+
+        assert!(
+            matches!(result, Err(BusError::Transport(_))),
+            "a transient reply publication failure must keep its own error, got {result:?}"
         );
     }
 }

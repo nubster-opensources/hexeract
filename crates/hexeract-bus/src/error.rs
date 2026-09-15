@@ -120,6 +120,21 @@ pub enum BusError {
         reply_code: u16,
     },
 
+    /// A reply could not be delivered because its destination no longer exists.
+    ///
+    /// Raised by the request/reply responder when the broker returns a mandatory
+    /// reply publication as unroutable. A server-named reply inbox never comes
+    /// back once gone, so redelivering the request cannot succeed.
+    #[error("reply to `{destination}` is undeliverable: {reply_text} (code {reply_code})")]
+    ReplyUndeliverable {
+        /// Reply destination the publication targeted.
+        destination: String,
+        /// Human-readable reply text sent by the broker.
+        reply_text: String,
+        /// AMQP reply code sent by the broker (typically `312`).
+        reply_code: u16,
+    },
+
     /// The worker consumed an envelope whose `message_type` has no registered handler.
     #[error("no handler registered for message type `{message_type}`")]
     MissingHandler {
@@ -201,6 +216,28 @@ impl BusError {
             Self::Connection { retryable, .. } => Some(*retryable),
             _ => None,
         }
+    }
+
+    /// Whether redelivering the same delivery can never succeed.
+    ///
+    /// A worker routes such a failure straight to its dead-letter path
+    /// instead of spending its retry budget. Only two variants are
+    /// permanent: [`Self::MissingHandler`], since no handler will register
+    /// itself between one attempt and the next, and
+    /// [`Self::ReplyUndeliverable`], since a server-named reply inbox never
+    /// comes back once gone. Every other variant, including
+    /// `Connection { retryable: false }`, returns `false` here: a permanent
+    /// connection failure is a supervision concern (the connection itself
+    /// must stop reconnecting), not a delivery-redelivery concern, and the
+    /// delivery that happened to be in flight when the connection failed
+    /// may still succeed once the connection recovers or a new one takes
+    /// over.
+    #[must_use]
+    pub fn is_permanent_delivery_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingHandler { .. } | Self::ReplyUndeliverable { .. }
+        )
     }
 }
 
@@ -339,5 +376,46 @@ mod tests {
 
         assert!(message.contains("non-utf8 long string"));
         assert!(!message.contains("tenant-secret"));
+    }
+
+    /// A missing handler can never succeed on redelivery: no handler will
+    /// register itself between one attempt and the next.
+    #[test]
+    fn missing_handler_is_a_permanent_delivery_failure() {
+        let error = BusError::MissingHandler {
+            message_type: "orders.placed".to_owned(),
+        };
+        assert!(error.is_permanent_delivery_failure());
+    }
+
+    /// An undeliverable reply can never succeed on redelivery: a server-named
+    /// reply inbox never comes back once gone.
+    #[test]
+    fn an_undeliverable_reply_is_a_permanent_delivery_failure() {
+        let error = BusError::ReplyUndeliverable {
+            destination: "amq.gen-inbox".to_owned(),
+            reply_text: "NO_ROUTE".to_owned(),
+            reply_code: 312,
+        };
+        assert!(error.is_permanent_delivery_failure());
+    }
+
+    /// A transient failure, or one that routing alone can fix, may still
+    /// succeed on redelivery, so none of these must be classified permanent.
+    #[test]
+    fn transient_and_routing_failures_are_not_permanent_delivery_failures() {
+        let unroutable = BusError::Unroutable {
+            routing_key: "orders.unknown".to_owned(),
+            reply_text: "NO_ROUTE".to_owned(),
+            reply_code: 312,
+        };
+        let transport = BusError::Transport(Box::new(std::io::Error::other("channel closed")));
+        let connection = BusError::connection(std::io::Error::other("access refused"), false);
+        let internal = BusError::Internal("bug".to_owned());
+
+        assert!(!unroutable.is_permanent_delivery_failure());
+        assert!(!transport.is_permanent_delivery_failure());
+        assert!(!connection.is_permanent_delivery_failure());
+        assert!(!internal.is_permanent_delivery_failure());
     }
 }

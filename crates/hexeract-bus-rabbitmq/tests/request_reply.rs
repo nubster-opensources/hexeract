@@ -61,7 +61,6 @@ use hexeract_bus_rabbitmq::connect_request_client;
 use hexeract_bus_rabbitmq::connect_request_client_with_config;
 use hexeract_bus_rabbitmq::declare_reply_inbox_for_test;
 use hexeract_bus_rabbitmq::run_reply_inbox_for_test;
-use hexeract_bus_rabbitmq::worker::DEFAULT_MAX_ATTEMPTS;
 use lapin::BasicProperties;
 use lapin::Channel;
 use lapin::Confirmation;
@@ -1594,28 +1593,22 @@ async fn publish_ping_with_unroutable_reply(channel: &Channel, queue: &str, repl
         .expect("publish must succeed");
 }
 
-/// Pins how many times the business handler runs when only the reply
-/// publication keeps failing.
+/// Pins how many times the business handler runs when the reply publication
+/// can never succeed.
 ///
 /// The failure is real, not injected: a `reply_to` of the form
 /// `amq.gen-<uuid>` names no queue at all, so the responder's `mandatory`
-/// reply publication comes back `BusError::Unroutable`, `RepliedHandler`
-/// propagates it with `?`, and the worker treats the request itself as a
-/// failed delivery under `AckMode::Manual`. Under the default retry
-/// policy that request is redelivered, through the wait queue, up to
-/// `DEFAULT_MAX_ATTEMPTS` times before landing in the configured
-/// dead-letter queue. The request is never silently acknowledged away, and
-/// it ends up parked rather than lost.
-///
-/// The execution count pins current behavior, not the desired one: none of
-/// those retries can succeed, since a server-named inbox never comes back
-/// once gone, so the handler runs `DEFAULT_MAX_ATTEMPTS` times for a reply
-/// nobody can receive. Making an undeliverable reply terminal is tracked in
-/// nubster-opensources/hexeract#557, which rewrites this assertion to a
-/// single execution.
+/// reply publication comes back `BusError::Unroutable`. `RepliedHandler`
+/// translates that into `BusError::ReplyUndeliverable`, which the worker
+/// classifies as a permanent delivery failure: the request is never
+/// redelivered, it is dead-lettered straight from its first, only attempt.
+/// A server-named reply inbox never comes back once gone, so no amount of
+/// redelivery could ever make this reply publishable, and the handler must
+/// run exactly once for it. The request is never silently acknowledged
+/// away, and it still ends up parked rather than lost.
 #[tokio::test]
 #[ignore = "requires Docker"]
-async fn an_unroutable_reply_is_retried_under_the_default_retry_policy() {
+async fn an_unroutable_reply_is_dead_lettered_without_retry() {
     let broker = harness::start_rabbitmq().await;
     let cancel = CancellationToken::new();
     let queue = "tests.ping.unroutable-reply.default";
@@ -1663,12 +1656,12 @@ async fn an_unroutable_reply_is_retried_under_the_default_retry_policy() {
     );
 
     // The handler counts its execution before the reply publication fails,
-    // and the worker dead-letters only after that failure, so by the time
-    // the request is parked every execution has already been counted.
+    // and the worker dead-letters immediately after that single failure, so
+    // by the time the request is parked exactly one execution was counted.
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        usize::try_from(DEFAULT_MAX_ATTEMPTS).unwrap(),
-        "the handler runs once per attempt of the default retry policy"
+        1,
+        "an undeliverable reply is a permanent delivery failure: the handler runs exactly once"
     );
 
     let remaining = publish_channel
