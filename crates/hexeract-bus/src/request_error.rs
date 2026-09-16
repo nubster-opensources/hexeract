@@ -4,6 +4,7 @@ use hexeract_core::RequestId;
 
 use crate::BusError;
 use crate::remote_error::RemoteErrorType;
+use crate::reply_acceptance::ReplyRejection;
 use crate::request_registry::RegisterRejection;
 
 /// A violation of the request-reply protocol, observed by the caller
@@ -56,8 +57,20 @@ pub enum RequestError {
     ///
     /// If the deadline raced publication, the broker may already have
     /// accepted the request even though its transport future was cancelled.
-    #[error("request timed out after {0:?}")]
-    Timeout(Duration),
+    #[error("request timed out after {elapsed:?}")]
+    Timeout {
+        /// How long the call ran for before timing out.
+        elapsed: Duration,
+        /// The last reason a delivery bearing this call's identity was
+        /// refused.
+        ///
+        /// `None` means no delivery was refused, which includes no delivery
+        /// at all. This is what tells a caller that timed out because every
+        /// delivery was refused apart from one that timed out in silence.
+        last_rejection: Option<ReplyRejection>,
+        /// How many deliveries bearing this call's identity were refused.
+        rejected_deliveries: u32,
+    },
     /// The client reached its in-flight capacity.
     ///
     /// The registry refuses the call immediately rather than waiting for a
@@ -127,7 +140,11 @@ mod tests {
 
     #[test]
     fn timeout_renders_duration() {
-        let err = RequestError::Timeout(Duration::from_millis(250));
+        let err = RequestError::Timeout {
+            elapsed: Duration::from_millis(250),
+            last_rejection: None,
+            rejected_deliveries: 0,
+        };
         assert!(err.to_string().contains("250ms"));
     }
 
