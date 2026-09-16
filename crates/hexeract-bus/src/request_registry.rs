@@ -1345,6 +1345,35 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_arriving_after_the_registry_closed_is_counted_late() {
+        let registry = Arc::new(RequestRegistry::default());
+        let pending = registry
+            .register(RequestId::new(), expectation())
+            .expect("registration succeeds");
+        let request_id = pending.request_id();
+
+        registry.close();
+
+        registry.resolve(
+            tagged(ok_reply(EXPECTED_REPLY), request_id),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+
+        assert_eq!(
+            registry.counters().late,
+            1,
+            "closing abandons the slots it clears, so a reply still in flight is late rather than traffic for a request this process never made"
+        );
+        assert_eq!(
+            registry.counters().orphaned,
+            0,
+            "a reply in flight when the registry closes must never inflate the orphaned counter, which would show foreign traffic on every clean shutdown"
+        );
+
+        drop(pending);
+    }
+
+    #[test]
     fn a_reply_for_an_identity_never_seen_is_counted_orphaned() {
         let registry = Arc::new(RequestRegistry::default());
 
