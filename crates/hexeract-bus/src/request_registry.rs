@@ -24,52 +24,78 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::BusEnvelope;
-use crate::reply_acceptance::{self, ReplyExpectation};
+use crate::reply_acceptance::{self, ReplyExpectation, ReplyRejection};
 use crate::reply_authentication::ReplyAuthentication;
 use crate::rpc_protocol::REQUEST_ID_HEADER;
+use crate::slot_retirement::{RetiredSlots, SlotRetirement};
 
+// `last_rejection` and `rejected_deliveries` are wired to `resolve`'s `Err`
+// branch in the Building phase: inert for the Red phase of #453.
+#[allow(dead_code)]
 #[derive(Debug)]
 struct Slot {
     expectation: ReplyExpectation,
     sender: oneshot::Sender<(BusEnvelope, ReplyAuthentication)>,
+    last_rejection: Option<ReplyRejection>,
+    rejected_deliveries: u32,
 }
 
 type Slots = HashMap<RequestId, Slot>;
 
-/// Slot map and closed flag, guarded by the same lock.
+/// Slot map, retired-identity memory and closed flag, guarded by the same
+/// lock.
 ///
-/// The two live under one [`Mutex`] on purpose: `close` must flip
+/// The three live under one [`Mutex`] on purpose: `close` must flip
 /// `closed` and clear `slots` atomically with respect to `register`, or a
 /// `register` racing a `close` could read `closed` as still `false`,
 /// insert its slot, and never be undone by `close`'s own clear. Keeping
 /// them apart as an atomic bool checked before a separately locked map
-/// would reopen exactly that window.
-#[derive(Debug, Default)]
+/// would reopen exactly that window. `retired` shares the lock for the same
+/// reason: recording a retirement must be atomic with the slot removal that
+/// caused it.
+#[derive(Debug)]
 struct RegistryState {
     slots: Slots,
+    retired: RetiredSlots,
     closed: bool,
 }
 
+impl RegistryState {
+    fn new(retired_capacity: usize) -> Self {
+        Self {
+            slots: Slots::default(),
+            retired: RetiredSlots::new(retired_capacity),
+            closed: false,
+        }
+    }
+}
+
 /// Counts of deliveries the registry refused to route.
-///
-/// `duplicate` is deliberately absent: once a slot is consumed by a valid
-/// reply it is removed, so a second valid reply is indistinguishable from an
-/// orphan at this level and is counted as `orphaned`. Telling the two apart
-/// requires retaining resolved identities for a short window, which belongs
-/// to the observability work (#441).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ReplyCountersSnapshot {
+    /// No envelope could be reconstructed from the delivery.
+    pub undecodable: u64,
+    /// Deliveries with an absent, unparsable or never-seen identity.
+    pub orphaned: u64,
+    /// Deliveries the transport refused before a verdict on their content.
+    pub unauthenticated: u64,
     /// Deliveries whose identity was known but which `accepts` refused.
     pub invalid: u64,
-    /// Deliveries with an absent, unparsable or unknown identity.
-    pub orphaned: u64,
+    /// Deliveries bearing an identity already resolved by a valid reply.
+    pub duplicate: u64,
+    /// Deliveries bearing an identity abandoned before they arrived.
+    pub late: u64,
 }
 
 #[derive(Debug, Default)]
 struct ReplyCounters {
-    invalid: AtomicU64,
+    undecodable: AtomicU64,
     orphaned: AtomicU64,
+    unauthenticated: AtomicU64,
+    invalid: AtomicU64,
+    duplicate: AtomicU64,
+    late: AtomicU64,
 }
 
 /// Why a call could not be registered.
@@ -122,7 +148,7 @@ impl RequestRegistry {
     #[must_use]
     pub fn new(max_in_flight: usize) -> Self {
         Self {
-            state: Mutex::new(RegistryState::default()),
+            state: Mutex::new(RegistryState::new(max_in_flight)),
             counters: ReplyCounters::default(),
             max_in_flight,
         }
@@ -177,6 +203,8 @@ impl RequestRegistry {
                 vacant.insert(Slot {
                     expectation,
                     sender,
+                    last_rejection: None,
+                    rejected_deliveries: 0,
                 });
                 Ok(PendingReply {
                     request_id,
@@ -204,7 +232,18 @@ impl RequestRegistry {
     /// at all must write [`ReplyAuthentication::NotEnforced`] itself, since
     /// writing that variant is itself a claim, and a transport that never
     /// asked the question is the one making it.
-    pub fn resolve(&self, envelope: BusEnvelope, authentication: ReplyAuthentication) {
+    ///
+    /// A transport that refused the delivery before reaching a verdict on its
+    /// content passes `Err`. Inert for the Red phase of #453: the `Err` arm
+    /// is ignored, carrying no counting or slot-attribution side effect yet.
+    pub fn resolve(
+        &self,
+        envelope: BusEnvelope,
+        authentication: Result<ReplyAuthentication, ReplyRejection>,
+    ) {
+        let Ok(authentication) = authentication else {
+            return;
+        };
         let Some(raw) = envelope.header(REQUEST_ID_HEADER) else {
             self.counters.orphaned.fetch_add(1, Ordering::Relaxed);
             tracing::debug!("reply without a request id header, dropping");
@@ -219,9 +258,22 @@ impl RequestRegistry {
 
         let mut state = self.state();
         let Some(slot) = state.slots.get(&request_id) else {
+            let retirement = state.retired.lookup(request_id);
             drop(state);
-            self.counters.orphaned.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(%request_id, "reply for an unknown or already-resolved request");
+            match retirement {
+                Some(SlotRetirement::Resolved) => {
+                    self.counters.duplicate.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(%request_id, "reply for an already-resolved request");
+                }
+                Some(SlotRetirement::Abandoned) => {
+                    self.counters.late.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(%request_id, "reply for an abandoned request, arrived late");
+                }
+                None => {
+                    self.counters.orphaned.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(%request_id, "reply for an unknown request");
+                }
+            }
             return;
         };
 
@@ -233,18 +285,36 @@ impl RequestRegistry {
         }
 
         let slot = state.slots.remove(&request_id);
+        if slot.is_some() {
+            state.retired.record(request_id, SlotRetirement::Resolved);
+        }
         drop(state);
         if let Some(slot) = slot {
             let _ = slot.sender.send((envelope, authentication));
         }
     }
 
+    /// Count a delivery that produced no envelope at all.
+    ///
+    /// The only bare counter mutator on this surface, and the only case
+    /// where there is no data to carry: without an envelope there is no
+    /// identity, so nothing can be attributed to a slot.
+    ///
+    /// Inert for the Red phase of #453: does not yet increment `undecodable`.
+    pub fn record_undecodable(&self) {
+        let _ = self;
+    }
+
     /// Snapshot of the refused-delivery counters.
     #[must_use]
     pub fn counters(&self) -> ReplyCountersSnapshot {
         ReplyCountersSnapshot {
-            invalid: self.counters.invalid.load(Ordering::Relaxed),
+            undecodable: self.counters.undecodable.load(Ordering::Relaxed),
             orphaned: self.counters.orphaned.load(Ordering::Relaxed),
+            unauthenticated: self.counters.unauthenticated.load(Ordering::Relaxed),
+            invalid: self.counters.invalid.load(Ordering::Relaxed),
+            duplicate: self.counters.duplicate.load(Ordering::Relaxed),
+            late: self.counters.late.load(Ordering::Relaxed),
         }
     }
 
@@ -255,12 +325,21 @@ impl RequestRegistry {
     /// still register after a `drain`, which is exactly what a reconnected
     /// transport needs.
     ///
+    /// Every slot cleared here is recorded `SlotRetirement::Abandoned`:
+    /// a reply bearing one of these identities that arrives after the drain
+    /// is late, not orphaned.
+    ///
     /// A transport supervisor that owns a [`crate::ReplyInboxState`] must
     /// mark it [`crate::ReplyInboxState::Reconnecting`] before calling
     /// this: see [`crate::ReplyInboxState`] for the guarantee that order
     /// gives a waiting caller.
     pub fn drain(&self) {
-        self.state().slots.clear();
+        let mut state = self.state();
+        let drained: Vec<RequestId> = state.slots.keys().copied().collect();
+        state.slots.clear();
+        for request_id in drained {
+            state.retired.record(request_id, SlotRetirement::Abandoned);
+        }
     }
 
     /// Fail every pending call and refuse further registrations.
@@ -272,10 +351,17 @@ impl RequestRegistry {
     /// orphan inserted after the map was cleared. Every waiting caller
     /// observes a closed channel, the same signal [`Self::drain`] produces,
     /// but here no further registration ever succeeds again.
+    ///
+    /// Every slot cleared here is recorded `SlotRetirement::Abandoned`,
+    /// for the same reason [`Self::drain`] records it.
     pub fn close(&self) {
         let mut state = self.state();
         state.closed = true;
+        let closed: Vec<RequestId> = state.slots.keys().copied().collect();
         state.slots.clear();
+        for request_id in closed {
+            state.retired.record(request_id, SlotRetirement::Abandoned);
+        }
     }
 
     /// Whether the registry has been closed and refuses further
@@ -297,8 +383,17 @@ impl RequestRegistry {
         self.len() == 0
     }
 
+    /// Remove `request_id`, recording why it left.
+    ///
+    /// Records `SlotRetirement::Abandoned` only when the slot was still
+    /// present. A slot that [`Self::resolve`] already removed has been
+    /// recorded `SlotRetirement::Resolved`, and overwriting that would
+    /// make every duplicate count as `late`.
     fn remove(&self, request_id: RequestId) {
-        self.state().slots.remove(&request_id);
+        let mut state = self.state();
+        if state.slots.remove(&request_id).is_some() {
+            state.retired.record(request_id, SlotRetirement::Abandoned);
+        }
     }
 
     /// Identities of every slot currently in flight.
@@ -328,6 +423,31 @@ impl PendingReply<'_> {
     #[must_use]
     pub fn request_id(&self) -> RequestId {
         self.request_id
+    }
+
+    /// The last reason a delivery bearing this identity was refused.
+    ///
+    /// Read it before the guard is dropped: dropping removes the slot.
+    ///
+    /// Inert for the Red phase of #453: always `None`.
+    #[must_use]
+    pub fn last_rejection(&self) -> Option<ReplyRejection> {
+        let _ = self;
+        None
+    }
+
+    /// How many deliveries bearing this identity were refused.
+    ///
+    /// One reason alone does not separate a misconfigured responder, which
+    /// produces a handful, from a flood, which produces thousands. This
+    /// count is what replaces the per-delivery warning that used to carry
+    /// that signal.
+    ///
+    /// Inert for the Red phase of #453: always `0`.
+    #[must_use]
+    pub fn rejected_deliveries(&self) -> u32 {
+        let _ = self;
+        0
     }
 
     /// Await the reply envelope, alongside what this transport established
@@ -459,11 +579,11 @@ mod tests {
 
         registry.resolve(
             reply_for(second.request_id(), shared_chain, 2),
-            ReplyAuthentication::NotEnforced,
+            Ok(ReplyAuthentication::NotEnforced),
         );
         registry.resolve(
             reply_for(first.request_id(), shared_chain, 1),
-            ReplyAuthentication::NotEnforced,
+            Ok(ReplyAuthentication::NotEnforced),
         );
 
         let (first_envelope, _first_authentication) = first.wait().await.expect("first reply");
@@ -493,7 +613,7 @@ mod tests {
             .expect("registration succeeds");
         let envelope =
             BusEnvelope::new(Uuid::now_v7(), &Pong { seq: 7 }).expect("pong must serialize");
-        registry.resolve(envelope, ReplyAuthentication::NotEnforced);
+        registry.resolve(envelope, Ok(ReplyAuthentication::NotEnforced));
         assert_eq!(registry.len(), 1, "the slot must stay in flight");
     }
 
@@ -506,7 +626,7 @@ mod tests {
         let mut envelope =
             BusEnvelope::new(Uuid::now_v7(), &Pong { seq: 7 }).expect("pong must serialize");
         envelope.insert_protocol_header(REQUEST_ID_HEADER, "not-a-uuid".to_owned());
-        registry.resolve(envelope, ReplyAuthentication::NotEnforced);
+        registry.resolve(envelope, Ok(ReplyAuthentication::NotEnforced));
         assert_eq!(registry.len(), 1, "the slot must stay in flight");
         assert_eq!(registry.counters().orphaned, 1);
     }
@@ -525,7 +645,7 @@ mod tests {
             RequestId::new().to_string(),
         );
 
-        registry.resolve(envelope, ReplyAuthentication::NotEnforced);
+        registry.resolve(envelope, Ok(ReplyAuthentication::NotEnforced));
 
         assert!(
             registry.is_empty(),
@@ -544,11 +664,11 @@ mod tests {
 
         registry.resolve(
             reply_for(request_id, chain, 1),
-            ReplyAuthentication::NotEnforced,
+            Ok(ReplyAuthentication::NotEnforced),
         );
         registry.resolve(
             reply_for(request_id, chain, 2),
-            ReplyAuthentication::NotEnforced,
+            Ok(ReplyAuthentication::NotEnforced),
         );
 
         let (envelope, _authentication) = pending.wait().await.expect("reply");
@@ -603,7 +723,7 @@ mod tests {
                 let seq = u64::try_from(resolve_index).expect("seq fits in u64");
                 resolver.resolve(
                     reply_for(resolver_ids[resolve_index], chain, seq),
-                    ReplyAuthentication::NotEnforced,
+                    Ok(ReplyAuthentication::NotEnforced),
                 );
             }
         });
@@ -631,7 +751,7 @@ mod tests {
 
         registry.resolve(
             tagged(ok_reply("attacker.reply"), request_id),
-            ReplyAuthentication::NotEnforced,
+            Ok(ReplyAuthentication::NotEnforced),
         );
 
         assert_eq!(registry.len(), 1, "the slot must survive an invalid reply");
@@ -639,7 +759,7 @@ mod tests {
 
         registry.resolve(
             tagged(ok_reply(EXPECTED_REPLY), request_id),
-            ReplyAuthentication::NotEnforced,
+            Ok(ReplyAuthentication::NotEnforced),
         );
 
         let (reply, _authentication) = pending.wait().await.expect("the legitimate reply must win");
@@ -656,7 +776,7 @@ mod tests {
 
         registry.resolve(
             tagged(ok_reply(EXPECTED_REPLY), RequestId::new()),
-            ReplyAuthentication::NotEnforced,
+            Ok(ReplyAuthentication::NotEnforced),
         );
 
         assert_eq!(registry.len(), 1);
@@ -671,7 +791,10 @@ mod tests {
             .register(RequestId::new(), expectation())
             .expect("registration succeeds");
 
-        registry.resolve(ok_reply(EXPECTED_REPLY), ReplyAuthentication::NotEnforced);
+        registry.resolve(
+            ok_reply(EXPECTED_REPLY),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
 
         assert_eq!(registry.counters().orphaned, 1);
     }
@@ -729,7 +852,7 @@ mod tests {
         let chain = Uuid::now_v7();
         registry.resolve(
             reply_for(request_id, chain, 11),
-            ReplyAuthentication::NotEnforced,
+            Ok(ReplyAuthentication::NotEnforced),
         );
 
         let (envelope, _authentication) = first
@@ -763,7 +886,7 @@ mod tests {
         let request_id = pending.request_id();
         registry.resolve(
             tagged(ok_reply(EXPECTED_REPLY), request_id),
-            ReplyAuthentication::NotEnforced,
+            Ok(ReplyAuthentication::NotEnforced),
         );
         assert!(
             registry.is_empty(),
@@ -910,7 +1033,7 @@ mod tests {
                 let seq = u64::try_from(resolve_index).expect("seq fits in u64");
                 resolver.resolve(
                     reply_for(resolver_ids[resolve_index], chain, seq),
-                    ReplyAuthentication::NotEnforced,
+                    Ok(ReplyAuthentication::NotEnforced),
                 );
             }
         });
@@ -952,7 +1075,7 @@ mod tests {
 
         registry.resolve(
             tagged(ok_reply(EXPECTED_REPLY), request_id),
-            ReplyAuthentication::Authenticated(principal.clone()),
+            Ok(ReplyAuthentication::Authenticated(principal.clone())),
         );
 
         let (envelope, authentication) = pending
@@ -984,7 +1107,7 @@ mod tests {
 
         registry.resolve(
             tagged(ok_reply(EXPECTED_REPLY), request_id),
-            ReplyAuthentication::NotEnforced,
+            Ok(ReplyAuthentication::NotEnforced),
         );
 
         let (_envelope, authentication) = pending
@@ -1012,7 +1135,7 @@ mod tests {
 
         registry.resolve(
             tagged(ok_reply(EXPECTED_REPLY), request_id),
-            ReplyAuthentication::WaivedUnsigned,
+            Ok(ReplyAuthentication::WaivedUnsigned),
         );
 
         let (_envelope, authentication) = pending
@@ -1038,7 +1161,7 @@ mod tests {
 
         registry.resolve(
             tagged(ok_reply("attacker.reply"), request_id),
-            ReplyAuthentication::Authenticated(principal()),
+            Ok(ReplyAuthentication::Authenticated(principal())),
         );
 
         assert_eq!(
@@ -1050,7 +1173,7 @@ mod tests {
 
         registry.resolve(
             tagged(ok_reply(EXPECTED_REPLY), request_id),
-            ReplyAuthentication::NotEnforced,
+            Ok(ReplyAuthentication::NotEnforced),
         );
 
         let (envelope, authentication) = pending
@@ -1063,5 +1186,269 @@ mod tests {
             ReplyAuthentication::NotEnforced,
             "the legitimate reply's own authentication must win, never the rejected one"
         );
+    }
+
+    #[test]
+    fn a_delivery_the_transport_refused_is_counted_unauthenticated() {
+        let registry = Arc::new(RequestRegistry::default());
+        let request_id = RequestId::new();
+        let _pending = registry
+            .register(request_id, expectation())
+            .expect("registration succeeds");
+
+        registry.resolve(
+            tagged(ok_reply(EXPECTED_REPLY), request_id),
+            Err(ReplyRejection::Unauthenticated),
+        );
+
+        assert_eq!(registry.counters().unauthenticated, 1);
+    }
+
+    #[tokio::test]
+    async fn an_unauthenticated_delivery_leaves_the_slot_pending() {
+        let registry = Arc::new(RequestRegistry::default());
+        let mut pending = registry
+            .register(RequestId::new(), expectation())
+            .expect("registration succeeds");
+        let request_id = pending.request_id();
+
+        registry.resolve(
+            tagged(ok_reply(EXPECTED_REPLY), request_id),
+            Err(ReplyRejection::Unauthenticated),
+        );
+
+        assert_eq!(
+            registry.len(),
+            1,
+            "a delivery the transport refused must leave the slot pending"
+        );
+
+        registry.resolve(
+            tagged(ok_reply(EXPECTED_REPLY), request_id),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+
+        let (envelope, _authentication) = pending
+            .wait()
+            .await
+            .expect("the legitimate reply must still resolve the slot");
+        assert_eq!(envelope.message_type, EXPECTED_REPLY);
+    }
+
+    #[tokio::test]
+    async fn a_second_valid_reply_is_counted_duplicate_not_orphaned() {
+        let registry = Arc::new(RequestRegistry::default());
+        let mut pending = registry
+            .register(RequestId::new(), pong_expectation())
+            .expect("registration succeeds");
+        let request_id = pending.request_id();
+        let chain = Uuid::now_v7();
+
+        registry.resolve(
+            reply_for(request_id, chain, 1),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+        pending.wait().await.expect("the first reply must resolve");
+
+        registry.resolve(
+            reply_for(request_id, chain, 2),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+
+        assert_eq!(
+            registry.counters().duplicate,
+            1,
+            "a second valid reply for an already-resolved identity must be counted duplicate"
+        );
+        assert_eq!(
+            registry.counters().orphaned,
+            0,
+            "a duplicate must never inflate the orphaned counter"
+        );
+    }
+
+    #[test]
+    fn a_reply_arriving_after_the_caller_gave_up_is_counted_late() {
+        let registry = Arc::new(RequestRegistry::default());
+        let pending = registry
+            .register(RequestId::new(), expectation())
+            .expect("registration succeeds");
+        let request_id = pending.request_id();
+        drop(pending);
+
+        registry.resolve(
+            tagged(ok_reply(EXPECTED_REPLY), request_id),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+
+        assert_eq!(
+            registry.counters().late,
+            1,
+            "a reply for an identity the caller abandoned must be counted late"
+        );
+        assert_eq!(
+            registry.counters().orphaned,
+            0,
+            "a late reply must never inflate the orphaned counter"
+        );
+    }
+
+    #[test]
+    fn a_reply_for_an_identity_never_seen_is_counted_orphaned() {
+        let registry = Arc::new(RequestRegistry::default());
+
+        registry.resolve(
+            tagged(ok_reply(EXPECTED_REPLY), RequestId::new()),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+
+        assert_eq!(registry.counters().orphaned, 1);
+    }
+
+    #[test]
+    fn an_undecodable_delivery_is_counted_undecodable() {
+        let registry = RequestRegistry::default();
+
+        registry.record_undecodable();
+
+        assert_eq!(registry.counters().undecodable, 1);
+    }
+
+    #[tokio::test]
+    async fn resolving_a_slot_records_it_as_resolved_not_abandoned() {
+        let registry = Arc::new(RequestRegistry::default());
+        let mut pending = registry
+            .register(RequestId::new(), pong_expectation())
+            .expect("registration succeeds");
+        let request_id = pending.request_id();
+        let chain = Uuid::now_v7();
+
+        registry.resolve(
+            reply_for(request_id, chain, 1),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+        pending
+            .wait()
+            .await
+            .expect("the resolved reply must be delivered");
+        drop(pending);
+
+        registry.resolve(
+            reply_for(request_id, chain, 2),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+
+        assert_eq!(
+            registry.counters().duplicate,
+            1,
+            "a slot resolved before the guard drops must still be counted duplicate"
+        );
+        assert_eq!(
+            registry.counters().late,
+            0,
+            "resolving must record the retirement before the guard drops, never letting the \
+             drop overwrite it as abandoned"
+        );
+    }
+
+    #[test]
+    fn the_last_rejection_is_readable_from_the_pending_reply() {
+        let registry = Arc::new(RequestRegistry::default());
+        let pending = registry
+            .register(RequestId::new(), expectation())
+            .expect("registration succeeds");
+        let request_id = pending.request_id();
+
+        registry.resolve(
+            tagged(ok_reply(EXPECTED_REPLY), request_id),
+            Err(ReplyRejection::MissingVersion),
+        );
+        registry.resolve(
+            tagged(ok_reply(EXPECTED_REPLY), request_id),
+            Err(ReplyRejection::UnsupportedVersion { version: 7 }),
+        );
+
+        assert_eq!(
+            pending.last_rejection(),
+            Some(ReplyRejection::UnsupportedVersion { version: 7 }),
+            "the last rejection must be the most recent one, not the first"
+        );
+    }
+
+    #[test]
+    fn each_refused_delivery_increments_the_slot_counter() {
+        let registry = Arc::new(RequestRegistry::default());
+        let pending = registry
+            .register(RequestId::new(), expectation())
+            .expect("registration succeeds");
+        let request_id = pending.request_id();
+
+        for _ in 0..3 {
+            registry.resolve(
+                tagged(ok_reply(EXPECTED_REPLY), request_id),
+                Err(ReplyRejection::Unauthenticated),
+            );
+        }
+
+        assert_eq!(pending.rejected_deliveries(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_valid_reply_after_rejections_still_wins() {
+        let registry = Arc::new(RequestRegistry::default());
+        let mut pending = registry
+            .register(RequestId::new(), pong_expectation())
+            .expect("registration succeeds");
+        let request_id = pending.request_id();
+        let chain = Uuid::now_v7();
+
+        registry.resolve(
+            tagged(ok_reply("attacker.reply"), request_id),
+            Err(ReplyRejection::Unauthenticated),
+        );
+        registry.resolve(
+            tagged(ok_reply("attacker.reply"), request_id),
+            Err(ReplyRejection::MissingVersion),
+        );
+
+        registry.resolve(
+            reply_for(request_id, chain, 42),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+
+        let (envelope, _authentication) = pending
+            .wait()
+            .await
+            .expect("the legitimate reply must still win after prior rejections");
+        let reply: Pong = envelope.decode().expect("decode");
+        assert_eq!(reply.seq, 42);
+    }
+
+    #[test]
+    fn beyond_capacity_a_late_reply_is_counted_orphaned() {
+        let registry = Arc::new(RequestRegistry::new(1));
+
+        let first = registry
+            .register(RequestId::new(), expectation())
+            .expect("the first slot fits within the bound");
+        let first_id = first.request_id();
+        drop(first);
+
+        let second = registry
+            .register(RequestId::new(), expectation())
+            .expect("capacity freed by the previous drop");
+        drop(second);
+
+        registry.resolve(
+            tagged(ok_reply(EXPECTED_REPLY), first_id),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+
+        assert_eq!(
+            registry.counters().orphaned,
+            1,
+            "a straggler beyond the documented retirement capacity must be orphaned again"
+        );
+        assert_eq!(registry.counters().late, 0);
     }
 }

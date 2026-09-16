@@ -7,6 +7,7 @@
 //! caller's generic reply type, which the registry does not know.
 
 use crate::BusEnvelope;
+use crate::reply_rejection_kind::ReplyRejectionKind;
 use crate::rpc_protocol::{
     PROTOCOL_VERSION, REPLY_ERROR_MESSAGE_TYPE, REPLY_STATUS_ERROR, REPLY_STATUS_HEADER,
     REPLY_STATUS_OK, read_protocol_version,
@@ -48,6 +49,25 @@ pub enum ReplyRejection {
     UnknownStatus,
     /// The message type does not match the status.
     UnexpectedType,
+    /// The signature could not be established against a known key.
+    ///
+    /// Carries no cause on purpose. Telling an unknown key apart from an
+    /// invalid signature or a wrong audience would build an oracle into a
+    /// value that is derived from untrusted input and travels all the way to
+    /// the caller, which may log it or forward it. The detailed cause stays
+    /// in the transport's own `debug!`, on the side that observed it.
+    Unauthenticated,
+}
+
+impl ReplyRejection {
+    /// The operational category this reason feeds.
+    // Inert for the Red phase of #453: every variant maps to `Invalid` until
+    // the Building phase wires the real mapping in.
+    #[must_use]
+    pub fn kind(self) -> ReplyRejectionKind {
+        let _ = self;
+        ReplyRejectionKind::Invalid
+    }
 }
 
 /// Whether `envelope` is an acceptable reply for `expectation`.
@@ -203,5 +223,32 @@ mod tests {
             accepts(&expectation(), &envelope),
             Err(ReplyRejection::UnexpectedType)
         );
+    }
+
+    #[test]
+    fn an_unauthenticated_rejection_maps_to_its_own_kind() {
+        assert_eq!(
+            ReplyRejection::Unauthenticated.kind(),
+            ReplyRejectionKind::Unauthenticated
+        );
+    }
+
+    #[test]
+    fn every_shape_rejection_maps_to_invalid() {
+        let shape_rejections = [
+            ReplyRejection::MissingVersion,
+            ReplyRejection::UnsupportedVersion { version: 99 },
+            ReplyRejection::MissingStatus,
+            ReplyRejection::UnknownStatus,
+            ReplyRejection::UnexpectedType,
+        ];
+
+        for rejection in shape_rejections {
+            assert_eq!(
+                rejection.kind(),
+                ReplyRejectionKind::Invalid,
+                "expected {rejection:?} to map to Invalid"
+            );
+        }
     }
 }

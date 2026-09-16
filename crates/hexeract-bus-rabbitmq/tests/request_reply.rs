@@ -190,6 +190,83 @@ async fn connection_drop_fails_in_flight_fast() {
     cancel.cancel();
 }
 
+/// Critere 7 de #445: a connection loss drains every in-flight slot before a
+/// fresh inbox is declared (see `RequestRegistry::drain`'s own doc for why a
+/// transport supervisor calls exactly that on reconnect), and a reply that
+/// then arrives for one of those drained identities must be counted `late`,
+/// never `orphaned`: an operator reading `orphaned` after a reconnect would
+/// otherwise chase an identity that was never seen, when in fact the caller
+/// that owned it simply gave up first.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn a_reply_arriving_after_a_reconnect_drain_is_counted_late() {
+    let broker = harness::start_rabbitmq().await;
+    let connection =
+        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+            .await
+            .unwrap();
+    let consumer_channel = connection.create_channel().await.unwrap();
+    let inbox = declare_reply_inbox_for_test(&consumer_channel)
+        .await
+        .unwrap();
+
+    let registry = Arc::new(RequestRegistry::default());
+    let cancel = CancellationToken::new();
+    let handle = {
+        let registry = Arc::clone(&registry);
+        let inbox = inbox.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            let _ = run_reply_inbox_for_test(consumer_channel, inbox, registry, cancel).await;
+        })
+    };
+
+    let request_id = hexeract_core::RequestId::new();
+    let pending = registry
+        .register(request_id, ReplyExpectation::new(Pong::MESSAGE_TYPE))
+        .expect("registration succeeds");
+
+    // Simulate what a transport supervisor does on connection loss, before
+    // this test's own fresh inbox stands in for the reconnected one.
+    registry.drain();
+    drop(pending);
+
+    let publish_channel = connection.create_channel().await.unwrap();
+    let mut reply = BusEnvelope::new(Uuid::now_v7(), &Pong { seq: 42 }).unwrap();
+    reply
+        .headers
+        .insert(REPLY_STATUS_HEADER.to_owned(), REPLY_STATUS_OK.to_owned());
+    reply
+        .headers
+        .insert(REQUEST_ID_HEADER.to_owned(), request_id.to_string());
+    reply.headers.insert(
+        PROTOCOL_VERSION_HEADER.to_owned(),
+        PROTOCOL_VERSION.to_string(),
+    );
+    harness::publish_to_default_exchange(&publish_channel, &inbox, &reply).await;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if registry.counters().late >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the late reply was never counted within the budget"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert_eq!(
+        registry.counters().orphaned,
+        0,
+        "a drained identity's late reply must never be counted orphaned"
+    );
+
+    cancel.cancel();
+    let _ = handle.await;
+}
+
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn request_client_config_rejects_a_second_concurrent_request_at_its_bound() {
