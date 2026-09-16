@@ -783,6 +783,7 @@ mod tests {
     use crate::request_options::RequestOptions;
     use crate::request_registry::ReplyCountersSnapshot;
     use crate::rpc_protocol::DEADLINE_HEADER;
+    use crate::transport_refusal::TransportRefusal;
 
     #[derive(Debug, Serialize, Deserialize)]
     struct Ping {
@@ -958,6 +959,15 @@ mod tests {
         env.insert_protocol_header(REPLY_STATUS_HEADER, REPLY_STATUS_OK.to_owned());
         env.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
         env.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
+        env
+    }
+
+    /// A reply shaped like [`ok_reply`], but with no protocol version
+    /// header: refused by `reply_acceptance::accepts` as `MissingVersion`.
+    fn missing_version_reply(request_id: RequestId, seq: u64) -> BusEnvelope {
+        let mut env = BusEnvelope::new(Uuid::now_v7(), &Pong { seq }).unwrap();
+        env.insert_protocol_header(REPLY_STATUS_HEADER, REPLY_STATUS_OK.to_owned());
+        env.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
         env
     }
 
@@ -1571,9 +1581,12 @@ mod tests {
 
         registry.resolve(
             ok_reply(request_id, 1),
-            Err(ReplyRejection::Unauthenticated),
+            Err(TransportRefusal::Unauthenticated),
         );
-        registry.resolve(ok_reply(request_id, 1), Err(ReplyRejection::MissingVersion));
+        registry.resolve(
+            missing_version_reply(request_id, 1),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
 
         let error = request_fut
             .await

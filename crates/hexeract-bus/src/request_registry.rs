@@ -29,6 +29,7 @@ use crate::reply_authentication::ReplyAuthentication;
 use crate::reply_rejection_kind::ReplyRejectionKind;
 use crate::rpc_protocol::REQUEST_ID_HEADER;
 use crate::slot_retirement::{RetiredSlots, SlotRetirement};
+use crate::transport_refusal::TransportRefusal;
 
 #[derive(Debug)]
 struct Slot {
@@ -251,11 +252,12 @@ impl RequestRegistry {
     pub fn resolve(
         &self,
         envelope: BusEnvelope,
-        authentication: Result<ReplyAuthentication, ReplyRejection>,
+        authentication: Result<ReplyAuthentication, TransportRefusal>,
     ) {
         let authentication = match authentication {
             Ok(authentication) => authentication,
-            Err(rejection) => {
+            Err(refusal) => {
+                let rejection = ReplyRejection::from(refusal);
                 self.record_rejection_kind(rejection.kind());
                 if let Some(request_id) = readable_request_id(&envelope) {
                     let mut state = self.state();
@@ -602,6 +604,37 @@ mod tests {
 
     fn tagged(mut envelope: BusEnvelope, request_id: RequestId) -> BusEnvelope {
         envelope.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
+        envelope
+    }
+
+    /// A reply shaped like [`ok_reply`], but with no protocol version
+    /// header: refused by `reply_acceptance::accepts` as `MissingVersion`.
+    fn reply_missing_version(message_type: &str) -> BusEnvelope {
+        let mut envelope = BusEnvelope::restore(
+            Uuid::now_v7(),
+            message_type.to_owned(),
+            Vec::new(),
+            Uuid::now_v7(),
+            None,
+            HashMap::default(),
+            std::time::SystemTime::now(),
+        );
+        envelope.insert_protocol_header(
+            crate::rpc_protocol::REPLY_STATUS_HEADER,
+            crate::rpc_protocol::REPLY_STATUS_OK.to_owned(),
+        );
+        envelope
+    }
+
+    /// A reply shaped like [`ok_reply`], but announcing `version`: refused
+    /// by `reply_acceptance::accepts` as `UnsupportedVersion` whenever
+    /// `version` is not [`crate::rpc_protocol::PROTOCOL_VERSION`].
+    fn reply_announcing_version(message_type: &str, version: u32) -> BusEnvelope {
+        let mut envelope = ok_reply(message_type);
+        envelope.insert_protocol_header(
+            crate::rpc_protocol::PROTOCOL_VERSION_HEADER,
+            version.to_string(),
+        );
         envelope
     }
 
@@ -1249,7 +1282,7 @@ mod tests {
 
         registry.resolve(
             tagged(ok_reply(EXPECTED_REPLY), request_id),
-            Err(ReplyRejection::Unauthenticated),
+            Err(TransportRefusal::Unauthenticated),
         );
 
         assert_eq!(registry.counters().unauthenticated, 1);
@@ -1265,7 +1298,7 @@ mod tests {
 
         registry.resolve(
             tagged(ok_reply(EXPECTED_REPLY), request_id),
-            Err(ReplyRejection::Unauthenticated),
+            Err(TransportRefusal::Unauthenticated),
         );
 
         assert_eq!(
@@ -1342,6 +1375,35 @@ mod tests {
             0,
             "a late reply must never inflate the orphaned counter"
         );
+    }
+
+    #[test]
+    fn a_reply_arriving_after_a_drain_is_counted_late() {
+        let registry = Arc::new(RequestRegistry::default());
+        let pending = registry
+            .register(RequestId::new(), expectation())
+            .expect("registration succeeds");
+        let request_id = pending.request_id();
+
+        registry.drain();
+
+        registry.resolve(
+            tagged(ok_reply(EXPECTED_REPLY), request_id),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+
+        assert_eq!(
+            registry.counters().late,
+            1,
+            "draining abandons the slots it clears, so a reply still in flight is late rather than traffic for a request this process never made"
+        );
+        assert_eq!(
+            registry.counters().orphaned,
+            0,
+            "a reply in flight when the registry drains must never inflate the orphaned counter, which would show foreign traffic on every reconnect"
+        );
+
+        drop(pending);
     }
 
     #[test]
@@ -1440,12 +1502,12 @@ mod tests {
         let request_id = pending.request_id();
 
         registry.resolve(
-            tagged(ok_reply(EXPECTED_REPLY), request_id),
-            Err(ReplyRejection::MissingVersion),
+            tagged(reply_missing_version(EXPECTED_REPLY), request_id),
+            Ok(ReplyAuthentication::NotEnforced),
         );
         registry.resolve(
-            tagged(ok_reply(EXPECTED_REPLY), request_id),
-            Err(ReplyRejection::UnsupportedVersion { version: 7 }),
+            tagged(reply_announcing_version(EXPECTED_REPLY, 7), request_id),
+            Ok(ReplyAuthentication::NotEnforced),
         );
 
         assert_eq!(
@@ -1466,7 +1528,7 @@ mod tests {
         for _ in 0..3 {
             registry.resolve(
                 tagged(ok_reply(EXPECTED_REPLY), request_id),
-                Err(ReplyRejection::Unauthenticated),
+                Err(TransportRefusal::Unauthenticated),
             );
         }
 
@@ -1484,11 +1546,11 @@ mod tests {
 
         registry.resolve(
             tagged(ok_reply("attacker.reply"), request_id),
-            Err(ReplyRejection::Unauthenticated),
+            Err(TransportRefusal::Unauthenticated),
         );
         registry.resolve(
-            tagged(ok_reply("attacker.reply"), request_id),
-            Err(ReplyRejection::MissingVersion),
+            tagged(reply_missing_version("attacker.reply"), request_id),
+            Ok(ReplyAuthentication::NotEnforced),
         );
 
         registry.resolve(
