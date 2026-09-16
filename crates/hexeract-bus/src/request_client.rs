@@ -1236,7 +1236,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn publication_latency_consumes_the_reply_wait_budget_and_late_replies_are_orphaned() {
+    async fn publication_latency_consumes_the_reply_wait_budget_and_late_replies_are_counted_late()
+    {
         let timeout = Duration::from_millis(30);
         let publish_latency = Duration::from_millis(20);
         let transport = Arc::new(GatedTransport::default());
@@ -1274,10 +1275,14 @@ mod tests {
             ok_reply(published_request_id(&published), 1),
             Ok(ReplyAuthentication::NotEnforced),
         );
+        let counters = registry.counters();
         assert_eq!(
-            registry.counters().orphaned,
-            1,
-            "a reply after the absolute deadline must remain orphaned"
+            counters.late, 1,
+            "the caller abandoned this identity rather than resolving it, so a reply past the deadline is late, not orphaned"
+        );
+        assert_eq!(
+            counters.orphaned, 0,
+            "counting the same delivery twice would break the sum of the six counters, which the metrics built on them assume"
         );
     }
 

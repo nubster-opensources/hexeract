@@ -61,12 +61,16 @@ pub enum ReplyRejection {
 
 impl ReplyRejection {
     /// The operational category this reason feeds.
-    // Inert for the Red phase of #453: every variant maps to `Invalid` until
-    // the Building phase wires the real mapping in.
     #[must_use]
     pub fn kind(self) -> ReplyRejectionKind {
-        let _ = self;
-        ReplyRejectionKind::Invalid
+        match self {
+            ReplyRejection::Unauthenticated => ReplyRejectionKind::Unauthenticated,
+            ReplyRejection::MissingVersion
+            | ReplyRejection::UnsupportedVersion { .. }
+            | ReplyRejection::MissingStatus
+            | ReplyRejection::UnknownStatus
+            | ReplyRejection::UnexpectedType => ReplyRejectionKind::Invalid,
+        }
     }
 }
 

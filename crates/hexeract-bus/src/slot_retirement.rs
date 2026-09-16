@@ -20,10 +20,6 @@ pub(crate) enum SlotRetirement {
 /// a straggler is counted `Orphaned` again. A time window would match the
 /// word "short" more closely, but would put a clock inside a structure that
 /// is otherwise pure, and make its tests depend on it.
-///
-/// Inert for the Red phase of #453: `record` and `lookup` are wired to the
-/// bounded eviction their fields describe in the Building phase.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct RetiredSlots {
     entries: HashMap<RequestId, SlotRetirement>,
@@ -40,13 +36,32 @@ impl RetiredSlots {
         }
     }
 
-    pub(crate) fn record(&mut self, _request_id: RequestId, _retirement: SlotRetirement) {
-        let _ = self;
+    /// Record `request_id` as retired for `retirement`, evicting the oldest
+    /// entry once `capacity` would otherwise be exceeded.
+    ///
+    /// A capacity of zero never remembers anything. Re-recording an
+    /// identity already present overwrites its retirement in place, without
+    /// disturbing its position (or absence of one) in the eviction order.
+    pub(crate) fn record(&mut self, request_id: RequestId, retirement: SlotRetirement) {
+        if self.capacity == 0 {
+            return;
+        }
+        if let Some(existing) = self.entries.get_mut(&request_id) {
+            *existing = retirement;
+            return;
+        }
+        while self.order.len() >= self.capacity {
+            let Some(evicted) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&evicted);
+        }
+        self.order.push_back(request_id);
+        self.entries.insert(request_id, retirement);
     }
 
-    pub(crate) fn lookup(&self, _request_id: RequestId) -> Option<SlotRetirement> {
-        let _ = self;
-        None
+    pub(crate) fn lookup(&self, request_id: RequestId) -> Option<SlotRetirement> {
+        self.entries.get(&request_id).copied()
     }
 }
 

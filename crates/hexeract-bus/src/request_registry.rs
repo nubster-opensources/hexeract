@@ -26,12 +26,10 @@ use uuid::Uuid;
 use crate::BusEnvelope;
 use crate::reply_acceptance::{self, ReplyExpectation, ReplyRejection};
 use crate::reply_authentication::ReplyAuthentication;
+use crate::reply_rejection_kind::ReplyRejectionKind;
 use crate::rpc_protocol::REQUEST_ID_HEADER;
 use crate::slot_retirement::{RetiredSlots, SlotRetirement};
 
-// `last_rejection` and `rejected_deliveries` are wired to `resolve`'s `Err`
-// branch in the Building phase: inert for the Red phase of #453.
-#[allow(dead_code)]
 #[derive(Debug)]
 struct Slot {
     expectation: ReplyExpectation,
@@ -41,6 +39,16 @@ struct Slot {
 }
 
 type Slots = HashMap<RequestId, Slot>;
+
+/// Parse the request identity header, if present and well-formed.
+///
+/// Returns `None` uniformly for an absent header and a header that fails to
+/// parse as a UUID: both leave a delivery impossible to attribute to any
+/// slot, so every caller of this function treats them identically.
+fn readable_request_id(envelope: &BusEnvelope) -> Option<RequestId> {
+    let raw = envelope.header(REQUEST_ID_HEADER)?;
+    raw.parse::<Uuid>().ok().map(RequestId::from)
+}
 
 /// Slot map, retired-identity memory and closed flag, guarded by the same
 /// lock.
@@ -234,30 +242,51 @@ impl RequestRegistry {
     /// asked the question is the one making it.
     ///
     /// A transport that refused the delivery before reaching a verdict on its
-    /// content passes `Err`. Inert for the Red phase of #453: the `Err` arm
-    /// is ignored, carrying no counting or slot-attribution side effect yet.
+    /// content passes `Err`. The transport's refusal always wins over any
+    /// other categorization: the retired-identity memory is never consulted
+    /// on this branch, and the slot, if it can be found, is always left
+    /// pending. This is what keeps a flood of forged signatures against
+    /// random identities counted as `unauthenticated`, never diluted across
+    /// `orphaned`, `duplicate` and `late`.
     pub fn resolve(
         &self,
         envelope: BusEnvelope,
         authentication: Result<ReplyAuthentication, ReplyRejection>,
     ) {
-        let Ok(authentication) = authentication else {
-            return;
+        let authentication = match authentication {
+            Ok(authentication) => authentication,
+            Err(rejection) => {
+                self.record_rejection_kind(rejection.kind());
+                if let Some(request_id) = readable_request_id(&envelope) {
+                    let mut state = self.state();
+                    if let Some(slot) = state.slots.get_mut(&request_id) {
+                        slot.last_rejection = Some(rejection);
+                        slot.rejected_deliveries = slot.rejected_deliveries.saturating_add(1);
+                    }
+                    drop(state);
+                    tracing::debug!(
+                        %request_id,
+                        ?rejection,
+                        "delivery refused by the transport, slot left pending"
+                    );
+                } else {
+                    tracing::debug!(
+                        ?rejection,
+                        "delivery refused by the transport, identity unreadable"
+                    );
+                }
+                return;
+            }
         };
-        let Some(raw) = envelope.header(REQUEST_ID_HEADER) else {
+
+        let Some(request_id) = readable_request_id(&envelope) else {
             self.counters.orphaned.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!("reply without a request id header, dropping");
+            tracing::debug!("reply with no usable request id header, dropping");
             return;
         };
-        let Ok(uuid) = raw.parse::<Uuid>() else {
-            self.counters.orphaned.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!("reply with an unparsable request id header, dropping");
-            return;
-        };
-        let request_id = RequestId::from(uuid);
 
         let mut state = self.state();
-        let Some(slot) = state.slots.get(&request_id) else {
+        let Some(slot) = state.slots.get_mut(&request_id) else {
             let retirement = state.retired.lookup(request_id);
             drop(state);
             match retirement {
@@ -278,8 +307,10 @@ impl RequestRegistry {
         };
 
         if let Err(rejection) = reply_acceptance::accepts(&slot.expectation, &envelope) {
+            slot.last_rejection = Some(rejection);
+            slot.rejected_deliveries = slot.rejected_deliveries.saturating_add(1);
             drop(state);
-            self.counters.invalid.fetch_add(1, Ordering::Relaxed);
+            self.record_rejection_kind(rejection.kind());
             tracing::debug!(%request_id, ?rejection, "invalid reply, slot left pending");
             return;
         }
@@ -299,10 +330,21 @@ impl RequestRegistry {
     /// The only bare counter mutator on this surface, and the only case
     /// where there is no data to carry: without an envelope there is no
     /// identity, so nothing can be attributed to a slot.
-    ///
-    /// Inert for the Red phase of #453: does not yet increment `undecodable`.
     pub fn record_undecodable(&self) {
-        let _ = self;
+        self.counters.undecodable.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the counter named by `kind`.
+    fn record_rejection_kind(&self, kind: ReplyRejectionKind) {
+        let counter = match kind {
+            ReplyRejectionKind::Undecodable => &self.counters.undecodable,
+            ReplyRejectionKind::Orphaned => &self.counters.orphaned,
+            ReplyRejectionKind::Unauthenticated => &self.counters.unauthenticated,
+            ReplyRejectionKind::Invalid => &self.counters.invalid,
+            ReplyRejectionKind::Duplicate => &self.counters.duplicate,
+            ReplyRejectionKind::Late => &self.counters.late,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Snapshot of the refused-delivery counters.
@@ -428,12 +470,15 @@ impl PendingReply<'_> {
     /// The last reason a delivery bearing this identity was refused.
     ///
     /// Read it before the guard is dropped: dropping removes the slot.
-    ///
-    /// Inert for the Red phase of #453: always `None`.
+    /// Renders the neutral `None` once the slot itself has disappeared,
+    /// exactly as if nothing had ever been refused.
     #[must_use]
     pub fn last_rejection(&self) -> Option<ReplyRejection> {
-        let _ = self;
-        None
+        self.registry
+            .state()
+            .slots
+            .get(&self.request_id)
+            .and_then(|slot| slot.last_rejection)
     }
 
     /// How many deliveries bearing this identity were refused.
@@ -441,13 +486,15 @@ impl PendingReply<'_> {
     /// One reason alone does not separate a misconfigured responder, which
     /// produces a handful, from a flood, which produces thousands. This
     /// count is what replaces the per-delivery warning that used to carry
-    /// that signal.
-    ///
-    /// Inert for the Red phase of #453: always `0`.
+    /// that signal. Renders the neutral `0` once the slot itself has
+    /// disappeared.
     #[must_use]
     pub fn rejected_deliveries(&self) -> u32 {
-        let _ = self;
-        0
+        self.registry
+            .state()
+            .slots
+            .get(&self.request_id)
+            .map_or(0, |slot| slot.rejected_deliveries)
     }
 
     /// Await the reply envelope, alongside what this transport established
@@ -674,10 +721,14 @@ mod tests {
         let (envelope, _authentication) = pending.wait().await.expect("reply");
         let reply: Pong = envelope.decode().expect("decode");
         assert_eq!(reply.seq, 1);
+        let counters = registry.counters();
         assert_eq!(
-            registry.counters().orphaned,
-            1,
-            "the second valid delivery arrives after the slot is gone, so it is indistinguishable from an orphan"
+            counters.duplicate, 1,
+            "the second valid delivery names an identity this registry resolved itself, which is what tells a duplicate apart from an orphan"
+        );
+        assert_eq!(
+            counters.orphaned, 0,
+            "counting the same delivery twice would break the sum of the six counters, which the metrics built on them assume"
         );
     }
 
