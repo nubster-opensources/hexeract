@@ -18,7 +18,9 @@ pub enum TransportRefusal {
 
 impl From<TransportRefusal> for ReplyRejection {
     fn from(refusal: TransportRefusal) -> Self {
-        todo!()
+        match refusal {
+            TransportRefusal::Unauthenticated => ReplyRejection::Unauthenticated,
+        }
     }
 }
 

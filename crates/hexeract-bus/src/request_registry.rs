@@ -77,9 +77,20 @@ impl RegistryState {
             closed: false,
         }
     }
+
+    /// Clear every slot, recording each identity `SlotRetirement::Abandoned`.
+    fn abandon_every_slot(&mut self) {
+        for (request_id, _slot) in self.slots.drain() {
+            self.retired.record(request_id, SlotRetirement::Abandoned);
+        }
+    }
 }
 
 /// Counts of deliveries the registry refused to route.
+///
+/// Telling `duplicate` and `late` apart from `orphaned` relies on a memory of
+/// the last `max_in_flight` retirements, counted in events rather than time.
+/// Past that window, the same delivery counts `orphaned`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ReplyCountersSnapshot {
@@ -287,43 +298,44 @@ impl RequestRegistry {
             return;
         };
 
-        let mut state = self.state();
-        let Some(slot) = state.slots.get_mut(&request_id) else {
-            let retirement = state.retired.lookup(request_id);
-            drop(state);
-            match retirement {
-                Some(SlotRetirement::Resolved) => {
-                    self.counters.duplicate.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!(%request_id, "reply for an already-resolved request");
-                }
-                Some(SlotRetirement::Abandoned) => {
-                    self.counters.late.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!(%request_id, "reply for an abandoned request, arrived late");
-                }
-                None => {
-                    self.counters.orphaned.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!(%request_id, "reply for an unknown request");
+        let mut guard = self.state();
+        let state = &mut *guard;
+        match state.slots.entry(request_id) {
+            Entry::Vacant(_) => {
+                let retirement = state.retired.lookup(request_id);
+                drop(guard);
+                match retirement {
+                    Some(SlotRetirement::Resolved) => {
+                        self.counters.duplicate.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(%request_id, "reply for an already-resolved request");
+                    }
+                    Some(SlotRetirement::Abandoned) => {
+                        self.counters.late.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(%request_id, "reply for an abandoned request, arrived late");
+                    }
+                    None => {
+                        self.counters.orphaned.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(%request_id, "reply for an unknown request");
+                    }
                 }
             }
-            return;
-        };
-
-        if let Err(rejection) = reply_acceptance::accepts(&slot.expectation, &envelope) {
-            slot.last_rejection = Some(rejection);
-            slot.rejected_deliveries = slot.rejected_deliveries.saturating_add(1);
-            drop(state);
-            self.record_rejection_kind(rejection.kind());
-            tracing::debug!(%request_id, ?rejection, "invalid reply, slot left pending");
-            return;
-        }
-
-        let slot = state.slots.remove(&request_id);
-        if slot.is_some() {
-            state.retired.record(request_id, SlotRetirement::Resolved);
-        }
-        drop(state);
-        if let Some(slot) = slot {
-            let _ = slot.sender.send((envelope, authentication));
+            Entry::Occupied(mut entry) => {
+                if let Err(rejection) =
+                    reply_acceptance::accepts(&entry.get().expectation, &envelope)
+                {
+                    let slot = entry.get_mut();
+                    slot.last_rejection = Some(rejection);
+                    slot.rejected_deliveries = slot.rejected_deliveries.saturating_add(1);
+                    drop(guard);
+                    self.record_rejection_kind(rejection.kind());
+                    tracing::debug!(%request_id, ?rejection, "invalid reply, slot left pending");
+                    return;
+                }
+                let slot = entry.remove();
+                state.retired.record(request_id, SlotRetirement::Resolved);
+                drop(guard);
+                let _ = slot.sender.send((envelope, authentication));
+            }
         }
     }
 
@@ -350,6 +362,10 @@ impl RequestRegistry {
     }
 
     /// Snapshot of the refused-delivery counters.
+    ///
+    /// Each field is monotonic and exact, but the six fields are loaded one
+    /// after another, not atomically, so their sum is exact only when no
+    /// delivery is being processed concurrently.
     #[must_use]
     pub fn counters(&self) -> ReplyCountersSnapshot {
         ReplyCountersSnapshot {
@@ -378,12 +394,7 @@ impl RequestRegistry {
     /// this: see [`crate::ReplyInboxState`] for the guarantee that order
     /// gives a waiting caller.
     pub fn drain(&self) {
-        let mut state = self.state();
-        let drained: Vec<RequestId> = state.slots.keys().copied().collect();
-        state.slots.clear();
-        for request_id in drained {
-            state.retired.record(request_id, SlotRetirement::Abandoned);
-        }
+        self.state().abandon_every_slot();
     }
 
     /// Fail every pending call and refuse further registrations.
@@ -401,11 +412,7 @@ impl RequestRegistry {
     pub fn close(&self) {
         let mut state = self.state();
         state.closed = true;
-        let closed: Vec<RequestId> = state.slots.keys().copied().collect();
-        state.slots.clear();
-        for request_id in closed {
-            state.retired.record(request_id, SlotRetirement::Abandoned);
-        }
+        state.abandon_every_slot();
     }
 
     /// Whether the registry has been closed and refuses further
