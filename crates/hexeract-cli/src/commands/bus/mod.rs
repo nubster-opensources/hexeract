@@ -19,8 +19,10 @@ pub(crate) enum BusAction {
     /// side effects" primitive. This flips each message's AMQP
     /// `redelivered` flag to `true`, so consumers that use that flag for
     /// poison-message detection should account for peeks inflating it.
-    /// Payload previews are capped at `--max-bytes` (1 KiB by default);
-    /// pass `--raw` to print the full payload.
+    /// Payload previews are capped at `--max-bytes` (1 KiB by default)
+    /// before control characters are escaped. The message properties remain
+    /// escaped in every mode. Pass `--raw` to print the full literal payload,
+    /// which may emit terminal control characters.
     Peek(peek::PeekArgs),
     /// Drop every message from a queue.
     Purge(purge::PurgeArgs),

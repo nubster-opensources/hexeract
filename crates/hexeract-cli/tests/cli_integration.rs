@@ -117,6 +117,46 @@ async fn start_rabbit() -> (testcontainers::ContainerAsync<RabbitMq>, String) {
     (container, uri)
 }
 
+async fn publish_peek_message(
+    uri: &str,
+    queue_name: &str,
+    payload: &[u8],
+    properties: BasicProperties,
+) {
+    let setup = Connection::connect(uri, ConnectionProperties::default())
+        .await
+        .expect("setup connection must open");
+    let channel = setup
+        .create_channel()
+        .await
+        .expect("setup channel must open");
+    channel
+        .queue_declare(
+            ShortString::from(queue_name),
+            QueueDeclareOptions {
+                durable: false,
+                auto_delete: false,
+                ..QueueDeclareOptions::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .expect("queue declare must succeed");
+    channel
+        .basic_publish(
+            ShortString::from(""),
+            ShortString::from(queue_name),
+            BasicPublishOptions::default(),
+            payload,
+            properties,
+        )
+        .await
+        .expect("publish must succeed")
+        .await
+        .expect("confirm must succeed");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn bus_declare_applies_topology_against_rabbitmq_container() {
@@ -352,6 +392,96 @@ async fn bus_peek_count_n_returns_n_distinct_messages() {
     assert!(
         !after_out.contains("is empty"),
         "queue must not be empty after non-destructive peek"
+    );
+}
+
+#[test]
+fn bus_peek_help_documents_safe_default_and_literal_raw_payload() {
+    let output = Command::cargo_bin("hexeract")
+        .unwrap()
+        .args(["bus", "peek", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("help output must be valid UTF-8");
+
+    assert!(
+        stdout.contains("message properties remain escaped"),
+        "help must state that message properties remain escaped; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("literal payload") && stdout.contains("terminal control characters"),
+        "help must state that --raw can emit payload controls literally; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("before control characters are escaped"),
+        "help must state that --max-bytes applies before escaping; got: {stdout}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn bus_peek_escapes_hostile_broker_fields_and_confines_delivery_to_two_lines() {
+    let (_container, uri) = start_rabbit().await;
+    let queue_name = "cli.peek.terminal-safe";
+    let properties = BasicProperties::default()
+        .with_type("orders\nforged\u{1b}[2J".into())
+        .with_message_id("message\tforged\u{85}".into())
+        .with_correlation_id("correlation\rforged\u{1}".into());
+    publish_peek_message(
+        &uri,
+        queue_name,
+        b"body\nforged\t\x1b[31m\xc2\x85",
+        properties,
+    )
+    .await;
+
+    let output = Command::cargo_bin("hexeract")
+        .unwrap()
+        .args(["bus", "peek", "--conn", &uri, "--queue", queue_name])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("peek output must be valid UTF-8");
+
+    assert_eq!(
+        stdout,
+        "#1 type=orders\\nforged\\u{1b}[2J message_id=message\\tforged\\u{85} correlation_id=correlation\\rforged\\u{1}\n    payload: body\\nforged\\t\\u{1b}[31m\\u{85}\n",
+        "default peek must escape every broker-controlled field and emit exactly two lines"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn bus_peek_raw_still_escapes_hostile_metadata() {
+    let (_container, uri) = start_rabbit().await;
+    let queue_name = "cli.peek.raw-metadata-safe";
+    let properties = BasicProperties::default()
+        .with_type("orders\nforged".into())
+        .with_message_id("message\tforged".into())
+        .with_correlation_id("correlation\u{1b}[2J".into());
+    publish_peek_message(&uri, queue_name, b"literal payload", properties).await;
+
+    let output = Command::cargo_bin("hexeract")
+        .unwrap()
+        .args([
+            "bus", "peek", "--conn", &uri, "--queue", queue_name, "--raw",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("peek output must be valid UTF-8");
+
+    assert_eq!(
+        stdout,
+        "#1 type=orders\\nforged message_id=message\\tforged correlation_id=correlation\\u{1b}[2J\n    payload: literal payload\n",
+        "--raw must never disable terminal-safe metadata rendering"
     );
 }
 
