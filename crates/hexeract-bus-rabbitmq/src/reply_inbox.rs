@@ -22,8 +22,8 @@ use futures_util::StreamExt;
 use hexeract_bus::BusEnvelope;
 use hexeract_bus::BusError;
 use hexeract_bus::ReplyAuthentication;
-use hexeract_bus::ReplyRejection;
 use hexeract_bus::RequestRegistry;
+use hexeract_bus::TransportRefusal;
 use lapin::BasicProperties;
 use lapin::Channel;
 use lapin::options::BasicConsumeOptions;
@@ -268,7 +268,7 @@ async fn verify_before_resolution<Resolve>(
     destination: &str,
     resolve: Resolve,
 ) where
-    Resolve: FnOnce(BusEnvelope, Result<ReplyAuthentication, ReplyRejection>),
+    Resolve: FnOnce(BusEnvelope, Result<ReplyAuthentication, TransportRefusal>),
 {
     match envelope_security {
         None => resolve(envelope, Ok(ReplyAuthentication::NotEnforced)),
@@ -282,7 +282,7 @@ async fn verify_before_resolution<Resolve>(
                     %error,
                     "reply rejected before it could resolve a correlation slot"
                 );
-                resolve(envelope, Err(ReplyRejection::Unauthenticated));
+                resolve(envelope, Err(TransportRefusal::Unauthenticated));
             }
         },
     }
@@ -824,7 +824,7 @@ mod tests {
             let mut envelope = signed_reply(CLIENT_INBOX, request_id);
             envelope.payload = b"{ \"tampered\": true }".to_vec();
 
-            let received: Arc<Mutex<Option<Result<ReplyAuthentication, ReplyRejection>>>> =
+            let received: Arc<Mutex<Option<Result<ReplyAuthentication, TransportRefusal>>>> =
                 Arc::new(Mutex::new(None));
             let received_in_closure = Arc::clone(&received);
 
@@ -840,7 +840,7 @@ mod tests {
 
             assert_eq!(
                 *received.lock().unwrap(),
-                Some(Err(ReplyRejection::Unauthenticated)),
+                Some(Err(TransportRefusal::Unauthenticated)),
                 "a verification failure must reach resolve as Err(Unauthenticated), never be \
                  dropped before it"
             );

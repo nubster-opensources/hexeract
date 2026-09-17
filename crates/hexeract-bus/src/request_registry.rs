@@ -29,6 +29,7 @@ use crate::reply_authentication::ReplyAuthentication;
 use crate::reply_rejection_kind::ReplyRejectionKind;
 use crate::rpc_protocol::REQUEST_ID_HEADER;
 use crate::slot_retirement::{RetiredSlots, SlotRetirement};
+use crate::transport_refusal::TransportRefusal;
 
 #[derive(Debug)]
 struct Slot {
@@ -76,9 +77,20 @@ impl RegistryState {
             closed: false,
         }
     }
+
+    /// Clear every slot, recording each identity `SlotRetirement::Abandoned`.
+    fn abandon_every_slot(&mut self) {
+        for (request_id, _slot) in self.slots.drain() {
+            self.retired.record(request_id, SlotRetirement::Abandoned);
+        }
+    }
 }
 
 /// Counts of deliveries the registry refused to route.
+///
+/// Telling `duplicate` and `late` apart from `orphaned` relies on a memory of
+/// the last `max_in_flight` retirements, counted in events rather than time.
+/// Past that window, the same delivery counts `orphaned`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ReplyCountersSnapshot {
@@ -251,11 +263,12 @@ impl RequestRegistry {
     pub fn resolve(
         &self,
         envelope: BusEnvelope,
-        authentication: Result<ReplyAuthentication, ReplyRejection>,
+        authentication: Result<ReplyAuthentication, TransportRefusal>,
     ) {
         let authentication = match authentication {
             Ok(authentication) => authentication,
-            Err(rejection) => {
+            Err(refusal) => {
+                let rejection = ReplyRejection::from(refusal);
                 self.record_rejection_kind(rejection.kind());
                 if let Some(request_id) = readable_request_id(&envelope) {
                     let mut state = self.state();
@@ -285,43 +298,44 @@ impl RequestRegistry {
             return;
         };
 
-        let mut state = self.state();
-        let Some(slot) = state.slots.get_mut(&request_id) else {
-            let retirement = state.retired.lookup(request_id);
-            drop(state);
-            match retirement {
-                Some(SlotRetirement::Resolved) => {
-                    self.counters.duplicate.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!(%request_id, "reply for an already-resolved request");
-                }
-                Some(SlotRetirement::Abandoned) => {
-                    self.counters.late.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!(%request_id, "reply for an abandoned request, arrived late");
-                }
-                None => {
-                    self.counters.orphaned.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!(%request_id, "reply for an unknown request");
+        let mut guard = self.state();
+        let state = &mut *guard;
+        match state.slots.entry(request_id) {
+            Entry::Vacant(_) => {
+                let retirement = state.retired.lookup(request_id);
+                drop(guard);
+                match retirement {
+                    Some(SlotRetirement::Resolved) => {
+                        self.counters.duplicate.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(%request_id, "reply for an already-resolved request");
+                    }
+                    Some(SlotRetirement::Abandoned) => {
+                        self.counters.late.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(%request_id, "reply for an abandoned request, arrived late");
+                    }
+                    None => {
+                        self.counters.orphaned.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(%request_id, "reply for an unknown request");
+                    }
                 }
             }
-            return;
-        };
-
-        if let Err(rejection) = reply_acceptance::accepts(&slot.expectation, &envelope) {
-            slot.last_rejection = Some(rejection);
-            slot.rejected_deliveries = slot.rejected_deliveries.saturating_add(1);
-            drop(state);
-            self.record_rejection_kind(rejection.kind());
-            tracing::debug!(%request_id, ?rejection, "invalid reply, slot left pending");
-            return;
-        }
-
-        let slot = state.slots.remove(&request_id);
-        if slot.is_some() {
-            state.retired.record(request_id, SlotRetirement::Resolved);
-        }
-        drop(state);
-        if let Some(slot) = slot {
-            let _ = slot.sender.send((envelope, authentication));
+            Entry::Occupied(mut entry) => {
+                if let Err(rejection) =
+                    reply_acceptance::accepts(&entry.get().expectation, &envelope)
+                {
+                    let slot = entry.get_mut();
+                    slot.last_rejection = Some(rejection);
+                    slot.rejected_deliveries = slot.rejected_deliveries.saturating_add(1);
+                    drop(guard);
+                    self.record_rejection_kind(rejection.kind());
+                    tracing::debug!(%request_id, ?rejection, "invalid reply, slot left pending");
+                    return;
+                }
+                let slot = entry.remove();
+                state.retired.record(request_id, SlotRetirement::Resolved);
+                drop(guard);
+                let _ = slot.sender.send((envelope, authentication));
+            }
         }
     }
 
@@ -348,6 +362,10 @@ impl RequestRegistry {
     }
 
     /// Snapshot of the refused-delivery counters.
+    ///
+    /// Each field is monotonic and exact, but the six fields are loaded one
+    /// after another, not atomically, so their sum is exact only when no
+    /// delivery is being processed concurrently.
     #[must_use]
     pub fn counters(&self) -> ReplyCountersSnapshot {
         ReplyCountersSnapshot {
@@ -376,12 +394,7 @@ impl RequestRegistry {
     /// this: see [`crate::ReplyInboxState`] for the guarantee that order
     /// gives a waiting caller.
     pub fn drain(&self) {
-        let mut state = self.state();
-        let drained: Vec<RequestId> = state.slots.keys().copied().collect();
-        state.slots.clear();
-        for request_id in drained {
-            state.retired.record(request_id, SlotRetirement::Abandoned);
-        }
+        self.state().abandon_every_slot();
     }
 
     /// Fail every pending call and refuse further registrations.
@@ -399,11 +412,7 @@ impl RequestRegistry {
     pub fn close(&self) {
         let mut state = self.state();
         state.closed = true;
-        let closed: Vec<RequestId> = state.slots.keys().copied().collect();
-        state.slots.clear();
-        for request_id in closed {
-            state.retired.record(request_id, SlotRetirement::Abandoned);
-        }
+        state.abandon_every_slot();
     }
 
     /// Whether the registry has been closed and refuses further
@@ -602,6 +611,37 @@ mod tests {
 
     fn tagged(mut envelope: BusEnvelope, request_id: RequestId) -> BusEnvelope {
         envelope.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
+        envelope
+    }
+
+    /// A reply shaped like [`ok_reply`], but with no protocol version
+    /// header: refused by `reply_acceptance::accepts` as `MissingVersion`.
+    fn reply_missing_version(message_type: &str) -> BusEnvelope {
+        let mut envelope = BusEnvelope::restore(
+            Uuid::now_v7(),
+            message_type.to_owned(),
+            Vec::new(),
+            Uuid::now_v7(),
+            None,
+            HashMap::default(),
+            std::time::SystemTime::now(),
+        );
+        envelope.insert_protocol_header(
+            crate::rpc_protocol::REPLY_STATUS_HEADER,
+            crate::rpc_protocol::REPLY_STATUS_OK.to_owned(),
+        );
+        envelope
+    }
+
+    /// A reply shaped like [`ok_reply`], but announcing `version`: refused
+    /// by `reply_acceptance::accepts` as `UnsupportedVersion` whenever
+    /// `version` is not [`crate::rpc_protocol::PROTOCOL_VERSION`].
+    fn reply_announcing_version(message_type: &str, version: u32) -> BusEnvelope {
+        let mut envelope = ok_reply(message_type);
+        envelope.insert_protocol_header(
+            crate::rpc_protocol::PROTOCOL_VERSION_HEADER,
+            version.to_string(),
+        );
         envelope
     }
 
@@ -1249,7 +1289,7 @@ mod tests {
 
         registry.resolve(
             tagged(ok_reply(EXPECTED_REPLY), request_id),
-            Err(ReplyRejection::Unauthenticated),
+            Err(TransportRefusal::Unauthenticated),
         );
 
         assert_eq!(registry.counters().unauthenticated, 1);
@@ -1265,7 +1305,7 @@ mod tests {
 
         registry.resolve(
             tagged(ok_reply(EXPECTED_REPLY), request_id),
-            Err(ReplyRejection::Unauthenticated),
+            Err(TransportRefusal::Unauthenticated),
         );
 
         assert_eq!(
@@ -1342,6 +1382,35 @@ mod tests {
             0,
             "a late reply must never inflate the orphaned counter"
         );
+    }
+
+    #[test]
+    fn a_reply_arriving_after_a_drain_is_counted_late() {
+        let registry = Arc::new(RequestRegistry::default());
+        let pending = registry
+            .register(RequestId::new(), expectation())
+            .expect("registration succeeds");
+        let request_id = pending.request_id();
+
+        registry.drain();
+
+        registry.resolve(
+            tagged(ok_reply(EXPECTED_REPLY), request_id),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+
+        assert_eq!(
+            registry.counters().late,
+            1,
+            "draining abandons the slots it clears, so a reply still in flight is late rather than traffic for a request this process never made"
+        );
+        assert_eq!(
+            registry.counters().orphaned,
+            0,
+            "a reply in flight when the registry drains must never inflate the orphaned counter, which would show foreign traffic on every reconnect"
+        );
+
+        drop(pending);
     }
 
     #[test]
@@ -1440,12 +1509,12 @@ mod tests {
         let request_id = pending.request_id();
 
         registry.resolve(
-            tagged(ok_reply(EXPECTED_REPLY), request_id),
-            Err(ReplyRejection::MissingVersion),
+            tagged(reply_missing_version(EXPECTED_REPLY), request_id),
+            Ok(ReplyAuthentication::NotEnforced),
         );
         registry.resolve(
-            tagged(ok_reply(EXPECTED_REPLY), request_id),
-            Err(ReplyRejection::UnsupportedVersion { version: 7 }),
+            tagged(reply_announcing_version(EXPECTED_REPLY, 7), request_id),
+            Ok(ReplyAuthentication::NotEnforced),
         );
 
         assert_eq!(
@@ -1466,7 +1535,7 @@ mod tests {
         for _ in 0..3 {
             registry.resolve(
                 tagged(ok_reply(EXPECTED_REPLY), request_id),
-                Err(ReplyRejection::Unauthenticated),
+                Err(TransportRefusal::Unauthenticated),
             );
         }
 
@@ -1484,11 +1553,11 @@ mod tests {
 
         registry.resolve(
             tagged(ok_reply("attacker.reply"), request_id),
-            Err(ReplyRejection::Unauthenticated),
+            Err(TransportRefusal::Unauthenticated),
         );
         registry.resolve(
-            tagged(ok_reply("attacker.reply"), request_id),
-            Err(ReplyRejection::MissingVersion),
+            tagged(reply_missing_version("attacker.reply"), request_id),
+            Ok(ReplyAuthentication::NotEnforced),
         );
 
         registry.resolve(

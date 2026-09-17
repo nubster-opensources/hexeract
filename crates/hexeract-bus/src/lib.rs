@@ -98,6 +98,8 @@ mod slot_retirement;
 pub mod topology;
 /// Backend-agnostic publish contract implemented by bus backends.
 pub mod transport;
+/// Why a transport refused a delivery before any verdict on its content.
+pub mod transport_refusal;
 
 pub use deadline::Deadline;
 pub use deadline::DeadlineReading;
@@ -178,3 +180,4 @@ pub use topology::ExchangeKind;
 pub use topology::Queue;
 pub use topology::RoutingKey;
 pub use transport::Transport;
+pub use transport_refusal::TransportRefusal;
