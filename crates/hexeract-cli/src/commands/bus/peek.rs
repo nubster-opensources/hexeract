@@ -61,8 +61,8 @@ pub(crate) struct PeekArgs {
     raw: bool,
     /// Maximum number of original payload bytes to print before truncating.
     ///
-    /// Applied on UTF-8 boundaries before control characters are escaped.
-    /// Ignored when `--raw` is set.
+    /// Applied on UTF-8 boundaries before control and invisible formatting
+    /// characters are escaped. Ignored when `--raw` is set.
     #[arg(long, default_value_t = DEFAULT_MAX_PAYLOAD_BYTES)]
     max_bytes: usize,
     #[command(flatten)]
@@ -140,19 +140,19 @@ impl PeekArgs {
 
     fn print_delivery(&self, index: u32, message: &BasicGetMessage) {
         let props = &message.delivery.properties;
-        let message_type = escape_terminal_controls(
+        let message_type = escape_unsafe_characters(
             props
                 .kind()
                 .as_ref()
                 .map_or("<unknown>", lapin::types::ShortString::as_str),
         );
-        let message_id = escape_terminal_controls(
+        let message_id = escape_unsafe_characters(
             props
                 .message_id()
                 .as_ref()
                 .map_or("<unknown>", lapin::types::ShortString::as_str),
         );
-        let correlation_id = escape_terminal_controls(
+        let correlation_id = escape_unsafe_characters(
             props
                 .correlation_id()
                 .as_ref()
@@ -171,7 +171,7 @@ impl PeekArgs {
             return Cow::Borrowed(payload);
         }
         let (shown, truncated) = truncate_payload(payload, self.max_bytes);
-        let escaped = escape_terminal_controls(shown);
+        let escaped = escape_unsafe_characters(shown);
         if truncated {
             Cow::Owned(format!("{escaped}{TRUNCATION_MARKER}"))
         } else {
@@ -180,20 +180,43 @@ impl PeekArgs {
     }
 }
 
-fn escape_terminal_controls(value: &str) -> Cow<'_, str> {
-    if !value.chars().any(char::is_control) {
+/// Escape the characters of broker data that can alter how output is displayed.
+fn escape_unsafe_characters(value: &str) -> Cow<'_, str> {
+    if !value.chars().any(is_unsafe_character) {
         return Cow::Borrowed(value);
     }
 
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
-        if character.is_control() {
+        if is_unsafe_character(character) {
             escaped.extend(character.escape_debug());
         } else {
             escaped.push(character);
         }
     }
     Cow::Owned(escaped)
+}
+
+/// Whether `character` must be escaped before reaching a terminal or log.
+///
+/// Covers control characters, bidirectional formatting, line and paragraph
+/// separators, invisible operators and the byte order mark, which can
+/// inject terminal sequences, reorder or hide displayed text. The backslash
+/// is escaped too, so an escaped sequence stays distinguishable from the
+/// same literal text. Joiners, combining marks and variation selectors are
+/// kept: printable scripts and emoji need them to render.
+fn is_unsafe_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\\' | '\u{061C}'
+                | '\u{200B}'
+                | '\u{200E}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
 }
 
 /// Requeue every message fetched so far in one atomic `basic_nack`.
@@ -463,6 +486,48 @@ mod tests {
             args.render_payload(payload),
             payload,
             "printable Unicode must remain readable and unchanged"
+        );
+    }
+
+    #[test]
+    fn default_payload_escapes_bidirectional_and_invisible_formatting() {
+        let args = parse_peek_args(&[]);
+        let unsafe_characters = [
+            '\u{061C}', '\u{200B}', '\u{200E}', '\u{200F}', '\u{2028}', '\u{2029}', '\u{202A}',
+            '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2060}', '\u{2061}', '\u{2062}',
+            '\u{2063}', '\u{2064}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{FEFF}',
+        ];
+
+        for character in unsafe_characters {
+            let code_point = u32::from(character);
+            assert_eq!(
+                args.render_payload(&format!("before{character}after")),
+                format!("before\\u{{{code_point:x}}}after"),
+                "U+{code_point:04X} can reorder or hide displayed text and must be escaped"
+            );
+        }
+    }
+
+    #[test]
+    fn default_payload_escapes_backslash() {
+        let args = parse_peek_args(&[]);
+
+        assert_eq!(
+            args.render_payload("literal\\u{1b}text"),
+            "literal\\\\u{1b}text",
+            "a literal backslash must not be confusable with an escaped control"
+        );
+    }
+
+    #[test]
+    fn default_payload_preserves_joiners_combining_marks_and_variation_selectors() {
+        let args = parse_peek_args(&[]);
+        let payload = "Cafe\u{301} \u{2764}\u{FE0F} \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} \u{915}\u{94D}\u{200C}\u{937}";
+
+        assert_eq!(
+            args.render_payload(payload),
+            payload,
+            "joiners, combining marks and variation selectors are needed to render text and emoji"
         );
     }
 

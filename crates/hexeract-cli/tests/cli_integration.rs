@@ -416,7 +416,7 @@ fn bus_peek_help_documents_safe_default_and_literal_raw_payload() {
         "help must state that --raw can emit payload controls literally; got: {stdout}"
     );
     assert!(
-        stdout.contains("before control characters are escaped"),
+        stdout.contains("before control and invisible formatting characters are escaped"),
         "help must state that --max-bytes applies before escaping; got: {stdout}"
     );
 }
@@ -428,12 +428,12 @@ async fn bus_peek_escapes_hostile_broker_fields_and_confines_delivery_to_two_lin
     let queue_name = "cli.peek.terminal-safe";
     let properties = BasicProperties::default()
         .with_type("orders\nforged\u{1b}[2J".into())
-        .with_message_id("message\tforged\u{85}".into())
-        .with_correlation_id("correlation\rforged\u{1}".into());
+        .with_message_id("message\tforged\u{85}\u{202e}".into())
+        .with_correlation_id("correlation\rforged\u{1}\\".into());
     publish_peek_message(
         &uri,
         queue_name,
-        b"body\nforged\t\x1b[31m\xc2\x85",
+        b"body\nforged\t\x1b[31m\xc2\x85\xe2\x81\xa6\\",
         properties,
     )
     .await;
@@ -450,7 +450,7 @@ async fn bus_peek_escapes_hostile_broker_fields_and_confines_delivery_to_two_lin
 
     assert_eq!(
         stdout,
-        "#1 type=orders\\nforged\\u{1b}[2J message_id=message\\tforged\\u{85} correlation_id=correlation\\rforged\\u{1}\n    payload: body\\nforged\\t\\u{1b}[31m\\u{85}\n",
+        "#1 type=orders\\nforged\\u{1b}[2J message_id=message\\tforged\\u{85}\\u{202e} correlation_id=correlation\\rforged\\u{1}\\\\\n    payload: body\\nforged\\t\\u{1b}[31m\\u{85}\\u{2066}\\\\\n",
         "default peek must escape every broker-controlled field and emit exactly two lines"
     );
 }

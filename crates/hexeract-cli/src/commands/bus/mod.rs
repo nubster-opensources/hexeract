@@ -20,9 +20,9 @@ pub(crate) enum BusAction {
     /// `redelivered` flag to `true`, so consumers that use that flag for
     /// poison-message detection should account for peeks inflating it.
     /// Payload previews are capped at `--max-bytes` (1 KiB by default)
-    /// before control characters are escaped. The message properties remain
-    /// escaped in every mode. Pass `--raw` to print the full literal payload,
-    /// which may emit terminal control characters.
+    /// before control and invisible formatting characters are escaped. The
+    /// message properties remain escaped in every mode. Pass `--raw` to print
+    /// the full literal payload, which may emit terminal control characters.
     Peek(peek::PeekArgs),
     /// Drop every message from a queue.
     Purge(purge::PurgeArgs),
