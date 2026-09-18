@@ -68,6 +68,8 @@ pub mod reply_destination;
 pub mod reply_inbox_state;
 /// Contract for publishing a reply, isolated from application routing.
 pub mod reply_publisher;
+/// What an operator counts when a reply delivery is refused.
+pub mod reply_rejection_kind;
 /// Trait for messages that expect a single typed reply.
 pub mod request;
 /// Generic request-reply client built on top of a [`Transport`].
@@ -90,10 +92,14 @@ pub mod request_registry;
 pub mod responder_counters;
 /// Wire constants of the request-reply protocol.
 pub mod rpc_protocol;
+/// Bounded memory of the identities that recently left the slot table.
+mod slot_retirement;
 /// Strongly-typed topology declarations shared by transports.
 pub mod topology;
 /// Backend-agnostic publish contract implemented by bus backends.
 pub mod transport;
+/// Why a transport refused a delivery before any verdict on its content.
+pub mod transport_refusal;
 
 pub use deadline::Deadline;
 pub use deadline::DeadlineReading;
@@ -140,6 +146,7 @@ pub use reply_destination::ReplyDestination;
 pub use reply_destination::ReplyDestinationError;
 pub use reply_inbox_state::ReplyInboxState;
 pub use reply_publisher::ReplyPublisher;
+pub use reply_rejection_kind::ReplyRejectionKind;
 pub use request::Request;
 pub use request_client::AuthenticatedReply;
 pub use request_client::RequestClient;
@@ -173,3 +180,4 @@ pub use topology::ExchangeKind;
 pub use topology::Queue;
 pub use topology::RoutingKey;
 pub use transport::Transport;
+pub use transport_refusal::TransportRefusal;

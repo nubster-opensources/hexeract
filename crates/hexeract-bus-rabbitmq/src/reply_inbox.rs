@@ -23,6 +23,7 @@ use hexeract_bus::BusEnvelope;
 use hexeract_bus::BusError;
 use hexeract_bus::ReplyAuthentication;
 use hexeract_bus::RequestRegistry;
+use hexeract_bus::TransportRefusal;
 use lapin::BasicProperties;
 use lapin::Channel;
 use lapin::options::BasicConsumeOptions;
@@ -167,29 +168,21 @@ pub(crate) async fn run_reply_inbox_with_limits(
         tokio::select! {
             () = cancel.cancelled() => return Ok(()),
             next = consumer.next() => match next {
-                Some(Ok(delivery)) => match decode_delivery(
-                    &delivery.properties,
-                    &delivery.data,
-                    metadata_limits,
-                    required_fields,
-                ) {
-                    Ok(envelope) => {
-                        verify_before_resolution(
-                            envelope_security.as_deref(),
-                            envelope,
-                            delivery.routing_key.as_str(),
-                            |envelope, authentication| registry.resolve(envelope, authentication),
-                        )
-                        .await;
-                    }
-                    // The typed error carries a reason and sizes only, never a
-                    // header key or value, and the delivery is dropped under
-                    // the existing no_ack contract before it can take a
-                    // correlation slot.
-                    Err(error) => {
-                        tracing::warn!(%error, "undecodable reply delivery, dropping");
-                    }
-                },
+                Some(Ok(delivery)) => {
+                    let decoded = decode_delivery(
+                        &delivery.properties,
+                        &delivery.data,
+                        metadata_limits,
+                        required_fields,
+                    );
+                    handle_decoded_delivery(
+                        decoded,
+                        envelope_security.as_deref(),
+                        delivery.routing_key.as_str(),
+                        &registry,
+                    )
+                    .await;
+                }
                 Some(Err(error)) => {
                     return Err(BusError::connection(Box::new(error), true));
                 }
@@ -204,9 +197,41 @@ pub(crate) async fn run_reply_inbox_with_limits(
     }
 }
 
+/// Route one decoded-or-not delivery to the registry.
+///
+/// Extracted from [`run_reply_inbox_with_limits`]'s consumer loop so the
+/// decode-failure path is unit-testable without a broker: [`decode_delivery`]
+/// itself takes no registry, so nothing else in this module can observe
+/// [`RequestRegistry::record_undecodable`] being called.
+async fn handle_decoded_delivery(
+    decoded: Result<BusEnvelope, BusError>,
+    envelope_security: Option<&InboundEnvelopeSecurity>,
+    destination: &str,
+    registry: &RequestRegistry,
+) {
+    match decoded {
+        Ok(envelope) => {
+            verify_before_resolution(
+                envelope_security,
+                envelope,
+                destination,
+                |envelope, authentication| registry.resolve(envelope, authentication),
+            )
+            .await;
+        }
+        // The typed error carries a reason and sizes only, never a header key
+        // or value, and the delivery is dropped under the existing no_ack
+        // contract before it can take a correlation slot.
+        Err(error) => {
+            registry.record_undecodable();
+            tracing::debug!(%error, "undecodable reply delivery, dropping");
+        }
+    }
+}
+
 /// Verify `envelope`, delivered on `destination`, against `envelope_security`,
-/// then, only once verification passes, hand it, alongside what that
-/// verification established about its signer, to `resolve`.
+/// then hand it to `resolve`, alongside either what verification established
+/// about its signer or the reason it was refused.
 ///
 /// Generic over the resolution operation, the same pattern
 /// [`crate::worker::RabbitMqWorker::verify_before_settlement`] uses for the
@@ -220,11 +245,12 @@ pub(crate) async fn run_reply_inbox_with_limits(
 /// for one caller's inbox be rejected when replayed into another's, since
 /// each caller's inbox is a distinct, broker-generated name.
 ///
-/// A verification failure is logged and the delivery is dropped without ever
-/// reaching `resolve`: the correlation slot the reply claims stays intact,
-/// so the legitimate reply, if one is still coming, can still resolve it.
-/// This is what makes the first *valid* reply win rather than the first
-/// delivery to arrive, exactly mirroring
+/// A verification failure is logged and the envelope still reaches `resolve`,
+/// carrying `Err`: this is the only way the registry can attribute the
+/// rejection to the very slot the delivery claims. The correlation slot
+/// itself stays intact either way, so the legitimate reply, if one is still
+/// coming, can still resolve it. This is what makes the first *valid* reply
+/// win rather than the first delivery to arrive, exactly mirroring
 /// [`hexeract_bus::RequestRegistry::resolve`]'s own contract for a reply that
 /// fails its protocol-shape check.
 ///
@@ -242,18 +268,21 @@ async fn verify_before_resolution<Resolve>(
     destination: &str,
     resolve: Resolve,
 ) where
-    Resolve: FnOnce(BusEnvelope, ReplyAuthentication),
+    Resolve: FnOnce(BusEnvelope, Result<ReplyAuthentication, TransportRefusal>),
 {
     match envelope_security {
-        None => resolve(envelope, ReplyAuthentication::NotEnforced),
+        None => resolve(envelope, Ok(ReplyAuthentication::NotEnforced)),
         Some(security) => match security.verify(&envelope, destination).await {
-            Ok(principal) => resolve(envelope, ReplyAuthentication::from_verification(principal)),
+            Ok(principal) => resolve(
+                envelope,
+                Ok(ReplyAuthentication::from_verification(principal)),
+            ),
             Err(error) => {
-                tracing::warn!(
+                tracing::debug!(
                     %error,
-                    "forged or misdirected reply rejected before it could resolve a \
-                     correlation slot, the slot is left pending"
+                    "reply rejected before it could resolve a correlation slot"
                 );
+                resolve(envelope, Err(TransportRefusal::Unauthenticated));
             }
         },
     }
@@ -721,7 +750,7 @@ mod tests {
             verify_before_resolution(None, envelope, CLIENT_INBOX, |envelope, authentication| {
                 assert_eq!(
                     authentication,
-                    ReplyAuthentication::NotEnforced,
+                    Ok(ReplyAuthentication::NotEnforced),
                     "an unconfigured client must report nothing enforced, never fabricate an \
                      authenticated or waived reply"
                 );
@@ -768,7 +797,7 @@ mod tests {
                 |envelope, authentication| {
                     assert_eq!(
                         authentication,
-                        ReplyAuthentication::WaivedUnsigned,
+                        Ok(ReplyAuthentication::WaivedUnsigned),
                         "a configured security that waived the signature requirement must \
                          report the waiver, never the absence of any security"
                     );
@@ -783,5 +812,52 @@ mod tests {
             );
             assert!(pending.wait().await.is_ok());
         }
+
+        #[tokio::test]
+        async fn a_verification_failure_reaches_the_registry_as_unauthenticated() {
+            let request_id = RequestId::new();
+            let security = required_security();
+
+            // Signed correctly, then tampered, exactly like
+            // `a_forged_reply_never_resolves_the_correlation_slot`: this test
+            // is about what reaches `resolve`, not about verification itself.
+            let mut envelope = signed_reply(CLIENT_INBOX, request_id);
+            envelope.payload = b"{ \"tampered\": true }".to_vec();
+
+            let received: Arc<Mutex<Option<Result<ReplyAuthentication, TransportRefusal>>>> =
+                Arc::new(Mutex::new(None));
+            let received_in_closure = Arc::clone(&received);
+
+            verify_before_resolution(
+                Some(&security),
+                envelope,
+                CLIENT_INBOX,
+                move |_envelope, authentication| {
+                    *received_in_closure.lock().unwrap() = Some(authentication);
+                },
+            )
+            .await;
+
+            assert_eq!(
+                *received.lock().unwrap(),
+                Some(Err(TransportRefusal::Unauthenticated)),
+                "a verification failure must reach resolve as Err(Unauthenticated), never be \
+                 dropped before it"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_delivery_reaches_the_registry_as_undecodable() {
+        let registry = RequestRegistry::default();
+        let decoded: Result<BusEnvelope, BusError> = Err(BusError::MetadataLimitExceeded {
+            limit: hexeract_bus::MetadataLimit::HeaderCount,
+            actual: 1,
+            max: 0,
+        });
+
+        handle_decoded_delivery(decoded, None, "reply.inbox", &registry).await;
+
+        assert_eq!(registry.counters().undecodable, 1);
     }
 }

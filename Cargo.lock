@@ -1567,6 +1567,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "trait-variant",
+ "trybuild",
  "uuid",
 ]
 

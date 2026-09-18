@@ -451,8 +451,8 @@ async fn run_timeout(client: &RequestClient<RabbitMqTransport>) -> Result<(), Bo
         )
         .await;
     match outcome {
-        Err(RequestError::Timeout(after)) => {
-            tracing::info!(?after, "mute responder timed out as expected");
+        Err(RequestError::Timeout { elapsed, .. }) => {
+            tracing::info!(?elapsed, "mute responder timed out as expected");
             Ok(())
         }
         Ok(_) => Err("expected a timeout, got a reply from a mute responder".into()),

@@ -644,7 +644,13 @@ impl<T: Transport> RequestClient<T> {
         )
         .await
         {
-            Err(_elapsed) => return Err(RequestError::Timeout(timeout)),
+            Err(_elapsed) => {
+                return Err(RequestError::Timeout {
+                    elapsed: timeout,
+                    last_rejection: pending.last_rejection(),
+                    rejected_deliveries: pending.rejected_deliveries(),
+                });
+            }
             Ok(Err(error)) => return Err(RequestError::Transport(error)),
             Ok(Ok(_message_id)) => {}
         }
@@ -652,7 +658,13 @@ impl<T: Transport> RequestClient<T> {
 
         let (reply, authentication) = match tokio::time::timeout_at(deadline, pending.wait()).await
         {
-            Err(_elapsed) => return Err(RequestError::Timeout(timeout)),
+            Err(_elapsed) => {
+                return Err(RequestError::Timeout {
+                    elapsed: timeout,
+                    last_rejection: pending.last_rejection(),
+                    rejected_deliveries: pending.rejected_deliveries(),
+                });
+            }
             Ok(Err(_closed)) => {
                 // The registry drops every sender on both `close` (permanent)
                 // and `drain` (transient, on broker loss). A close, including
@@ -766,10 +778,12 @@ mod tests {
     use crate::envelope_security::identity::{Audience, Issuer, KeyId, SignatureAlgorithm};
     use crate::envelope_security::principal::VerifiedPrincipal;
     use crate::remote_error::RemoteErrorType;
+    use crate::reply_acceptance::ReplyRejection;
     use crate::reply_authentication::ReplyAuthentication;
     use crate::request_options::RequestOptions;
     use crate::request_registry::ReplyCountersSnapshot;
     use crate::rpc_protocol::DEADLINE_HEADER;
+    use crate::transport_refusal::TransportRefusal;
 
     #[derive(Debug, Serialize, Deserialize)]
     struct Ping {
@@ -945,6 +959,15 @@ mod tests {
         env.insert_protocol_header(REPLY_STATUS_HEADER, REPLY_STATUS_OK.to_owned());
         env.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
         env.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
+        env
+    }
+
+    /// A reply shaped like [`ok_reply`], but with no protocol version
+    /// header: refused by `reply_acceptance::accepts` as `MissingVersion`.
+    fn missing_version_reply(request_id: RequestId, seq: u64) -> BusEnvelope {
+        let mut env = BusEnvelope::new(Uuid::now_v7(), &Pong { seq }).unwrap();
+        env.insert_protocol_header(REPLY_STATUS_HEADER, REPLY_STATUS_OK.to_owned());
+        env.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
         env
     }
 
@@ -1177,7 +1200,7 @@ mod tests {
             .await
             .expect_err("the publication must share the request timeout");
 
-        assert!(matches!(error, RequestError::Timeout(elapsed) if elapsed == timeout));
+        assert!(matches!(error, RequestError::Timeout { elapsed, .. } if elapsed == timeout));
         assert_eq!(tokio::time::Instant::now() - started_at, timeout);
         assert!(
             transport.last_published().is_none(),
@@ -1189,8 +1212,42 @@ mod tests {
         );
     }
 
+    /// The upstream, publication-side timeout: no delivery could possibly
+    /// have arrived yet, so it must carry no rejection either, exactly like
+    /// the downstream reply-wait timeout tested in
+    /// `a_timeout_with_no_delivery_carries_no_rejection`.
     #[tokio::test(start_paused = true)]
-    async fn publication_latency_consumes_the_reply_wait_budget_and_late_replies_are_orphaned() {
+    async fn a_publication_timeout_carries_no_rejection() {
+        let timeout = Duration::from_millis(30);
+        let transport = Arc::new(GatedTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = gated_client(Arc::clone(&transport), Arc::clone(&registry), timeout);
+
+        let request = client.request(Ping { seq: 1 });
+        tokio::pin!(request);
+        tokio::select! {
+            () = transport.wait_until_publish_started() => {}
+            result = &mut request => panic!("publication unexpectedly completed: {result:?}"),
+        }
+        tokio::time::advance(timeout).await;
+
+        let error = request
+            .await
+            .expect_err("the publication must share the request timeout");
+
+        assert!(matches!(
+            error,
+            RequestError::Timeout {
+                last_rejection: None,
+                rejected_deliveries: 0,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn publication_latency_consumes_the_reply_wait_budget_and_late_replies_are_counted_late()
+    {
         let timeout = Duration::from_millis(30);
         let publish_latency = Duration::from_millis(20);
         let transport = Arc::new(GatedTransport::default());
@@ -1220,18 +1277,22 @@ mod tests {
             .await
             .expect_err("the reply wait receives only the remaining budget");
 
-        assert!(matches!(error, RequestError::Timeout(elapsed) if elapsed == timeout));
+        assert!(matches!(error, RequestError::Timeout { elapsed, .. } if elapsed == timeout));
         assert_eq!(tokio::time::Instant::now() - started_at, timeout);
         assert!(registry.is_empty(), "the timed-out slot must be released");
 
         registry.resolve(
             ok_reply(published_request_id(&published), 1),
-            ReplyAuthentication::NotEnforced,
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+        let counters = registry.counters();
+        assert_eq!(
+            counters.late, 1,
+            "the caller abandoned this identity rather than resolving it, so a reply past the deadline is late, not orphaned"
         );
         assert_eq!(
-            registry.counters().orphaned,
-            1,
-            "a reply after the absolute deadline must remain orphaned"
+            counters.orphaned, 0,
+            "counting the same delivery twice would break the sum of the six counters, which the metrics built on them assume"
         );
     }
 
@@ -1264,7 +1325,7 @@ mod tests {
         tokio::time::advance(Duration::from_millis(9)).await;
         registry.resolve(
             ok_reply(published_request_id(&published), 7),
-            ReplyAuthentication::NotEnforced,
+            Ok(ReplyAuthentication::NotEnforced),
         );
 
         assert_eq!(
@@ -1332,7 +1393,7 @@ mod tests {
         assert_eq!(published.header(PROTOCOL_VERSION_HEADER), Some("1"));
         registry.resolve(
             ok_reply(published_request_id(&published), 3),
-            ReplyAuthentication::NotEnforced,
+            Ok(ReplyAuthentication::NotEnforced),
         );
         let pong = request_fut.await.expect("reply");
         assert_eq!(pong, Pong { seq: 3 });
@@ -1446,7 +1507,7 @@ mod tests {
         let error = request_fut
             .await
             .expect_err("no reply arrived before the caller's own local timeout");
-        assert!(matches!(error, RequestError::Timeout(elapsed) if elapsed == timeout));
+        assert!(matches!(error, RequestError::Timeout { elapsed, .. } if elapsed == timeout));
     }
 
     #[tokio::test]
@@ -1461,8 +1522,84 @@ mod tests {
             RequestClientSupervisor::detached(CancellationToken::new()),
         );
         let err = client.request(Ping { seq: 1 }).await.expect_err("no reply");
-        assert!(matches!(err, RequestError::Timeout(_)));
+        assert!(matches!(err, RequestError::Timeout { .. }));
         assert_eq!(registry.len(), 0);
+    }
+
+    /// Critere 1 de #453: a caller that times out with no delivery at all
+    /// must not be told a rejection happened. `None` here has to mean
+    /// exactly that, since it is the same value a caller sees when every
+    /// delivery was refused apart from one that timed out in silence.
+    #[tokio::test]
+    async fn a_timeout_with_no_delivery_carries_no_rejection() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = RequestClient::new(
+            transport,
+            Arc::clone(&registry),
+            Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
+            Duration::from_millis(30),
+            RequestClientSupervisor::detached(CancellationToken::new()),
+        );
+
+        let err = client.request(Ping { seq: 1 }).await.expect_err("no reply");
+
+        assert!(matches!(
+            err,
+            RequestError::Timeout {
+                last_rejection: None,
+                rejected_deliveries: 0,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timeout_after_refused_deliveries_carries_the_last_rejection() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            Arc::clone(&registry),
+            Arc::new(Mutex::new(ReplyInboxState::Ready(
+                "caller.inbox".to_owned(),
+            ))),
+            Duration::from_millis(100),
+            RequestClientSupervisor::detached(CancellationToken::new()),
+        );
+
+        let request_fut = client.request(Ping { seq: 1 });
+        tokio::pin!(request_fut);
+        tokio::select! {
+            _ = &mut request_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let published = transport
+            .last_published()
+            .expect("request must have published by now");
+        let request_id = published_request_id(&published);
+
+        registry.resolve(
+            ok_reply(request_id, 1),
+            Err(TransportRefusal::Unauthenticated),
+        );
+        registry.resolve(
+            missing_version_reply(request_id, 1),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+
+        let error = request_fut
+            .await
+            .expect_err("no valid delivery ever arrives");
+
+        assert!(matches!(
+            error,
+            RequestError::Timeout {
+                last_rejection: Some(ReplyRejection::MissingVersion),
+                rejected_deliveries: 2,
+                ..
+            }
+        ));
     }
 
     /// The `RegisterRejection::AtCapacity -> RequestError::AtCapacity`
@@ -1543,7 +1680,7 @@ mod tests {
             Some(request_id.to_string()).as_deref()
         );
         assert_eq!(err_env.header(PROTOCOL_VERSION_HEADER), Some("1"));
-        registry.resolve(err_env, ReplyAuthentication::NotEnforced);
+        registry.resolve(err_env, Ok(ReplyAuthentication::NotEnforced));
         let err = request_fut.await.expect_err("remote error");
         assert!(matches!(
             err,
@@ -1560,7 +1697,7 @@ mod tests {
             reply.remove_protocol_header(REPLY_STATUS_HEADER);
         })
         .await;
-        assert!(matches!(error, RequestError::Timeout(_)));
+        assert!(matches!(error, RequestError::Timeout { .. }));
         assert_eq!(counters.invalid, 1);
     }
 
@@ -1570,7 +1707,7 @@ mod tests {
             reply.insert_protocol_header(PROTOCOL_VERSION_HEADER, "99".to_owned());
         })
         .await;
-        assert!(matches!(error, RequestError::Timeout(_)));
+        assert!(matches!(error, RequestError::Timeout { .. }));
         assert_eq!(counters.invalid, 1);
     }
 
@@ -1580,7 +1717,7 @@ mod tests {
             reply.message_type = "accounts.something_else".to_owned();
         })
         .await;
-        assert!(matches!(error, RequestError::Timeout(_)));
+        assert!(matches!(error, RequestError::Timeout { .. }));
         assert_eq!(counters.invalid, 1);
     }
 
@@ -1888,7 +2025,7 @@ mod tests {
             .expect_err("no responder ever answers");
 
         match error {
-            RequestError::Timeout(elapsed) => assert_eq!(elapsed, Duration::from_millis(30)),
+            RequestError::Timeout { elapsed, .. } => assert_eq!(elapsed, Duration::from_millis(30)),
             other => panic!("expected RequestError::Timeout, got {other:?}"),
         }
         let routing_key = transport
@@ -1946,7 +2083,7 @@ mod tests {
             .expect_err("no responder ever answers");
 
         match error {
-            RequestError::Timeout(elapsed) => assert_eq!(elapsed, Duration::from_millis(30)),
+            RequestError::Timeout { elapsed, .. } => assert_eq!(elapsed, Duration::from_millis(30)),
             other => panic!("expected RequestError::Timeout, got {other:?}"),
         }
     }
@@ -2063,11 +2200,11 @@ mod tests {
         // would deliver the wrong Pong to the wrong caller.
         registry.resolve(
             ok_reply(second_request_id, 2),
-            ReplyAuthentication::NotEnforced,
+            Ok(ReplyAuthentication::NotEnforced),
         );
         registry.resolve(
             ok_reply(first_request_id, 1),
-            ReplyAuthentication::NotEnforced,
+            Ok(ReplyAuthentication::NotEnforced),
         );
 
         let first_reply = first_fut.await.expect("first reply");
@@ -2136,9 +2273,12 @@ mod tests {
         let request_id = registry_single_request_id(&registry);
         registry.resolve(
             forged_reply("attacker.reply", request_id),
-            ReplyAuthentication::NotEnforced,
+            Ok(ReplyAuthentication::NotEnforced),
         );
-        registry.resolve(pong_reply(request_id, 7), ReplyAuthentication::NotEnforced);
+        registry.resolve(
+            pong_reply(request_id, 7),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
 
         let reply = call
             .await
@@ -2200,7 +2340,7 @@ mod tests {
         reply.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
         reply.insert_protocol_header(REPLY_STATUS_HEADER, REPLY_STATUS_OK.to_owned());
         mutate(request_id, &mut reply);
-        registry.resolve(reply, ReplyAuthentication::NotEnforced);
+        registry.resolve(reply, Ok(ReplyAuthentication::NotEnforced));
 
         let error = request_fut
             .await
@@ -2859,7 +2999,7 @@ mod tests {
 
         registry.resolve(
             ok_reply(published_request_id(&published), 3),
-            ReplyAuthentication::Authenticated(principal.clone()),
+            Ok(ReplyAuthentication::Authenticated(principal.clone())),
         );
 
         let authenticated = request_fut.await.expect("reply");
@@ -2892,7 +3032,7 @@ mod tests {
 
         registry.resolve(
             ok_reply(published_request_id(&published), 5),
-            ReplyAuthentication::NotEnforced,
+            Ok(ReplyAuthentication::NotEnforced),
         );
 
         // The type ascription below is the assertion: `request` must still
@@ -2943,7 +3083,7 @@ mod tests {
         let principal = principal();
         registry.resolve(
             ok_reply(published_request_id(&published), 9),
-            ReplyAuthentication::Authenticated(principal.clone()),
+            Ok(ReplyAuthentication::Authenticated(principal.clone())),
         );
 
         let authenticated = request_fut.await.expect("reply");
@@ -2980,7 +3120,7 @@ mod tests {
             .expect_err("nothing ever resolves this call");
 
         assert!(
-            matches!(error, RequestError::Timeout(elapsed) if elapsed == OVERRIDE),
+            matches!(error, RequestError::Timeout { elapsed, .. } if elapsed == OVERRIDE),
             "expected the timeout the options carried, got {error:?}"
         );
         assert_eq!(tokio::time::Instant::now() - started_at, OVERRIDE);

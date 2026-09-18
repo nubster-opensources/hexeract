@@ -1621,7 +1621,7 @@ async fn a_client_built_without_outbound_security_sends_a_request_the_responder_
 
     let outcome = client.request(Ping { seq: 77 }).await;
     assert!(
-        matches!(&outcome, Err(RequestError::Timeout(_))),
+        matches!(&outcome, Err(RequestError::Timeout { .. })),
         "the responder must refuse an unsigned request before the handler ever runs, leaving \
          the caller's correlation slot to expire instead of resolve: got {outcome:?}"
     );
