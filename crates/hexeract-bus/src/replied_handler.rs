@@ -443,6 +443,82 @@ fn error_reply(
     Ok(envelope)
 }
 
+/// Closed-set outcome of one responder dispatch, as observed by
+/// [`RepliedHandler::handle`].
+///
+/// Unlike [`crate::request_outcome::RequestOutcome`] on the caller side,
+/// this outcome has no terminal event of its own: the
+/// existing `warn!`/`error!` calls on the responder's own rejection guards
+/// stay the sole record of a non-nominal dispatch, so a span carrying this
+/// outcome, `rpc.respond`, is this responder's only new observability
+/// surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResponderOutcome {
+    /// The handler produced a reply, and it was published.
+    Replied,
+    /// The handler failed, and its sanitized error reply was published.
+    RepliedWithError,
+    /// The request was dropped before the handler ran: no readable
+    /// `reply_to` or request identity, or an elapsed deadline.
+    Dropped,
+    /// A reply was computed but suppressed because its deadline passed
+    /// while the handler ran.
+    Failed,
+    /// Publishing the reply itself failed.
+    SuppressedAfterDeadline,
+    /// The dispatch future was dropped before an outcome was established.
+    Cancelled,
+}
+
+impl ResponderOutcome {
+    /// Render this outcome as its stable metric-label spelling.
+    ///
+    /// Inert in this revision: always renders the empty string, regardless
+    /// of `self`. The real, frozen spellings land with the implementation.
+    pub(crate) fn as_str(self) -> &'static str {
+        ""
+    }
+}
+
+/// One responder dispatch's observation: the `rpc.respond` span it carries
+/// and the terminal state a [`Drop`] must not double-count.
+///
+/// Mirrors [`crate::call_observation::CallObservation`] on the caller side,
+/// but carries no counters of its own: [`crate::ResponderCounters`] already
+/// covers the pre-dispatch rejections this span does not, per its own doc.
+/// A responder's totals would duplicate what a caller already counts, one
+/// call at a time, so this side carries a span and nothing more.
+struct ResponseObservation {
+    span: tracing::Span,
+    started_at: tokio::time::Instant,
+    is_finished: bool,
+}
+
+impl ResponseObservation {
+    /// Open an observation for a dispatch about to run.
+    fn start(span: tracing::Span) -> Self {
+        Self {
+            span,
+            started_at: tokio::time::Instant::now(),
+            is_finished: false,
+        }
+    }
+
+    /// Consume this observation with its dispatch's final outcome.
+    ///
+    /// Inert in this revision: closing the span's `elapsed_ms` and
+    /// `outcome` fields land with the implementation.
+    fn finish(self, outcome: ResponderOutcome) {
+        let _ = outcome;
+    }
+}
+
+impl Drop for ResponseObservation {
+    /// Inert in this revision: any effect for a dispatch future dropped
+    /// before `finish` ran lands with the implementation.
+    fn drop(&mut self) {}
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex as StdMutex;
@@ -458,6 +534,7 @@ mod tests {
     use crate::RequestContext;
     use crate::deadline::Deadline;
     use crate::rpc_protocol::DEADLINE_HEADER;
+    use crate::span_capture::SpanCapture;
     use crate::{ReplyDestination, ReplyDestinationError, ReplyPublisher};
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -1804,6 +1881,117 @@ mod tests {
         assert!(
             matches!(result, Err(BusError::Transport(_))),
             "a transient reply publication failure must keep its own error, got {result:?}"
+        );
+    }
+
+    /// A nominal reply must open an `rpc.respond` span
+    /// carrying `request_type`, `request_id`, `correlation_id` and
+    /// `outcome = replied`.
+    #[tokio::test]
+    async fn a_nominal_reply_opens_an_rpc_respond_span_with_its_identity_and_outcome() {
+        let (capture, _guard) = SpanCapture::install();
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let handler = RepliedHandler::new(Echo, Arc::clone(&publisher));
+        let request_id = RequestId::new();
+        let request = request_envelope_with_id(Some("amq.gen-inbox"), request_id);
+        let handler_ctx = ctx();
+
+        handler.handle(&request, &handler_ctx).await.unwrap();
+
+        let spans = capture.spans_named("rpc.respond");
+        assert_eq!(
+            spans.len(),
+            1,
+            "handling a nominal request must open exactly one rpc.respond span, got {spans:?}"
+        );
+        let span = &spans[0];
+        assert_eq!(
+            span.fields.get("request_type").map(String::as_str),
+            Some(Ping::MESSAGE_TYPE)
+        );
+        assert_eq!(
+            span.fields.get("request_id").map(String::as_str),
+            Some(request_id.to_string()).as_deref()
+        );
+        assert_eq!(
+            span.fields.get("correlation_id").map(String::as_str),
+            Some(handler_ctx.correlation_id.to_string()).as_deref()
+        );
+        assert_eq!(
+            span.fields.get("outcome").map(String::as_str),
+            Some("replied")
+        );
+    }
+
+    /// A request with no readable
+    /// `x-hexeract-request-id` must still be observed, with
+    /// `outcome = dropped` and no `request_id` field, since guard 2 stops
+    /// the request before any identity is known good.
+    #[tokio::test]
+    async fn a_request_without_a_readable_request_id_is_observed_as_dropped_with_no_request_id_field()
+     {
+        let (capture, _guard) = SpanCapture::install();
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let handler = RepliedHandler::new(Echo, Arc::clone(&publisher));
+        let mut request = request_envelope(Some("amq.gen-inbox"));
+        request.remove_protocol_header(REQUEST_ID_HEADER);
+
+        handler.handle(&request, &ctx()).await.unwrap();
+
+        let spans = capture.spans_named("rpc.respond");
+        assert_eq!(
+            spans.len(),
+            1,
+            "a request with no readable request id must still open an rpc.respond span, got {spans:?}"
+        );
+        let span = &spans[0];
+        assert_eq!(
+            span.fields.get("outcome").map(String::as_str),
+            Some("dropped")
+        );
+        assert!(
+            !span.fields.contains_key("request_id"),
+            "no request_id field may be recorded before guard 2 has validated one"
+        );
+    }
+
+    /// A handler failure must be observed as
+    /// `outcome = replied_with_error`.
+    #[tokio::test]
+    async fn a_handler_failure_is_observed_as_replied_with_error() {
+        let (capture, _guard) = SpanCapture::install();
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let handler = RepliedHandler::new(Boom, Arc::clone(&publisher));
+        let request = request_envelope(Some("amq.gen-inbox"));
+
+        handler.handle(&request, &ctx()).await.unwrap();
+
+        let spans = capture.spans_named("rpc.respond");
+        assert_eq!(spans.len(), 1, "got {spans:?}");
+        assert_eq!(
+            spans[0].fields.get("outcome").map(String::as_str),
+            Some("replied_with_error")
+        );
+    }
+
+    /// A reply publication that fails must be
+    /// observed as `outcome = failed`.
+    #[tokio::test]
+    async fn a_failed_reply_publication_is_observed_as_failed() {
+        let (capture, _guard) = SpanCapture::install();
+        let publisher = Arc::new(FailingReplyPublisher::new(
+            unroutable_reply_publication_error,
+        ));
+        let handler = RepliedHandler::new(Echo, Arc::clone(&publisher));
+        let request = request_envelope(Some("amq.gen-inbox"));
+
+        let _ = handler.handle(&request, &ctx()).await;
+
+        let spans = capture.spans_named("rpc.respond");
+        assert_eq!(spans.len(), 1, "got {spans:?}");
+        assert_eq!(
+            spans[0].fields.get("outcome").map(String::as_str),
+            Some("failed")
         );
     }
 }

@@ -19,3 +19,13 @@ pub enum ReplyRejectionKind {
     /// Identity abandoned (timeout, drain) before this delivery arrived.
     Late,
 }
+
+impl ReplyRejectionKind {
+    /// Render this kind as its stable `rejection_kind` field spelling.
+    ///
+    /// Inert in this revision: always renders the empty string, regardless
+    /// of `self`. The real, frozen spellings land with the implementation.
+    pub(crate) fn as_str(self) -> &'static str {
+        ""
+    }
+}

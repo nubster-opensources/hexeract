@@ -39,6 +39,9 @@
 //! Backend implementations live in companion crates such as
 //! `hexeract-bus-rabbitmq`.
 
+/// Per-call observation of one request-reply attempt: its span and its
+/// contribution to a [`RequestClient`]'s counters.
+pub(crate) mod call_observation;
 /// Absolute deadlines carried across the bus by the request-reply protocol.
 pub mod deadline;
 /// In-flight representation of a message crossing the bus.
@@ -74,6 +77,8 @@ pub mod reply_rejection_kind;
 pub mod request;
 /// Generic request-reply client built on top of a [`Transport`].
 pub mod request_client;
+/// Point-in-time totals of calls issued through a [`RequestClient`].
+pub mod request_client_counters;
 /// Opaque handle binding a request client's reply-inbox consumer task to its
 /// completion signal.
 pub mod request_client_supervisor;
@@ -85,6 +90,8 @@ pub mod request_error;
 pub mod request_handler;
 /// Per-call overrides for a request issued through a [`RequestClient`].
 pub mod request_options;
+/// Closed-set categorization of a finished request-reply call.
+pub(crate) mod request_outcome;
 /// Rendezvous point between request callers and reply deliveries, keyed by
 /// request identity.
 pub mod request_registry;
@@ -94,6 +101,9 @@ pub mod responder_counters;
 pub mod rpc_protocol;
 /// Bounded memory of the identities that recently left the slot table.
 mod slot_retirement;
+/// Test-only capture of spans and events emitted through `tracing`.
+#[cfg(test)]
+pub(crate) mod span_capture;
 /// Strongly-typed topology declarations shared by transports.
 pub mod topology;
 /// Backend-agnostic publish contract implemented by bus backends.
@@ -150,6 +160,7 @@ pub use reply_rejection_kind::ReplyRejectionKind;
 pub use request::Request;
 pub use request_client::AuthenticatedReply;
 pub use request_client::RequestClient;
+pub use request_client_counters::RequestClientCountersSnapshot;
 pub use request_client_supervisor::RequestClientSupervisor;
 pub use request_context::RequestContext;
 pub use request_error::ProtocolViolation;
@@ -181,3 +192,92 @@ pub use topology::Queue;
 pub use topology::RoutingKey;
 pub use transport::Transport;
 pub use transport_refusal::TransportRefusal;
+
+#[cfg(test)]
+mod tests {
+    use crate::replied_handler::ResponderOutcome;
+    use crate::reply_rejection_kind::ReplyRejectionKind;
+    use crate::request_outcome::{RequestOutcome, TransportCause};
+
+    /// Every label rendered by a group of same-typed values must be
+    /// non-empty and pairwise distinct.
+    fn assert_labels_are_frozen_and_distinct<T: Copy>(
+        values: &[T],
+        as_str: impl Fn(T) -> &'static str,
+        group: &str,
+    ) {
+        let labels: Vec<&'static str> = values.iter().copied().map(as_str).collect();
+        for label in &labels {
+            assert!(
+                !label.is_empty(),
+                "{group}: every value must render a non-empty label"
+            );
+        }
+        let mut unique = labels.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            values.len(),
+            "{group}: labels must all be distinct, got {labels:?}"
+        );
+    }
+
+    /// The `as_str` labels are frozen across every
+    /// enum this brief introduces: 8 client outcomes, 3 transport causes, 6
+    /// reply-rejection kinds, 6 responder outcomes. Each group's labels
+    /// must be non-empty and pairwise distinct.
+    #[test]
+    fn every_as_str_label_vocabulary_is_frozen_and_distinct() {
+        assert_labels_are_frozen_and_distinct(
+            &[
+                RequestOutcome::Succeeded,
+                RequestOutcome::TimedOut,
+                RequestOutcome::RemoteFailed,
+                RequestOutcome::TransportFailed,
+                RequestOutcome::Refused,
+                RequestOutcome::PublicationUnknown,
+                RequestOutcome::InvalidReply,
+                RequestOutcome::Cancelled,
+            ],
+            RequestOutcome::as_str,
+            "the eight client outcomes",
+        );
+
+        assert_labels_are_frozen_and_distinct(
+            &[
+                TransportCause::PublicationFailed,
+                TransportCause::ReplyChannelLost,
+                TransportCause::ReplyInboxReconnecting,
+            ],
+            TransportCause::as_str,
+            "the three transport causes",
+        );
+
+        assert_labels_are_frozen_and_distinct(
+            &[
+                ReplyRejectionKind::Undecodable,
+                ReplyRejectionKind::Orphaned,
+                ReplyRejectionKind::Unauthenticated,
+                ReplyRejectionKind::Invalid,
+                ReplyRejectionKind::Duplicate,
+                ReplyRejectionKind::Late,
+            ],
+            ReplyRejectionKind::as_str,
+            "the six reply-rejection kinds",
+        );
+
+        assert_labels_are_frozen_and_distinct(
+            &[
+                ResponderOutcome::Replied,
+                ResponderOutcome::RepliedWithError,
+                ResponderOutcome::Dropped,
+                ResponderOutcome::SuppressedAfterDeadline,
+                ResponderOutcome::Failed,
+                ResponderOutcome::Cancelled,
+            ],
+            ResponderOutcome::as_str,
+            "the six responder outcomes",
+        );
+    }
+}

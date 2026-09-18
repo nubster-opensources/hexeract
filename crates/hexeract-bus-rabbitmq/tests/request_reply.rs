@@ -1753,3 +1753,101 @@ async fn an_unroutable_reply_is_dead_lettered_without_retry() {
     cancel.cancel();
     let _ = worker_handle.await;
 }
+
+/// A healthy call, a forced reconnect while a
+/// call is in flight, then a fresh successful call once the client has
+/// recovered. At rest, `in_flight` must read `0` and `started` must equal
+/// the sum of the eight outcome totals, both read through
+/// [`RequestClient::counters`].
+///
+/// Inert in this revision: `RequestClient::counters()` renders every
+/// call-level field as `0` (`replies` excepted), so the final assertion
+/// fails on `started`, not on a panic anywhere in the round trip itself,
+/// which is real, unmodified code.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn counters_rest_correctly_after_a_forced_reconnect_and_a_fresh_successful_call() {
+    let broker = harness::start_rabbitmq().await;
+    let cancel = CancellationToken::new();
+
+    declare_ping_queue(broker.uri(), "tests.ping").await;
+
+    let responder_transport = Arc::new(RabbitMqTransport::new(broker.uri()).await.unwrap());
+    let worker = RabbitMqWorkerBuilder::new(
+        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+            .await
+            .unwrap(),
+    )
+    .queue("tests.ping")
+    .register_request_handler::<Ping, _>(Echo, Arc::clone(&responder_transport))
+    .build()
+    .unwrap();
+    let worker_cancel = cancel.clone();
+    let worker_handle = tokio::spawn(async move { worker.run(worker_cancel).await });
+
+    let client = connect_request_client(broker.uri(), Duration::from_secs(10), cancel.clone())
+        .await
+        .unwrap();
+
+    // A call while the broker is healthy.
+    let pong = client
+        .request(Ping { seq: 1 })
+        .await
+        .expect("the first call must succeed while the broker is healthy");
+    assert_eq!(pong.seq, 1);
+
+    // Force a reconnect: freeze the broker's process while a second call is
+    // in flight, so that call cannot complete, then resume it.
+    let mut in_flight_call = Box::pin(client.request(Ping { seq: 2 }));
+    broker.pause().await;
+    let outcome = tokio::select! {
+        result = &mut in_flight_call => Some(result),
+        () = tokio::time::sleep(Duration::from_secs(15)) => None,
+    };
+    broker.unpause().await;
+    if outcome.is_none() {
+        let _ = in_flight_call.await;
+    }
+
+    // A fresh call must eventually succeed once the client has reconnected,
+    // without rebuilding it.
+    let mut recovered = false;
+    for _ in 0..20 {
+        if client.request(Ping { seq: 3 }).await.is_ok() {
+            recovered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        recovered,
+        "a fresh call must succeed once the client has reconnected"
+    );
+
+    let counters = client.counters();
+    assert_eq!(
+        counters.in_flight, 0,
+        "every call must have released its slot at rest"
+    );
+    let sum = counters.succeeded
+        + counters.timed_out
+        + counters.remote_failed
+        + counters.transport_failed
+        + counters.refused
+        + counters.publication_unknown
+        + counters.invalid_reply
+        + counters.cancelled;
+    assert_eq!(
+        counters.started, sum,
+        "at rest, started must equal the sum of the eight outcome totals (started={}, sum={})",
+        counters.started, sum
+    );
+    assert!(
+        counters.started >= 3,
+        "at least the three calls issued in this test must be counted, got {}",
+        counters.started
+    );
+
+    cancel.cancel();
+    let _ = worker_handle.await;
+}
