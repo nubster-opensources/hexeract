@@ -3228,11 +3228,21 @@ mod tests {
             _routing_key: &str,
             _envelope: &BusEnvelope,
         ) -> Result<Uuid, BusError> {
-            Err(BusError::Transport(Box::new(std::io::Error::other(
-                "canary-9F3B connection reset by peer",
-            ))))
+            Err(BusError::Internal(format!(
+                "{CANARY_PUBLICATION} connection reset by peer"
+            )))
         }
     }
+
+    /// Planted in the error a failed publication returns, then looked for in
+    /// every captured field.
+    ///
+    /// Carried by a variant whose own `Display` renders it, rather than one
+    /// that hides it behind a source: a `BusError::Transport` renders as a
+    /// fixed string and only reveals its source through `Debug`, so a leak
+    /// written `%error` would slip past while one written `?error` was
+    /// caught. Here either spelling surfaces the canary.
+    const CANARY_PUBLICATION: &str = "canary-9F3B";
 
     /// Publishes normally, except toward `"tests.ping.fail"`, which it
     /// always refuses: lets a single test mix a successful call and a
@@ -3430,7 +3440,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_failed_publication_counts_transport_failed_with_publication_failed_cause_and_hides_its_canary()
      {
-        const CANARY: &str = "canary-9F3B";
         let (capture, _guard) = SpanCapture::install();
         let transport = Arc::new(FailingPublicationTransport);
         let registry = Arc::new(RequestRegistry::default());
@@ -3457,7 +3466,7 @@ mod tests {
         assert_eq!(client.counters().transport_failed, 1);
         for value in capture.every_field_value() {
             assert!(
-                !value.contains(CANARY),
+                !value.contains(CANARY_PUBLICATION),
                 "the canary leaked into a captured field: {value}"
             );
         }
