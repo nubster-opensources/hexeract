@@ -5,7 +5,9 @@ use hexeract_core::{CorrelationId, RequestId};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
+use crate::call_observation::CallObservation;
 use crate::deadline::Deadline;
 use crate::remote_error::RemoteErrorPayload;
 use crate::reply_acceptance::ReplyExpectation;
@@ -15,6 +17,7 @@ use crate::request_client_counters::{RequestClientCounters, RequestClientCounter
 use crate::request_client_supervisor::RequestClientSupervisor;
 use crate::request_error::ProtocolViolation;
 use crate::request_options::RequestOptions;
+use crate::request_outcome::{RequestOutcome, TransportCause};
 use crate::request_registry::RequestRegistry;
 use crate::rpc_protocol::{
     DEADLINE_HEADER, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, REPLY_ERROR_MESSAGE_TYPE,
@@ -617,6 +620,49 @@ impl<T: Transport> RequestClient<T> {
     ) -> Result<AuthenticatedReply<R::Reply>, RequestError> {
         let deadline = tokio::time::Instant::now() + timeout;
         let request_id = RequestId::new();
+        let correlation_id = *correlation_id.as_uuid();
+        let span = tracing::info_span!(
+            "rpc.request",
+            destination = destination,
+            request_type = R::MESSAGE_TYPE,
+            request_id = %request_id,
+            correlation_id = %correlation_id,
+            outcome = tracing::field::Empty,
+            elapsed_ms = tracing::field::Empty,
+            cause = tracing::field::Empty,
+            remote_error_type = tracing::field::Empty,
+        );
+        let mut observation = CallObservation::start(&self.inner.counters, span.clone());
+        let result = self
+            .request_attempt(
+                request,
+                destination,
+                timeout,
+                correlation_id,
+                request_id,
+                deadline,
+                &mut observation,
+            )
+            .instrument(span)
+            .await;
+        observation.finish(RequestOutcome::of(&result));
+        result
+    }
+
+    /// The body of one request-reply attempt, run under this call's
+    /// `rpc.request` span through [`Instrument`]: never holds
+    /// `Span::enter()` across an `.await`.
+    #[allow(clippy::too_many_arguments)]
+    async fn request_attempt<R: Request>(
+        &self,
+        request: &R,
+        destination: &str,
+        timeout: Duration,
+        correlation_id: uuid::Uuid,
+        request_id: RequestId,
+        deadline: tokio::time::Instant,
+        observation: &mut CallObservation<'_>,
+    ) -> Result<AuthenticatedReply<R::Reply>, RequestError> {
         // Registering first, and only then reading the inbox state, is
         // what closes the reconnect race: see the `reply_inbox` doc on
         // `Self::new` and `ReplyInboxState` for why this order, not the
@@ -625,7 +671,10 @@ impl<T: Transport> RequestClient<T> {
             .inner
             .registry
             .register(request_id, ReplyExpectation::new(R::Reply::MESSAGE_TYPE))?;
-        let correlation_id = *correlation_id.as_uuid();
+        // The `in_flight` gauge only ever rises after this registration
+        // succeeded: a registration refusal counts `started` and `refused`,
+        // never the gauge.
+        observation.admit();
         let inbox = match &*self
             .inner
             .reply_inbox
@@ -634,6 +683,7 @@ impl<T: Transport> RequestClient<T> {
         {
             ReplyInboxState::Ready(inbox) => inbox.clone(),
             ReplyInboxState::Reconnecting => {
+                observation.note_transport_cause(TransportCause::ReplyInboxReconnecting);
                 return Err(RequestError::Transport(reply_inbox_reconnecting()));
             }
         };
@@ -665,7 +715,10 @@ impl<T: Transport> RequestClient<T> {
                     rejected_deliveries: pending.rejected_deliveries(),
                 });
             }
-            Ok(Err(error)) => return Err(RequestError::Transport(error)),
+            Ok(Err(error)) => {
+                observation.note_transport_cause(TransportCause::PublicationFailed);
+                return Err(RequestError::Transport(error));
+            }
             Ok(Ok(_message_id)) => {}
         }
         drop(publication);
@@ -691,6 +744,7 @@ impl<T: Transport> RequestClient<T> {
                     {
                         RequestError::PublicationUnknown
                     } else {
+                        observation.note_transport_cause(TransportCause::ReplyChannelLost);
                         RequestError::Transport(reply_channel_lost())
                     },
                 );
@@ -698,10 +752,18 @@ impl<T: Transport> RequestClient<T> {
             Ok(Ok((envelope, authentication))) => (envelope, authentication),
         };
 
-        decode_reply::<R>(reply).map(|reply| AuthenticatedReply {
-            reply,
-            authentication,
-        })
+        match decode_reply::<R>(reply) {
+            Ok(reply) => Ok(AuthenticatedReply {
+                reply,
+                authentication,
+            }),
+            Err(error) => {
+                if let RequestError::Remote { error_type, .. } = &error {
+                    observation.note_remote_error_type(*error_type);
+                }
+                Err(error)
+            }
+        }
     }
 }
 
@@ -3891,9 +3953,14 @@ mod tests {
         );
     }
 
-    /// A reply arriving after the caller already timed
-    /// out must emit a debug event carrying `rejection_kind = late`, and no
-    /// warn event.
+    /// A reply arriving after the caller already timed out must emit a debug
+    /// event carrying `rejection_kind = late`, and must not raise the warn
+    /// count at all.
+    ///
+    /// The comparison is against the warn count the timeout itself already
+    /// produced, not against zero: a timed-out call warns once, by design.
+    /// What must never happen is a warn *per late reply*, which is how a
+    /// flood of stragglers used to drown the logs.
     #[tokio::test(start_paused = true)]
     async fn a_late_reply_after_timeout_emits_a_debug_event_with_rejection_kind_late_and_no_warn() {
         let (capture, _guard) = SpanCapture::install();
@@ -3909,6 +3976,12 @@ mod tests {
 
         let error = client.request(Ping { seq: 1 }).await.expect_err("no reply");
         assert!(matches!(error, RequestError::Timeout { .. }));
+
+        let warns_before_the_late_reply = capture
+            .events()
+            .into_iter()
+            .filter(|event| event.level == tracing::Level::WARN)
+            .count();
 
         let published = transport.last_published().expect("a request was published");
         registry.resolve(
@@ -3932,9 +4005,10 @@ mod tests {
             .into_iter()
             .filter(|event| event.level == tracing::Level::WARN)
             .collect();
-        assert!(
-            warn_events.is_empty(),
-            "a late reply must never emit a warn event, got {warn_events:?}"
+        assert_eq!(
+            warn_events.len(),
+            warns_before_the_late_reply,
+            "a late reply must add no warn event of its own, got {warn_events:?}"
         );
     }
 

@@ -3,11 +3,55 @@
 //! not double-count.
 
 use tokio::time::Instant;
-use tracing::Span;
+use tracing::{Level, Span};
 
 use crate::remote_error::RemoteErrorType;
 use crate::request_client_counters::RequestClientCounters;
 use crate::request_outcome::{RequestOutcome, TransportCause};
+
+/// Milliseconds elapsed since `started_at`, saturating rather than
+/// panicking: a call's observed duration is never meaningfully above
+/// `u64::MAX` milliseconds.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "a request-reply call running for u64::MAX milliseconds is not a realistic duration"
+)]
+fn elapsed_ms(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis() as u64
+}
+
+/// Outcomes whose terminal event is emitted at [`Level::WARN`] rather than
+/// [`Level::DEBUG`]: see the outcome-level table this crate documents.
+fn is_warn_outcome(outcome: RequestOutcome) -> bool {
+    matches!(
+        outcome,
+        RequestOutcome::TimedOut | RequestOutcome::TransportFailed | RequestOutcome::InvalidReply
+    )
+}
+
+/// Emit this call's terminal event on `span`, at the level its outcome
+/// calls for.
+///
+/// The `tracing` macros require a compile-time level, so the runtime choice
+/// between [`Level::WARN`] and [`Level::DEBUG`] is dispatched to one of two
+/// monomorphic branches rather than passed as a value. `cause`'s absence
+/// simply omits the field, through `tracing`'s own `Option<Value>` support,
+/// rather than branching this function a second time.
+fn emit_terminal_event(
+    span: &Span,
+    outcome: RequestOutcome,
+    elapsed_ms: u64,
+    cause: Option<TransportCause>,
+) {
+    let is_warn = is_warn_outcome(outcome);
+    let outcome = outcome.as_str();
+    let cause = cause.map(TransportCause::as_str);
+    if is_warn {
+        tracing::event!(parent: span, Level::WARN, outcome, elapsed_ms, cause, "rpc request finished");
+    } else {
+        tracing::event!(parent: span, Level::DEBUG, outcome, elapsed_ms, cause, "rpc request finished");
+    }
+}
 
 /// One request-reply call's observation.
 ///
@@ -28,9 +72,12 @@ pub(crate) struct CallObservation<'a> {
 impl<'a> CallObservation<'a> {
     /// Open an observation for a call about to attempt registration.
     ///
-    /// Counts nothing on its own: [`Self::admit`] and [`Self::finish`] are
-    /// what move the counters, once the implementation wires them.
+    /// Counts `started` immediately: every call this client attempts,
+    /// admitted or refused alike, reaches this constructor exactly once,
+    /// which makes it the one place that can count it unconditionally of
+    /// whatever this call's eventual outcome turns out to be.
     pub(crate) fn start(counters: &'a RequestClientCounters, span: Span) -> Self {
+        counters.count_started();
         Self {
             counters,
             span,
@@ -44,46 +91,79 @@ impl<'a> CallObservation<'a> {
     /// Mark this call as admitted: its registration succeeded and it is
     /// about to be published.
     ///
-    /// Inert in this revision: raising the `in_flight` gauge, which only
-    /// ever happens after a successful `register`, lands with the
-    /// implementation.
-    pub(crate) fn admit(&mut self) {}
+    /// Raises the `in_flight` gauge, which only ever happens after a
+    /// successful `register`, so the gauge never exceeds `max_in_flight`.
+    pub(crate) fn admit(&mut self) {
+        self.is_admitted = true;
+        self.counters.raise_in_flight();
+    }
 
     /// Record which of the three transport sites this call's
     /// [`crate::RequestError::Transport`] failed at.
     ///
-    /// Inert in this revision: recording `cause` on the span lands with the
-    /// implementation.
+    /// Stashed rather than written to the span immediately: [`Self::finish`]
+    /// writes `cause` onto the span in the same pass as `outcome` and
+    /// `elapsed_ms`, so the three always land together.
     pub(crate) fn note_transport_cause(&mut self, cause: TransportCause) {
-        let _ = cause;
+        self.transport_cause = Some(cause);
     }
 
     /// Record the public category of a [`crate::RequestError::Remote`]
     /// failure.
     ///
-    /// Inert in this revision: recording `remote_error_type` on the span
-    /// lands with the implementation.
+    /// Written to the span immediately, unlike [`Self::note_transport_cause`]:
+    /// this call is not stashed anywhere else, so there is nothing later to
+    /// keep it in step with.
     pub(crate) fn note_remote_error_type(&self, error_type: RemoteErrorType) {
-        let _ = error_type;
+        self.span
+            .record("remote_error_type", format!("{error_type:?}").as_str());
     }
 
     /// Consume this observation with its call's final outcome.
     ///
-    /// Inert in this revision: counting `outcome`, recording the span's
-    /// `elapsed_ms` and `outcome` fields, and emitting the terminal event
-    /// at the level this outcome calls for all land with the
-    /// implementation.
-    pub(crate) fn finish(self, outcome: RequestOutcome) {
-        let _ = outcome;
+    /// Counts `outcome`, records the span's `outcome`, `elapsed_ms` and,
+    /// when present, `cause` fields, and emits the terminal event at the
+    /// level this outcome calls for. Bringing the `in_flight` gauge back
+    /// down is left to the [`Drop`] below, which always runs immediately
+    /// after this method returns since it consumes `self` by value: that
+    /// keeps the gauge release to the single code path shared with the
+    /// cancellation exit.
+    pub(crate) fn finish(mut self, outcome: RequestOutcome) {
+        self.is_finished = true;
+        let elapsed_ms = elapsed_ms(self.started_at);
+        self.span.record("outcome", outcome.as_str());
+        self.span.record("elapsed_ms", elapsed_ms);
+        if let Some(cause) = self.transport_cause {
+            self.span.record("cause", cause.as_str());
+        }
+        self.counters.count_outcome(outcome);
+        emit_terminal_event(&self.span, outcome, elapsed_ms, self.transport_cause);
     }
 }
 
 impl Drop for CallObservation<'_> {
-    /// Count `cancelled` for a call whose future was dropped before
-    /// [`Self::finish`] ran, and bring the `in_flight` gauge back down.
-    ///
-    /// Inert in this revision: both effects land with the implementation.
-    fn drop(&mut self) {}
+    /// Bring the `in_flight` gauge back down for an admitted call, on every
+    /// exit path. Count `cancelled` and record the span's terminal fields
+    /// only when [`Self::finish`] never ran: a call that did finish already
+    /// recorded its own outcome there, and this must not double-count it.
+    fn drop(&mut self) {
+        if self.is_admitted {
+            self.counters.release_in_flight();
+        }
+        if !self.is_finished {
+            self.counters.count_cancelled();
+            let elapsed_ms = elapsed_ms(self.started_at);
+            self.span
+                .record("outcome", RequestOutcome::Cancelled.as_str());
+            self.span.record("elapsed_ms", elapsed_ms);
+            emit_terminal_event(
+                &self.span,
+                RequestOutcome::Cancelled,
+                elapsed_ms,
+                self.transport_cause,
+            );
+        }
+    }
 }
 
 #[cfg(test)]

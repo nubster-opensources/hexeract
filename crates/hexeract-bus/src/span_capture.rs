@@ -7,8 +7,9 @@
 //! actually records them; there is no neutral value that would let such an
 //! assertion mean anything.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
@@ -62,10 +63,41 @@ struct Recorded {
     events: Vec<CapturedEvent>,
 }
 
+thread_local! {
+    /// Where this thread's capture, if any, is currently recording.
+    ///
+    /// The layer below is installed once, globally, and writes here. A
+    /// thread with no active capture is one where this is `None`, and the
+    /// layer then drops what it sees.
+    static ACTIVE_CAPTURE: RefCell<Option<Arc<Mutex<Recorded>>>> = const { RefCell::new(None) };
+}
+
+/// Installed exactly once for the whole test binary.
+static GLOBAL_SUBSCRIBER: OnceLock<()> = OnceLock::new();
+
 /// The [`Layer`] doing the actual recording. Kept private: a test only ever
 /// touches it through [`SpanCapture`].
-struct CaptureLayer {
-    recorded: Arc<Mutex<Recorded>>,
+///
+/// Stateless, and installed as the process-wide subscriber rather than per
+/// thread. That distinction is load-bearing. `tracing` caches each
+/// callsite's `Interest` globally, so a thread-local subscriber lets a
+/// thread that has none decide a callsite is never of interest, after which
+/// a concurrently running test captures nothing at all and fails claiming
+/// the span was never opened. One always-listening subscriber makes that
+/// verdict stable; which thread is recording is then decided here, where it
+/// costs nothing.
+struct CaptureLayer;
+
+impl CaptureLayer {
+    /// Run `record` against this thread's active capture, if it has one.
+    fn with_active<R>(record: impl FnOnce(&mut Recorded) -> R) -> Option<R> {
+        ACTIVE_CAPTURE.with(|active| {
+            let active = active.borrow();
+            let recorded = active.as_ref()?;
+            let mut recorded = recorded.lock().unwrap_or_else(PoisonError::into_inner);
+            Some(record(&mut recorded))
+        })
+    }
 }
 
 impl<S> Layer<S> for CaptureLayer
@@ -77,14 +109,15 @@ where
         attrs.record(&mut visitor);
         let name = attrs.metadata().name();
 
-        let index = {
-            let mut recorded = self.recorded.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(index) = Self::with_active(|recorded| {
             let index = recorded.spans.len();
             recorded.spans.push(CapturedSpan {
                 name,
                 fields: visitor.0,
             });
             index
+        }) else {
+            return;
         };
 
         if let Some(span_ref) = ctx.span(id) {
@@ -102,10 +135,11 @@ where
         let Some(&SpanIndex(index)) = span_ref.extensions().get::<SpanIndex>() else {
             return;
         };
-        let mut recorded = self.recorded.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(span) = recorded.spans.get_mut(index) {
-            span.fields.extend(visitor.0);
-        }
+        Self::with_active(|recorded| {
+            if let Some(span) = recorded.spans.get_mut(index) {
+                span.fields.extend(visitor.0);
+            }
+        });
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
@@ -115,43 +149,57 @@ where
             .event_span(event)
             .map(|span_ref| span_ref.metadata().name());
 
-        self.recorded
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .events
-            .push(CapturedEvent {
+        Self::with_active(|recorded| {
+            recorded.events.push(CapturedEvent {
                 level: *event.metadata().level(),
                 span_name,
                 fields: visitor.0,
             });
+        });
     }
 }
 
-/// Handle onto every span and event captured while its [`tracing::subscriber::DefaultGuard`]
-/// stays alive.
+/// Stops this thread's capture when dropped, so one test never records what
+/// the next one emits on the same thread.
+pub(crate) struct CaptureGuard;
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        ACTIVE_CAPTURE.with(|active| *active.borrow_mut() = None);
+    }
+}
+
+/// Handle onto every span and event this thread captured while its
+/// [`CaptureGuard`] was alive.
 ///
-/// Built by [`Self::install`], which returns both this handle and the
-/// guard: dropping the guard restores whatever subscriber was previously
-/// installed for the current thread. `#[tokio::test]` is single-threaded by
-/// default, so the guard covers everything a test spawns on that runtime. A
-/// `multi_thread` test would not be captured faithfully: the guard is
-/// thread-local, so anything emitted from another worker thread escapes it.
+/// `#[tokio::test]` is single-threaded by default, so a capture covers
+/// everything its test drives on that runtime. A `multi_thread` test would
+/// not be captured faithfully: recording is per thread, so anything emitted
+/// from another worker thread escapes it.
 pub(crate) struct SpanCapture {
     recorded: Arc<Mutex<Recorded>>,
 }
 
 impl SpanCapture {
-    /// Install a fresh capturing subscriber as the default for the current
-    /// thread, and return a handle onto it alongside the guard that keeps
-    /// it installed.
-    pub(crate) fn install() -> (Self, tracing::subscriber::DefaultGuard) {
+    /// Start capturing on the current thread, and return a handle onto what
+    /// it records alongside the guard that stops it.
+    ///
+    /// The subscriber itself is process-wide and installed at most once, on
+    /// the first call: see [`CaptureLayer`] for why anything thread-local
+    /// there would make tests lose spans under a parallel runner.
+    pub(crate) fn install() -> (Self, CaptureGuard) {
+        GLOBAL_SUBSCRIBER.get_or_init(|| {
+            let subscriber = Registry::default().with(CaptureLayer);
+            // Only ever fails if something else claimed the global
+            // subscriber first, in which case this binary's captures would
+            // stay empty and say so through failing assertions.
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            tracing::callsite::rebuild_interest_cache();
+        });
+
         let recorded = Arc::new(Mutex::new(Recorded::default()));
-        let layer = CaptureLayer {
-            recorded: Arc::clone(&recorded),
-        };
-        let subscriber = Registry::default().with(layer);
-        let guard = tracing::subscriber::set_default(subscriber);
-        (Self { recorded }, guard)
+        ACTIVE_CAPTURE.with(|active| *active.borrow_mut() = Some(Arc::clone(&recorded)));
+        (Self { recorded }, CaptureGuard)
     }
 
     /// Every span captured so far whose static name is exactly `name`, in

@@ -22,10 +22,14 @@ pub enum ReplyRejectionKind {
 
 impl ReplyRejectionKind {
     /// Render this kind as its stable `rejection_kind` field spelling.
-    ///
-    /// Inert in this revision: always renders the empty string, regardless
-    /// of `self`. The real, frozen spellings land with the implementation.
     pub(crate) fn as_str(self) -> &'static str {
-        ""
+        match self {
+            Self::Undecodable => "undecodable",
+            Self::Orphaned => "orphaned",
+            Self::Unauthenticated => "unauthenticated",
+            Self::Invalid => "invalid",
+            Self::Duplicate => "duplicate",
+            Self::Late => "late",
+        }
     }
 }

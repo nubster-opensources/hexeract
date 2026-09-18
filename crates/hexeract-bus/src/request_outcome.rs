@@ -7,6 +7,7 @@
 //! which error groups into which outcome, and why.
 
 use crate::RequestError;
+use crate::request_error::ProtocolViolation;
 
 /// Closed-set outcome of one request-reply call, as observed by the caller.
 ///
@@ -43,21 +44,39 @@ pub(crate) enum RequestOutcome {
 impl RequestOutcome {
     /// Categorize a finished call's result into its closed-set outcome.
     ///
-    /// Inert in this revision: always reports [`Self::Succeeded`],
-    /// regardless of `result`. The real mapping lands with the
-    /// implementation, once the tests exercising each of its branches are
-    /// in place and red.
+    /// See the table on [`Self`]'s module doc for the full mapping: every
+    /// [`RequestError`] variant groups into exactly one outcome here,
+    /// `Protocol(IdentityCollision)` routed to [`Self::Refused`] since it is
+    /// a pre-publication defect, every other [`ProtocolViolation`] routed to
+    /// [`Self::InvalidReply`] alongside [`RequestError::Decode`] since both
+    /// arrive after publication.
     pub(crate) fn of<T>(result: &Result<T, RequestError>) -> Self {
-        let _ = result;
-        Self::Succeeded
+        match result {
+            Ok(_) => Self::Succeeded,
+            Err(RequestError::Timeout { .. }) => Self::TimedOut,
+            Err(RequestError::Remote { .. }) => Self::RemoteFailed,
+            Err(RequestError::Transport(_)) => Self::TransportFailed,
+            Err(RequestError::AtCapacity | RequestError::Closed | RequestError::Encode(_)) => {
+                Self::Refused
+            }
+            Err(RequestError::Protocol(ProtocolViolation::IdentityCollision)) => Self::Refused,
+            Err(RequestError::PublicationUnknown) => Self::PublicationUnknown,
+            Err(RequestError::Protocol(_) | RequestError::Decode(_)) => Self::InvalidReply,
+        }
     }
 
     /// Render this outcome as its stable metric-label spelling.
-    ///
-    /// Inert in this revision: always renders the empty string, regardless
-    /// of `self`. The real, frozen spellings land with the implementation.
     pub(crate) fn as_str(self) -> &'static str {
-        ""
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::TimedOut => "timed_out",
+            Self::RemoteFailed => "remote_failed",
+            Self::TransportFailed => "transport_failed",
+            Self::Refused => "refused",
+            Self::PublicationUnknown => "publication_unknown",
+            Self::InvalidReply => "invalid_reply",
+            Self::Cancelled => "cancelled",
+        }
     }
 }
 
@@ -79,11 +98,12 @@ pub(crate) enum TransportCause {
 
 impl TransportCause {
     /// Render this cause as its stable metric-label spelling.
-    ///
-    /// Inert in this revision: always renders the empty string, regardless
-    /// of `self`.
     pub(crate) fn as_str(self) -> &'static str {
-        ""
+        match self {
+            Self::PublicationFailed => "publication_failed",
+            Self::ReplyChannelLost => "reply_channel_lost",
+            Self::ReplyInboxReconnecting => "reply_inbox_reconnecting",
+        }
     }
 }
 
