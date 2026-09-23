@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use clap::Args;
 use clap::builder::RangedU64ValueParser;
 use hexeract_bus::Queue;
@@ -48,16 +50,19 @@ pub(crate) struct PeekArgs {
         value_parser = RangedU64ValueParser::<u32>::new().range(1..)
     )]
     count: u32,
-    /// Print the full, unredacted payload instead of a capped preview.
+    /// Print the full literal payload without escaping or truncation.
     ///
-    /// Ignores `--max-bytes`. Payload bytes routinely contain personal
-    /// data or secrets; only pass this when every reader of this
-    /// terminal, log or pipe is trusted with the full message body.
+    /// This can emit terminal control characters from broker data. The
+    /// message properties remain escaped. Ignores `--max-bytes`. Payload
+    /// bytes routinely contain personal data or secrets; only pass this
+    /// when every reader of this terminal, log or pipe is trusted with
+    /// the full message body.
     #[arg(long)]
     raw: bool,
-    /// Maximum number of payload bytes to print before truncating.
+    /// Maximum number of original payload bytes to print before truncating.
     ///
-    /// Ignored when `--raw` is set.
+    /// Applied on UTF-8 boundaries before control and invisible formatting
+    /// characters are escaped. Ignored when `--raw` is set.
     #[arg(long, default_value_t = DEFAULT_MAX_PAYLOAD_BYTES)]
     max_bytes: usize,
     #[command(flatten)]
@@ -135,18 +140,24 @@ impl PeekArgs {
 
     fn print_delivery(&self, index: u32, message: &BasicGetMessage) {
         let props = &message.delivery.properties;
-        let message_type = props
-            .kind()
-            .as_ref()
-            .map_or("<unknown>", lapin::types::ShortString::as_str);
-        let message_id = props
-            .message_id()
-            .as_ref()
-            .map_or("<unknown>", lapin::types::ShortString::as_str);
-        let correlation_id = props
-            .correlation_id()
-            .as_ref()
-            .map_or("<unknown>", lapin::types::ShortString::as_str);
+        let message_type = escape_unsafe_characters(
+            props
+                .kind()
+                .as_ref()
+                .map_or("<unknown>", lapin::types::ShortString::as_str),
+        );
+        let message_id = escape_unsafe_characters(
+            props
+                .message_id()
+                .as_ref()
+                .map_or("<unknown>", lapin::types::ShortString::as_str),
+        );
+        let correlation_id = escape_unsafe_characters(
+            props
+                .correlation_id()
+                .as_ref()
+                .map_or("<unknown>", lapin::types::ShortString::as_str),
+        );
         let payload = std::str::from_utf8(&message.delivery.data).unwrap_or("<non-utf8 payload>");
         println!(
             "#{index} type={message_type} message_id={message_id} correlation_id={correlation_id}"
@@ -155,17 +166,57 @@ impl PeekArgs {
     }
 
     /// Render `payload` for display, truncating it unless `--raw` was passed.
-    fn render_payload<'a>(&self, payload: &'a str) -> std::borrow::Cow<'a, str> {
+    fn render_payload<'a>(&self, payload: &'a str) -> Cow<'a, str> {
         if self.raw {
-            return std::borrow::Cow::Borrowed(payload);
+            return Cow::Borrowed(payload);
         }
         let (shown, truncated) = truncate_payload(payload, self.max_bytes);
+        let escaped = escape_unsafe_characters(shown);
         if truncated {
-            std::borrow::Cow::Owned(format!("{shown}{TRUNCATION_MARKER}"))
+            Cow::Owned(format!("{escaped}{TRUNCATION_MARKER}"))
         } else {
-            std::borrow::Cow::Borrowed(shown)
+            escaped
         }
     }
+}
+
+/// Escape the characters of broker data that can alter how output is displayed.
+fn escape_unsafe_characters(value: &str) -> Cow<'_, str> {
+    if !value.chars().any(is_unsafe_character) {
+        return Cow::Borrowed(value);
+    }
+
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if is_unsafe_character(character) {
+            escaped.extend(character.escape_debug());
+        } else {
+            escaped.push(character);
+        }
+    }
+    Cow::Owned(escaped)
+}
+
+/// Whether `character` must be escaped before reaching a terminal or log.
+///
+/// Covers control characters, bidirectional formatting, line and paragraph
+/// separators, invisible operators and the byte order mark, which can
+/// inject terminal sequences, reorder or hide displayed text. The backslash
+/// is escaped too, so an escaped sequence stays distinguishable from the
+/// same literal text. Joiners, combining marks and variation selectors are
+/// kept: printable scripts and emoji need them to render.
+fn is_unsafe_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\\' | '\u{061C}'
+                | '\u{200B}'
+                | '\u{200E}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
 }
 
 /// Requeue every message fetched so far in one atomic `basic_nack`.
@@ -220,6 +271,23 @@ mod tests {
     struct TestCli {
         #[command(subcommand)]
         action: BusAction,
+    }
+
+    fn parse_peek_args(extra_arguments: &[&str]) -> PeekArgs {
+        let mut arguments = vec![
+            "hexeract",
+            "peek",
+            "--conn",
+            "amqp://localhost:5672",
+            "--queue",
+            "orders.received",
+        ];
+        arguments.extend_from_slice(extra_arguments);
+        let cli = TestCli::try_parse_from(arguments).expect("peek arguments must parse");
+        let BusAction::Peek(args) = cli.action else {
+            panic!("expected peek subcommand");
+        };
+        args
     }
 
     #[test]
@@ -352,5 +420,137 @@ mod tests {
         assert!(truncated);
         assert!(std::str::from_utf8(shown.as_bytes()).is_ok());
         assert!(shown.len() <= 5);
+    }
+
+    #[test]
+    fn default_payload_escapes_c0_control() {
+        let args = parse_peek_args(&[]);
+
+        assert_eq!(
+            args.render_payload("before\u{1}after"),
+            "before\\u{1}after",
+            "default payload rendering must escape C0 controls"
+        );
+    }
+
+    #[test]
+    fn default_payload_escapes_escape_control() {
+        let args = parse_peek_args(&[]);
+
+        assert_eq!(
+            args.render_payload("before\u{1b}[2Jafter"),
+            "before\\u{1b}[2Jafter",
+            "default payload rendering must neutralize terminal escape sequences"
+        );
+    }
+
+    #[test]
+    fn default_payload_escapes_c1_control() {
+        let args = parse_peek_args(&[]);
+
+        assert_eq!(
+            args.render_payload("before\u{85}after"),
+            "before\\u{85}after",
+            "default payload rendering must escape C1 controls"
+        );
+    }
+
+    #[test]
+    fn default_payload_escapes_newline() {
+        let args = parse_peek_args(&[]);
+
+        assert_eq!(
+            args.render_payload("before\nafter"),
+            "before\\nafter",
+            "broker-supplied newlines must not create extra output lines"
+        );
+    }
+
+    #[test]
+    fn default_payload_escapes_tab() {
+        let args = parse_peek_args(&[]);
+
+        assert_eq!(
+            args.render_payload("before\tafter"),
+            "before\\tafter",
+            "broker-supplied tabs must not alter output alignment"
+        );
+    }
+
+    #[test]
+    fn default_payload_preserves_printable_unicode() {
+        let args = parse_peek_args(&[]);
+        let payload = "Café 東京 🚀";
+
+        assert_eq!(
+            args.render_payload(payload),
+            payload,
+            "printable Unicode must remain readable and unchanged"
+        );
+    }
+
+    #[test]
+    fn default_payload_escapes_bidirectional_and_invisible_formatting() {
+        let args = parse_peek_args(&[]);
+        let unsafe_characters = [
+            '\u{061C}', '\u{200B}', '\u{200E}', '\u{200F}', '\u{2028}', '\u{2029}', '\u{202A}',
+            '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2060}', '\u{2061}', '\u{2062}',
+            '\u{2063}', '\u{2064}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{FEFF}',
+        ];
+
+        for character in unsafe_characters {
+            let code_point = u32::from(character);
+            assert_eq!(
+                args.render_payload(&format!("before{character}after")),
+                format!("before\\u{{{code_point:x}}}after"),
+                "U+{code_point:04X} can reorder or hide displayed text and must be escaped"
+            );
+        }
+    }
+
+    #[test]
+    fn default_payload_escapes_backslash() {
+        let args = parse_peek_args(&[]);
+
+        assert_eq!(
+            args.render_payload("literal\\u{1b}text"),
+            "literal\\\\u{1b}text",
+            "a literal backslash must not be confusable with an escaped control"
+        );
+    }
+
+    #[test]
+    fn default_payload_preserves_joiners_combining_marks_and_variation_selectors() {
+        let args = parse_peek_args(&[]);
+        let payload = "Cafe\u{301} \u{2764}\u{FE0F} \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} \u{915}\u{94D}\u{200C}\u{937}";
+
+        assert_eq!(
+            args.render_payload(payload),
+            payload,
+            "joiners, combining marks and variation selectors are needed to render text and emoji"
+        );
+    }
+
+    #[test]
+    fn default_payload_truncates_original_utf8_before_escaping() {
+        let args = parse_peek_args(&["--max-bytes", "3"]);
+
+        assert_eq!(
+            args.render_payload("\u{1b}éZ"),
+            "\\u{1b}é ...<truncated, use --raw or --max-bytes to see more>",
+            "the byte cap must apply before escaping and preserve the literal truncation marker"
+        );
+    }
+
+    #[test]
+    fn raw_payload_remains_literal_complete_and_unescaped() {
+        let args = parse_peek_args(&["--raw", "--max-bytes", "1"]);
+        let payload = "Café\n\t\u{1b}[2J\u{85}";
+
+        assert_eq!(
+            args.render_payload(payload),
+            payload,
+            "--raw must keep the complete literal payload even when a byte cap is present"
+        );
     }
 }
