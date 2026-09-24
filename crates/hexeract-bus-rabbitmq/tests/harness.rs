@@ -68,6 +68,24 @@ impl RunningBroker {
             .await
             .expect("rabbitmq container must stop");
     }
+
+    /// Freeze the underlying container's process, simulating a network
+    /// blip that a client's auto-recovering connection must survive rather
+    /// than fail forever. Pair with [`Self::unpause`].
+    pub(crate) async fn pause(&self) {
+        self.container
+            .pause()
+            .await
+            .expect("rabbitmq container must pause");
+    }
+
+    /// Resume a container previously frozen by [`Self::pause`].
+    pub(crate) async fn unpause(&self) {
+        self.container
+            .unpause()
+            .await
+            .expect("rabbitmq container must resume");
+    }
 }
 
 /// Start a fresh RabbitMQ container and resolve its AMQP URI.

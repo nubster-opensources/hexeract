@@ -33,6 +33,7 @@ uuid = { workspace = true, features = ["serde", "v7"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true }
 trybuild = { workspace = true }
 
 [package.metadata.docs.rs]

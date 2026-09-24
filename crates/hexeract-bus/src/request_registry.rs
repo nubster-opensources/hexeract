@@ -280,11 +280,13 @@ impl RequestRegistry {
                     tracing::debug!(
                         %request_id,
                         ?rejection,
+                        rejection_kind = rejection.kind().as_str(),
                         "delivery refused by the transport, slot left pending"
                     );
                 } else {
                     tracing::debug!(
                         ?rejection,
+                        rejection_kind = rejection.kind().as_str(),
                         "delivery refused by the transport, identity unreadable"
                     );
                 }
@@ -307,15 +309,27 @@ impl RequestRegistry {
                 match retirement {
                     Some(SlotRetirement::Resolved) => {
                         self.counters.duplicate.fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!(%request_id, "reply for an already-resolved request");
+                        tracing::debug!(
+                            %request_id,
+                            rejection_kind = ReplyRejectionKind::Duplicate.as_str(),
+                            "reply for an already-resolved request"
+                        );
                     }
                     Some(SlotRetirement::Abandoned) => {
                         self.counters.late.fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!(%request_id, "reply for an abandoned request, arrived late");
+                        tracing::debug!(
+                            %request_id,
+                            rejection_kind = ReplyRejectionKind::Late.as_str(),
+                            "reply for an abandoned request, arrived late"
+                        );
                     }
                     None => {
                         self.counters.orphaned.fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!(%request_id, "reply for an unknown request");
+                        tracing::debug!(
+                            %request_id,
+                            rejection_kind = ReplyRejectionKind::Orphaned.as_str(),
+                            "reply for an unknown request"
+                        );
                     }
                 }
             }
@@ -328,7 +342,12 @@ impl RequestRegistry {
                     slot.rejected_deliveries = slot.rejected_deliveries.saturating_add(1);
                     drop(guard);
                     self.record_rejection_kind(rejection.kind());
-                    tracing::debug!(%request_id, ?rejection, "invalid reply, slot left pending");
+                    tracing::debug!(
+                        %request_id,
+                        ?rejection,
+                        rejection_kind = rejection.kind().as_str(),
+                        "invalid reply, slot left pending"
+                    );
                     return;
                 }
                 let slot = entry.remove();

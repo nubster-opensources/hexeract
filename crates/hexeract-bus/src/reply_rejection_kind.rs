@@ -19,3 +19,17 @@ pub enum ReplyRejectionKind {
     /// Identity abandoned (timeout, drain) before this delivery arrived.
     Late,
 }
+
+impl ReplyRejectionKind {
+    /// Render this kind as its stable `rejection_kind` field spelling.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Undecodable => "undecodable",
+            Self::Orphaned => "orphaned",
+            Self::Unauthenticated => "unauthenticated",
+            Self::Invalid => "invalid",
+            Self::Duplicate => "duplicate",
+            Self::Late => "late",
+        }
+    }
+}

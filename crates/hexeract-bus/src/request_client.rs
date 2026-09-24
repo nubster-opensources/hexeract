@@ -5,15 +5,19 @@ use hexeract_core::{CorrelationId, RequestId};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
+use crate::call_observation::CallObservation;
 use crate::deadline::Deadline;
 use crate::remote_error::RemoteErrorPayload;
 use crate::reply_acceptance::ReplyExpectation;
 use crate::reply_authentication::ReplyAuthentication;
 use crate::reply_inbox_state::ReplyInboxState;
+use crate::request_client_counters::{RequestClientCounters, RequestClientCountersSnapshot};
 use crate::request_client_supervisor::RequestClientSupervisor;
 use crate::request_error::ProtocolViolation;
 use crate::request_options::RequestOptions;
+use crate::request_outcome::{RequestOutcome, TransportCause};
 use crate::request_registry::RequestRegistry;
 use crate::rpc_protocol::{
     DEADLINE_HEADER, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, REPLY_ERROR_MESSAGE_TYPE,
@@ -89,6 +93,7 @@ pub(crate) struct RequestClientInner<T: Transport> {
     default_timeout: Duration,
     cancel: CancellationToken,
     publication_lifecycle: PublicationLifecycle,
+    counters: RequestClientCounters,
     supervisor: Mutex<Option<JoinHandle<()>>>,
     supervisor_task_id: Option<tokio::task::Id>,
     /// Cancelled by the reply consumer task itself, right before it
@@ -271,6 +276,7 @@ impl<T: Transport> RequestClient<T> {
                 default_timeout,
                 cancel,
                 publication_lifecycle: PublicationLifecycle::default(),
+                counters: RequestClientCounters::default(),
                 supervisor: Mutex::new(supervisor),
                 supervisor_task_id,
                 finished,
@@ -378,6 +384,17 @@ impl<T: Transport> RequestClient<T> {
                 }
             }
         }
+    }
+
+    /// Return a point-in-time snapshot of this client's call-level totals.
+    ///
+    /// The `replies` field of the returned snapshot reflects this client's
+    /// [`RequestRegistry`], read for real; every other field is inert in
+    /// this revision: the implementation wires the counters this method
+    /// reads.
+    #[must_use]
+    pub fn counters(&self) -> RequestClientCountersSnapshot {
+        self.inner.counters.snapshot(self.inner.registry.counters())
     }
 
     /// Send `request` on a fresh causal chain, using this client's default
@@ -603,6 +620,49 @@ impl<T: Transport> RequestClient<T> {
     ) -> Result<AuthenticatedReply<R::Reply>, RequestError> {
         let deadline = tokio::time::Instant::now() + timeout;
         let request_id = RequestId::new();
+        let correlation_id = *correlation_id.as_uuid();
+        let span = tracing::info_span!(
+            "rpc.request",
+            destination = destination,
+            request_type = R::MESSAGE_TYPE,
+            request_id = %request_id,
+            correlation_id = %correlation_id,
+            outcome = tracing::field::Empty,
+            elapsed_ms = tracing::field::Empty,
+            cause = tracing::field::Empty,
+            remote_error_type = tracing::field::Empty,
+        );
+        let mut observation = CallObservation::start(&self.inner.counters, span.clone());
+        let result = self
+            .request_attempt(
+                request,
+                destination,
+                timeout,
+                correlation_id,
+                request_id,
+                deadline,
+                &mut observation,
+            )
+            .instrument(span)
+            .await;
+        observation.finish(RequestOutcome::of(&result));
+        result
+    }
+
+    /// The body of one request-reply attempt, run under this call's
+    /// `rpc.request` span through [`Instrument`]: never holds
+    /// `Span::enter()` across an `.await`.
+    #[allow(clippy::too_many_arguments)]
+    async fn request_attempt<R: Request>(
+        &self,
+        request: &R,
+        destination: &str,
+        timeout: Duration,
+        correlation_id: uuid::Uuid,
+        request_id: RequestId,
+        deadline: tokio::time::Instant,
+        observation: &mut CallObservation<'_>,
+    ) -> Result<AuthenticatedReply<R::Reply>, RequestError> {
         // Registering first, and only then reading the inbox state, is
         // what closes the reconnect race: see the `reply_inbox` doc on
         // `Self::new` and `ReplyInboxState` for why this order, not the
@@ -611,7 +671,10 @@ impl<T: Transport> RequestClient<T> {
             .inner
             .registry
             .register(request_id, ReplyExpectation::new(R::Reply::MESSAGE_TYPE))?;
-        let correlation_id = *correlation_id.as_uuid();
+        // The `in_flight` gauge only ever rises after this registration
+        // succeeded: a registration refusal counts `started` and `refused`,
+        // never the gauge.
+        observation.admit();
         let inbox = match &*self
             .inner
             .reply_inbox
@@ -620,6 +683,7 @@ impl<T: Transport> RequestClient<T> {
         {
             ReplyInboxState::Ready(inbox) => inbox.clone(),
             ReplyInboxState::Reconnecting => {
+                observation.note_transport_cause(TransportCause::ReplyInboxReconnecting);
                 return Err(RequestError::Transport(reply_inbox_reconnecting()));
             }
         };
@@ -651,7 +715,10 @@ impl<T: Transport> RequestClient<T> {
                     rejected_deliveries: pending.rejected_deliveries(),
                 });
             }
-            Ok(Err(error)) => return Err(RequestError::Transport(error)),
+            Ok(Err(error)) => {
+                observation.note_transport_cause(TransportCause::PublicationFailed);
+                return Err(RequestError::Transport(error));
+            }
             Ok(Ok(_message_id)) => {}
         }
         drop(publication);
@@ -677,6 +744,7 @@ impl<T: Transport> RequestClient<T> {
                     {
                         RequestError::PublicationUnknown
                     } else {
+                        observation.note_transport_cause(TransportCause::ReplyChannelLost);
                         RequestError::Transport(reply_channel_lost())
                     },
                 );
@@ -684,10 +752,18 @@ impl<T: Transport> RequestClient<T> {
             Ok(Ok((envelope, authentication))) => (envelope, authentication),
         };
 
-        decode_reply::<R>(reply).map(|reply| AuthenticatedReply {
-            reply,
-            authentication,
-        })
+        match decode_reply::<R>(reply) {
+            Ok(reply) => Ok(AuthenticatedReply {
+                reply,
+                authentication,
+            }),
+            Err(error) => {
+                if let RequestError::Remote { error_type, .. } = &error {
+                    observation.note_remote_error_type(*error_type);
+                }
+                Err(error)
+            }
+        }
     }
 }
 
@@ -777,13 +853,21 @@ mod tests {
     use crate::deadline::{Deadline, DeadlineReading};
     use crate::envelope_security::identity::{Audience, Issuer, KeyId, SignatureAlgorithm};
     use crate::envelope_security::principal::VerifiedPrincipal;
+    use crate::handler::{BoxFuture, ErasedHandler};
     use crate::remote_error::RemoteErrorType;
+    use crate::replied_handler::RepliedHandler;
     use crate::reply_acceptance::ReplyRejection;
     use crate::reply_authentication::ReplyAuthentication;
+    use crate::reply_destination::{ReplyDestination, ReplyDestinationError};
+    use crate::reply_publisher::ReplyPublisher;
+    use crate::request_context::RequestContext;
+    use crate::request_handler::RequestHandler;
     use crate::request_options::RequestOptions;
     use crate::request_registry::ReplyCountersSnapshot;
     use crate::rpc_protocol::DEADLINE_HEADER;
+    use crate::span_capture::SpanCapture;
     use crate::transport_refusal::TransportRefusal;
+    use hexeract_core::{HandlerContext, MessageId};
 
     #[derive(Debug, Serialize, Deserialize)]
     struct Ping {
@@ -3124,5 +3208,1011 @@ mod tests {
             "expected the timeout the options carried, got {error:?}"
         );
         assert_eq!(tokio::time::Instant::now() - started_at, OVERRIDE);
+    }
+
+    // -- #441 instrumentation.
+    // Every one of them exercises `RequestClient::counters()` and the
+    // `rpc.request` span through `SpanCapture`; neither is wired into
+    // `request_inner` yet, so each fails on the assertion noted in its own
+    // doc comment, not on a panic from the skeleton itself.
+
+    /// A publish that always fails, carrying a canary in its error message,
+    /// so a test can prove the canary never reaches a captured field.
+    #[derive(Default)]
+    struct FailingPublicationTransport;
+
+    #[async_trait]
+    impl Transport for FailingPublicationTransport {
+        async fn publish_envelope(
+            &self,
+            _routing_key: &str,
+            _envelope: &BusEnvelope,
+        ) -> Result<Uuid, BusError> {
+            Err(BusError::Internal(format!(
+                "{CANARY_PUBLICATION} connection reset by peer"
+            )))
+        }
+    }
+
+    /// Planted in the error a failed publication returns, then looked for in
+    /// every captured field.
+    ///
+    /// Carried by a variant whose own `Display` renders it, rather than one
+    /// that hides it behind a source: a `BusError::Transport` renders as a
+    /// fixed string and only reveals its source through `Debug`, so a leak
+    /// written `%error` would slip past while one written `?error` was
+    /// caught. Here either spelling surfaces the canary.
+    const CANARY_PUBLICATION: &str = "canary-9F3B";
+
+    /// Publishes normally, except toward `"tests.ping.fail"`, which it
+    /// always refuses: lets a single test mix a successful call and a
+    /// publication failure on one client without needing two transports.
+    #[derive(Default)]
+    struct FlakyTransport {
+        published: StdMutex<Vec<(String, BusEnvelope)>>,
+    }
+
+    #[async_trait]
+    impl Transport for FlakyTransport {
+        async fn publish_envelope(
+            &self,
+            routing_key: &str,
+            envelope: &BusEnvelope,
+        ) -> Result<Uuid, BusError> {
+            if routing_key == "tests.ping.fail" {
+                return Err(BusError::Transport(Box::new(std::io::Error::other(
+                    "deliberate publication failure",
+                ))));
+            }
+            self.published
+                .lock()
+                .unwrap()
+                .push((routing_key.to_owned(), envelope.clone()));
+            Ok(envelope.message_id)
+        }
+    }
+
+    impl FlakyTransport {
+        fn last_published(&self) -> Option<BusEnvelope> {
+            self.published
+                .lock()
+                .unwrap()
+                .last()
+                .map(|(_, envelope)| envelope.clone())
+        }
+    }
+
+    /// A successful call must open an `rpc.request`
+    /// span carrying `destination`, `request_type`, `request_id` and
+    /// `correlation_id` equal to the call's own values, `outcome =
+    /// succeeded` and a present `elapsed_ms`; and the counters must show
+    /// `started = 1`, `succeeded = 1`, `in_flight = 0`.
+    #[tokio::test(start_paused = true)]
+    async fn a_successful_call_opens_its_rpc_request_span_and_counts_succeeded() {
+        let (capture, _guard) = SpanCapture::install();
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = client(Arc::clone(&transport), Arc::clone(&registry));
+
+        let request_fut = client.request(Ping { seq: 3 });
+        tokio::pin!(request_fut);
+        tokio::select! {
+            _ = &mut request_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let published = transport.last_published().expect("a request was published");
+        let request_id = published_request_id(&published);
+        registry.resolve(
+            ok_reply(request_id, 3),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+        assert_eq!(request_fut.await.expect("reply"), Pong { seq: 3 });
+
+        let spans = capture.spans_named("rpc.request");
+        assert_eq!(
+            spans.len(),
+            1,
+            "a call must open exactly one rpc.request span, got {spans:?}"
+        );
+        let span = &spans[0];
+        assert_eq!(
+            span.fields.get("destination").map(String::as_str),
+            transport.last_routing_key().as_deref()
+        );
+        assert_eq!(
+            span.fields.get("request_type").map(String::as_str),
+            Some(Ping::MESSAGE_TYPE)
+        );
+        assert_eq!(
+            span.fields.get("request_id").map(String::as_str),
+            Some(request_id.to_string()).as_deref()
+        );
+        assert_eq!(
+            span.fields.get("correlation_id").map(String::as_str),
+            Some(published.correlation_id.to_string()).as_deref()
+        );
+        assert_eq!(
+            span.fields.get("outcome").map(String::as_str),
+            Some("succeeded")
+        );
+        assert!(
+            span.fields.contains_key("elapsed_ms"),
+            "elapsed_ms must be recorded once the call finishes"
+        );
+
+        let counters = client.counters();
+        assert_eq!(counters.started, 1);
+        assert_eq!(counters.succeeded, 1);
+        assert_eq!(counters.in_flight, 0);
+    }
+
+    /// While a call is admitted and awaiting its reply,
+    /// `in_flight` must read `1`.
+    #[tokio::test(start_paused = true)]
+    async fn in_flight_reads_one_while_an_admitted_call_awaits_its_reply() {
+        let transport = Arc::new(GatedTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = gated_client(
+            Arc::clone(&transport),
+            Arc::clone(&registry),
+            Duration::from_secs(30),
+        );
+
+        let request = client.request(Ping { seq: 1 });
+        tokio::pin!(request);
+        tokio::select! {
+            () = transport.wait_until_publish_started() => {}
+            result = &mut request => panic!("publication unexpectedly completed: {result:?}"),
+        }
+        transport.release_publish();
+        tokio::select! {
+            biased;
+            result = &mut request => panic!("request unexpectedly completed: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+
+        assert_eq!(
+            client.counters().in_flight,
+            1,
+            "an admitted call awaiting its reply must show in_flight = 1"
+        );
+    }
+
+    /// A timeout while awaiting a reply must count
+    /// `timed_out` and emit exactly one warn-level terminal event.
+    #[tokio::test]
+    async fn a_reply_wait_timeout_counts_timed_out_and_emits_a_warn_event() {
+        let (capture, _guard) = SpanCapture::install();
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = RequestClient::new(
+            transport,
+            Arc::clone(&registry),
+            Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
+            Duration::from_millis(30),
+            RequestClientSupervisor::detached(CancellationToken::new()),
+        );
+
+        let err = client.request(Ping { seq: 1 }).await.expect_err("no reply");
+        assert!(matches!(err, RequestError::Timeout { .. }));
+
+        assert_eq!(client.counters().timed_out, 1);
+        let warn_events: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter(|event| event.level == tracing::Level::WARN)
+            .collect();
+        assert_eq!(
+            warn_events.len(),
+            1,
+            "a timed-out call must emit exactly one warn-level terminal event, got {warn_events:?}"
+        );
+    }
+
+    /// A timeout while a publication never returns must
+    /// still count `timed_out`.
+    #[tokio::test(start_paused = true)]
+    async fn a_publication_that_never_returns_times_out_and_counts_timed_out() {
+        let timeout = Duration::from_millis(30);
+        let transport = Arc::new(GatedTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = gated_client(Arc::clone(&transport), Arc::clone(&registry), timeout);
+
+        let request = client.request(Ping { seq: 1 });
+        tokio::pin!(request);
+        tokio::select! {
+            () = transport.wait_until_publish_started() => {}
+            result = &mut request => panic!("publication unexpectedly completed: {result:?}"),
+        }
+        tokio::time::advance(timeout).await;
+        let error = request
+            .await
+            .expect_err("the publication must share the request timeout");
+        assert!(matches!(error, RequestError::Timeout { .. }));
+
+        assert_eq!(client.counters().timed_out, 1);
+    }
+
+    /// A publication failure whose underlying error
+    /// carries a canary must count `transport_failed` with `cause =
+    /// publication_failed`, and the canary must never appear in any
+    /// captured field.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_publication_counts_transport_failed_with_publication_failed_cause_and_hides_its_canary()
+     {
+        let (capture, _guard) = SpanCapture::install();
+        let transport = Arc::new(FailingPublicationTransport);
+        let registry = Arc::new(RequestRegistry::default());
+        let client = RequestClient::new(
+            transport,
+            Arc::clone(&registry),
+            Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
+            Duration::from_secs(5),
+            RequestClientSupervisor::detached(CancellationToken::new()),
+        );
+
+        let error = client
+            .request(Ping { seq: 1 })
+            .await
+            .expect_err("publication fails");
+        assert!(matches!(error, RequestError::Transport(_)));
+
+        let spans = capture.spans_named("rpc.request");
+        assert_eq!(spans.len(), 1, "got {spans:?}");
+        assert_eq!(
+            spans[0].fields.get("cause").map(String::as_str),
+            Some("publication_failed")
+        );
+        assert_eq!(client.counters().transport_failed, 1);
+        for value in capture.every_field_value() {
+            assert!(
+                !value.contains(CANARY_PUBLICATION),
+                "the canary leaked into a captured field: {value}"
+            );
+        }
+    }
+
+    /// A `drain` while a call awaits its reply must
+    /// count `transport_failed` with `cause = reply_channel_lost`, and
+    /// `in_flight` must return to `0`.
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_while_waiting_counts_transport_failed_with_reply_channel_lost_cause() {
+        let (capture, _guard) = SpanCapture::install();
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let reply_inbox = Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned())));
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            Arc::clone(&registry),
+            Arc::clone(&reply_inbox),
+            Duration::from_secs(30),
+            RequestClientSupervisor::detached(CancellationToken::new()),
+        );
+
+        let request_fut = client.request(Ping { seq: 1 });
+        tokio::pin!(request_fut);
+        tokio::select! {
+            _ = &mut request_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        *reply_inbox.lock().unwrap_or_else(PoisonError::into_inner) = ReplyInboxState::Reconnecting;
+        registry.drain();
+
+        let error = request_fut
+            .await
+            .expect_err("connection loss must surface as an error");
+        assert!(matches!(error, RequestError::Transport(_)));
+
+        let spans = capture.spans_named("rpc.request");
+        assert_eq!(spans.len(), 1, "got {spans:?}");
+        assert_eq!(
+            spans[0].fields.get("cause").map(String::as_str),
+            Some("reply_channel_lost")
+        );
+        assert_eq!(client.counters().in_flight, 0);
+    }
+
+    /// A call made while the reply inbox is
+    /// `Reconnecting` must count `transport_failed` with `cause =
+    /// reply_inbox_reconnecting`; `in_flight` stays `0` even though the
+    /// call was admitted (registration runs before the inbox is read).
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnecting_inbox_counts_transport_failed_with_reply_inbox_reconnecting_cause() {
+        let (capture, _guard) = SpanCapture::install();
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let reply_inbox = Arc::new(Mutex::new(ReplyInboxState::Reconnecting));
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            registry,
+            reply_inbox,
+            Duration::from_secs(30),
+            RequestClientSupervisor::detached(CancellationToken::new()),
+        );
+
+        let error = client
+            .request(Ping { seq: 1 })
+            .await
+            .expect_err("a reconnecting inbox must be refused");
+        assert!(matches!(error, RequestError::Transport(_)));
+
+        let spans = capture.spans_named("rpc.request");
+        assert_eq!(spans.len(), 1, "got {spans:?}");
+        assert_eq!(
+            spans[0].fields.get("cause").map(String::as_str),
+            Some("reply_inbox_reconnecting")
+        );
+        assert_eq!(client.counters().in_flight, 0);
+    }
+
+    /// `close` while a call awaits its reply must
+    /// count `publication_unknown`, and `in_flight` must return to `0`.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_while_waiting_counts_publication_unknown() {
+        let (capture, _guard) = SpanCapture::install();
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = client(Arc::clone(&transport), Arc::clone(&registry));
+
+        let request_fut = client.request(Ping { seq: 1 });
+        tokio::pin!(request_fut);
+        tokio::select! {
+            _ = &mut request_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        client.close().await;
+
+        let error = request_fut
+            .await
+            .expect_err("a call admitted before close observes an ambiguous outcome");
+        assert!(matches!(error, RequestError::PublicationUnknown));
+
+        let spans = capture.spans_named("rpc.request");
+        assert_eq!(spans.len(), 1, "got {spans:?}");
+        assert_eq!(
+            spans[0].fields.get("outcome").map(String::as_str),
+            Some("publication_unknown")
+        );
+        assert_eq!(client.counters().in_flight, 0);
+    }
+
+    /// A call refused because the registry is at
+    /// capacity must count `refused`, `started` must still be incremented
+    /// for it, and `in_flight` must never exceed `max_in_flight`.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_at_registry_capacity_is_refused_and_never_exceeds_max_in_flight() {
+        let (capture, _guard) = SpanCapture::install();
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::new(1));
+        let client = client(Arc::clone(&transport), Arc::clone(&registry));
+
+        let first_fut = client.request(Ping { seq: 1 });
+        tokio::pin!(first_fut);
+        tokio::select! {
+            _ = &mut first_fut => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        let error = client
+            .request(Ping { seq: 2 })
+            .await
+            .expect_err("the registry has no free slot for a second call");
+        assert!(matches!(error, RequestError::AtCapacity));
+
+        let counters = client.counters();
+        assert_eq!(counters.refused, 1);
+        assert_eq!(
+            counters.started, 2,
+            "both the admitted call and the refused one must count started"
+        );
+        assert!(
+            counters.in_flight <= 1,
+            "in_flight must never exceed max_in_flight (1), got {}",
+            counters.in_flight
+        );
+
+        let spans = capture.spans_named("rpc.request");
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.fields.get("outcome").map(String::as_str) == Some("refused")),
+            "the refused call must open its own rpc.request span with outcome = refused, got {spans:?}"
+        );
+    }
+
+    /// A remote error reply must count
+    /// `remote_failed`, record `remote_error_type`, and emit exactly one
+    /// debug-level terminal event.
+    #[tokio::test(start_paused = true)]
+    async fn a_remote_error_reply_counts_remote_failed_and_records_remote_error_type() {
+        let (capture, _guard) = SpanCapture::install();
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = client(Arc::clone(&transport), Arc::clone(&registry));
+
+        let request_fut = client.request(Ping { seq: 9 });
+        tokio::pin!(request_fut);
+        tokio::select! {
+            _ = &mut request_fut => panic!("pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let published = transport.last_published().expect("a request was published");
+        let request_id = published_request_id(&published);
+        let payload = RemoteErrorPayload {
+            error_type: RemoteErrorType::Internal,
+            request_id: *request_id.as_uuid(),
+        };
+        let mut err_env = BusEnvelope::restore(
+            Uuid::now_v7(),
+            REPLY_ERROR_MESSAGE_TYPE.to_owned(),
+            serde_json::to_vec(&payload).unwrap(),
+            published.correlation_id,
+            None,
+            HashMap::default(),
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        err_env.insert_protocol_header(REPLY_STATUS_HEADER, REPLY_STATUS_ERROR.to_owned());
+        err_env.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
+        err_env.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
+        registry.resolve(err_env, Ok(ReplyAuthentication::NotEnforced));
+        let err = request_fut.await.expect_err("remote error");
+        assert!(matches!(err, RequestError::Remote { .. }));
+
+        assert_eq!(client.counters().remote_failed, 1);
+
+        let spans = capture.spans_named("rpc.request");
+        assert_eq!(spans.len(), 1, "got {spans:?}");
+        assert_eq!(
+            spans[0].fields.get("remote_error_type").map(String::as_str),
+            Some("Internal")
+        );
+
+        let debug_events: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.span_name == Some("rpc.request") && event.level == tracing::Level::DEBUG
+            })
+            .collect();
+        assert_eq!(
+            debug_events.len(),
+            1,
+            "a remote failure must emit exactly one debug-level terminal event, got {debug_events:?}"
+        );
+    }
+
+    /// An undecodable reply must count `invalid_reply`
+    /// and emit a warn-level terminal event.
+    #[tokio::test(start_paused = true)]
+    async fn an_undecodable_reply_counts_invalid_reply_and_emits_a_warn_event() {
+        let (capture, _guard) = SpanCapture::install();
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = client(Arc::clone(&transport), Arc::clone(&registry));
+
+        let request_fut = client.request(Ping { seq: 1 });
+        tokio::pin!(request_fut);
+        tokio::select! {
+            _ = &mut request_fut => panic!("pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let published = transport.last_published().expect("a request was published");
+        let request_id = published_request_id(&published);
+        let mut reply = ok_reply(request_id, 1);
+        reply.payload = b"not json".to_vec();
+        registry.resolve(reply, Ok(ReplyAuthentication::NotEnforced));
+
+        let error = request_fut
+            .await
+            .expect_err("an undecodable payload must fail the call");
+        assert!(matches!(error, RequestError::Decode(_)));
+
+        assert_eq!(client.counters().invalid_reply, 1);
+        let warn_events: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.span_name == Some("rpc.request") && event.level == tracing::Level::WARN
+            })
+            .collect();
+        assert_eq!(warn_events.len(), 1, "got {warn_events:?}");
+    }
+
+    /// Dropping the call's future while it awaits a
+    /// reply must count `cancelled`, and `in_flight` must return to `0`.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_future_while_awaiting_a_reply_counts_cancelled() {
+        let (capture, _guard) = SpanCapture::install();
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = client(Arc::clone(&transport), Arc::clone(&registry));
+
+        // `Box::pin`, not `tokio::pin!`: the latter rebinds the name to a
+        // `Pin<&mut _>`, so the `drop` below would release a reference and
+        // leave the call alive until the end of this scope. The assertions
+        // that follow would then observe a cancellation that has not
+        // happened yet.
+        let mut request = Box::pin(client.request(Ping { seq: 1 }));
+        tokio::select! {
+            _ = &mut request => panic!("should still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        assert_eq!(
+            registry.len(),
+            1,
+            "the call must be waiting on its reply slot"
+        );
+
+        drop(request);
+
+        assert_eq!(client.counters().cancelled, 1);
+        assert_eq!(client.counters().in_flight, 0);
+        let spans = capture.spans_named("rpc.request");
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.fields.get("outcome").map(String::as_str) == Some("cancelled")),
+            "got {spans:?}"
+        );
+    }
+
+    /// A sequence mixing the outcomes of tests 6, 8,
+    /// 10, 13, 14, 15 and 17 must rest with `started` equal to the sum of
+    /// the eight outcome totals, and `in_flight = 0`. `13`
+    /// (`publication_unknown`, via `close`) runs last, since it ends the
+    /// client's ability to admit further calls.
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::too_many_lines)]
+    async fn a_sequence_mixing_seven_outcomes_rests_with_started_equal_to_the_sum_of_the_eight_totals()
+     {
+        let transport = Arc::new(FlakyTransport::default());
+        let registry = Arc::new(RequestRegistry::new(1));
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            Arc::clone(&registry),
+            Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
+            Duration::from_secs(30),
+            RequestClientSupervisor::detached(CancellationToken::new()),
+        );
+
+        // 6: succeeded
+        {
+            let request_fut = client.request(Ping { seq: 1 });
+            tokio::pin!(request_fut);
+            tokio::select! {
+                _ = &mut request_fut => panic!("pending"),
+                () = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+            let published = transport.last_published().expect("published");
+            registry.resolve(
+                ok_reply(published_request_id(&published), 1),
+                Ok(ReplyAuthentication::NotEnforced),
+            );
+            request_fut.await.expect("succeeds");
+        }
+
+        // 8: timed_out
+        {
+            let error = client
+                .request_with(
+                    Ping { seq: 2 },
+                    RequestOptions::new().with_timeout(Duration::from_millis(10)),
+                )
+                .await
+                .expect_err("timeout");
+            assert!(matches!(error, RequestError::Timeout { .. }));
+        }
+
+        // 10: transport_failed (publication)
+        {
+            let error = client
+                .request_with(
+                    Ping { seq: 3 },
+                    RequestOptions::new().with_destination("tests.ping.fail"),
+                )
+                .await
+                .expect_err("publication fails");
+            assert!(matches!(error, RequestError::Transport(_)));
+        }
+
+        // 14: refused (AtCapacity), registry capacity is 1
+        {
+            let held_fut = client.request(Ping { seq: 4 });
+            tokio::pin!(held_fut);
+            tokio::select! {
+                _ = &mut held_fut => panic!("pending"),
+                () = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+            let error = client
+                .request(Ping { seq: 5 })
+                .await
+                .expect_err("registry full");
+            assert!(matches!(error, RequestError::AtCapacity));
+            let published = transport.last_published().expect("published");
+            registry.resolve(
+                ok_reply(published_request_id(&published), 4),
+                Ok(ReplyAuthentication::NotEnforced),
+            );
+            held_fut.await.expect("succeeds");
+        }
+
+        // 15: remote_failed
+        {
+            let request_fut = client.request(Ping { seq: 6 });
+            tokio::pin!(request_fut);
+            tokio::select! {
+                _ = &mut request_fut => panic!("pending"),
+                () = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+            let published = transport.last_published().expect("published");
+            let request_id = published_request_id(&published);
+            let payload = RemoteErrorPayload {
+                error_type: RemoteErrorType::Internal,
+                request_id: *request_id.as_uuid(),
+            };
+            let mut err_env = BusEnvelope::restore(
+                Uuid::now_v7(),
+                REPLY_ERROR_MESSAGE_TYPE.to_owned(),
+                serde_json::to_vec(&payload).unwrap(),
+                published.correlation_id,
+                None,
+                HashMap::default(),
+                std::time::SystemTime::UNIX_EPOCH,
+            );
+            err_env.insert_protocol_header(REPLY_STATUS_HEADER, REPLY_STATUS_ERROR.to_owned());
+            err_env.insert_protocol_header(REQUEST_ID_HEADER, request_id.to_string());
+            err_env.insert_protocol_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
+            registry.resolve(err_env, Ok(ReplyAuthentication::NotEnforced));
+            let error = request_fut.await.expect_err("remote failure");
+            assert!(matches!(error, RequestError::Remote { .. }));
+        }
+
+        // 17: cancelled
+        {
+            let mut request = Box::pin(client.request(Ping { seq: 7 }));
+            tokio::select! {
+                _ = &mut request => panic!("pending"),
+                () = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+            drop(request);
+        }
+
+        // 13: publication_unknown, run last since close ends the client
+        {
+            let request_fut = client.request(Ping { seq: 8 });
+            tokio::pin!(request_fut);
+            tokio::select! {
+                _ = &mut request_fut => panic!("pending"),
+                () = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+            client.close().await;
+            let error = request_fut
+                .await
+                .expect_err("ambiguous outcome after close");
+            assert!(matches!(error, RequestError::PublicationUnknown));
+        }
+
+        let counters = client.counters();
+        assert_eq!(
+            counters.in_flight, 0,
+            "every call must have released its slot at rest"
+        );
+        let sum = counters.succeeded
+            + counters.timed_out
+            + counters.remote_failed
+            + counters.transport_failed
+            + counters.refused
+            + counters.publication_unknown
+            + counters.invalid_reply
+            + counters.cancelled;
+        assert_eq!(
+            counters.started, sum,
+            "at rest, started must equal the sum of the eight outcome totals (started={}, sum={})",
+            counters.started, sum
+        );
+        assert_eq!(
+            counters.started, 8,
+            "eight distinct calls were issued in this sequence"
+        );
+    }
+
+    /// One snapshot must carry both halves of the
+    /// picture at once, the registry's refused deliveries and this client's
+    /// own call outcomes.
+    ///
+    /// The `replies` half alone would prove nothing: `RequestRegistry`
+    /// counts it, and this method only threads it through. What this test
+    /// pins is that a single read reports a refused delivery *and* the call
+    /// outcome it belongs to, which is the only reason the field exists: a
+    /// caller built through `connect_request_client` never gets a handle on
+    /// the registry, so it can reach those counters through no other route.
+    #[tokio::test]
+    async fn client_counters_reports_registry_rejections_and_call_outcomes_in_one_read() {
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = RequestClient::new(
+            transport,
+            Arc::clone(&registry),
+            Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
+            Duration::from_millis(30),
+            RequestClientSupervisor::detached(CancellationToken::new()),
+        );
+
+        registry.resolve(
+            ok_reply(RequestId::new(), 1),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+        let err = client.request(Ping { seq: 1 }).await.expect_err("no reply");
+        assert!(matches!(err, RequestError::Timeout { .. }));
+
+        let counters = client.counters();
+        assert_eq!(
+            counters.replies.orphaned, 1,
+            "the registry's own rejection totals must reach the caller through this snapshot"
+        );
+        assert_eq!(
+            counters.timed_out, 1,
+            "the same snapshot must report the call outcome, not only the registry's view"
+        );
+        assert_eq!(
+            counters.started, 1,
+            "a delivery refused by the registry belongs to no call and must not count started"
+        );
+    }
+
+    /// A reply arriving after the caller already timed out must emit a debug
+    /// event carrying `rejection_kind = late`, and must not raise the warn
+    /// count at all.
+    ///
+    /// The comparison is against the warn count the timeout itself already
+    /// produced, not against zero: a timed-out call warns once, by design.
+    /// What must never happen is a warn *per late reply*, which is how a
+    /// flood of stragglers used to drown the logs.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_reply_after_timeout_emits_a_debug_event_with_rejection_kind_late_and_no_warn() {
+        let (capture, _guard) = SpanCapture::install();
+        let transport = Arc::new(CapturingTransport::default());
+        let registry = Arc::new(RequestRegistry::default());
+        let client = RequestClient::new(
+            Arc::clone(&transport),
+            Arc::clone(&registry),
+            Arc::new(Mutex::new(ReplyInboxState::Ready("reply.inbox".to_owned()))),
+            Duration::from_millis(10),
+            RequestClientSupervisor::detached(CancellationToken::new()),
+        );
+
+        let error = client.request(Ping { seq: 1 }).await.expect_err("no reply");
+        assert!(matches!(error, RequestError::Timeout { .. }));
+
+        let warns_before_the_late_reply = capture
+            .events()
+            .into_iter()
+            .filter(|event| event.level == tracing::Level::WARN)
+            .count();
+
+        let published = transport.last_published().expect("a request was published");
+        registry.resolve(
+            ok_reply(published_request_id(&published), 1),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+
+        let debug_events: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter(|event| event.level == tracing::Level::DEBUG)
+            .collect();
+        assert!(
+            debug_events.iter().any(
+                |event| event.fields.get("rejection_kind").map(String::as_str) == Some("late")
+            ),
+            "a late reply must emit a debug event carrying rejection_kind = late, got {debug_events:?}"
+        );
+        let warn_events: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter(|event| event.level == tracing::Level::WARN)
+            .collect();
+        assert_eq!(
+            warn_events.len(),
+            warns_before_the_late_reply,
+            "a late reply must add no warn event of its own, got {warn_events:?}"
+        );
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct CanaryPing {
+        seq: u64,
+        note: String,
+    }
+    impl Message for CanaryPing {
+        const MESSAGE_TYPE: &'static str = "tests.canary_ping";
+    }
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct CanaryPong {
+        seq: u64,
+        note: String,
+    }
+    impl Message for CanaryPong {
+        const MESSAGE_TYPE: &'static str = "tests.canary_pong";
+    }
+    impl Request for CanaryPing {
+        type Reply = CanaryPong;
+    }
+
+    struct CanaryEcho;
+    impl RequestHandler<CanaryPing> for CanaryEcho {
+        type Error = BusError;
+        async fn handle(
+            &self,
+            request: CanaryPing,
+            _ctx: &RequestContext<'_>,
+        ) -> Result<CanaryPong, BusError> {
+            Ok(CanaryPong {
+                seq: request.seq,
+                note: request.note,
+            })
+        }
+    }
+
+    /// Loops a client's publication straight into an in-process responder,
+    /// stamping an application header alongside the payload so test 25 can
+    /// prove a canary on either channel never reaches a captured field.
+    struct LoopbackTransport {
+        handler: Arc<dyn ErasedHandler>,
+    }
+
+    #[async_trait]
+    impl Transport for LoopbackTransport {
+        async fn publish_envelope(
+            &self,
+            _routing_key: &str,
+            envelope: &BusEnvelope,
+        ) -> Result<Uuid, BusError> {
+            let message_id = envelope.message_id;
+            let mut inbound = envelope.clone();
+            inbound
+                .headers
+                .insert("x-app-canary".to_owned(), CANARY_E2E.to_owned());
+            let ctx = HandlerContext::new(
+                MessageId::new(),
+                CorrelationId::from(envelope.correlation_id),
+            );
+            self.handler.handle(&inbound, &ctx).await?;
+            Ok(message_id)
+        }
+    }
+
+    /// Resolves a responder's reply straight back into the client's own
+    /// registry, standing in for the broker round trip.
+    struct LoopbackReplyPublisher {
+        registry: Arc<RequestRegistry>,
+    }
+
+    impl ReplyPublisher for LoopbackReplyPublisher {
+        fn publish_reply<'a>(
+            &'a self,
+            _destination: &'a ReplyDestination,
+            envelope: &'a BusEnvelope,
+        ) -> BoxFuture<'a, Result<(), BusError>> {
+            let registry = Arc::clone(&self.registry);
+            let envelope = envelope.clone();
+            Box::pin(async move {
+                registry.resolve(envelope, Ok(ReplyAuthentication::NotEnforced));
+                Ok(())
+            })
+        }
+
+        fn accept_destination(&self, raw: &str) -> Result<ReplyDestination, ReplyDestinationError> {
+            ReplyDestination::parse(raw)
+        }
+    }
+
+    const CANARY_E2E: &str = "canary-E2E-7Q2K";
+
+    /// An in-memory client/responder round trip must
+    /// open `rpc.request` and `rpc.respond` spans sharing the same
+    /// `request_id` and `correlation_id`; a canary planted in the payload
+    /// and in an application header must never reach a captured field; and
+    /// every captured field name, across both spans, must belong to the
+    /// closed allow-list this test carries.
+    #[tokio::test(start_paused = true)]
+    async fn an_in_memory_round_trip_correlates_its_spans_hides_the_canary_and_stays_within_the_allow_list()
+     {
+        /// The closed allow-list of observability fields: no span this
+        /// crate opens may carry a field outside it.
+        const ALLOW_LIST: &[&str] = &[
+            "destination",
+            "request_type",
+            "request_id",
+            "correlation_id",
+            "outcome",
+            "elapsed_ms",
+            "cause",
+            "remote_error_type",
+        ];
+
+        let (capture, _guard) = SpanCapture::install();
+
+        let registry = Arc::new(RequestRegistry::default());
+        let reply_publisher = Arc::new(LoopbackReplyPublisher {
+            registry: Arc::clone(&registry),
+        });
+        let erased: Arc<dyn ErasedHandler> = Arc::new(RepliedHandler::new(
+            CanaryEcho,
+            Arc::clone(&reply_publisher),
+        ));
+        let transport = Arc::new(LoopbackTransport { handler: erased });
+
+        let client = RequestClient::new(
+            transport,
+            Arc::clone(&registry),
+            Arc::new(Mutex::new(ReplyInboxState::Ready(
+                "amq.gen-test-inbox".to_owned(),
+            ))),
+            Duration::from_secs(5),
+            RequestClientSupervisor::detached(CancellationToken::new()),
+        );
+
+        let reply = client
+            .request(CanaryPing {
+                seq: 1,
+                note: CANARY_E2E.to_owned(),
+            })
+            .await
+            .expect("the loopback round trip must succeed");
+        assert_eq!(
+            reply.note, CANARY_E2E,
+            "the domain payload itself legitimately carries the canary"
+        );
+
+        let request_spans = capture.spans_named("rpc.request");
+        let respond_spans = capture.spans_named("rpc.respond");
+        assert_eq!(request_spans.len(), 1, "got {request_spans:?}");
+        assert_eq!(respond_spans.len(), 1, "got {respond_spans:?}");
+
+        let request_id = request_spans[0].fields.get("request_id").cloned();
+        let correlation_id = request_spans[0].fields.get("correlation_id").cloned();
+        assert!(
+            request_id.is_some(),
+            "the rpc.request span must carry a request_id"
+        );
+        assert!(
+            correlation_id.is_some(),
+            "the rpc.request span must carry a correlation_id"
+        );
+        assert_eq!(
+            respond_spans[0].fields.get("request_id").cloned(),
+            request_id,
+            "both spans must share the same request_id"
+        );
+        assert_eq!(
+            respond_spans[0].fields.get("correlation_id").cloned(),
+            correlation_id,
+            "both spans must share the same correlation_id"
+        );
+
+        for value in capture.every_field_value() {
+            assert!(
+                !value.contains(CANARY_E2E),
+                "the canary leaked into a captured field: {value}"
+            );
+        }
+
+        let mut captured_field_names: Vec<&str> = request_spans[0]
+            .fields
+            .keys()
+            .copied()
+            .chain(respond_spans[0].fields.keys().copied())
+            .collect();
+        captured_field_names.sort_unstable();
+        captured_field_names.dedup();
+        for name in captured_field_names {
+            assert!(
+                ALLOW_LIST.contains(&name),
+                "field `{name}` is not in the closed allow-list of observability fields"
+            );
+        }
     }
 }

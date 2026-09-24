@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use hexeract_core::{HandlerContext, RequestId};
+use tracing::Instrument;
 
 use crate::deadline::{DeadlineReading, LocalDeadline};
 use crate::remote_error::{RemoteErrorPayload, RemoteErrorType};
@@ -254,7 +255,57 @@ where
         R::MESSAGE_TYPE
     }
 
-    /// Decode the inbound request, run the handler, and publish the reply.
+    /// Decode the inbound request, run the handler, and publish the reply,
+    /// observed end to end by an `rpc.respond` span. The guard order below
+    /// is preserved unchanged; this wrapper's only job is opening that span
+    /// and mapping the dispatch's outcome, success or failure alike, onto
+    /// it.
+    fn handle<'a>(
+        &'a self,
+        envelope: &'a BusEnvelope,
+        ctx: &'a HandlerContext,
+    ) -> BoxFuture<'a, Result<(), BusError>> {
+        let correlation_id = envelope.correlation_id;
+        let span = tracing::info_span!(
+            "rpc.respond",
+            request_type = R::MESSAGE_TYPE,
+            request_id = tracing::field::Empty,
+            correlation_id = %correlation_id,
+            outcome = tracing::field::Empty,
+            elapsed_ms = tracing::field::Empty,
+        );
+        let observation_span = span.clone();
+        Box::pin(
+            async move {
+                let observation = ResponseObservation::start(observation_span);
+                match self.dispatch(envelope, ctx, correlation_id).await {
+                    Ok(outcome) => {
+                        observation.finish(outcome);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        observation.finish(ResponderOutcome::Failed);
+                        Err(error)
+                    }
+                }
+            }
+            .instrument(span),
+        )
+    }
+}
+
+impl<R, H, P> RepliedHandler<R, H, P>
+where
+    R: Request,
+    H: RequestHandler<R>,
+    P: ReplyPublisher,
+{
+    /// The body of one dispatch, run under this call's `rpc.respond` span
+    /// through [`Instrument`]: never holds `Span::enter()` across an
+    /// `.await`. Returns the [`ResponderOutcome`] reached on every
+    /// successful path; [`RepliedHandler::handle`] maps any propagated
+    /// [`BusError`] to [`ResponderOutcome::Failed`], since every such error
+    /// here originates at a reply publication that failed.
     ///
     /// Five guards run in a fixed order before the handler is ever invoked,
     /// each one stopping the request before the handler runs, rather than
@@ -282,7 +333,9 @@ where
     ///    the version and decode checks, also means every later branch that
     ///    builds a reply can carry `request_id` as a plain [`RequestId`]
     ///    rather than an `Option<RequestId>`: there is no "unknown
-    ///    identity" case left for it to represent past this point.
+    ///    identity" case left for it to represent past this point. This is
+    ///    also the point the `rpc.respond` span's own `request_id` field is
+    ///    recorded, once it is known good.
     /// 3. The protocol version is checked third, once both `reply_to` and
     ///    `request_id` are known good: its own rejection branch is the
     ///    first one in this method that publishes, and it now has both a
@@ -313,98 +366,101 @@ where
     /// reply whose deadline passed while the handler ran is suppressed
     /// rather than published, since by then it could reach nothing but an
     /// orphaned inbox.
-    fn handle<'a>(
-        &'a self,
-        envelope: &'a BusEnvelope,
-        ctx: &'a HandlerContext,
-    ) -> BoxFuture<'a, Result<(), BusError>> {
-        Box::pin(async move {
-            let correlation_id = envelope.correlation_id;
+    async fn dispatch(
+        &self,
+        envelope: &BusEnvelope,
+        ctx: &HandlerContext,
+        correlation_id: uuid::Uuid,
+    ) -> Result<ResponderOutcome, BusError> {
+        let Some(reply_to) = self.validated_reply_to(envelope) else {
+            return Ok(ResponderOutcome::Dropped);
+        };
 
-            let Some(reply_to) = self.validated_reply_to(envelope) else {
-                return Ok(());
-            };
-
-            let request_id = match parse_request_id(envelope) {
-                RequestIdHeader::Present(request_id) => request_id,
-                RequestIdHeader::Missing => {
-                    self.counters.count_invalid_request_id();
-                    tracing::warn!(
-                        message_type = R::MESSAGE_TYPE,
-                        %correlation_id,
-                        "request without a request id header, dropping without running the handler"
-                    );
-                    return Ok(());
-                }
-                RequestIdHeader::Unreadable => {
-                    self.counters.count_invalid_request_id();
-                    tracing::warn!(
-                        message_type = R::MESSAGE_TYPE,
-                        %correlation_id,
-                        "request with an unparsable request id header, dropping without running the handler"
-                    );
-                    return Ok(());
-                }
-            };
-
-            let protocol_version = match read_protocol_version(envelope) {
-                Some(version) if version == PROTOCOL_VERSION => version,
-                _ => {
-                    self.counters.count_unsupported_protocol_version();
-                    tracing::warn!(
-                        message_type = R::MESSAGE_TYPE,
-                        "request announces an unsupported protocol version, rejecting"
-                    );
-                    let reply =
-                        error_reply(RemoteErrorType::Unsupported, correlation_id, request_id)?;
-                    self.deliver_reply(&reply_to, &reply).await?;
-                    return Ok(());
-                }
-            };
-
-            let deadline = match self
-                .judge_deadline(envelope, &reply_to, correlation_id, request_id)
-                .await?
-            {
-                ControlFlow::Break(()) => return Ok(()),
-                ControlFlow::Continue(deadline) => deadline,
-            };
-
-            let request: R = match envelope.decode() {
-                Ok(request) => request,
-                Err(error) => {
-                    tracing::warn!(
-                        message_type = R::MESSAGE_TYPE,
-                        %error,
-                        "undecodable request, replying with an opaque category"
-                    );
-                    let reply =
-                        error_reply(RemoteErrorType::Malformed, correlation_id, request_id)?;
-                    self.deliver_reply(&reply_to, &reply).await?;
-                    return Ok(());
-                }
-            };
-
-            let mut request_context = RequestContext::new(request_id, protocol_version, ctx);
-            if let Some(deadline) = deadline {
-                request_context = request_context.with_deadline(deadline);
-            }
-            let reply_envelope = match self.handler.handle(request, &request_context).await {
-                Ok(reply) => Self::encode_ok_reply(correlation_id, request_id, &reply)?,
-                Err(error) => Self::encode_handler_error_reply(correlation_id, request_id, error)?,
-            };
-            if deadline.is_some_and(LocalDeadline::is_expired) {
-                self.counters.count_reply_dropped_after_deadline();
+        let request_id = match parse_request_id(envelope) {
+            RequestIdHeader::Present(request_id) => request_id,
+            RequestIdHeader::Missing => {
+                self.counters.count_invalid_request_id();
                 tracing::warn!(
                     message_type = R::MESSAGE_TYPE,
-                    %request_id,
-                    "deadline passed while handling, suppressing a reply nobody awaits"
+                    %correlation_id,
+                    "request without a request id header, dropping without running the handler"
                 );
-                return Ok(());
+                return Ok(ResponderOutcome::Dropped);
             }
-            self.deliver_reply(&reply_to, &reply_envelope).await?;
-            Ok(())
-        })
+            RequestIdHeader::Unreadable => {
+                self.counters.count_invalid_request_id();
+                tracing::warn!(
+                    message_type = R::MESSAGE_TYPE,
+                    %correlation_id,
+                    "request with an unparsable request id header, dropping without running the handler"
+                );
+                return Ok(ResponderOutcome::Dropped);
+            }
+        };
+        tracing::Span::current().record("request_id", request_id.to_string().as_str());
+
+        let protocol_version = match read_protocol_version(envelope) {
+            Some(version) if version == PROTOCOL_VERSION => version,
+            _ => {
+                self.counters.count_unsupported_protocol_version();
+                tracing::warn!(
+                    message_type = R::MESSAGE_TYPE,
+                    "request announces an unsupported protocol version, rejecting"
+                );
+                let reply = error_reply(RemoteErrorType::Unsupported, correlation_id, request_id)?;
+                self.deliver_reply(&reply_to, &reply).await?;
+                return Ok(ResponderOutcome::Dropped);
+            }
+        };
+
+        let deadline = match self
+            .judge_deadline(envelope, &reply_to, correlation_id, request_id)
+            .await?
+        {
+            ControlFlow::Break(()) => return Ok(ResponderOutcome::Dropped),
+            ControlFlow::Continue(deadline) => deadline,
+        };
+
+        let request: R = match envelope.decode() {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::warn!(
+                    message_type = R::MESSAGE_TYPE,
+                    %error,
+                    "undecodable request, replying with an opaque category"
+                );
+                let reply = error_reply(RemoteErrorType::Malformed, correlation_id, request_id)?;
+                self.deliver_reply(&reply_to, &reply).await?;
+                return Ok(ResponderOutcome::Dropped);
+            }
+        };
+
+        let mut request_context = RequestContext::new(request_id, protocol_version, ctx);
+        if let Some(deadline) = deadline {
+            request_context = request_context.with_deadline(deadline);
+        }
+        let (reply_envelope, handled_outcome) =
+            match self.handler.handle(request, &request_context).await {
+                Ok(reply) => (
+                    Self::encode_ok_reply(correlation_id, request_id, &reply)?,
+                    ResponderOutcome::Replied,
+                ),
+                Err(error) => (
+                    Self::encode_handler_error_reply(correlation_id, request_id, error)?,
+                    ResponderOutcome::RepliedWithError,
+                ),
+            };
+        if deadline.is_some_and(LocalDeadline::is_expired) {
+            self.counters.count_reply_dropped_after_deadline();
+            tracing::warn!(
+                message_type = R::MESSAGE_TYPE,
+                %request_id,
+                "deadline passed while handling, suppressing a reply nobody awaits"
+            );
+            return Ok(ResponderOutcome::SuppressedAfterDeadline);
+        }
+        self.deliver_reply(&reply_to, &reply_envelope).await?;
+        Ok(handled_outcome)
     }
 }
 
@@ -443,6 +499,106 @@ fn error_reply(
     Ok(envelope)
 }
 
+/// Closed-set outcome of one responder dispatch, as observed by
+/// [`RepliedHandler::handle`].
+///
+/// Unlike [`crate::request_outcome::RequestOutcome`] on the caller side,
+/// this outcome has no terminal event of its own: the
+/// existing `warn!`/`error!` calls on the responder's own rejection guards
+/// stay the sole record of a non-nominal dispatch, so a span carrying this
+/// outcome, `rpc.respond`, is this responder's only new observability
+/// surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResponderOutcome {
+    /// The handler produced a reply, and it was published.
+    Replied,
+    /// The handler failed, and its sanitized error reply was published.
+    RepliedWithError,
+    /// The request was dropped before the handler ran: no readable
+    /// `reply_to` or request identity, or an elapsed deadline, or a
+    /// pre-dispatch guard answered it with its own categorized error reply.
+    Dropped,
+    /// Publishing the reply itself failed.
+    Failed,
+    /// A reply was computed but suppressed because its deadline passed
+    /// while the handler ran.
+    SuppressedAfterDeadline,
+    /// The dispatch future was dropped before an outcome was established.
+    Cancelled,
+}
+
+impl ResponderOutcome {
+    /// Render this outcome as its stable metric-label spelling.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Replied => "replied",
+            Self::RepliedWithError => "replied_with_error",
+            Self::Dropped => "dropped",
+            Self::Failed => "failed",
+            Self::SuppressedAfterDeadline => "suppressed_after_deadline",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// One responder dispatch's observation: the `rpc.respond` span it carries
+/// and the terminal state a [`Drop`] must not double-count.
+///
+/// Mirrors [`crate::call_observation::CallObservation`] on the caller side,
+/// but carries no counters of its own: [`crate::ResponderCounters`] already
+/// covers the pre-dispatch rejections this span does not, per its own doc.
+/// A responder's totals would duplicate what a caller already counts, one
+/// call at a time, so this side carries a span and nothing more.
+struct ResponseObservation {
+    span: tracing::Span,
+    started_at: tokio::time::Instant,
+    is_finished: bool,
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "a responder dispatch running for u64::MAX milliseconds is not a realistic duration"
+)]
+fn elapsed_ms(started_at: tokio::time::Instant) -> u64 {
+    started_at.elapsed().as_millis() as u64
+}
+
+impl ResponseObservation {
+    /// Open an observation for a dispatch about to run.
+    fn start(span: tracing::Span) -> Self {
+        Self {
+            span,
+            started_at: tokio::time::Instant::now(),
+            is_finished: false,
+        }
+    }
+
+    /// Consume this observation with its dispatch's final outcome.
+    ///
+    /// Records the span's `outcome` and `elapsed_ms` fields. Unlike
+    /// [`crate::call_observation::CallObservation`] on the caller side, this
+    /// outcome has no terminal event of its own, so there is nothing more
+    /// to emit.
+    fn finish(mut self, outcome: ResponderOutcome) {
+        self.is_finished = true;
+        self.span.record("outcome", outcome.as_str());
+        self.span.record("elapsed_ms", elapsed_ms(self.started_at));
+    }
+}
+
+impl Drop for ResponseObservation {
+    /// Record this dispatch as cancelled if the future was dropped before
+    /// [`Self::finish`] ran; a dispatch that did finish already recorded its
+    /// own outcome there.
+    fn drop(&mut self) {
+        if !self.is_finished {
+            self.span
+                .record("outcome", ResponderOutcome::Cancelled.as_str());
+            self.span.record("elapsed_ms", elapsed_ms(self.started_at));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex as StdMutex;
@@ -458,6 +614,7 @@ mod tests {
     use crate::RequestContext;
     use crate::deadline::Deadline;
     use crate::rpc_protocol::DEADLINE_HEADER;
+    use crate::span_capture::SpanCapture;
     use crate::{ReplyDestination, ReplyDestinationError, ReplyPublisher};
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -1804,6 +1961,124 @@ mod tests {
         assert!(
             matches!(result, Err(BusError::Transport(_))),
             "a transient reply publication failure must keep its own error, got {result:?}"
+        );
+    }
+
+    /// A nominal reply must open an `rpc.respond` span
+    /// carrying `request_type`, `request_id`, `correlation_id` and
+    /// `outcome = replied`.
+    #[tokio::test]
+    async fn a_nominal_reply_opens_an_rpc_respond_span_with_its_identity_and_outcome() {
+        let (capture, _guard) = SpanCapture::install();
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let handler = RepliedHandler::new(Echo, Arc::clone(&publisher));
+        let request_id = RequestId::new();
+        let request = request_envelope_with_id(Some("amq.gen-inbox"), request_id);
+        let handler_ctx = ctx();
+
+        handler.handle(&request, &handler_ctx).await.unwrap();
+
+        let spans = capture.spans_named("rpc.respond");
+        assert_eq!(
+            spans.len(),
+            1,
+            "handling a nominal request must open exactly one rpc.respond span, got {spans:?}"
+        );
+        let span = &spans[0];
+        assert_eq!(
+            span.fields.get("request_type").map(String::as_str),
+            Some(Ping::MESSAGE_TYPE)
+        );
+        assert_eq!(
+            span.fields.get("request_id").map(String::as_str),
+            Some(request_id.to_string()).as_deref()
+        );
+        // The span's correlation_id is read from the envelope, not from
+        // `handler_ctx`: `handle`'s own logic builds every reply from
+        // `envelope.correlation_id`, the value that actually travels back on
+        // the wire. The two agree only through the RabbitMQ worker's own
+        // wiring, not through any guarantee `handle` itself makes, so a
+        // transport that called `handle` directly could hand it a
+        // `HandlerContext` carrying an unrelated correlation id.
+        assert_eq!(
+            span.fields.get("correlation_id").map(String::as_str),
+            Some(request.correlation_id.to_string()).as_deref()
+        );
+        assert_eq!(
+            span.fields.get("outcome").map(String::as_str),
+            Some("replied")
+        );
+    }
+
+    /// A request with no readable
+    /// `x-hexeract-request-id` must still be observed, with
+    /// `outcome = dropped` and no `request_id` field, since guard 2 stops
+    /// the request before any identity is known good.
+    #[tokio::test]
+    async fn a_request_without_a_readable_request_id_is_observed_as_dropped_with_no_request_id_field()
+     {
+        let (capture, _guard) = SpanCapture::install();
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let handler = RepliedHandler::new(Echo, Arc::clone(&publisher));
+        let mut request = request_envelope(Some("amq.gen-inbox"));
+        request.remove_protocol_header(REQUEST_ID_HEADER);
+
+        handler.handle(&request, &ctx()).await.unwrap();
+
+        let spans = capture.spans_named("rpc.respond");
+        assert_eq!(
+            spans.len(),
+            1,
+            "a request with no readable request id must still open an rpc.respond span, got {spans:?}"
+        );
+        let span = &spans[0];
+        assert_eq!(
+            span.fields.get("outcome").map(String::as_str),
+            Some("dropped")
+        );
+        assert!(
+            !span.fields.contains_key("request_id"),
+            "no request_id field may be recorded before guard 2 has validated one"
+        );
+    }
+
+    /// A handler failure must be observed as
+    /// `outcome = replied_with_error`.
+    #[tokio::test]
+    async fn a_handler_failure_is_observed_as_replied_with_error() {
+        let (capture, _guard) = SpanCapture::install();
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let handler = RepliedHandler::new(Boom, Arc::clone(&publisher));
+        let request = request_envelope(Some("amq.gen-inbox"));
+
+        handler.handle(&request, &ctx()).await.unwrap();
+
+        let spans = capture.spans_named("rpc.respond");
+        assert_eq!(spans.len(), 1, "got {spans:?}");
+        assert_eq!(
+            spans[0].fields.get("outcome").map(String::as_str),
+            Some("replied_with_error")
+        );
+    }
+
+    /// A reply publication that fails must be
+    /// observed as `outcome = failed`.
+    #[tokio::test]
+    async fn a_failed_reply_publication_is_observed_as_failed() {
+        let (capture, _guard) = SpanCapture::install();
+        let publisher = Arc::new(FailingReplyPublisher::new(
+            unroutable_reply_publication_error,
+        ));
+        let handler = RepliedHandler::new(Echo, Arc::clone(&publisher));
+        let request = request_envelope(Some("amq.gen-inbox"));
+
+        let _ = handler.handle(&request, &ctx()).await;
+
+        let spans = capture.spans_named("rpc.respond");
+        assert_eq!(spans.len(), 1, "got {spans:?}");
+        assert_eq!(
+            spans[0].fields.get("outcome").map(String::as_str),
+            Some("failed")
         );
     }
 }
