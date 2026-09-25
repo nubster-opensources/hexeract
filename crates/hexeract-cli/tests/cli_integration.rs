@@ -761,3 +761,65 @@ async fn scheduler_dead_letter_list_and_replay_round_trip() {
         .failure()
         .code(1);
 }
+
+/// Assert that `--help` on a scheduler subcommand, run with a `DATABASE_URL`
+/// carrying sentinel credentials, never echoes the username or the password
+/// (regression coverage for #428: `DatabaseArgs::conn` used to be a plain
+/// `String` without `hide_env_values = true`, so clap's derived `--help`
+/// printed the raw environment value verbatim).
+fn assert_scheduler_help_does_not_leak_database_url_credentials(args: &[&str]) {
+    let url = "postgres://sentinel_user:sentinel_password@sentinel-host.example/db";
+    let output = Command::cargo_bin("hexeract")
+        .unwrap()
+        .env("DATABASE_URL", url)
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("help output must be valid UTF-8");
+
+    assert!(
+        !stdout.contains("sentinel_user"),
+        "help output for {args:?} must not echo the DATABASE_URL username; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("sentinel_password"),
+        "help output for {args:?} must not echo the DATABASE_URL password; got: {stdout}"
+    );
+}
+
+#[test]
+fn scheduler_list_help_does_not_leak_database_url_credentials() {
+    assert_scheduler_help_does_not_leak_database_url_credentials(&["scheduler", "list", "--help"]);
+}
+
+#[test]
+fn scheduler_inspect_help_does_not_leak_database_url_credentials() {
+    assert_scheduler_help_does_not_leak_database_url_credentials(&[
+        "scheduler",
+        "inspect",
+        "--help",
+    ]);
+}
+
+#[test]
+fn scheduler_dead_letter_list_help_does_not_leak_database_url_credentials() {
+    assert_scheduler_help_does_not_leak_database_url_credentials(&[
+        "scheduler",
+        "dead-letter",
+        "list",
+        "--help",
+    ]);
+}
+
+#[test]
+fn scheduler_dead_letter_replay_help_does_not_leak_database_url_credentials() {
+    assert_scheduler_help_does_not_leak_database_url_credentials(&[
+        "scheduler",
+        "dead-letter",
+        "replay",
+        "--help",
+    ]);
+}

@@ -112,7 +112,9 @@ Without `--yes-i-know`, the command refuses to purge with a non-zero exit, print
 
 ## `hexeract scheduler`
 
-The `list`, `inspect`, `dead-letter list` and `dead-letter replay` subcommands share connection flags: `--conn` (env `DATABASE_URL`; the URL scheme selects the backend, `postgres://`/`postgresql://`, `mysql://` or `sqlite://`) and `--table` (env `HEXERACT_SCHEDULER_TABLE`, default `scheduled_messages`). Of these, only `list`, `inspect` and `dead-letter list` also accept `--format text|json` (default `text`): `dead-letter replay` has no `--format` flag. `scheduler schema` is offline DDL generation: it only accepts `--dialect` and `--table`, no `--conn` or `--format`.
+The `list`, `inspect`, `dead-letter list` and `dead-letter replay` subcommands share connection flags: `--conn` (env `DATABASE_URL`; the URL scheme selects the backend, `postgres://`/`postgresql://`, `mysql://` or `sqlite://`) and `--table` (env `HEXERACT_SCHEDULER_TABLE`, default `scheduled_messages`). Of these, only `list`, `inspect` and `dead-letter list` also accept `--format text|json` (default `text`): `dead-letter replay` has no `--format` flag. `scheduler schema` is offline DDL generation: it only accepts `--dialect` and `--table`, no `--conn` or `--format`. `--conn` never echoes its value: neither the flag on the command line nor `DATABASE_URL` read from the environment is printed in `--help` output.
+
+**TLS policy.** For PostgreSQL and MySQL, an unspecified `sslmode`/`ssl-mode`, or an explicit `prefer`/`require` (`preferred`/`required` on MySQL), is raised to `verify-full`/`verify-identity`: the server certificate is validated against the operating-system trust store and its hostname is checked against the URL. An explicit `verify-ca`/`verify_ca` is kept as configured (chain verified, hostname not checked), for a database reached by IP address or through a tunnel. The only opt-out is an explicit `sslmode=disable` / `ssl-mode=disabled` (or `PGSSLMODE=disable` for PostgreSQL), which logs a warning naming the redacted target. `sqlite://` connections carry no transport policy: a local file has no network hop to protect.
 
 ### `scheduler schema`
 

@@ -20,7 +20,16 @@ wildcards = "deny"
 # (needed to break the hexeract-core <-> hexeract-macros dev-dependency
 # cycle at publish time). Registry dependencies must still be pinned.
 allow-wildcard-paths = true
-deny = []
+# The CLI must trust the operating system's certificate store, the one an
+# administrator can add an internal authority to, and only that one. Both
+# `outbox` and `scheduler` connections depend on it. `webpki-roots` ships a
+# fixed Mozilla bundle compiled into the binary, and pulling it back in means
+# some connection silently stopped trusting what the machine trusts: sqlx
+# selects one or the other through its `tls-rustls-ring-*` features, and
+# nothing else in the gate can tell the two apart. If a third-party
+# dependency ever needs this crate for its own reasons, document the
+# exception in `skip` rather than lifting the ban.
+deny = [{ crate = "webpki-roots", reason = "the TLS trust store must come from the operating system, never from a bundle baked into the binary" }]
 skip = []
 skip-tree = []
 

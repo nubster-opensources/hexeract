@@ -164,3 +164,57 @@ still reads every message. Replaying an authentic, unmodified message is not
 prevented. And a handler still cannot learn who signed the message it received,
 because the verified principal is not yet exposed to `HandlerContext`. Envelope
 security decides what reaches a handler, not what the handler knows.
+
+## Scheduler admin commands now enforce TLS
+
+`hexeract scheduler list`, `inspect`, `dead-letter list` and `dead-letter
+replay` used to open their PostgreSQL and MySQL pools through `sqlx` with no
+transport policy of their own: an omitted `sslmode`/`ssl-mode`, or an explicit
+`prefer`/`require` (`preferred`/`required` for MySQL), let the driver try TLS
+and silently fall back to a cleartext session if the server declined it.
+
+Every scheduler admin connection now raises an unspecified, `prefer` or
+`require` mode to the strongest verification level the driver offers:
+`sslmode=verify-full` on PostgreSQL, `ssl-mode=verify_identity` on MySQL.
+Both verify the server
+certificate against a trusted authority and check that the certificate
+matches the host being dialled; the connection attempt fails outright rather
+than downgrading if the server cannot present one.
+
+**The only opt-out is an explicit `disable`.** Set `sslmode=disable`
+(PostgreSQL) or `ssl-mode=disabled` (MySQL) in the connection string, or
+`PGSSLMODE=disable` in the environment for PostgreSQL, to keep connecting in
+cleartext. The CLI logs a warning naming the redacted target whenever this
+opt-out is taken. There is no other way to disable the policy: unlike the
+previous behaviour, a value merely containing the text `disable` inside a
+password or an unrelated parameter is never mistaken for the setting.
+
+**`verify-ca` is respected, not raised.** An explicit `sslmode=verify-ca` or
+`ssl-mode=verify_ca` is kept exactly as configured. It already verifies the
+certificate chain against a trusted authority; it just does not also check
+that the certificate's name matches the host, which is a deliberate choice
+for a deployment that reaches its database by IP address or through a tunnel.
+Raising it to the `verify-full`/`verify-identity` level would break that
+setup for no additional guarantee it asked for.
+
+**The trust store is now the operating system's.** The workspace's `sqlx`
+feature moved from `tls-rustls-ring` (a Mozilla certificate bundle baked into
+the binary) to `tls-rustls-ring-native-roots`, so the scheduler commands
+trust the same certificate authorities as `outbox apply`/`outbox check`
+instead of a second, disjoint set. A database certificate issued by an
+internal or enterprise CA that is installed in the operating system's trust
+store is now accepted, where it previously was not.
+
+The consequence runs the other way too: on a machine whose system trust
+store is empty (a minimal container image without a `ca-certificates`
+package is the common case), a connection to a database with a public,
+well-known certificate now fails where it previously succeeded against the
+baked-in bundle. Install `ca-certificates` (or your platform's equivalent) in
+any image that runs `hexeract scheduler` commands against a TLS-protected
+database.
+
+**What to do if a scheduler command that used to work now fails to
+connect.** Either add the database's certificate authority to the machine's
+trust store, or, if the connection is genuinely local or already tunnelled,
+opt out in full knowledge of the trade-off with `sslmode=disable` /
+`ssl-mode=disabled`.
