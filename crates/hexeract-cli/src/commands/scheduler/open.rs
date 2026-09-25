@@ -11,18 +11,20 @@ use hexeract_scheduler::{ScheduleAdmin, ScheduleSnapshot, ScheduleStore, Schedul
 use hexeract_scheduler_sql::{
     DEFAULT_TABLE_NAME, MySqlScheduleStore, PgScheduleStore, SqliteScheduleStore,
 };
-use sqlx::{MySqlPool, PgPool, SqlitePool};
 use uuid::Uuid;
 
+use crate::conn_string::ConnString;
 use crate::error::CliError;
+
+use super::connect::{mysql_pool, postgres_pool, sqlite_pool};
 
 /// Shared connection arguments for every scheduler admin command.
 #[derive(Args, Debug)]
 pub(crate) struct DatabaseArgs {
     /// Database connection URL. Its scheme selects the backend
     /// (`postgres://`, `mysql://` or `sqlite://`).
-    #[arg(long, env = "DATABASE_URL")]
-    pub(crate) conn: String,
+    #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
+    pub(crate) conn: ConnString,
     /// Name of the scheduler table.
     #[arg(long, default_value = DEFAULT_TABLE_NAME, env = "HEXERACT_SCHEDULER_TABLE")]
     pub(crate) table: String,
@@ -41,14 +43,17 @@ pub(crate) enum DialectKind {
 /// # Errors
 ///
 /// Returns [`CliError::Fatal`] if the scheme is not one of `postgres`,
-/// `postgresql`, `mysql` or `sqlite`.
-pub(crate) fn dialect_of(conn: &str) -> Result<DialectKind, CliError> {
-    let scheme = conn
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    match scheme.as_str() {
+/// `postgresql`, `mysql` or `sqlite`. A value with no `:` at all has no
+/// scheme to report, so the error names the shape of the problem instead
+/// of echoing the value, which could otherwise be a secret-bearing
+/// connection string.
+pub(crate) fn dialect_of(conn: &ConnString) -> Result<DialectKind, CliError> {
+    let Some((scheme, _rest)) = conn.as_str().split_once(':') else {
+        return Err(CliError::Fatal(
+            "database url has no scheme: expected postgres://, mysql:// or sqlite://".into(),
+        ));
+    };
+    match scheme.to_ascii_lowercase().as_str() {
         "postgres" | "postgresql" => Ok(DialectKind::Postgres),
         "mysql" => Ok(DialectKind::MySql),
         "sqlite" => Ok(DialectKind::Sqlite),
@@ -78,24 +83,23 @@ impl AnyScheduleAdmin {
     /// Returns [`CliError::Fatal`] if the scheme is unsupported, the pool
     /// fails to connect, or the store rejects `table` as an invalid
     /// identifier.
-    pub(crate) async fn open(conn: &str, table: &str) -> Result<Self, CliError> {
+    pub(crate) async fn open(conn: &ConnString, table: &str) -> Result<Self, CliError> {
         let fatal = |e: SchedulerError| CliError::Fatal(Box::new(e));
-        let connect = |e: sqlx::Error| CliError::Fatal(Box::new(e));
         match dialect_of(conn)? {
             DialectKind::Postgres => {
-                let pool = PgPool::connect(conn).await.map_err(connect)?;
+                let pool = postgres_pool(conn).await?;
                 Ok(Self::Postgres(
                     PgScheduleStore::new(pool, table).map_err(fatal)?,
                 ))
             }
             DialectKind::MySql => {
-                let pool = MySqlPool::connect(conn).await.map_err(connect)?;
+                let pool = mysql_pool(conn).await?;
                 Ok(Self::MySql(
                     MySqlScheduleStore::new(pool, table).map_err(fatal)?,
                 ))
             }
             DialectKind::Sqlite => {
-                let pool = SqlitePool::connect(conn).await.map_err(connect)?;
+                let pool = sqlite_pool(conn).await?;
                 Ok(Self::Sqlite(
                     SqliteScheduleStore::new(pool, table).map_err(fatal)?,
                 ))
@@ -156,19 +160,19 @@ mod tests {
     #[test]
     fn dialect_is_deduced_from_url_scheme() {
         assert!(matches!(
-            dialect_of("postgres://x").unwrap(),
+            dialect_of(&"postgres://x".parse().unwrap()).unwrap(),
             DialectKind::Postgres
         ));
         assert!(matches!(
-            dialect_of("postgresql://x").unwrap(),
+            dialect_of(&"postgresql://x".parse().unwrap()).unwrap(),
             DialectKind::Postgres
         ));
         assert!(matches!(
-            dialect_of("mysql://x").unwrap(),
+            dialect_of(&"mysql://x".parse().unwrap()).unwrap(),
             DialectKind::MySql
         ));
         assert!(matches!(
-            dialect_of("sqlite://x.db").unwrap(),
+            dialect_of(&"sqlite://x.db".parse().unwrap()).unwrap(),
             DialectKind::Sqlite
         ));
     }
@@ -177,21 +181,33 @@ mod tests {
     fn dialect_is_deduced_case_insensitively() {
         // URL schemes are case-insensitive per RFC 3986.
         assert!(matches!(
-            dialect_of("Postgres://x").unwrap(),
+            dialect_of(&"Postgres://x".parse().unwrap()).unwrap(),
             DialectKind::Postgres
         ));
         assert!(matches!(
-            dialect_of("MySQL://x").unwrap(),
+            dialect_of(&"MySQL://x".parse().unwrap()).unwrap(),
             DialectKind::MySql
         ));
         assert!(matches!(
-            dialect_of("SQLite://x.db").unwrap(),
+            dialect_of(&"SQLite://x.db".parse().unwrap()).unwrap(),
             DialectKind::Sqlite
         ));
     }
 
     #[test]
     fn unknown_scheme_is_rejected() {
-        assert!(dialect_of("redis://x").is_err());
+        assert!(dialect_of(&"redis://x".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn dialect_of_on_a_colonless_value_does_not_reproduce_it_in_the_error() {
+        let value = "sentinel_scheme_without_colon";
+        let conn: ConnString = value.parse().unwrap();
+        let error = dialect_of(&conn).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            !message.contains(value),
+            "error message must not echo the raw value: {message}"
+        );
     }
 }

@@ -1,3 +1,4 @@
+mod connect;
 pub(crate) mod dead_letter;
 pub(crate) mod inspect;
 pub(crate) mod list;
