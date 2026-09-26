@@ -16,12 +16,21 @@ use crate::rpc_protocol::is_reserved_header;
 ///
 /// # Observability note
 ///
-/// The `Debug` implementation masks `payload` (rendered as `<N bytes>`)
-/// to avoid leaking sensitive event data into logs and tracing output.
-/// However, `headers` are printed verbatim. If your application uses
-/// headers to carry tenancy identifiers, authorization tokens or other
-/// sensitive metadata, filter them at the subscriber level before they
-/// reach persistent storage.
+/// The `Debug` implementation never prints a header value, application or
+/// protocol. It renders `payload` as `<N bytes>`, application `headers` as
+/// their count alone, and `protocol_headers` as the canonical names of the
+/// framework headers present, followed by a count of the reserved names this
+/// crate does not know.
+///
+/// Application header names are not printed either. A name built from a
+/// tenant or a subject carries the datum itself, and this type cannot tell
+/// such a name apart from a schema name. A protocol header name is printed
+/// from the framework constant, never from the spelling read off the wire, so
+/// no untrusted string reaches a log line.
+///
+/// To read a value, ask for it: [`Self::header`] returns one named header.
+/// That makes the disclosure a decision at the call site instead of a side
+/// effect of formatting.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct BusEnvelope {
@@ -43,17 +52,86 @@ pub struct BusEnvelope {
     pub published_at: SystemTime,
 }
 
-impl std::fmt::Debug for BusEnvelope {
+/// Every reserved header name a formatter may disclose.
+///
+/// Chains the list each protocol module publishes rather than holding names of
+/// its own, so whoever adds a reserved header decides in the module that owns
+/// it whether its presence is safe to announce.
+fn disclosable_header_names() -> impl Iterator<Item = &'static str> {
+    crate::rpc_protocol::DISCLOSABLE_HEADER_NAMES
+        .iter()
+        .chain(crate::envelope_security::protocol::DISCLOSABLE_HEADER_NAMES)
+        .copied()
+}
+
+/// Whether a formatter may name this header.
+fn is_disclosable_header_name(key: &str) -> bool {
+    disclosable_header_names().any(|name| key.eq_ignore_ascii_case(name))
+}
+
+/// Renders a count of withheld entries in place of the entries themselves.
+struct WithheldHeaderCount(usize);
+
+impl std::fmt::Debug for WithheldHeaderCount {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{} redacted>", self.0)
+    }
+}
+
+/// Renders the canonical names of the framework headers a map carries.
+///
+/// Iterates the disclosable list rather than the map, which keeps the rendering
+/// deterministic and keeps the wire spelling out of the output. Reserved names
+/// this crate does not know are counted at the end.
+struct DisclosedHeaderNames<'a>(&'a HashMap<String, String>);
+
+impl std::fmt::Debug for DisclosedHeaderNames<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut names = f.debug_list();
+        for name in disclosable_header_names() {
+            if self.0.keys().any(|key| key.eq_ignore_ascii_case(name)) {
+                names.entry(&format_args!("{name}"));
+            }
+        }
+        let withheld = self
+            .0
+            .keys()
+            .filter(|key| !is_disclosable_header_name(key))
+            .count();
+        if withheld > 0 {
+            names.entry(&WithheldHeaderCount(withheld));
+        }
+        names.finish()
+    }
+}
+
+impl std::fmt::Debug for BusEnvelope {
+    /// Destructures `Self` without a rest pattern on purpose, the way the
+    /// crate-private `security_parts` does and for the same reason: adding a
+    /// field to the envelope breaks this function, which forces whoever adds it
+    /// to decide whether the new field is safe to print. A sensitive field
+    /// silently swept in by a `..` would be invisible to review.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            message_id,
+            message_type,
+            payload,
+            correlation_id,
+            reply_to,
+            headers,
+            protocol_headers,
+            published_at,
+        } = self;
+
         f.debug_struct("BusEnvelope")
-            .field("message_id", &self.message_id)
-            .field("message_type", &self.message_type)
-            .field("payload", &format_args!("<{} bytes>", self.payload.len()))
-            .field("correlation_id", &self.correlation_id)
-            .field("reply_to", &self.reply_to)
-            .field("headers", &self.headers)
-            .field("protocol_headers", &self.protocol_headers)
-            .field("published_at", &self.published_at)
+            .field("message_id", message_id)
+            .field("message_type", message_type)
+            .field("payload", &format_args!("<{} bytes>", payload.len()))
+            .field("correlation_id", correlation_id)
+            .field("reply_to", reply_to)
+            .field("headers", &WithheldHeaderCount(headers.len()))
+            .field("protocol_headers", &DisclosedHeaderNames(protocol_headers))
+            .field("published_at", published_at)
             .finish()
     }
 }
@@ -286,9 +364,26 @@ impl BusEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envelope_security::protocol::SIGNATURE_HEADER;
+    use crate::rpc_protocol::PROTOCOL_VERSION_HEADER;
     use crate::rpc_protocol::REQUEST_ID_HEADER;
     use serde::Deserialize;
     use serde::Serialize;
+
+    /// Sentinel standing for authorization material an application attaches to
+    /// an application header. It must never reach a formatter's output.
+    const SENTINEL_AUTHORIZATION: &str = "Bearer sentinel-authorization-never-logged";
+
+    /// Sentinel standing for cryptographic material the framework attaches to a
+    /// protocol header.
+    const SENTINEL_SIGNATURE: &str = "sentinel-signature-never-logged";
+
+    /// Sentinel reserved name a hostile peer can put on the wire, which this
+    /// crate does not know and must therefore never name back.
+    const SENTINEL_RESERVED_NAME: &str = "x-hexeract-sentinel-unknown-name";
+
+    /// Sentinel value carried by an unknown reserved header.
+    const SENTINEL_RESERVED_VALUE: &str = "sentinel-unknown-reserved-value";
 
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct OrderPlaced {
@@ -314,6 +409,28 @@ mod tests {
             order_id: Uuid::from_u128(1),
             amount_cents: 9999,
         }
+    }
+
+    /// Build an envelope whose every field but the header maps is fixed.
+    ///
+    /// Goes through the transport restoration seam on purpose: it is the one
+    /// constructor that accepts arbitrary protocol header names, which is how
+    /// a broker delivery reaches this type, and therefore how a hostile peer
+    /// reaches the formatter.
+    fn envelope_with(
+        headers: HashMap<String, String>,
+        protocol_headers: HashMap<String, String>,
+    ) -> BusEnvelope {
+        BusEnvelope::restore_from_transport(
+            Uuid::from_u128(7),
+            OrderPlaced::MESSAGE_TYPE.to_owned(),
+            b"{}".to_vec(),
+            Uuid::from_u128(8),
+            Some("q.replies".to_owned()),
+            headers,
+            protocol_headers,
+            SystemTime::UNIX_EPOCH,
+        )
     }
 
     #[test]
@@ -459,6 +576,210 @@ mod tests {
         assert!(debug_output.contains('<'));
         assert!(debug_output.contains("bytes>"));
         assert!(!debug_output.contains("order_id"));
+    }
+
+    #[test]
+    fn debug_never_prints_an_application_header_value() {
+        let envelope = envelope_with(
+            HashMap::from([
+                (
+                    "authorization".to_owned(),
+                    SENTINEL_AUTHORIZATION.to_owned(),
+                ),
+                ("tenant".to_owned(), "acme".to_owned()),
+            ]),
+            HashMap::new(),
+        );
+
+        let debug_output = format!("{envelope:?}");
+
+        assert!(
+            !debug_output.contains(SENTINEL_AUTHORIZATION),
+            "authorization material reached the formatter"
+        );
+        assert!(
+            !debug_output.contains("acme"),
+            "a tenancy identifier reached the formatter"
+        );
+    }
+
+    #[test]
+    fn debug_never_prints_an_application_header_name() {
+        let envelope = envelope_with(
+            HashMap::from([(
+                "authorization".to_owned(),
+                SENTINEL_AUTHORIZATION.to_owned(),
+            )]),
+            HashMap::new(),
+        );
+
+        assert!(
+            !format!("{envelope:?}").contains("authorization"),
+            "an application header name reached the formatter, and a name built \
+             from a tenant or a subject carries the datum itself"
+        );
+    }
+
+    #[test]
+    fn debug_never_prints_a_protocol_header_value() {
+        let envelope = envelope_with(
+            HashMap::new(),
+            HashMap::from([
+                (SIGNATURE_HEADER.to_owned(), SENTINEL_SIGNATURE.to_owned()),
+                (REQUEST_ID_HEADER.to_owned(), "request-1".to_owned()),
+            ]),
+        );
+
+        let debug_output = format!("{envelope:?}");
+
+        assert!(
+            !debug_output.contains(SENTINEL_SIGNATURE),
+            "cryptographic material reached the formatter"
+        );
+        assert!(
+            !debug_output.contains("request-1"),
+            "a protocol header value reached the formatter"
+        );
+    }
+
+    #[test]
+    fn debug_names_the_protocol_headers_it_knows() {
+        let envelope = envelope_with(
+            HashMap::new(),
+            HashMap::from([
+                (SIGNATURE_HEADER.to_owned(), SENTINEL_SIGNATURE.to_owned()),
+                (PROTOCOL_VERSION_HEADER.to_owned(), "1".to_owned()),
+            ]),
+        );
+
+        let debug_output = format!("{envelope:?}");
+
+        assert!(
+            debug_output.contains(SIGNATURE_HEADER),
+            "an envelope carrying a signature must say so"
+        );
+        assert!(
+            debug_output.contains(PROTOCOL_VERSION_HEADER),
+            "an envelope announcing a protocol version must say so"
+        );
+    }
+
+    #[test]
+    fn debug_never_prints_a_reserved_name_this_crate_does_not_know() {
+        let envelope = envelope_with(
+            HashMap::new(),
+            HashMap::from([(
+                SENTINEL_RESERVED_NAME.to_owned(),
+                SENTINEL_RESERVED_VALUE.to_owned(),
+            )]),
+        );
+
+        let debug_output = format!("{envelope:?}");
+
+        assert!(
+            !debug_output.contains(SENTINEL_RESERVED_NAME),
+            "a reserved name read off the wire reached the formatter, so an \
+             untrusted string can carry control characters into a log line"
+        );
+        assert!(
+            !debug_output.contains(SENTINEL_RESERVED_VALUE),
+            "the value of an unknown reserved header reached the formatter"
+        );
+    }
+
+    #[test]
+    fn debug_prints_the_canonical_protocol_header_name_not_the_wire_spelling() {
+        let envelope = envelope_with(
+            HashMap::new(),
+            HashMap::from([("X-Hexeract-Request-Id".to_owned(), "request-1".to_owned())]),
+        );
+
+        let debug_output = format!("{envelope:?}");
+
+        assert!(
+            debug_output.contains(REQUEST_ID_HEADER),
+            "a reserved header spelled in another case must still be recognised"
+        );
+        assert!(
+            !debug_output.contains("X-Hexeract-Request-Id"),
+            "the spelling read off the wire reached the formatter"
+        );
+    }
+
+    #[test]
+    fn debug_reveals_the_application_header_count_and_nothing_else() {
+        let two_headers = envelope_with(
+            HashMap::from([
+                ("first".to_owned(), "one".to_owned()),
+                ("second".to_owned(), "two".to_owned()),
+            ]),
+            HashMap::new(),
+        );
+        let two_other_headers = envelope_with(
+            HashMap::from([
+                ("third".to_owned(), "three".to_owned()),
+                ("fourth".to_owned(), "four".to_owned()),
+            ]),
+            HashMap::new(),
+        );
+        let three_headers = envelope_with(
+            HashMap::from([
+                ("first".to_owned(), "one".to_owned()),
+                ("second".to_owned(), "two".to_owned()),
+                ("third".to_owned(), "three".to_owned()),
+            ]),
+            HashMap::new(),
+        );
+
+        assert_eq!(
+            format!("{two_headers:?}"),
+            format!("{two_other_headers:?}"),
+            "two envelopes differing only by the names and values of their \
+             application headers must be indistinguishable"
+        );
+        assert_ne!(
+            format!("{two_headers:?}"),
+            format!("{three_headers:?}"),
+            "how many application headers an envelope carries must stay visible"
+        );
+    }
+
+    #[test]
+    fn debug_stays_readable_without_any_header() {
+        let debug_output = format!("{:?}", envelope_with(HashMap::new(), HashMap::new()));
+
+        assert!(debug_output.contains("BusEnvelope"));
+        assert!(debug_output.contains(OrderPlaced::MESSAGE_TYPE));
+        assert!(
+            !debug_output.contains(crate::rpc_protocol::RESERVED_HEADER_PREFIX),
+            "an envelope carrying no protocol header must name none"
+        );
+    }
+
+    /// Carries no sentinel on purpose. This is the one header test comparing two
+    /// whole outputs, and a failing `assert_ne!` prints both sides, which would
+    /// put the compared values in the panic message.
+    #[test]
+    fn debug_counts_the_reserved_names_it_does_not_know() {
+        let known_only = envelope_with(
+            HashMap::new(),
+            HashMap::from([(REQUEST_ID_HEADER.to_owned(), "neutral".to_owned())]),
+        );
+        let known_and_unknown = envelope_with(
+            HashMap::new(),
+            HashMap::from([
+                (REQUEST_ID_HEADER.to_owned(), "neutral".to_owned()),
+                ("x-hexeract-not-known-here".to_owned(), "neutral".to_owned()),
+            ]),
+        );
+
+        assert_ne!(
+            format!("{known_only:?}"),
+            format!("{known_and_unknown:?}"),
+            "a reserved header this version does not understand must still be \
+             counted, otherwise an envelope carrying unknown framework metadata \
+             reads as if it carried none"
+        );
     }
 
     #[test]
