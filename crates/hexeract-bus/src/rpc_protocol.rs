@@ -40,6 +40,23 @@ pub const REPLY_ERROR_MESSAGE_TYPE: &str = "hexeract.rpc.error";
 /// request without this header is served with no deadline.
 pub const DEADLINE_HEADER: &str = "x-hexeract-deadline";
 
+/// Reserved header names this module allows a formatter to disclose.
+///
+/// Only the names are disclosable, never the values: a formatter naming a
+/// header says that the envelope carries it, and stops there. A reserved name
+/// absent from this list is read off the wire without being understood, so it
+/// is counted rather than printed, and an untrusted string never reaches a log
+/// line.
+///
+/// Adding a header constant above means deciding here whether its presence is
+/// safe to announce. The list is exhaustive by test, not by convention.
+pub const DISCLOSABLE_HEADER_NAMES: &[&str] = &[
+    PROTOCOL_VERSION_HEADER,
+    REQUEST_ID_HEADER,
+    REPLY_STATUS_HEADER,
+    DEADLINE_HEADER,
+];
+
 /// Read the protocol version announced by an envelope.
 ///
 /// Returns `None` when the header is absent or cannot be parsed. Both cases
@@ -102,6 +119,39 @@ mod tests {
         ] {
             assert!(
                 header.starts_with("x-hexeract-"),
+                "{header} escapes the reserved namespace"
+            );
+        }
+    }
+
+    #[test]
+    fn every_protocol_header_is_disclosable_by_name() {
+        for header in [
+            PROTOCOL_VERSION_HEADER,
+            REQUEST_ID_HEADER,
+            REPLY_STATUS_HEADER,
+            DEADLINE_HEADER,
+        ] {
+            assert!(
+                DISCLOSABLE_HEADER_NAMES.contains(&header),
+                "{header} is absent from DISCLOSABLE_HEADER_NAMES, so a formatter \
+                 counts it instead of naming it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_disclosable_list_holds_exactly_the_protocol_headers() {
+        assert_eq!(
+            DISCLOSABLE_HEADER_NAMES.len(),
+            4,
+            "a header constant was added or removed above without deciding here \
+             whether its presence is safe to announce. Rust cannot enumerate a \
+             module's constants, so this count is the only guard there is"
+        );
+        for header in DISCLOSABLE_HEADER_NAMES {
+            assert!(
+                is_reserved_header(header),
                 "{header} escapes the reserved namespace"
             );
         }
