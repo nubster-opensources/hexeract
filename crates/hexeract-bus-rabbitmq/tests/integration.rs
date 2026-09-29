@@ -61,10 +61,10 @@ use lapin::types::ShortString;
 use serde::Deserialize;
 use serde::Serialize;
 use std::sync::Arc;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::rabbitmq::RabbitMq;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+mod harness; // reuse the crate's testcontainers helper
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct OrderPlaced {
@@ -78,24 +78,12 @@ impl Message for OrderPlaced {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn transport_publishes_through_default_exchange_and_consumer_reads_it_back() {
-    let container = RabbitMq::default()
-        .start()
-        .await
-        .expect("rabbitmq container must start");
-    let host = container
-        .get_host()
-        .await
-        .expect("rabbitmq container must expose a host");
-    let port = container
-        .get_host_port_ipv4(5672)
-        .await
-        .expect("rabbitmq container must expose AMQP port");
-    let uri = format!("amqp://{host}:{port}");
+    let broker = harness::start_rabbitmq().await;
 
     // Declare a queue bound to the default exchange. The default
     // exchange routes by routing_key directly to the queue of the
     // same name.
-    let consumer_conn = Connection::connect(&uri, ConnectionProperties::default())
+    let consumer_conn = Connection::connect(broker.uri(), ConnectionProperties::default())
         .await
         .expect("consumer connection must open");
     let consumer_channel = consumer_conn
@@ -118,7 +106,7 @@ async fn transport_publishes_through_default_exchange_and_consumer_reads_it_back
         .expect("queue declare must succeed");
 
     // Publish through the transport on the default exchange.
-    let transport = RabbitMqTransport::new(&uri)
+    let transport = RabbitMqTransport::new(broker.uri())
         .await
         .expect("transport must connect");
     let order = OrderPlaced {
@@ -168,8 +156,8 @@ async fn transport_publishes_through_default_exchange_and_consumer_reads_it_back
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn transport_publish_to_unroutable_routing_key_fails() {
-    let (_container, uri) = start_rabbit().await;
-    let transport = RabbitMqTransport::new(&uri)
+    let broker = harness::start_rabbitmq().await;
+    let transport = RabbitMqTransport::new(broker.uri())
         .await
         .expect("transport must connect");
 
@@ -192,8 +180,8 @@ async fn transport_publish_to_unroutable_routing_key_fails() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn fire_and_forget_publish_to_unroutable_routing_key_returns_ok() {
-    let (_container, uri) = start_rabbit().await;
-    let transport = RabbitMqTransport::new(&uri)
+    let broker = harness::start_rabbitmq().await;
+    let transport = RabbitMqTransport::new(broker.uri())
         .await
         .expect("transport must connect")
         .fire_and_forget();
@@ -214,21 +202,9 @@ async fn fire_and_forget_publish_to_unroutable_routing_key_returns_ok() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn publish_with_correlation_id_propagates_to_amqp_properties() {
-    let container = RabbitMq::default()
-        .start()
-        .await
-        .expect("rabbitmq container must start");
-    let host = container
-        .get_host()
-        .await
-        .expect("rabbitmq container must expose a host");
-    let port = container
-        .get_host_port_ipv4(5672)
-        .await
-        .expect("rabbitmq container must expose AMQP port");
-    let uri = format!("amqp://{host}:{port}");
+    let broker = harness::start_rabbitmq().await;
 
-    let consumer_conn = Connection::connect(&uri, ConnectionProperties::default())
+    let consumer_conn = Connection::connect(broker.uri(), ConnectionProperties::default())
         .await
         .expect("consumer connection must open");
     let consumer_channel = consumer_conn
@@ -250,7 +226,7 @@ async fn publish_with_correlation_id_propagates_to_amqp_properties() {
         .await
         .expect("queue declare must succeed");
 
-    let transport = RabbitMqTransport::new(&uri)
+    let transport = RabbitMqTransport::new(broker.uri())
         .await
         .expect("transport must connect");
     let order = OrderPlaced {
@@ -298,19 +274,7 @@ async fn publish_with_correlation_id_propagates_to_amqp_properties() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn ensure_topology_declares_exchange_queue_and_binding() {
-    let container = RabbitMq::default()
-        .start()
-        .await
-        .expect("rabbitmq container must start");
-    let host = container
-        .get_host()
-        .await
-        .expect("rabbitmq container must expose a host");
-    let port = container
-        .get_host_port_ipv4(5672)
-        .await
-        .expect("rabbitmq container must expose AMQP port");
-    let uri = format!("amqp://{host}:{port}");
+    let broker = harness::start_rabbitmq().await;
 
     let exchange = Exchange::new("topology.orders", ExchangeKind::Topic)
         .expect("exchange must validate")
@@ -324,7 +288,7 @@ async fn ensure_topology_declares_exchange_queue_and_binding() {
     let binding = Binding::new(&queue.name, &exchange.name, routing_key.clone())
         .expect("binding must validate");
 
-    let connection = RabbitMqConnection::connect(&uri)
+    let connection = RabbitMqConnection::connect(broker.uri())
         .await
         .expect("RabbitMqConnection must open");
     ensure_topology(
@@ -339,7 +303,7 @@ async fn ensure_topology_declares_exchange_queue_and_binding() {
     // Verify via passive declarations: a passive `queue_declare` /
     // `exchange_declare` fails if the entity is missing, so success
     // means the helper effectively reached the broker.
-    let probe = Connection::connect(&uri, ConnectionProperties::default())
+    let probe = Connection::connect(broker.uri(), ConnectionProperties::default())
         .await
         .expect("probe connection must open");
     let probe_channel = probe
@@ -564,7 +528,7 @@ fn forged_signed_properties_and_payload(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn a_security_rejection_never_requeues() {
-    let (_container, uri) = start_rabbit().await;
+    let broker = harness::start_rabbitmq().await;
 
     for ack_mode in [
         AckMode::Manual,
@@ -572,12 +536,12 @@ async fn a_security_rejection_never_requeues() {
         AckMode::Unacknowledged,
     ] {
         let queue_name = format!("worker.security.requeue.{ack_mode:?}");
-        declare_temporary_queue(&uri, &queue_name).await;
+        declare_temporary_queue(broker.uri(), &queue_name).await;
 
         let (properties, payload) =
             forged_signed_properties_and_payload(&queue_name, Uuid::now_v7(), Uuid::now_v7(), &[]);
 
-        let publisher = Connection::connect(&uri, ConnectionProperties::default())
+        let publisher = Connection::connect(broker.uri(), ConnectionProperties::default())
             .await
             .unwrap();
         let publish_channel = publisher.create_channel().await.unwrap();
@@ -595,7 +559,7 @@ async fn a_security_rejection_never_requeues() {
             .unwrap();
 
         let attempts = Arc::new(AtomicUsize::new(0));
-        let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+        let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
         let worker = RabbitMqWorkerBuilder::new(consumer_conn)
             .queue(queue_name.as_str())
             .ack_mode(ack_mode)
@@ -618,7 +582,7 @@ async fn a_security_rejection_never_requeues() {
             "handler must never run for a security rejection ({ack_mode:?})"
         );
 
-        let probe = Connection::connect(&uri, ConnectionProperties::default())
+        let probe = Connection::connect(broker.uri(), ConnectionProperties::default())
             .await
             .unwrap();
         let probe_channel = probe.create_channel().await.unwrap();
@@ -640,10 +604,10 @@ async fn a_security_rejection_never_requeues() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn a_security_rejection_is_dead_lettered_without_its_headers() {
-    let (_container, uri) = start_rabbit().await;
+    let broker = harness::start_rabbitmq().await;
     let queue_name = "worker.security.source";
     let dlr_queue = "worker.security.parked";
-    declare_temporary_queue(&uri, queue_name).await;
+    declare_temporary_queue(broker.uri(), queue_name).await;
 
     let message_id = Uuid::from_u128(0x5555_5555_5555_5555_5555_5555_5555_5555);
     let correlation_id = Uuid::from_u128(0x6666_6666_6666_6666_6666_6666_6666_6666);
@@ -654,7 +618,7 @@ async fn a_security_rejection_is_dead_lettered_without_its_headers() {
         &[("tenant", "acme-confidential")],
     );
 
-    let publisher = Connection::connect(&uri, ConnectionProperties::default())
+    let publisher = Connection::connect(broker.uri(), ConnectionProperties::default())
         .await
         .unwrap();
     let publish_channel = publisher.create_channel().await.unwrap();
@@ -672,7 +636,7 @@ async fn a_security_rejection_is_dead_lettered_without_its_headers() {
         .unwrap();
 
     let attempts = Arc::new(AtomicUsize::new(0));
-    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let worker = RabbitMqWorkerBuilder::new(consumer_conn)
         .queue(queue_name)
         .dead_letter_routing_key(dlr_queue)
@@ -687,7 +651,7 @@ async fn a_security_rejection_is_dead_lettered_without_its_headers() {
     let cancel_for_task = cancel.clone();
     let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
 
-    let parked = wait_for_dead_letter(&uri, dlr_queue)
+    let parked = wait_for_dead_letter(broker.uri(), dlr_queue)
         .await
         .expect("a security rejection must be routed to the dead-letter queue");
 
@@ -838,23 +802,6 @@ impl Handler<OrderPlaced> for ConcurrencyProbeHandler {
     }
 }
 
-async fn start_rabbit() -> (testcontainers::ContainerAsync<RabbitMq>, String) {
-    let container = RabbitMq::default()
-        .start()
-        .await
-        .expect("rabbitmq container must start");
-    let host = container
-        .get_host()
-        .await
-        .expect("rabbitmq container must expose a host");
-    let port = container
-        .get_host_port_ipv4(5672)
-        .await
-        .expect("rabbitmq container must expose AMQP port");
-    let uri = format!("amqp://{host}:{port}");
-    (container, uri)
-}
-
 async fn declare_temporary_queue(uri: &str, name: &str) {
     let conn = Connection::connect(uri, ConnectionProperties::default())
         .await
@@ -881,7 +828,7 @@ async fn declare_temporary_queue(uri: &str, name: &str) {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn transport_config_settings_reach_the_connected_transport() {
-    let (_container, uri) = start_rabbit().await;
+    let broker = harness::start_rabbitmq().await;
 
     let limits = AmqpMetadataLimits {
         max_headers: 3,
@@ -898,7 +845,7 @@ async fn transport_config_settings_reach_the_connected_transport() {
         .with_metadata_limits(limits)
         .with_outbound_envelope_security(Arc::clone(&security));
 
-    let transport = RabbitMqTransport::new_with_transport_config(&uri, &config)
+    let transport = RabbitMqTransport::new_with_transport_config(broker.uri(), &config)
         .await
         .expect("transport must connect");
 
@@ -923,11 +870,11 @@ async fn unacknowledged_worker_bounds_in_flight_deliveries_with_max_buffered() {
     const MESSAGE_COUNT: usize = 500;
     const MAX_BUFFERED: usize = 16;
 
-    let (_container, uri) = start_rabbit().await;
+    let broker = harness::start_rabbitmq().await;
     let queue_name = "worker.bounded.unack";
-    declare_temporary_queue(&uri, queue_name).await;
+    declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let transport = RabbitMqTransport::new(&uri)
+    let transport = RabbitMqTransport::new(broker.uri())
         .await
         .expect("transport must connect");
     for index in 0..MESSAGE_COUNT {
@@ -945,7 +892,7 @@ async fn unacknowledged_worker_bounds_in_flight_deliveries_with_max_buffered() {
     let live = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
     let completed = Arc::new(AtomicUsize::new(0));
-    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let worker = RabbitMqWorkerBuilder::new(consumer_conn)
         .queue(queue_name)
         .ack_mode(AckMode::Unacknowledged)
@@ -995,11 +942,11 @@ async fn unacknowledged_worker_bounds_in_flight_deliveries_with_max_buffered() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn worker_dispatches_envelope_and_acks_on_success() {
-    let (_container, uri) = start_rabbit().await;
+    let broker = harness::start_rabbitmq().await;
     let queue_name = "worker.happy";
-    declare_temporary_queue(&uri, queue_name).await;
+    declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let transport = RabbitMqTransport::new(&uri).await.unwrap();
+    let transport = RabbitMqTransport::new(broker.uri()).await.unwrap();
     transport
         .publish(
             queue_name,
@@ -1011,7 +958,7 @@ async fn worker_dispatches_envelope_and_acks_on_success() {
         .unwrap();
 
     let seen = Arc::new(AtomicUsize::new(0));
-    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let worker = RabbitMqWorkerBuilder::new(consumer_conn)
         .queue(queue_name)
         .register_handler::<OrderPlaced, _>(RecordingHandler {
@@ -1042,11 +989,11 @@ async fn worker_dispatches_envelope_and_acks_on_success() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn worker_retries_on_failure_then_succeeds() {
-    let (_container, uri) = start_rabbit().await;
+    let broker = harness::start_rabbitmq().await;
     let queue_name = "worker.retry";
-    declare_temporary_queue(&uri, queue_name).await;
+    declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let transport = RabbitMqTransport::new(&uri).await.unwrap();
+    let transport = RabbitMqTransport::new(broker.uri()).await.unwrap();
     transport
         .publish(
             queue_name,
@@ -1058,7 +1005,7 @@ async fn worker_retries_on_failure_then_succeeds() {
         .unwrap();
 
     let attempts = Arc::new(AtomicUsize::new(0));
-    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let worker = RabbitMqWorkerBuilder::new(consumer_conn)
         .queue(queue_name)
         .max_attempts(5)
@@ -1088,12 +1035,12 @@ async fn worker_retries_on_failure_then_succeeds() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn worker_routes_to_dead_letter_after_exhausting_attempts() {
-    let (_container, uri) = start_rabbit().await;
+    let broker = harness::start_rabbitmq().await;
     let queue_name = "worker.dlr.source";
     let dlr_queue = "worker.dlr.parked";
-    declare_temporary_queue(&uri, queue_name).await;
+    declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let transport = RabbitMqTransport::new(&uri).await.unwrap();
+    let transport = RabbitMqTransport::new(broker.uri()).await.unwrap();
     transport
         .publish(
             queue_name,
@@ -1105,7 +1052,7 @@ async fn worker_routes_to_dead_letter_after_exhausting_attempts() {
         .unwrap();
 
     let attempts = Arc::new(AtomicUsize::new(0));
-    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let worker = RabbitMqWorkerBuilder::new(consumer_conn)
         .queue(queue_name)
         .max_attempts(2)
@@ -1125,7 +1072,7 @@ async fn worker_routes_to_dead_letter_after_exhausting_attempts() {
     // is declared by the worker, so early probes can race the startup:
     // a basic_get on a missing queue is a channel-closing soft error,
     // hence a fresh channel per attempt and errors treated as retries.
-    let probe = Connection::connect(&uri, ConnectionProperties::default())
+    let probe = Connection::connect(broker.uri(), ConnectionProperties::default())
         .await
         .unwrap();
     let mut parked = None;
@@ -1161,12 +1108,12 @@ async fn worker_routes_to_dead_letter_after_exhausting_attempts() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn worker_routes_oversize_delivery_to_dead_letter_queue() {
-    let (_container, uri) = start_rabbit().await;
+    let broker = harness::start_rabbitmq().await;
     let queue_name = "worker.oversize.source";
     let dlr_queue = "worker.oversize.parked";
-    declare_temporary_queue(&uri, queue_name).await;
+    declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let publisher = Connection::connect(&uri, ConnectionProperties::default())
+    let publisher = Connection::connect(broker.uri(), ConnectionProperties::default())
         .await
         .unwrap();
     let publish_channel = publisher.create_channel().await.unwrap();
@@ -1185,7 +1132,7 @@ async fn worker_routes_oversize_delivery_to_dead_letter_queue() {
         .unwrap();
 
     let attempts = Arc::new(AtomicUsize::new(0));
-    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let worker = RabbitMqWorkerBuilder::new(consumer_conn)
         .queue(queue_name)
         .max_payload_bytes(64)
@@ -1203,7 +1150,7 @@ async fn worker_routes_oversize_delivery_to_dead_letter_queue() {
     // The DLR queue is declared by the worker, so early probes can race
     // the startup: a basic_get on a missing queue is a channel-closing
     // soft error, hence a fresh channel per attempt.
-    let probe = Connection::connect(&uri, ConnectionProperties::default())
+    let probe = Connection::connect(broker.uri(), ConnectionProperties::default())
         .await
         .unwrap();
     let mut parked = None;
@@ -1269,12 +1216,12 @@ async fn wait_for_dead_letter(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn oversized_metadata_is_quarantined_without_headers() {
-    let (_container, uri) = start_rabbit().await;
+    let broker = harness::start_rabbitmq().await;
     let queue_name = "worker.metadata.source";
     let dlr_queue = "worker.metadata.parked";
-    declare_temporary_queue(&uri, queue_name).await;
+    declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let publisher = Connection::connect(&uri, ConnectionProperties::default())
+    let publisher = Connection::connect(broker.uri(), ConnectionProperties::default())
         .await
         .unwrap();
     let publish_channel = publisher.create_channel().await.unwrap();
@@ -1301,7 +1248,7 @@ async fn oversized_metadata_is_quarantined_without_headers() {
         .unwrap();
 
     let attempts = Arc::new(AtomicUsize::new(0));
-    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let worker = RabbitMqWorkerBuilder::new(consumer_conn)
         .queue(queue_name)
         .metadata_limits(AmqpMetadataLimits {
@@ -1319,7 +1266,7 @@ async fn oversized_metadata_is_quarantined_without_headers() {
     let cancel_for_task = cancel.clone();
     let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
 
-    let parked = wait_for_dead_letter(&uri, dlr_queue)
+    let parked = wait_for_dead_letter(broker.uri(), dlr_queue)
         .await
         .expect("oversized metadata must be routed to the dead-letter queue");
 
@@ -1374,12 +1321,12 @@ async fn oversized_metadata_is_quarantined_without_headers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn worker_routes_undecodable_delivery_to_dead_letter_queue() {
-    let (_container, uri) = start_rabbit().await;
+    let broker = harness::start_rabbitmq().await;
     let queue_name = "worker.undecodable.source";
     let dlr_queue = "worker.undecodable.parked";
-    declare_temporary_queue(&uri, queue_name).await;
+    declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let publisher = Connection::connect(&uri, ConnectionProperties::default())
+    let publisher = Connection::connect(broker.uri(), ConnectionProperties::default())
         .await
         .unwrap();
     let publish_channel = publisher.create_channel().await.unwrap();
@@ -1397,7 +1344,7 @@ async fn worker_routes_undecodable_delivery_to_dead_letter_queue() {
         .unwrap();
 
     let attempts = Arc::new(AtomicUsize::new(0));
-    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let worker = RabbitMqWorkerBuilder::new(consumer_conn)
         .queue(queue_name)
         .dead_letter_routing_key(dlr_queue)
@@ -1411,7 +1358,7 @@ async fn worker_routes_undecodable_delivery_to_dead_letter_queue() {
     let cancel_for_task = cancel.clone();
     let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
 
-    let probe = Connection::connect(&uri, ConnectionProperties::default())
+    let probe = Connection::connect(broker.uri(), ConnectionProperties::default())
         .await
         .unwrap();
     let mut parked = None;
@@ -1443,11 +1390,11 @@ async fn worker_routes_undecodable_delivery_to_dead_letter_queue() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn worker_run_returns_connection_error_when_broker_stops() {
-    let (container, uri) = start_rabbit().await;
+    let broker = harness::start_rabbitmq().await;
     let queue_name = "worker.broker.down";
-    declare_temporary_queue(&uri, queue_name).await;
+    declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let worker = RabbitMqWorkerBuilder::new(consumer_conn)
         .queue(queue_name)
         .build()
@@ -1459,7 +1406,7 @@ async fn worker_run_returns_connection_error_when_broker_stops() {
 
     // Let the consumer subscribe before taking the broker down.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    container.stop().await.expect("container must stop");
+    broker.stop_gracefully().await;
 
     let result = tokio::time::timeout(Duration::from_secs(30), handle)
         .await
@@ -1474,11 +1421,11 @@ async fn worker_run_returns_connection_error_when_broker_stops() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn worker_returns_ok_on_cancellation_with_idle_queue() {
-    let (_container, uri) = start_rabbit().await;
+    let broker = harness::start_rabbitmq().await;
     let queue_name = "worker.cancel";
-    declare_temporary_queue(&uri, queue_name).await;
+    declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let worker = RabbitMqWorkerBuilder::new(consumer_conn)
         .queue(queue_name)
         .register_handler::<OrderPlaced, _>(RecordingHandler::default())
@@ -1501,11 +1448,11 @@ async fn worker_returns_ok_on_cancellation_with_idle_queue() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn worker_continues_after_handler_panic() {
-    let (_container, uri) = start_rabbit().await;
+    let broker = harness::start_rabbitmq().await;
     let queue_name = "worker.panic";
-    declare_temporary_queue(&uri, queue_name).await;
+    declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let transport = RabbitMqTransport::new(&uri).await.unwrap();
+    let transport = RabbitMqTransport::new(broker.uri()).await.unwrap();
     // First message triggers a panic (order_id == 0).
     transport
         .publish(
@@ -1528,7 +1475,7 @@ async fn worker_continues_after_handler_panic() {
         .unwrap();
 
     let seen_after = Arc::new(AtomicUsize::new(0));
-    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let worker = RabbitMqWorkerBuilder::new(consumer_conn)
         .queue(queue_name)
         .register_handler::<OrderPlaced, _>(PanickingHandler {
@@ -1564,13 +1511,13 @@ async fn worker_continues_after_handler_panic() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn worker_delays_retries_and_retry_count_survives_restart() {
-    let (_container, uri) = start_rabbit().await;
+    let broker = harness::start_rabbitmq().await;
     let queue_name = "worker.poison";
     let dlr_queue = "worker.poison.parked";
     let retry_delay = Duration::from_millis(300);
-    declare_temporary_queue(&uri, queue_name).await;
+    declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let transport = RabbitMqTransport::new(&uri).await.unwrap();
+    let transport = RabbitMqTransport::new(broker.uri()).await.unwrap();
     transport
         .publish(
             queue_name,
@@ -1586,7 +1533,7 @@ async fn worker_delays_retries_and_retry_count_survives_restart() {
 
     // First worker instance: two failing attempts, spaced by the wait
     // queue TTL rather than redelivered in a tight loop.
-    let first_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let first_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let first_worker = RabbitMqWorkerBuilder::new(first_conn)
         .queue(queue_name)
         .max_attempts(3)
@@ -1629,7 +1576,7 @@ async fn worker_delays_retries_and_retry_count_survives_restart() {
     first_cancel.cancel();
     first_handle.await.unwrap().unwrap();
 
-    let second_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let second_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let second_worker = RabbitMqWorkerBuilder::new(second_conn)
         .queue(queue_name)
         .max_attempts(3)
@@ -1646,7 +1593,7 @@ async fn worker_delays_retries_and_retry_count_survives_restart() {
     let second_handle =
         tokio::spawn(async move { second_worker.run(second_cancel_for_task).await });
 
-    let probe = Connection::connect(&uri, ConnectionProperties::default())
+    let probe = Connection::connect(broker.uri(), ConnectionProperties::default())
         .await
         .unwrap();
     let probe_channel = probe.create_channel().await.unwrap();
@@ -1679,10 +1626,10 @@ async fn worker_delays_retries_and_retry_count_survives_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn publish_raw_round_trips_with_supplied_message_id() {
-    let (_container, uri) = start_rabbit().await;
+    let broker = harness::start_rabbitmq().await;
     let queue_name = "raw.publish.round_trip";
 
-    let consumer_conn = Connection::connect(&uri, ConnectionProperties::default())
+    let consumer_conn = Connection::connect(broker.uri(), ConnectionProperties::default())
         .await
         .expect("consumer connection must open");
     let consumer_channel = consumer_conn
@@ -1703,7 +1650,7 @@ async fn publish_raw_round_trips_with_supplied_message_id() {
         .await
         .expect("queue declare must succeed");
 
-    let transport = RabbitMqTransport::new(&uri)
+    let transport = RabbitMqTransport::new(broker.uri())
         .await
         .expect("transport must connect");
     let known_id = Uuid::now_v7();
@@ -1785,14 +1732,14 @@ async fn declare_durable_queue(uri: &str, name: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn ack_on_receive_dead_letters_poison_flood_without_wedging() {
-    let (_container, uri) = start_rabbit().await;
+    let broker = harness::start_rabbitmq().await;
     let queue_name = "worker.ackonreceive.poison.source";
     let dlr_queue = "worker.ackonreceive.poison.parked";
-    declare_durable_queue(&uri, queue_name).await;
+    declare_durable_queue(broker.uri(), queue_name).await;
 
     // Publish more poison messages than the prefetch window so a wedge
     // would be observable: each lacks the AMQP `type` property.
-    let publisher = Connection::connect(&uri, ConnectionProperties::default())
+    let publisher = Connection::connect(broker.uri(), ConnectionProperties::default())
         .await
         .unwrap();
     let publish_channel = publisher.create_channel().await.unwrap();
@@ -1813,7 +1760,7 @@ async fn ack_on_receive_dead_letters_poison_flood_without_wedging() {
     }
 
     let attempts = Arc::new(AtomicUsize::new(0));
-    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let worker = RabbitMqWorkerBuilder::new(consumer_conn)
         .queue(queue_name)
         .ack_mode(AckMode::AckOnReceive)
@@ -1831,7 +1778,7 @@ async fn ack_on_receive_dead_letters_poison_flood_without_wedging() {
 
     // All poison messages must land in the DLQ. If the consumer wedged
     // after `prefetch` messages, the count would stall below poison_count.
-    let probe = Connection::connect(&uri, ConnectionProperties::default())
+    let probe = Connection::connect(broker.uri(), ConnectionProperties::default())
         .await
         .unwrap();
     let mut parked = 0u32;
@@ -1873,11 +1820,11 @@ async fn ack_on_receive_dead_letters_poison_flood_without_wedging() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn manual_without_dead_letter_enables_confirms_and_retries_safely() {
-    let (_container, uri) = start_rabbit().await;
+    let broker = harness::start_rabbitmq().await;
     let queue_name = "worker.manual.noconfirm.retry";
-    declare_durable_queue(&uri, queue_name).await;
+    declare_durable_queue(broker.uri(), queue_name).await;
 
-    let transport = RabbitMqTransport::new(&uri).await.unwrap();
+    let transport = RabbitMqTransport::new(broker.uri()).await.unwrap();
     transport
         .publish(
             queue_name,
@@ -1889,7 +1836,7 @@ async fn manual_without_dead_letter_enables_confirms_and_retries_safely() {
         .unwrap();
 
     let attempts = Arc::new(AtomicUsize::new(0));
-    let consumer_conn = RabbitMqConnection::connect(&uri).await.unwrap();
+    let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let worker = RabbitMqWorkerBuilder::new(consumer_conn)
         .queue(queue_name)
         .ack_mode(AckMode::Manual)
@@ -1923,8 +1870,8 @@ async fn manual_without_dead_letter_enables_confirms_and_retries_safely() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Docker"]
 async fn channel_pool_bounds_live_channels_and_returns_them_under_contention() {
-    let (_container, uri) = start_rabbit().await;
-    let connection = RabbitMqConnection::connect(&uri)
+    let broker = harness::start_rabbitmq().await;
+    let connection = RabbitMqConnection::connect(broker.uri())
         .await
         .expect("pool connection must open");
 
@@ -1979,19 +1926,15 @@ async fn channel_pool_bounds_live_channels_and_returns_them_under_contention() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn connect_with_retry_fails_fast_on_access_refused() {
-    let (container, _uri) = start_rabbit().await;
+    let broker = harness::start_rabbitmq().await;
     // Same host and port as the running container, deliberately wrong
     // credentials. The default image accepts guest/guest, so guest with a
     // bad password triggers an ACCESS_REFUSED handshake rejection.
-    let host = container
-        .get_host()
-        .await
-        .expect("rabbitmq container must expose a host");
-    let port = container
-        .get_host_port_ipv4(5672)
-        .await
-        .expect("rabbitmq container must expose AMQP port");
-    let bad_uri = format!("amqp://guest:wrong-password@{host}:{port}/%2f");
+    let bad_uri = format!(
+        "amqp://guest:wrong-password@{}:{}/%2f",
+        broker.host(),
+        broker.port()
+    );
 
     let started = std::time::Instant::now();
     // A generous per-attempt delay: if the loop wrongly retried all five
@@ -2027,11 +1970,11 @@ async fn connect_with_retry_fails_fast_on_access_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Docker"]
 async fn publish_recovers_after_a_broker_blip() {
-    let (container, uri) = start_rabbit().await;
+    let broker = harness::start_rabbitmq().await;
     let queue_name = "publish.recovery";
-    declare_temporary_queue(&uri, queue_name).await;
+    declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let transport = RabbitMqTransport::new(&uri)
+    let transport = RabbitMqTransport::new(broker.uri())
         .await
         .expect("transport connects");
 
@@ -2047,9 +1990,9 @@ async fn publish_recovers_after_a_broker_blip() {
         .expect("first publish succeeds");
 
     // Freeze then resume the broker to force a reconnect.
-    container.pause().await.expect("broker pauses");
+    broker.pause().await;
     tokio::time::sleep(Duration::from_secs(1)).await;
-    container.unpause().await.expect("broker resumes");
+    broker.unpause().await;
 
     // A publish issued after the blip must eventually succeed on its own,
     // without rebuilding the transport. Retry the call a few times to absorb
@@ -2096,9 +2039,9 @@ impl SigningKeySource for CountingSigningKeySource {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Docker"]
 async fn signing_happens_once_per_publication() {
-    let (container, uri) = start_rabbit().await;
+    let broker = harness::start_rabbitmq().await;
     let queue_name = "publish.signing-once";
-    declare_temporary_queue(&uri, queue_name).await;
+    declare_temporary_queue(broker.uri(), queue_name).await;
 
     let signing_calls = Arc::new(AtomicUsize::new(0));
     let keys: Arc<dyn SigningKeySource> = Arc::new(CountingSigningKeySource {
@@ -2116,7 +2059,7 @@ async fn signing_happens_once_per_publication() {
         keys,
     ));
 
-    let transport = RabbitMqTransport::new(&uri)
+    let transport = RabbitMqTransport::new(broker.uri())
         .await
         .expect("transport connects")
         .with_outbound_envelope_security(security);
@@ -2136,9 +2079,9 @@ async fn signing_happens_once_per_publication() {
     // Freeze then resume the broker to force `publish_envelope`'s internal
     // channel-recovery loop to retry, the same way as
     // `publish_recovers_after_a_broker_blip` above.
-    container.pause().await.expect("broker pauses");
+    broker.pause().await;
     tokio::time::sleep(Duration::from_secs(1)).await;
-    container.unpause().await.expect("broker resumes");
+    broker.unpause().await;
 
     let mut attempts: usize = 0;
     loop {
@@ -2201,13 +2144,13 @@ impl Handler<OrderPlaced> for SlowCountingHandler {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Docker"]
 async fn no_ack_shutdown_drains_in_flight_handlers() {
-    let (_container, uri) = start_rabbit().await;
+    let broker = harness::start_rabbitmq().await;
     let queue_name = "noack.drain";
-    declare_temporary_queue(&uri, queue_name).await;
+    declare_temporary_queue(broker.uri(), queue_name).await;
 
     let started = Arc::new(AtomicUsize::new(0));
     let done = Arc::new(AtomicUsize::new(0));
-    let transport = RabbitMqTransport::new(&uri)
+    let transport = RabbitMqTransport::new(broker.uri())
         .await
         .expect("transport connects");
     let batch = 4usize;
@@ -2223,7 +2166,7 @@ async fn no_ack_shutdown_drains_in_flight_handlers() {
             .expect("publish succeeds");
     }
 
-    let consumer_conn = RabbitMqConnection::connect(&uri)
+    let consumer_conn = RabbitMqConnection::connect(broker.uri())
         .await
         .expect("consumer connects");
     let worker = RabbitMqWorkerBuilder::new(consumer_conn)
