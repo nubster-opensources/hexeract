@@ -16,7 +16,6 @@
 mod harness;
 
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -46,8 +45,8 @@ const BUDGET: Duration = Duration::from_secs(120);
 
 #[tokio::test(start_paused = true)]
 async fn a_subject_ready_on_its_first_probe_is_returned_after_a_single_build() {
-    let builds = Arc::new(AtomicUsize::new(0));
-    let describes = Arc::new(AtomicUsize::new(0));
+    let builds = AtomicUsize::new(0);
+    let describes = AtomicUsize::new(0);
 
     let subject = start_until_ready(
         "an immediately ready subject",
@@ -105,7 +104,7 @@ async fn a_subject_ready_on_its_first_probe_costs_no_waiting() {
 
 #[tokio::test(start_paused = true)]
 async fn a_subject_that_overruns_its_budget_is_abandoned_for_a_freshly_built_one() {
-    let builds = Arc::new(AtomicUsize::new(0));
+    let builds = AtomicUsize::new(0);
 
     // The first subject built never reports ready; every later one does at
     // once. A policy that keeps probing the subject it already has can only
@@ -141,8 +140,8 @@ async fn running_out_of_attempts_panics_with_the_label_and_the_last_subject_repo
     const LABEL: &str = "a subject that never comes up";
     const REPORT: &str = "the streams of the subject that was given up on";
 
-    let builds = Arc::new(AtomicUsize::new(0));
-    let describes = Arc::new(AtomicUsize::new(0));
+    let builds = AtomicUsize::new(0);
+    let describes = AtomicUsize::new(0);
 
     // The panic is caught in place rather than declared with
     // `#[should_panic]`, which ends the test at the panic and would leave the
