@@ -30,8 +30,25 @@ use crate::OutboxError;
 /// - `event_type` is limited to **64 bytes**.
 /// - Table-name identifiers passed to the builder are limited to **63 bytes**.
 ///
-/// The `Debug` implementation masks the payload bytes to avoid leaking
-/// potentially sensitive event data into logs and tracing output.
+/// # Observability note
+///
+/// The `Debug` implementation never prints the bytes of `payload` or the text
+/// of `last_error`. It renders `payload` as `<N bytes>`, and `last_error` as
+/// its presence and its length in bytes alone, `Some(<N bytes redacted>)` or
+/// `None`. An error message is free-form text a dispatcher captured from a
+/// failure, and this type cannot tell a harmless message from one that
+/// carries a datum.
+///
+/// To read the text of an error, ask for it: [`Self::last_error`] stays a
+/// public field, and operators read it through the `check` command and the SQL
+/// views. That path is deliberate. It makes the disclosure a decision at the
+/// call site instead of a side effect of formatting, and the formatter does
+/// not pretend to redact what the field exposes.
+///
+/// The limit: `event_type` is printed verbatim. The SQL backends constrain it
+/// on their write paths, but [`Self::restore`] validates none of its fields,
+/// so a row written outside the framework can carry arbitrary text into this
+/// output. The type guarantees no more than that.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct OutboxEnvelope {
@@ -55,18 +72,48 @@ pub struct OutboxEnvelope {
     pub delivered_at: Option<SystemTime>,
 }
 
-impl std::fmt::Debug for OutboxEnvelope {
+/// Renders the byte length of a withheld error message in place of its text.
+struct WithheldErrorLength(usize);
+
+impl std::fmt::Debug for WithheldErrorLength {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{} bytes redacted>", self.0)
+    }
+}
+
+impl std::fmt::Debug for OutboxEnvelope {
+    /// Destructures `Self` without a rest pattern on purpose: adding a field
+    /// to the envelope breaks this function, which forces whoever adds it to
+    /// decide whether the new field is safe to print. A sensitive field
+    /// silently swept in by a `..` would be invisible to review.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            event_id,
+            event_type,
+            payload,
+            subject_id,
+            created_at,
+            attempts,
+            last_error,
+            next_retry_at,
+            delivered_at,
+        } = self;
+
         f.debug_struct("OutboxEnvelope")
-            .field("event_id", &self.event_id)
-            .field("event_type", &self.event_type)
-            .field("payload", &format_args!("<{} bytes>", self.payload.len()))
-            .field("subject_id", &self.subject_id)
-            .field("created_at", &self.created_at)
-            .field("attempts", &self.attempts)
-            .field("last_error", &self.last_error)
-            .field("next_retry_at", &self.next_retry_at)
-            .field("delivered_at", &self.delivered_at)
+            .field("event_id", event_id)
+            .field("event_type", event_type)
+            .field("payload", &format_args!("<{} bytes>", payload.len()))
+            .field("subject_id", subject_id)
+            .field("created_at", created_at)
+            .field("attempts", attempts)
+            .field(
+                "last_error",
+                &last_error
+                    .as_ref()
+                    .map(|message| WithheldErrorLength(message.len())),
+            )
+            .field("next_retry_at", next_retry_at)
+            .field("delivered_at", delivered_at)
             .finish()
     }
 }
@@ -251,6 +298,97 @@ mod tests {
         assert!(debug_output.contains('<'));
         assert!(debug_output.contains("bytes>"));
         assert!(!debug_output.contains("user_id"));
+    }
+
+    fn envelope_with_last_error(last_error: Option<&str>) -> OutboxEnvelope {
+        OutboxEnvelope::restore(
+            Uuid::nil(),
+            "users.registered".to_owned(),
+            Vec::new(),
+            None,
+            SystemTime::UNIX_EPOCH,
+            1,
+            last_error.map(str::to_owned),
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn debug_never_prints_last_error_text() {
+        let message = "postgres://svc:hunter2@db.internal:5432/app?sslmode=require";
+        let envelope = envelope_with_last_error(Some(message));
+        let debug_output = format!("{envelope:?}");
+        assert!(
+            !debug_output.contains(message),
+            "full error text leaked in Debug output: {debug_output}"
+        );
+        assert!(
+            !debug_output.contains("hunter2"),
+            "credential fragment leaked in Debug output: {debug_output}"
+        );
+        assert!(
+            !debug_output.contains("db.internal"),
+            "host fragment leaked in Debug output: {debug_output}"
+        );
+    }
+
+    #[test]
+    fn debug_reveals_last_error_presence_and_byte_length_only() {
+        let message = "connection refused by upstream";
+        let envelope = envelope_with_last_error(Some(message));
+        let debug_output = format!("{envelope:?}");
+        let expected = format!("last_error: Some(<{} bytes redacted>)", message.len());
+        assert!(
+            debug_output.contains(&expected),
+            "expected `{expected}` in Debug output: {debug_output}"
+        );
+        assert!(
+            debug_output.contains("redacted"),
+            "missing `redacted` marker in Debug output: {debug_output}"
+        );
+    }
+
+    #[test]
+    fn debug_renders_none_when_no_error_is_recorded() {
+        let envelope = envelope_with_last_error(None);
+        let debug_output = format!("{envelope:?}");
+        assert!(
+            debug_output.contains("last_error: None"),
+            "expected `last_error: None` in Debug output: {debug_output}"
+        );
+        assert!(
+            !debug_output.contains("redacted"),
+            "unexpected `redacted` marker in Debug output: {debug_output}"
+        );
+    }
+
+    #[test]
+    fn debug_distinguishes_an_empty_error_from_no_error() {
+        let envelope = envelope_with_last_error(Some(""));
+        let debug_output = format!("{envelope:?}");
+        assert!(
+            debug_output.contains("last_error: Some(<0 bytes redacted>)"),
+            "an empty recorded error must stay distinguishable from None: {debug_output}"
+        );
+    }
+
+    #[test]
+    fn debug_reports_last_error_length_in_bytes_not_characters() {
+        let message = "échec à la connexion près de zoé";
+        assert_ne!(message.len(), message.chars().count());
+        let envelope = envelope_with_last_error(Some(message));
+        let debug_output = format!("{envelope:?}");
+        let expected_bytes = format!("<{} bytes redacted>", message.len());
+        let wrong_characters = format!("<{} bytes redacted>", message.chars().count());
+        assert!(
+            debug_output.contains(&expected_bytes),
+            "expected `{expected_bytes}` in Debug output: {debug_output}"
+        );
+        assert!(
+            !debug_output.contains(&wrong_characters),
+            "character count used instead of byte length in Debug output: {debug_output}"
+        );
     }
 
     #[test]
