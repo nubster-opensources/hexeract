@@ -27,6 +27,7 @@ use crate::DEFAULT_TABLE_NAME;
 use crate::dialect::Dialect;
 use crate::envelope::assemble_envelope;
 use crate::envelope::primitive_utc_to_system_time;
+use crate::pool::pool_error;
 use crate::validate::validate_event_type;
 use crate::validate::validate_table_name;
 
@@ -40,14 +41,6 @@ fn duration_to_micros(d: Duration) -> i64 {
 
 fn database_error(error: impl std::error::Error + Send + Sync + 'static) -> OutboxError {
     OutboxError::Database(Box::new(error))
-}
-
-fn pool_error(error: sqlx::Error) -> OutboxError {
-    if matches!(error, sqlx::Error::PoolTimedOut) {
-        OutboxError::PoolTimeout
-    } else {
-        OutboxError::Database(Box::new(error))
-    }
 }
 
 /// Decode one polled row into an [`OutboxEnvelope`].
@@ -650,24 +643,6 @@ mod tests {
         ) -> Result<(), Self::Error> {
             Ok(())
         }
-    }
-
-    #[test]
-    fn pool_error_maps_pool_timed_out_to_pool_timeout_variant() {
-        let err = pool_error(sqlx::Error::PoolTimedOut);
-        assert!(
-            matches!(err, OutboxError::PoolTimeout),
-            "PoolTimedOut must map to OutboxError::PoolTimeout, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn pool_error_wraps_other_errors_as_database_error() {
-        let err = pool_error(sqlx::Error::RowNotFound);
-        assert!(
-            matches!(err, OutboxError::Database(_)),
-            "non-timeout errors must map to OutboxError::Database, got {err:?}"
-        );
     }
 
     #[tokio::test]
