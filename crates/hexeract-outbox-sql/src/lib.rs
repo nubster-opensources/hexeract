@@ -24,6 +24,9 @@ compile_error!(
 /// SQL dialect differences absorbed by the backend stores.
 pub mod dialect;
 mod envelope;
+#[doc(hidden)]
+pub mod identifier;
+mod pool;
 mod validate;
 
 #[cfg(feature = "postgres")]
