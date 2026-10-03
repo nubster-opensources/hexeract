@@ -16,7 +16,7 @@ The full rustdoc lives at <https://docs.rs/hexeract-outbox>.
 
 | Item | Role |
 | --- | --- |
-| `OutboxEnvelope` | Row representation of a persisted event. Holds `event_id`, `event_type`, JSON `payload`, optional `subject_id`, retry bookkeeping (`attempts`, `last_error`, `next_retry_at`) and `delivered_at`. `Debug` masks the payload. |
+| `OutboxEnvelope` | Row representation of a persisted event. Holds `event_id`, `event_type`, JSON `payload`, optional `subject_id`, retry bookkeeping (`attempts`, `last_error`, `next_retry_at`) and `delivered_at`. `Debug` masks the payload bytes and withholds the text of `last_error`, reporting its presence and byte length alone. |
 | `OutboxEnvelope::new(event_id, &E)` | Builds a fresh envelope without `subject_id`. |
 | `OutboxEnvelope::with_subject(event_id, subject_id, &E)` | Builds a fresh envelope tagged with a subject for partial ordering. |
 | `OutboxEnvelope::restore(...)` | Backend hook to rebuild an envelope from a database row. |
