@@ -1959,8 +1959,34 @@ pub(crate) fn delivery_to_envelope(
     // property; restore it from there and fall back to now only when the
     // property is absent (foreign producer that did not stamp it) and
     // `strict` does not demand it.
+    //
+    // The property is an untrusted `u64` read off the wire, and adding it to
+    // the epoch with `+` panics when the sum leaves the range the platform can
+    // represent. That panic would run before the handler's `catch_unwind`, so
+    // the addition is fallible and a present but unrepresentable value is
+    // rejected rather than replaced. This differs on purpose from the
+    // `message_id` branch above, which falls back to a fresh UUID in lenient
+    // mode: an identifier minted locally claims nothing about the producer,
+    // whereas a minted `published_at` would assert a publication instant the
+    // delivery never carried, indistinguishable from a real one for the
+    // handler. The field is also covered by the signature. The asymmetry is
+    // deliberate, not an oversight.
+    //
+    // Where the overflow boundary lies depends on the platform. `SystemTime`
+    // is a `FILETIME` on Windows, counted in hundreds of nanoseconds since
+    // 1601, and a `timespec` on Linux, so their upper ranges differ and an
+    // intermediate value may be accepted on one platform and rejected on
+    // another. This removes the panic; it does not make the boundary uniform.
     let published_at = match props.timestamp() {
-        Some(secs) => SystemTime::UNIX_EPOCH + Duration::from_secs(*secs),
+        Some(secs) => SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_secs(*secs))
+            .ok_or_else(|| {
+                BusError::EnvelopeSecurity(
+                    hexeract_bus::EnvelopeSecurityError::MalformedRequiredField {
+                        field: "published_at",
+                    },
+                )
+            })?,
         None if strict => {
             return Err(BusError::EnvelopeSecurity(
                 hexeract_bus::EnvelopeSecurityError::MissingRequiredField {
@@ -2499,6 +2525,52 @@ mod tests {
             restored, published_at_secs,
             "published_at must come from the AMQP timestamp, not consume time"
         );
+    }
+
+    #[test]
+    fn delivery_to_envelope_rejects_an_unrepresentable_timestamp() {
+        let props = BasicProperties::default()
+            .with_type("orders.placed".into())
+            .with_timestamp(u64::MAX);
+
+        let err = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
+        )
+        .expect_err("an unrepresentable timestamp must be rejected, not panic or fall back");
+        match err {
+            BusError::EnvelopeSecurity(
+                hexeract_bus::EnvelopeSecurityError::MalformedRequiredField { field },
+            ) => assert_eq!(field, "published_at"),
+            other => panic!("expected EnvelopeSecurity(MalformedRequiredField), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delivery_to_envelope_rejects_an_unrepresentable_timestamp_under_strict_fields() {
+        let props = BasicProperties::default()
+            .with_type("orders.placed".into())
+            .with_message_id(Uuid::from_u128(1).to_string().into())
+            .with_correlation_id(Uuid::from_u128(2).to_string().into())
+            .with_timestamp(u64::MAX);
+
+        let err = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Strict,
+        )
+        .expect_err("an unrepresentable timestamp must be rejected in strict mode too");
+        match err {
+            BusError::EnvelopeSecurity(
+                hexeract_bus::EnvelopeSecurityError::MalformedRequiredField { field },
+            ) => assert_eq!(field, "published_at"),
+            other => panic!("expected EnvelopeSecurity(MalformedRequiredField), got {other:?}"),
+        }
     }
 
     #[test]
