@@ -1099,7 +1099,7 @@ impl RabbitMqWorker {
     ) -> DeliveryDisposition {
         Self::retry_core(
             move || async move {
-                let published = Self::publish_to_wait_queue(channel, delivery, wait_queue).await;
+                let published = Self::publish_to_wait_queue(channel, delivery, envelope, wait_queue).await;
                 if let Err(err) = &published {
                     tracing::warn!(
                         message_id = %envelope.message_id,
@@ -1540,9 +1540,16 @@ impl RabbitMqWorker {
     /// the message and violating the at-least-once contract. The publish
     /// is `mandatory` so a missing wait queue surfaces as
     /// [`BusError::Unroutable`] instead of being silently discarded.
+    ///
+    /// Only this republished copy carries the normalised message identity
+    /// (see [`properties_with_effective_identity`]). A `basic_nack` with
+    /// `requeue: true` makes the broker hand back the original message,
+    /// whose properties cannot be modified, so that path keeps an unstable
+    /// identity for a delivery that supplied no parseable UUID.
     async fn publish_to_wait_queue(
         channel: &Channel,
         delivery: &Delivery,
+        envelope: &hexeract_bus::BusEnvelope,
         wait_queue: &str,
     ) -> Result<(), BusError> {
         let routing_key = to_short_string(wait_queue, "wait queue name")?;
@@ -1555,7 +1562,8 @@ impl RabbitMqWorker {
                     ..BasicPublishOptions::default()
                 },
                 &delivery.data,
-                delivery.properties.clone().with_delivery_mode(2),
+                properties_with_effective_identity(&delivery.properties, envelope)
+                    .with_delivery_mode(2),
             )
             .await
             .map_err(|err| BusError::Transport(Box::new(err)))?
@@ -1724,6 +1732,57 @@ fn properties_without_headers(properties: &BasicProperties) -> BasicProperties {
     rebuilt.with_headers(FieldTable::default())
 }
 
+/// Return `properties` carrying the envelope's effective identifiers.
+///
+/// `delivery_to_envelope` mints a UUID for a `message_id` or a
+/// `correlation_id` the delivery did not supply, or supplied unparseable,
+/// and that identifier exists only in the in-memory envelope. The retry
+/// copy republishes the original properties, so without this the next
+/// attempt mints a different identifier and one logical message changes
+/// identity on every attempt, breaking correlation, trace continuity,
+/// deduplication and any handler idempotency keyed by `message_id` (#427).
+///
+/// The returned copy differs from `properties` in `message_id` and
+/// `correlation_id` only, and only where the delivery carried no
+/// parseable UUID: a producer-supplied UUID round-trips verbatim, because
+/// the envelope already holds the value parsed from that same property.
+///
+/// Everything else is preserved, the field table above all. That table
+/// carries the broker's `x-death` history and therefore the retry count
+/// [`death_count`] reads, so this deliberately clones rather than
+/// rebuilding field by field the way [`properties_without_headers`] does:
+/// that function ends on `with_headers(FieldTable::default())`, which is
+/// the right trade for a quarantined copy and would turn a retry bounded
+/// by `max_attempts` into an endless loop here.
+///
+/// Writing these fields never overwrites a signed value. A signature over
+/// the envelope forces the strict identifier policy, under which nothing
+/// is minted at all, so the only deliveries whose properties change here
+/// are the unsigned ones that supplied no identifier of their own.
+fn properties_with_effective_identity(
+    properties: &BasicProperties,
+    envelope: &hexeract_bus::BusEnvelope,
+) -> BasicProperties {
+    let mut copy = properties.clone();
+    if !is_parseable_uuid(properties.message_id().as_ref()) {
+        copy = copy.with_message_id(envelope.message_id.to_string().into());
+    }
+    if !is_parseable_uuid(properties.correlation_id().as_ref()) {
+        copy = copy.with_correlation_id(envelope.correlation_id.to_string().into());
+    }
+    copy
+}
+
+/// Whether an AMQP identifier property holds a value `Uuid::parse_str`
+/// accepts.
+///
+/// This is the question [`delivery_to_envelope`] answers before it mints a
+/// replacement, so the retry copy rewrites a property under exactly the
+/// same condition and leaves a producer's own spelling untouched.
+fn is_parseable_uuid(property: Option<&ShortString>) -> bool {
+    property.is_some_and(|raw| Uuid::parse_str(raw.as_str()).is_ok())
+}
+
 /// Name of the wait queue paired with `queue`.
 pub(crate) fn wait_queue_name(queue: &str) -> String {
     format!("{queue}{RETRY_QUEUE_SUFFIX}")
@@ -1833,6 +1892,11 @@ pub(crate) fn derive_required_envelope_fields(
 }
 
 /// Rebuild a [`hexeract_bus::BusEnvelope`] from one AMQP delivery.
+///
+/// An identifier minted here for a missing or unparseable `message_id` or
+/// `correlation_id` is persisted on the retry copy (see
+/// [`properties_with_effective_identity`]), so it is stable from the first
+/// attempt to the last.
 ///
 /// Shared by the consumer worker and the reply inbox so both reconstruct a
 /// delivery identically and, more importantly, bound it identically: a path
@@ -2682,6 +2746,184 @@ mod tests {
             Some("acme")
         );
         assert_eq!(envelope.reply_to.as_deref(), Some("orders.replies"));
+    }
+
+    fn lenient_envelope(props: &BasicProperties) -> hexeract_bus::BusEnvelope {
+        delivery_to_envelope(
+            props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
+        )
+        .expect("must decode")
+    }
+
+    #[test]
+    fn effective_identity_fills_an_absent_message_id_from_the_envelope() {
+        let props = BasicProperties::default().with_type("orders.placed".into());
+        let envelope = lenient_envelope(&props);
+
+        let copy = properties_with_effective_identity(&props, &envelope);
+
+        assert_eq!(
+            copy.message_id().as_ref().map(ShortString::as_str),
+            Some(envelope.message_id.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn effective_identity_replaces_an_unparseable_message_id_with_the_envelope_one() {
+        let props = BasicProperties::default()
+            .with_type("orders.placed".into())
+            .with_message_id("not-a-uuid".into());
+        let envelope = lenient_envelope(&props);
+
+        let copy = properties_with_effective_identity(&props, &envelope);
+
+        assert_eq!(
+            copy.message_id().as_ref().map(ShortString::as_str),
+            Some(envelope.message_id.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn effective_identity_keeps_a_valid_message_id_verbatim() {
+        let message_id = Uuid::from_u128(0xABCD);
+        let props = BasicProperties::default()
+            .with_type("orders.placed".into())
+            .with_message_id(message_id.to_string().into());
+        let envelope = lenient_envelope(&props);
+
+        let copy = properties_with_effective_identity(&props, &envelope);
+
+        assert_eq!(
+            copy.message_id().as_ref().map(ShortString::as_str),
+            Some(message_id.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn effective_identity_keeps_a_non_canonical_message_id_byte_for_byte() {
+        let spelling = "{ABCDEF01-2345-6789-ABCD-EF0123456789}";
+        let props = BasicProperties::default()
+            .with_type("orders.placed".into())
+            .with_message_id(spelling.into());
+        let envelope = lenient_envelope(&props);
+
+        let copy = properties_with_effective_identity(&props, &envelope);
+
+        assert_eq!(
+            copy.message_id().as_ref().map(ShortString::as_str),
+            Some(spelling)
+        );
+    }
+
+    #[test]
+    fn effective_identity_keeps_a_non_canonical_correlation_id_byte_for_byte() {
+        let spelling = "ABCDEF01-2345-6789-ABCD-EF0123456789";
+        let props = BasicProperties::default()
+            .with_type("orders.placed".into())
+            .with_correlation_id(spelling.into());
+        let envelope = lenient_envelope(&props);
+
+        let copy = properties_with_effective_identity(&props, &envelope);
+
+        assert_eq!(
+            copy.correlation_id().as_ref().map(ShortString::as_str),
+            Some(spelling)
+        );
+    }
+
+    #[test]
+    fn effective_identity_fills_an_absent_correlation_id_from_the_envelope() {
+        let props = BasicProperties::default().with_type("orders.placed".into());
+        let envelope = lenient_envelope(&props);
+
+        let copy = properties_with_effective_identity(&props, &envelope);
+
+        assert_eq!(
+            copy.correlation_id().as_ref().map(ShortString::as_str),
+            Some(envelope.correlation_id.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn effective_identity_replaces_an_unparseable_correlation_id_with_the_envelope_one() {
+        let props = BasicProperties::default()
+            .with_type("orders.placed".into())
+            .with_correlation_id("not-a-uuid".into());
+        let envelope = lenient_envelope(&props);
+
+        let copy = properties_with_effective_identity(&props, &envelope);
+
+        assert_eq!(
+            copy.correlation_id().as_ref().map(ShortString::as_str),
+            Some(envelope.correlation_id.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn effective_identity_keeps_a_valid_correlation_id_verbatim() {
+        let correlation_id = Uuid::from_u128(0x1234);
+        let props = BasicProperties::default()
+            .with_type("orders.placed".into())
+            .with_correlation_id(correlation_id.to_string().into());
+        let envelope = lenient_envelope(&props);
+
+        let copy = properties_with_effective_identity(&props, &envelope);
+
+        assert_eq!(
+            copy.correlation_id().as_ref().map(ShortString::as_str),
+            Some(correlation_id.to_string().as_str())
+        );
+    }
+
+    /// The retry count is read from the `x-death` history in the field table,
+    /// so a copy that drops the table turns a bounded retry into an endless
+    /// loop.
+    #[test]
+    fn effective_identity_preserves_the_field_table_including_x_death() {
+        let mut headers = lapin::types::FieldTable::default();
+        headers.insert(
+            ShortString::from("x-death"),
+            lapin::types::AMQPValue::FieldArray(
+                vec![lapin::types::AMQPValue::LongString("history".into())].into(),
+            ),
+        );
+        headers.insert(
+            ShortString::from("tenant"),
+            lapin::types::AMQPValue::LongString("acme".into()),
+        );
+        let props = BasicProperties::default()
+            .with_type("orders.placed".into())
+            .with_headers(headers);
+        let envelope = lenient_envelope(&props);
+
+        let copy = properties_with_effective_identity(&props, &envelope);
+
+        assert!(
+            props
+                .headers()
+                .as_ref()
+                .is_some_and(|table| table.inner().contains_key("x-death")),
+            "the origin must carry a non-empty field table"
+        );
+        assert_eq!(copy.headers(), props.headers());
+    }
+
+    #[test]
+    fn effective_identity_preserves_unrelated_properties() {
+        let props = BasicProperties::default()
+            .with_type("orders.placed".into())
+            .with_reply_to(ShortString::from("orders.replies"))
+            .with_app_id(ShortString::from("checkout"));
+        let envelope = lenient_envelope(&props);
+
+        let copy = properties_with_effective_identity(&props, &envelope);
+
+        assert_eq!(copy.reply_to(), props.reply_to());
+        assert_eq!(copy.app_id(), props.app_id());
     }
 
     #[test]

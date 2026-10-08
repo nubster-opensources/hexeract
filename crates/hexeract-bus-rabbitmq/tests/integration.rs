@@ -1623,6 +1623,120 @@ async fn worker_delays_retries_and_retry_count_survives_restart() {
     second_handle.await.unwrap().unwrap();
 }
 
+#[derive(Debug)]
+struct MessageIdRecordingFailingHandler {
+    seen_message_ids: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Handler<OrderPlaced> for MessageIdRecordingFailingHandler {
+    type Error = hexeract_bus::BusError;
+
+    async fn handle(&self, _message: OrderPlaced, ctx: &HandlerContext) -> Result<(), Self::Error> {
+        self.seen_message_ids
+            .lock()
+            .expect("message id mutex must not be poisoned")
+            .push(format!("{:?}", ctx.message_id));
+        Err(hexeract_bus::BusError::Internal(
+            "deliberate poison".to_owned(),
+        ))
+    }
+}
+
+/// Publishes `properties` over raw AMQP (the transport always stamps a valid
+/// `message_id`, which would hide the defect), lets the handler fail three
+/// times, and returns the `message_id` the handler saw on each attempt.
+async fn message_ids_seen_across_retries(
+    queue_name: &str,
+    dlr_queue: &str,
+    properties: BasicProperties,
+) -> Vec<String> {
+    let broker = harness::start_rabbitmq().await;
+    declare_temporary_queue(broker.uri(), queue_name).await;
+
+    let publisher = Connection::connect(broker.uri(), ConnectionProperties::default())
+        .await
+        .unwrap();
+    let publish_channel = publisher.create_channel().await.unwrap();
+    publish_channel
+        .basic_publish(
+            ShortString::from(""),
+            ShortString::from(queue_name),
+            BasicPublishOptions::default(),
+            b"{\"order_id\":\"00000000-0000-0000-0000-000000000005\"}",
+            properties,
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+
+    let seen_message_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .max_attempts(3)
+        .retry_delay(Duration::from_millis(200))
+        .dead_letter_routing_key(dlr_queue)
+        .register_handler::<OrderPlaced, _>(MessageIdRecordingFailingHandler {
+            seen_message_ids: Arc::clone(&seen_message_ids),
+        })
+        .build()
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
+
+    for _ in 0..200 {
+        if seen_message_ids.lock().expect("message id mutex").len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    cancel.cancel();
+    handle.await.unwrap().unwrap();
+    seen_message_ids.lock().expect("message id mutex").clone()
+}
+
+fn assert_identity_is_stable(seen_message_ids: &[String]) {
+    assert!(
+        seen_message_ids.len() >= 2,
+        "the handler must have run at least twice, saw {seen_message_ids:?}"
+    );
+    assert!(
+        seen_message_ids.iter().all(|id| id == &seen_message_ids[0]),
+        "message_id must be identical on every attempt, saw {seen_message_ids:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn retry_preserves_generated_message_id_when_property_is_absent() {
+    let seen = message_ids_seen_across_retries(
+        "worker.identity.absent",
+        "worker.identity.absent.parked",
+        BasicProperties::default().with_type("orders.placed".into()),
+    )
+    .await;
+
+    assert_identity_is_stable(&seen);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn retry_preserves_generated_message_id_when_property_is_unparseable() {
+    let seen = message_ids_seen_across_retries(
+        "worker.identity.unparseable",
+        "worker.identity.unparseable.parked",
+        BasicProperties::default()
+            .with_type("orders.placed".into())
+            .with_message_id("not-a-uuid".into()),
+    )
+    .await;
+
+    assert_identity_is_stable(&seen);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn publish_raw_round_trips_with_supplied_message_id() {
