@@ -25,6 +25,8 @@ lefthook install
 cargo test --workspace --all-features
 ```
 
+On Windows, the full test gate can fail during compilation with `os error 1455`: the paging file is too small for the operation. This is a host memory limit, not a test failure, and the same command passes on the same code once the build parallelism is bounded: re-run it with `CARGO_BUILD_JOBS=2`.
+
 ## Discussion before code
 
 Until v1.0, all design decisions go through a `discussion/` thread on the repository before any pull request is opened. This includes the public traits, the transport abstraction, the outbox schema and the saga state machine.

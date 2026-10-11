@@ -15,6 +15,7 @@ mod cli;
 mod commands;
 mod conn_string;
 mod error;
+mod terminal_text;
 
 use cli::Cli;
 
@@ -37,7 +38,7 @@ fn main() {
     match result {
         Ok(()) => {}
         Err(err) => {
-            eprintln!("error: {err}");
+            eprintln!("error: {}", err.terminal_message());
             std::process::exit(err.exit_code());
         }
     }
