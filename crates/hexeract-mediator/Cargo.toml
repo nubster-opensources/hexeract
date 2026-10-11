@@ -18,7 +18,7 @@ workspace = true
 
 [dependencies]
 hexeract-core = { path = "../hexeract-core", version = "0.6" }
-futures-util = { workspace = true }
+futures-util = { workspace = true, features = ["std"] }
 inventory = { workspace = true }
 thiserror = { workspace = true }
 trait-variant = { workspace = true }

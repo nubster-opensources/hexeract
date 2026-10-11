@@ -95,6 +95,31 @@ pub enum HexeractError {
         failures: Vec<NotificationFailure>,
     },
 
+    /// A handler panicked while being polled, and the panic was caught at the
+    /// dispatch boundary instead of unwinding into the caller.
+    ///
+    /// A panic is a bug, not a business failure, so it carries its own variant
+    /// rather than reusing [`Dispatch`](Self::Dispatch): a caller that routes
+    /// on the error can alert instead of retrying, without parsing a string.
+    ///
+    /// The variant does not name the handler. During a notification fan-out it
+    /// is reached through [`NotificationFailure`], whose `handler` field
+    /// already carries that name, and duplicating it would give one fact two
+    /// sources.
+    #[error("handler panicked: {payload}")]
+    #[non_exhaustive]
+    HandlerPanicked {
+        /// Message carried by the panic payload, or a fixed placeholder when
+        /// the payload is neither `&str` nor `String`.
+        ///
+        /// Rust's default panic hook has already written this text to stderr
+        /// before the panic was caught, so keeping it here exposes nothing the
+        /// process did not already print. A caller that forwards a
+        /// `HexeractError` verbatim to a remote peer would, however, forward
+        /// this text with it.
+        payload: String,
+    },
+
     /// A generic dispatch-level error with a human-readable message.
     ///
     /// Reserved as a last resort for cases that have no dedicated structured
@@ -203,6 +228,16 @@ impl HexeractError {
             notification_type,
             total,
             failures,
+        }
+    }
+
+    /// Builds a [`HexeractError::HandlerPanicked`] from the message recovered
+    /// from a caught panic payload. This is the only way to construct the
+    /// variant from outside this crate, since it is marked `#[non_exhaustive]`.
+    #[must_use]
+    pub fn handler_panicked(payload: impl Into<String>) -> Self {
+        Self::HandlerPanicked {
+            payload: payload.into(),
         }
     }
 }
