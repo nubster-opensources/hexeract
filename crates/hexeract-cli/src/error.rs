@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+use crate::terminal_text::escape_unsafe_characters;
+
 /// A CLI-level error with an associated exit code.
 ///
 /// All command `run` methods return `Result<(), CliError>`. The binary's
@@ -22,6 +24,11 @@ pub(crate) enum CliError {
 }
 
 impl CliError {
+    /// Render this error with unsafe terminal characters escaped.
+    pub(crate) fn terminal_message(&self) -> String {
+        escape_unsafe_characters(&self.to_string()).into_owned()
+    }
+
     /// Process exit code that corresponds to this error variant.
     pub(crate) fn exit_code(&self) -> i32 {
         match self {
@@ -64,5 +71,69 @@ impl From<&str> for CliError {
 impl From<String> for CliError {
     fn from(s: String) -> Self {
         Self::Fatal(s.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CliError;
+
+    #[test]
+    fn terminal_message_escapes_terminal_sequences() {
+        let error = CliError::from("broker: \u{1b}[31mfailed\u{1b}[0m");
+        assert_eq!(
+            error.terminal_message(),
+            "broker: \\u{1b}[31mfailed\\u{1b}[0m"
+        );
+    }
+
+    #[test]
+    fn terminal_message_escapes_line_breaks() {
+        let error = CliError::from("failed\nforged success\r\t");
+        assert_eq!(error.terminal_message(), "failed\\nforged success\\r\\t");
+    }
+
+    #[test]
+    fn terminal_message_escapes_invisible_formatting() {
+        let error = CliError::from("queue\u{202e}\u{200b}\u{2066}\u{feff}");
+        assert_eq!(
+            error.terminal_message(),
+            "queue\\u{202e}\\u{200b}\\u{2066}\\u{feff}"
+        );
+    }
+
+    #[test]
+    fn terminal_message_distinguishes_literal_escape_sequences() {
+        let error = CliError::from("literal \\n, newline \n");
+        assert_eq!(error.terminal_message(), "literal \\\\n, newline \\n");
+    }
+
+    #[test]
+    fn terminal_message_preserves_readable_unicode() {
+        let message = "Échec de connexion : café e\u{301} 👩\u{200d}💻 ❤️";
+        assert_eq!(CliError::from(message).terminal_message(), message);
+    }
+
+    #[test]
+    fn terminal_message_preserves_original_error_and_exit_code() {
+        let original = "broker\nfailed";
+        let error = CliError::from(original);
+        assert_eq!(error.terminal_message(), "broker\\nfailed");
+        assert_eq!(error.to_string(), original);
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            original
+        );
+        assert_eq!(error.exit_code(), 1);
+    }
+
+    #[test]
+    fn terminal_message_escapes_safety_errors_without_changing_exit_code() {
+        let original = "queue\nrequires confirmation";
+        let error = CliError::SafetyFlagMissing(original.into());
+        assert_eq!(error.terminal_message(), "queue\\nrequires confirmation");
+        assert_eq!(error.to_string(), original);
+        assert!(std::error::Error::source(&error).is_none());
+        assert_eq!(error.exit_code(), 2);
     }
 }
