@@ -61,12 +61,14 @@
 mod erased;
 mod terminal;
 
-use std::any::{TypeId, type_name};
+use std::any::{Any, TypeId, type_name};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 
+use futures_util::FutureExt;
 use futures_util::future::join_all;
 use hexeract_core::{
     Command, CommandHandler, CorrelationId, DynMiddleware, HandlerContext, HandlerKind,
@@ -552,6 +554,28 @@ impl Mediator {
     /// each [`NotificationFailure`] retaining the failing handler's name and
     /// the error `source` chain so the caller can recover an individual
     /// failure instead of parsing a flattened string.
+    ///
+    /// # Panics in handlers
+    ///
+    /// A panic is isolated like any other failure. Each dispatch is wrapped
+    /// in [`catch_unwind`](futures_util::FutureExt::catch_unwind) around the
+    /// whole chain, middlewares and handler alike, so a panicking handler
+    /// does not unwind through the fan-out and its siblings still run. The
+    /// panic is recorded as a [`NotificationFailure`] carrying
+    /// [`HexeractError::HandlerPanicked`], in registration order with the
+    /// other failures. Its payload is the panic message when the payload is a
+    /// `&str` or a `String`, and the placeholder `unknown panic payload` for
+    /// any other type.
+    ///
+    /// Two limits remain:
+    ///
+    /// - The future is wrapped in [`AssertUnwindSafe`], which is an assertion
+    ///   and not a proof. A middleware holding mutable state shared across
+    ///   the handlers of one fan-out is outside the guarantee: a panic in the
+    ///   middle of a mutation of that state can leave it inconsistent for the
+    ///   handlers that run after it.
+    /// - Under `panic = "abort"`, a choice made by the downstream binary,
+    ///   `catch_unwind` captures nothing and the process terminates.
     pub async fn publish<N: Notification>(&self, notification: N) -> Result<(), HexeractError> {
         self.publish_with_correlation_id(notification, CorrelationId::new())
             .await
@@ -608,12 +632,20 @@ impl Mediator {
             let next = Next::new(self.inner.middlewares.clone(), terminal);
 
             async move {
-                next.run(&envelope, &ctx)
+                match AssertUnwindSafe(next.run(&envelope, &ctx))
+                    .catch_unwind()
                     .await
-                    .map_err(|error| NotificationFailure {
+                {
+                    Ok(Ok(_output)) => Ok(()),
+                    Ok(Err(error)) => Err(NotificationFailure {
                         handler: handler_name,
                         error,
-                    })
+                    }),
+                    Err(payload) => Err(NotificationFailure {
+                        handler: handler_name,
+                        error: HexeractError::handler_panicked(panic_message(&payload)),
+                    }),
+                }
             }
         });
 
@@ -635,10 +667,31 @@ impl Mediator {
     }
 }
 
+/// Recovers a human-readable message from a caught panic payload.
+///
+/// A panic payload is `&str` for a literal `panic!("...")` and `String` for a
+/// formatted one. Anything else, such as a `panic_any` of an arbitrary type,
+/// has no printable form and yields a fixed placeholder rather than a debug
+/// rendering of unknown data.
+///
+/// This duplicates the equivalent helper in the RabbitMQ worker on purpose.
+/// That one is private to its crate, and promoting a diagnostic helper into
+/// the public surface of `hexeract-core` would bind eight frozen lines to
+/// semver for the lifetime of the crate.
+fn panic_message(payload: &Box<dyn Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hexeract_core::HandlerContext;
+    use hexeract_core::{BoxOutput, HandlerContext};
 
     struct Ping {
         value: u32,
@@ -932,6 +985,435 @@ mod tests {
             recorded,
             vec![("first", 42), ("third", 42)],
             "siblings must run even after a failure"
+        );
+    }
+
+    use futures_util::FutureExt;
+    use std::cell::Cell;
+    use std::panic::AssertUnwindSafe;
+    use std::sync::Once;
+
+    thread_local! {
+        static PANIC_OUTPUT_SILENCED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    static PANIC_HOOK_INSTALLED: Once = Once::new();
+
+    /// Silences the default panic hook for the current thread only, for as
+    /// long as the guard lives.
+    ///
+    /// The panic hook is process-global state and tests run in parallel, so a
+    /// take/set/restore dance around each panic would race with itself. The
+    /// hook is instead installed once (idempotent, guarded by `Once`) and
+    /// delegates to the previous hook unless the panicking thread holds a
+    /// guard. The mute is thread-local: a genuine failure on any other test
+    /// thread still prints its trace. `#[tokio::test]` uses a current-thread
+    /// runtime, so every handler panic happens on the thread holding the guard.
+    struct PanicOutputSilencer;
+
+    impl PanicOutputSilencer {
+        fn new() -> Self {
+            PANIC_HOOK_INSTALLED.call_once(|| {
+                let previous = std::panic::take_hook();
+                std::panic::set_hook(Box::new(move |info| {
+                    if !PANIC_OUTPUT_SILENCED.with(Cell::get) {
+                        previous(info);
+                    }
+                }));
+            });
+            PANIC_OUTPUT_SILENCED.with(|flag| flag.set(true));
+            Self
+        }
+    }
+
+    impl Drop for PanicOutputSilencer {
+        fn drop(&mut self) {
+            PANIC_OUTPUT_SILENCED.with(|flag| flag.set(false));
+        }
+    }
+
+    struct PanickingNotifHandler {
+        yields_first: bool,
+    }
+
+    impl NotificationHandler<UserCreated> for PanickingNotifHandler {
+        type Error = HexeractError;
+
+        async fn handle(
+            &self,
+            _n: Arc<UserCreated>,
+            _ctx: &HandlerContext,
+        ) -> Result<(), Self::Error> {
+            if self.yields_first {
+                tokio::task::yield_now().await;
+            }
+            panic!("boom from handler")
+        }
+    }
+
+    struct LateRecordingNotifHandler {
+        label: &'static str,
+        yields: usize,
+        seen: Arc<Mutex<Vec<(&'static str, u32)>>>,
+    }
+
+    impl NotificationHandler<UserCreated> for LateRecordingNotifHandler {
+        type Error = HexeractError;
+
+        async fn handle(
+            &self,
+            notif: Arc<UserCreated>,
+            _ctx: &HandlerContext,
+        ) -> Result<(), Self::Error> {
+            for _ in 0..self.yields {
+                tokio::task::yield_now().await;
+            }
+            self.seen
+                .lock()
+                .expect("recorder mutex poisoned")
+                .push((self.label, notif.id));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_isolates_a_panicking_notification_handler() {
+        let mediator = MediatorBuilder::new()
+            .register_notification_handler::<UserCreated, _>(PanickingNotifHandler {
+                yields_first: false,
+            })
+            .build()
+            .expect("build must succeed");
+
+        let outcome = {
+            let _silencer = PanicOutputSilencer::new();
+            AssertUnwindSafe(mediator.publish(UserCreated { id: 1 }))
+                .catch_unwind()
+                .await
+        };
+
+        let result = outcome.expect("publish must not unwind when a handler panics");
+        assert!(
+            matches!(result, Err(HexeractError::PublishFailed { total: 1, .. })),
+            "unexpected result: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_lets_siblings_complete_when_a_handler_panics_before_yielding() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mediator = MediatorBuilder::new()
+            .register_notification_handler::<UserCreated, _>(RecordingNotifHandler {
+                label: "first",
+                seen: Arc::clone(&seen),
+            })
+            .register_notification_handler::<UserCreated, _>(PanickingNotifHandler {
+                yields_first: false,
+            })
+            .register_notification_handler::<UserCreated, _>(RecordingNotifHandler {
+                label: "third",
+                seen: Arc::clone(&seen),
+            })
+            .build()
+            .expect("build must succeed");
+
+        let outcome = {
+            let _silencer = PanicOutputSilencer::new();
+            AssertUnwindSafe(mediator.publish(UserCreated { id: 5 }))
+                .catch_unwind()
+                .await
+        };
+
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![("first", 5), ("third", 5)],
+            "every sibling must observe the notification despite the panic"
+        );
+        assert!(
+            matches!(outcome, Ok(Err(HexeractError::PublishFailed { .. }))),
+            "publish must return an aggregated error, not unwind"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_lets_siblings_complete_when_a_handler_panics_after_yielding() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        // The panicking handler is registered first and panics on its second
+        // poll. The siblings need two yields to finish, so they are still in
+        // flight, already polled once, when the panic lands.
+        let mediator = MediatorBuilder::new()
+            .register_notification_handler::<UserCreated, _>(PanickingNotifHandler {
+                yields_first: true,
+            })
+            .register_notification_handler::<UserCreated, _>(LateRecordingNotifHandler {
+                label: "second",
+                yields: 2,
+                seen: Arc::clone(&seen),
+            })
+            .register_notification_handler::<UserCreated, _>(LateRecordingNotifHandler {
+                label: "third",
+                yields: 3,
+                seen: Arc::clone(&seen),
+            })
+            .build()
+            .expect("build must succeed");
+
+        let outcome = {
+            let _silencer = PanicOutputSilencer::new();
+            AssertUnwindSafe(mediator.publish(UserCreated { id: 6 }))
+                .catch_unwind()
+                .await
+        };
+
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![("second", 6), ("third", 6)],
+            "in-flight siblings must complete after a late panic"
+        );
+        assert!(
+            matches!(outcome, Ok(Err(HexeractError::PublishFailed { .. }))),
+            "publish must return an aggregated error, not unwind"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_reports_a_panic_as_a_handler_scoped_failure() {
+        let mediator = MediatorBuilder::new()
+            .register_notification_handler::<UserCreated, _>(AuditHandler)
+            .register_notification_handler::<UserCreated, _>(PanickingNotifHandler {
+                yields_first: false,
+            })
+            .build()
+            .expect("build must succeed");
+
+        let outcome = {
+            let _silencer = PanicOutputSilencer::new();
+            AssertUnwindSafe(mediator.publish(UserCreated { id: 2 }))
+                .catch_unwind()
+                .await
+        };
+        let Ok(Err(HexeractError::PublishFailed {
+            total, failures, ..
+        })) = outcome
+        else {
+            panic!("expected an aggregated PublishFailed, publish unwound or succeeded");
+        };
+
+        assert_eq!(total, 2);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].handler.ends_with("PanickingNotifHandler"));
+        let HexeractError::HandlerPanicked { ref payload, .. } = failures[0].error else {
+            panic!("expected HandlerPanicked, got {:?}", failures[0].error);
+        };
+        assert!(
+            payload.contains("boom from handler"),
+            "the panic message must be preserved, got {payload:?}"
+        );
+    }
+
+    /// Panics with a formatted message, whose payload is a `String` and not a
+    /// `&str`. Every other panicking handler in this module uses a literal,
+    /// so without this one the `String` branch of `panic_message` is never
+    /// exercised and deleting it would leave the suite green.
+    struct FormattedPanicNotifHandler {
+        attempt: u32,
+    }
+
+    impl NotificationHandler<UserCreated> for FormattedPanicNotifHandler {
+        type Error = HexeractError;
+
+        async fn handle(
+            &self,
+            _n: Arc<UserCreated>,
+            _ctx: &HandlerContext,
+        ) -> Result<(), Self::Error> {
+            panic!("boom at attempt {}", self.attempt)
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_recovers_a_formatted_panic_message_in_full() {
+        let mediator = MediatorBuilder::new()
+            .register_notification_handler::<UserCreated, _>(FormattedPanicNotifHandler {
+                attempt: 7,
+            })
+            .build()
+            .expect("build must succeed");
+
+        let outcome = {
+            let _silencer = PanicOutputSilencer::new();
+            AssertUnwindSafe(mediator.publish(UserCreated { id: 3 }))
+                .catch_unwind()
+                .await
+        };
+        let Ok(Err(HexeractError::PublishFailed { ref failures, .. })) = outcome else {
+            panic!("expected an aggregated PublishFailed, publish unwound or succeeded");
+        };
+
+        let HexeractError::HandlerPanicked { ref payload, .. } = failures[0].error else {
+            panic!("expected HandlerPanicked, got {:?}", failures[0].error);
+        };
+        assert_eq!(
+            payload, "boom at attempt 7",
+            "a formatted panic carries a `String` payload and must be recovered in full"
+        );
+    }
+
+    /// Panics before delegating to `next`, so the panic happens inside the
+    /// middleware chain rather than inside a handler. The rustdoc of
+    /// `publish` promises that the chain is covered "middlewares and handler
+    /// alike", and this is what measures that promise.
+    struct PanickingMiddleware;
+
+    impl Middleware for PanickingMiddleware {
+        async fn execute(
+            &self,
+            _envelope: &MessageEnvelope,
+            _ctx: &HandlerContext,
+            _next: Next,
+        ) -> Result<BoxOutput, HexeractError> {
+            panic!("boom from middleware")
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_isolates_a_panicking_middleware() {
+        let mediator = MediatorBuilder::new()
+            .with_middleware(PanickingMiddleware)
+            .register_notification_handler::<UserCreated, _>(AuditHandler)
+            .build()
+            .expect("build must succeed");
+
+        let outcome = {
+            let _silencer = PanicOutputSilencer::new();
+            AssertUnwindSafe(mediator.publish(UserCreated { id: 4 }))
+                .catch_unwind()
+                .await
+        };
+        let Ok(Err(HexeractError::PublishFailed {
+            total,
+            ref failures,
+            ..
+        })) = outcome
+        else {
+            panic!("expected an aggregated PublishFailed, publish unwound or succeeded");
+        };
+
+        assert_eq!(total, 1);
+        assert_eq!(failures.len(), 1);
+        let HexeractError::HandlerPanicked { ref payload, .. } = failures[0].error else {
+            panic!("expected HandlerPanicked, got {:?}", failures[0].error);
+        };
+        assert!(
+            payload.contains("boom from middleware"),
+            "a panic raised inside the middleware chain must be caught too, got {payload:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_keeps_registration_order_when_a_panic_and_a_typed_error_mix() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mediator = MediatorBuilder::new()
+            .register_notification_handler::<UserCreated, _>(FailingNotifHandler)
+            .register_notification_handler::<UserCreated, _>(PanickingNotifHandler {
+                yields_first: true,
+            })
+            .register_notification_handler::<UserCreated, _>(RecordingNotifHandler {
+                label: "third",
+                seen: Arc::clone(&seen),
+            })
+            .build()
+            .expect("build must succeed");
+
+        let outcome = {
+            let _silencer = PanicOutputSilencer::new();
+            AssertUnwindSafe(mediator.publish(UserCreated { id: 3 }))
+                .catch_unwind()
+                .await
+        };
+        let Ok(Err(HexeractError::PublishFailed {
+            total, failures, ..
+        })) = outcome
+        else {
+            panic!("expected an aggregated PublishFailed, publish unwound or succeeded");
+        };
+
+        assert_eq!(total, 3);
+        assert_eq!(failures.len(), 2);
+        assert!(failures[0].handler.ends_with("FailingNotifHandler"));
+        assert!(matches!(failures[0].error, HexeractError::Dispatch(_)));
+        assert!(failures[1].handler.ends_with("PanickingNotifHandler"));
+        assert!(matches!(
+            failures[1].error,
+            HexeractError::HandlerPanicked { .. }
+        ));
+        assert_eq!(seen.lock().unwrap().clone(), vec![("third", 3)]);
+    }
+
+    #[test]
+    fn panic_message_falls_back_for_an_unknown_payload() {
+        let payload = {
+            let _silencer = PanicOutputSilencer::new();
+            std::panic::catch_unwind(|| std::panic::panic_any(42u8))
+                .expect_err("panic_any must unwind")
+        };
+
+        assert_eq!(panic_message(&payload), "unknown panic payload");
+    }
+
+    struct PanickingPingHandler;
+
+    impl CommandHandler<Ping> for PanickingPingHandler {
+        type Error = HexeractError;
+
+        async fn handle(&self, _cmd: Ping, _ctx: &HandlerContext) -> Result<u32, Self::Error> {
+            panic!("boom from command handler")
+        }
+    }
+
+    struct PanickingCountHandler;
+
+    impl QueryHandler<GetCount> for PanickingCountHandler {
+        type Error = HexeractError;
+
+        async fn handle(&self, _q: GetCount, _ctx: &HandlerContext) -> Result<u32, Self::Error> {
+            panic!("boom from query handler")
+        }
+    }
+
+    #[tokio::test]
+    async fn send_and_query_panic_behaviour_is_measured_not_assumed() {
+        let mediator = MediatorBuilder::new()
+            .register_command_handler::<Ping, _>(PanickingPingHandler)
+            .register_query_handler::<GetCount, _>(PanickingCountHandler)
+            .build()
+            .expect("build must succeed");
+
+        let (send_outcome, query_outcome) = {
+            let _silencer = PanicOutputSilencer::new();
+            let send_outcome = AssertUnwindSafe(mediator.send(Ping { value: 1 }))
+                .catch_unwind()
+                .await;
+            let query_outcome = AssertUnwindSafe(mediator.query(GetCount))
+                .catch_unwind()
+                .await;
+            (send_outcome, query_outcome)
+        };
+
+        // Measured on the base tree: neither path isolates a handler panic, so
+        // it unwinds straight through `await` into the caller. This freezes the
+        // observation; it does not endorse it. Fixing it is a separate lot.
+        let send_payload = send_outcome.expect_err("MEASURE: send was expected to unwind");
+        let query_payload = query_outcome.expect_err("MEASURE: query was expected to unwind");
+        assert_eq!(
+            send_payload.downcast_ref::<&str>().copied(),
+            Some("boom from command handler")
+        );
+        assert_eq!(
+            query_payload.downcast_ref::<&str>().copied(),
+            Some("boom from query handler")
         );
     }
 
