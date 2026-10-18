@@ -752,7 +752,7 @@ impl<T: Transport> RequestClient<T> {
             Ok(Ok((envelope, authentication))) => (envelope, authentication),
         };
 
-        match decode_reply::<R>(reply) {
+        match decode_reply::<R>(reply, request_id) {
             Ok(reply) => Ok(AuthenticatedReply {
                 reply,
                 authentication,
@@ -785,7 +785,14 @@ fn reply_inbox_reconnecting() -> crate::BusError {
 /// Checks are ordered from the most structural to the most specific: an
 /// unsupported version makes every later check meaningless, so it comes
 /// first.
-fn decode_reply<R: Request>(reply: BusEnvelope) -> Result<R::Reply, RequestError> {
+///
+/// `request_id` is the identity that resolved the slot, read from the
+/// validated reply header. It is authoritative: a remote failure is reported
+/// under it, never under the identity the untrusted payload names.
+fn decode_reply<R: Request>(
+    reply: BusEnvelope,
+    request_id: RequestId,
+) -> Result<R::Reply, RequestError> {
     match read_protocol_version(&reply) {
         Some(PROTOCOL_VERSION) => {}
         Some(version) => {
@@ -823,9 +830,12 @@ fn decode_reply<R: Request>(reply: BusEnvelope) -> Result<R::Reply, RequestError
             }
             let payload: RemoteErrorPayload = serde_json::from_slice(&reply.payload)
                 .map_err(|error| RequestError::Decode(error.into()))?;
+            if payload.request_id != *request_id.as_uuid() {
+                return Err(RequestError::Protocol(ProtocolViolation::IdentityMismatch));
+            }
             Err(RequestError::Remote {
                 error_type: payload.error_type,
-                request_id: RequestId::from(payload.request_id),
+                request_id,
             })
         }
         _ => Err(RequestError::Protocol(ProtocolViolation::MissingHeader {
@@ -1817,8 +1827,8 @@ mod tests {
     fn decode_reply_defense_in_depth_rejects_a_missing_or_unsupported_protocol_version() {
         let mut missing_version = ok_reply(RequestId::new(), 1);
         missing_version.remove_protocol_header(PROTOCOL_VERSION_HEADER);
-        let error =
-            decode_reply::<Ping>(missing_version).expect_err("missing protocol version header");
+        let error = decode_reply::<Ping>(missing_version, RequestId::new())
+            .expect_err("missing protocol version header");
         assert!(matches!(
             error,
             RequestError::Protocol(ProtocolViolation::MissingHeader {
@@ -1828,8 +1838,8 @@ mod tests {
 
         let mut unsupported_version = ok_reply(RequestId::new(), 1);
         unsupported_version.insert_protocol_header(PROTOCOL_VERSION_HEADER, "99".to_owned());
-        let error =
-            decode_reply::<Ping>(unsupported_version).expect_err("unsupported protocol version");
+        let error = decode_reply::<Ping>(unsupported_version, RequestId::new())
+            .expect_err("unsupported protocol version");
         assert!(matches!(
             error,
             RequestError::Protocol(ProtocolViolation::UnsupportedVersion { version: 99 })
@@ -1840,7 +1850,8 @@ mod tests {
     fn decode_reply_defense_in_depth_rejects_a_missing_or_unrecognized_reply_status() {
         let mut missing_status = ok_reply(RequestId::new(), 1);
         missing_status.remove_protocol_header(REPLY_STATUS_HEADER);
-        let error = decode_reply::<Ping>(missing_status).expect_err("missing reply status header");
+        let error = decode_reply::<Ping>(missing_status, RequestId::new())
+            .expect_err("missing reply status header");
         assert!(matches!(
             error,
             RequestError::Protocol(ProtocolViolation::MissingHeader {
@@ -1850,8 +1861,8 @@ mod tests {
 
         let mut unrecognized_status = ok_reply(RequestId::new(), 1);
         unrecognized_status.insert_protocol_header(REPLY_STATUS_HEADER, "pending".to_owned());
-        let error =
-            decode_reply::<Ping>(unrecognized_status).expect_err("unrecognized reply status");
+        let error = decode_reply::<Ping>(unrecognized_status, RequestId::new())
+            .expect_err("unrecognized reply status");
         assert!(matches!(
             error,
             RequestError::Protocol(ProtocolViolation::MissingHeader {
@@ -1864,7 +1875,8 @@ mod tests {
     fn decode_reply_defense_in_depth_rejects_an_unexpected_reply_message_type() {
         let mut reply = ok_reply(RequestId::new(), 1);
         reply.message_type = "accounts.something_else".to_owned();
-        let error = decode_reply::<Ping>(reply).expect_err("unexpected reply message type");
+        let error = decode_reply::<Ping>(reply, RequestId::new())
+            .expect_err("unexpected reply message type");
         assert!(matches!(
             error,
             RequestError::Protocol(ProtocolViolation::UnexpectedReplyType {
@@ -1902,7 +1914,8 @@ mod tests {
         let mut reply = ok_reply(RequestId::new(), 1);
         reply.payload = b"not json".to_vec();
 
-        let error = decode_reply::<Ping>(reply).expect_err("reply payload is malformed");
+        let error =
+            decode_reply::<Ping>(reply, RequestId::new()).expect_err("reply payload is malformed");
 
         assert!(matches!(
             error,
@@ -1912,15 +1925,131 @@ mod tests {
 
     #[test]
     fn a_malformed_remote_error_payload_surfaces_as_decode() {
-        let mut reply = error_reply(RequestId::new());
+        let request_id = RequestId::new();
+        let mut reply = error_reply(request_id);
         reply.payload = b"not json".to_vec();
 
-        let error = decode_reply::<Ping>(reply).expect_err("remote error payload is malformed");
+        let error =
+            decode_reply::<Ping>(reply, request_id).expect_err("remote error payload is malformed");
 
         assert!(matches!(
             error,
             RequestError::Decode(BusError::Serialization(_))
         ));
+    }
+
+    /// An error reply whose payload names `payload_identity` and whose
+    /// header names `header_identity`, built apart from [`error_reply`] so a
+    /// test can make the two disagree.
+    fn error_reply_naming(
+        header_identity: RequestId,
+        payload_identity: Uuid,
+        error_type: RemoteErrorType,
+    ) -> BusEnvelope {
+        let mut envelope = error_reply(header_identity);
+        envelope.payload = serde_json::to_vec(&RemoteErrorPayload {
+            error_type,
+            request_id: payload_identity,
+        })
+        .expect("payload must serialize");
+        envelope
+    }
+
+    #[test]
+    fn a_coherent_error_reply_decodes_to_a_remote_error_with_that_identity_and_category() {
+        let request_id = RequestId::new();
+        let reply = error_reply_naming(
+            request_id,
+            *request_id.as_uuid(),
+            RemoteErrorType::Unavailable,
+        );
+
+        let error = decode_reply::<Ping>(reply, request_id).expect_err("an error reply");
+
+        assert!(matches!(
+            error,
+            RequestError::Remote {
+                error_type: RemoteErrorType::Unavailable,
+                request_id: reported,
+            } if reported == request_id
+        ));
+    }
+
+    /// The remote failure is reported under the identity that resolved the
+    /// slot, passed in by the caller. The assertion is on the value the
+    /// public error carries, never on the payload's copy.
+    #[test]
+    fn a_remote_error_is_reported_under_the_authoritative_identity() {
+        let authoritative = RequestId::new();
+        let reply = error_reply(authoritative);
+
+        let error = decode_reply::<Ping>(reply, authoritative).expect_err("an error reply");
+
+        let RequestError::Remote { request_id, .. } = error else {
+            panic!("expected a remote error, got {error:?}");
+        };
+        assert_eq!(request_id, authoritative);
+        assert_ne!(request_id.as_uuid(), &Uuid::nil());
+    }
+
+    #[test]
+    fn a_payload_naming_another_identity_is_never_reported_as_a_remote_error() {
+        let authoritative = RequestId::new();
+        let other = Uuid::now_v7();
+        let reply = error_reply_naming(authoritative, other, RemoteErrorType::Internal);
+
+        let error = decode_reply::<Ping>(reply, authoritative).expect_err("a divergent reply");
+
+        assert!(
+            matches!(
+                error,
+                RequestError::Protocol(ProtocolViolation::IdentityMismatch)
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_nil_payload_identity_is_never_reported_as_a_remote_error() {
+        let authoritative = RequestId::new();
+        let reply = error_reply_naming(authoritative, Uuid::nil(), RemoteErrorType::Internal);
+
+        let error = decode_reply::<Ping>(reply, authoritative).expect_err("a nil identity reply");
+
+        assert!(
+            matches!(
+                error,
+                RequestError::Protocol(ProtocolViolation::IdentityMismatch)
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn an_authoritative_identity_other_than_the_payloads_is_a_protocol_violation() {
+        let payload_identity = RequestId::new();
+        let authoritative = RequestId::new();
+        let reply = error_reply(payload_identity);
+
+        let error = decode_reply::<Ping>(reply, authoritative).expect_err("a divergent reply");
+
+        assert!(
+            matches!(
+                error,
+                RequestError::Protocol(ProtocolViolation::IdentityMismatch)
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn an_ok_reply_decodes_without_consulting_any_error_identity() {
+        let reply = ok_reply(RequestId::new(), 5);
+
+        let decoded = decode_reply::<Ping>(reply, RequestId::new())
+            .expect("an ok reply must decode whatever identity is passed");
+
+        assert_eq!(decoded.seq, 5);
     }
 
     /// `accepts` (the registry's gate) and `decode_reply` (the client's
@@ -1985,7 +2114,7 @@ mod tests {
         for (label, envelope) in cases {
             let accepts_is_err = crate::reply_acceptance::accepts(&expectation, &envelope).is_err();
             let decode_is_protocol_violation = matches!(
-                decode_reply::<Ping>(envelope),
+                decode_reply::<Ping>(envelope, request_id),
                 Err(RequestError::Protocol(_))
             );
             assert_eq!(

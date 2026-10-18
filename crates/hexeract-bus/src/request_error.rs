@@ -46,6 +46,15 @@ pub enum ProtocolViolation {
     /// identities are unique for the lifetime of a call.
     #[error("request identity is already in flight")]
     IdentityCollision,
+    /// The error payload names an identity other than the validated header's.
+    ///
+    /// Unreachable through the registry, which refuses such a delivery at the
+    /// acceptance gate and leaves the slot pending. It exists because this
+    /// module revalidates the protocol version and the reply status that the
+    /// gate has already seen, and accepting an envelope known to be
+    /// inconsistent would contradict that same defense in depth.
+    #[error("error payload names an identity other than the reply header's")]
+    IdentityMismatch,
 }
 
 /// Failure of a request-reply round trip observed by the caller.

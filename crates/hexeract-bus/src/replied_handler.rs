@@ -814,6 +814,53 @@ mod tests {
         );
     }
 
+    /// The producer invariant: the identity of a failed call is written
+    /// twice, in the header and in the payload, and both writes must carry
+    /// the inbound request identity. Each location is asserted against the
+    /// known value, not against the other, so a mutation that nils either
+    /// one is caught on its own.
+    #[tokio::test]
+    async fn a_failing_handler_publishes_the_inbound_identity_in_header_and_payload() {
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let erased = RepliedHandler::new(Boom, Arc::clone(&publisher));
+        let request_id = RequestId::new();
+        let request = request_envelope_with_id(Some("amq.gen-inbox"), request_id);
+
+        erased.handle(&request, &ctx()).await.unwrap();
+
+        let reply = publisher.last_published().expect("an error reply");
+        let header_identity = reply
+            .header(REQUEST_ID_HEADER)
+            .expect("the error reply must carry the identity header");
+        assert_eq!(header_identity, request_id.to_string());
+        assert_ne!(header_identity, Uuid::nil().to_string());
+
+        let payload: RemoteErrorPayload = serde_json::from_slice(&reply.payload).unwrap();
+        assert_eq!(payload.request_id, *request_id.as_uuid());
+        assert_ne!(payload.request_id, Uuid::nil());
+    }
+
+    /// Both identity locations of an error reply are read back as the same
+    /// value, so no producer path can publish a reply the acceptance gate
+    /// would refuse as an identity mismatch.
+    #[tokio::test]
+    async fn the_header_and_payload_identities_of_an_error_reply_agree() {
+        let publisher = Arc::new(RecordingReplyPublisher::default());
+        let erased = RepliedHandler::new(Boom, Arc::clone(&publisher));
+        let request = request_envelope_with_id(Some("amq.gen-inbox"), RequestId::new());
+
+        erased.handle(&request, &ctx()).await.unwrap();
+
+        let reply = publisher.last_published().expect("an error reply");
+        let header_identity: Uuid = reply
+            .header(REQUEST_ID_HEADER)
+            .expect("the error reply must carry the identity header")
+            .parse()
+            .expect("the header identity must be a uuid");
+        let payload: RemoteErrorPayload = serde_json::from_slice(&reply.payload).unwrap();
+        assert_eq!(payload.request_id, header_identity);
+    }
+
     /// Security assertion, not a serialization test: no fragment of an
     /// internal failure message may cross the boundary, on any channel of
     /// the envelope, headers and `message_type` included, not only the
