@@ -32,9 +32,12 @@ use hexeract_bus::KeyId;
 use hexeract_bus::Message;
 use hexeract_bus::PROTOCOL_VERSION;
 use hexeract_bus::PROTOCOL_VERSION_HEADER;
+use hexeract_bus::REPLY_ERROR_MESSAGE_TYPE;
+use hexeract_bus::REPLY_STATUS_ERROR;
 use hexeract_bus::REPLY_STATUS_HEADER;
 use hexeract_bus::REPLY_STATUS_OK;
 use hexeract_bus::REQUEST_ID_HEADER;
+use hexeract_bus::RemoteErrorPayload;
 use hexeract_bus::RemoteErrorType;
 use hexeract_bus::ReplyExpectation;
 use hexeract_bus::ReplyInboxState;
@@ -945,6 +948,157 @@ async fn a_forged_reply_published_into_the_inbox_does_not_end_the_call() {
         .expect("the legitimate reply must win");
     assert_eq!(reply.seq, 1);
     assert_eq!(registry.counters().invalid, 1);
+
+    cancel.cancel();
+    let _ = worker_handle.await;
+    let _ = inbox_handle.await;
+}
+
+/// Publish a forged *error* reply into `inbox`, as [`publish_forged_reply`]
+/// does for a nominal one, with a correct `x-hexeract-request-id` header
+/// and a caller-chosen `payload`.
+///
+/// The message type, status and protocol version are the genuine ones for
+/// an error reply, so the only thing wrong with the delivery is what the
+/// payload says, or whether it can be read at all.
+async fn publish_forged_error_reply(
+    channel: &Channel,
+    inbox: &str,
+    request_id: &str,
+    payload: &[u8],
+) {
+    channel
+        .confirm_select(ConfirmSelectOptions::default())
+        .await
+        .expect("confirm select must succeed");
+
+    let mut headers = FieldTable::default();
+    headers.insert(
+        ShortString::from(PROTOCOL_VERSION_HEADER),
+        AMQPValue::LongString(PROTOCOL_VERSION.to_string().into()),
+    );
+    headers.insert(
+        ShortString::from(REPLY_STATUS_HEADER),
+        AMQPValue::LongString(REPLY_STATUS_ERROR.into()),
+    );
+    headers.insert(
+        ShortString::from(REQUEST_ID_HEADER),
+        AMQPValue::LongString(request_id.into()),
+    );
+    let properties = BasicProperties::default()
+        .with_type(REPLY_ERROR_MESSAGE_TYPE.into())
+        .with_correlation_id(Uuid::now_v7().to_string().into())
+        .with_headers(headers);
+
+    let confirmation = channel
+        .basic_publish(
+            ShortString::from(""),
+            ShortString::from(inbox),
+            BasicPublishOptions::default(),
+            payload,
+            properties,
+        )
+        .await
+        .expect("forged error publish must be accepted")
+        .await
+        .expect("forged error publish confirmation must resolve");
+    assert!(
+        matches!(confirmation, Confirmation::Ack(None)),
+        "the forged error reply must be durably queued before the test proceeds, got {confirmation:?}"
+    );
+}
+
+/// The identity-divergence counterpart of
+/// `a_forged_reply_published_into_the_inbox_does_not_end_the_call`, proven
+/// on the wire.
+///
+/// Three forged error replies carry the caller's real identity in the
+/// header and a wrong payload: another identity, the nil identity a peer
+/// produces by omission, and bytes that do not decode. Each must be refused
+/// at the acceptance gate, leaving the slot pending, so the legitimate and
+/// deliberately slow responder started afterward still wins the call.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn a_forged_error_reply_with_a_divergent_payload_identity_does_not_end_the_call() {
+    let broker = harness::start_rabbitmq().await;
+    let cancel = CancellationToken::new();
+
+    declare_ping_queue(broker.uri(), "tests.ping").await;
+
+    let registry = Arc::new(RequestRegistry::default());
+    let inbox_connection =
+        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+            .await
+            .unwrap();
+    let inbox_channel = inbox_connection.create_channel().await.unwrap();
+    let inbox = declare_reply_inbox_for_test(&inbox_channel).await.unwrap();
+    let reply_inbox = Arc::new(Mutex::new(ReplyInboxState::Ready(inbox.clone())));
+    let inbox_cancel = cancel.clone();
+    let inbox_registry = Arc::clone(&registry);
+    let inbox_name = inbox.clone();
+    let inbox_handle = tokio::spawn(async move {
+        let _ =
+            run_reply_inbox_for_test(inbox_channel, inbox_name, inbox_registry, inbox_cancel).await;
+    });
+
+    let publisher_transport = Arc::new(RecordingTransport::new(
+        RabbitMqTransport::new(broker.uri()).await.unwrap(),
+    ));
+    let client = RequestClient::new(
+        Arc::clone(&publisher_transport),
+        Arc::clone(&registry),
+        reply_inbox,
+        Duration::from_secs(10),
+        RequestClientSupervisor::detached(cancel.clone()),
+    );
+
+    let call = tokio::spawn(async move { client.request(Ping { seq: 1 }).await });
+
+    let request_id = wait_for_recorded_request_id(&publisher_transport).await;
+
+    let forger_connection = RabbitMqConnection::connect(broker.uri()).await.unwrap();
+    let forger_channel = forger_connection.create_channel().await.unwrap();
+    let forged_payloads: Vec<Vec<u8>> = vec![
+        serde_json::to_vec(&RemoteErrorPayload {
+            error_type: RemoteErrorType::Internal,
+            request_id: Uuid::now_v7(),
+        })
+        .unwrap(),
+        serde_json::to_vec(&RemoteErrorPayload {
+            error_type: RemoteErrorType::Internal,
+            request_id: Uuid::nil(),
+        })
+        .unwrap(),
+        b"not json at all".to_vec(),
+    ];
+    for payload in &forged_payloads {
+        publish_forged_error_reply(&forger_channel, &inbox, &request_id, payload).await;
+    }
+
+    let responder_transport = Arc::new(RabbitMqTransport::new(broker.uri()).await.unwrap());
+    let worker = RabbitMqWorkerBuilder::new(
+        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+            .await
+            .unwrap(),
+    )
+    .queue("tests.ping")
+    .register_request_handler::<Ping, _>(
+        SlowEcho {
+            delay: Duration::from_millis(400),
+        },
+        Arc::clone(&responder_transport),
+    )
+    .build()
+    .unwrap();
+    let worker_cancel = cancel.clone();
+    let worker_handle = tokio::spawn(async move { worker.run(worker_cancel).await });
+
+    let reply = call
+        .await
+        .expect("task panicked")
+        .expect("the legitimate reply must win over the forged error replies");
+    assert_eq!(reply.seq, 1);
+    assert_eq!(registry.counters().invalid, 3);
 
     cancel.cancel();
     let _ = worker_handle.await;

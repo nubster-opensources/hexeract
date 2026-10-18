@@ -335,7 +335,9 @@ impl RequestRegistry {
             }
             Entry::Occupied(mut entry) => {
                 if let Err(rejection) =
-                    reply_acceptance::accepts(&entry.get().expectation, &envelope)
+                    reply_acceptance::accepts(&entry.get().expectation, &envelope).and_then(|()| {
+                        reply_acceptance::accepts_error_identity(&envelope, request_id)
+                    })
                 {
                     let slot = entry.get_mut();
                     slot.last_rejection = Some(rejection);
@@ -1618,5 +1620,218 @@ mod tests {
             "a straggler beyond the documented retirement capacity must be orphaned again"
         );
         assert_eq!(registry.counters().late, 0);
+    }
+
+    /// An error reply whose header names `header_identity` and whose payload
+    /// names `payload_identity`. Both are free: the helper builds the
+    /// disagreement the acceptance gate must refuse, and the agreement it
+    /// must let through.
+    fn error_reply_naming(header_identity: RequestId, payload_identity: Uuid) -> BusEnvelope {
+        let payload = crate::remote_error::RemoteErrorPayload {
+            error_type: crate::remote_error::RemoteErrorType::Internal,
+            request_id: payload_identity,
+        };
+        error_reply_with_payload(
+            header_identity,
+            serde_json::to_vec(&payload).expect("payload must serialize"),
+        )
+    }
+
+    fn error_reply_with_payload(header_identity: RequestId, payload: Vec<u8>) -> BusEnvelope {
+        let mut envelope = BusEnvelope::restore(
+            Uuid::now_v7(),
+            crate::rpc_protocol::REPLY_ERROR_MESSAGE_TYPE.to_owned(),
+            payload,
+            Uuid::now_v7(),
+            None,
+            HashMap::default(),
+            std::time::SystemTime::now(),
+        );
+        envelope.insert_protocol_header(
+            crate::rpc_protocol::PROTOCOL_VERSION_HEADER,
+            crate::rpc_protocol::PROTOCOL_VERSION.to_string(),
+        );
+        envelope.insert_protocol_header(
+            crate::rpc_protocol::REPLY_STATUS_HEADER,
+            crate::rpc_protocol::REPLY_STATUS_ERROR.to_owned(),
+        );
+        envelope.insert_protocol_header(REQUEST_ID_HEADER, header_identity.to_string());
+        envelope
+    }
+
+    /// The four effects of a refused delivery, asserted together: the slot
+    /// is still there, the rejection is recorded, the slot counter moved,
+    /// and the operator counter credited is `invalid` and no other.
+    fn assert_refused_and_left_pending(
+        registry: &RequestRegistry,
+        pending: &PendingReply<'_>,
+        expected_rejection: ReplyRejection,
+    ) {
+        assert_eq!(registry.len(), 1, "the slot must survive the refusal");
+        assert_eq!(pending.last_rejection(), Some(expected_rejection));
+        assert_eq!(pending.rejected_deliveries(), 1);
+        let counters = registry.counters();
+        assert_eq!(counters.invalid, 1);
+        assert_eq!(counters.undecodable, 0);
+        assert_eq!(counters.orphaned, 0);
+        assert_eq!(counters.unauthenticated, 0);
+        assert_eq!(counters.duplicate, 0);
+        assert_eq!(counters.late, 0);
+    }
+
+    #[test]
+    fn an_error_reply_naming_another_identity_is_refused_and_leaves_the_slot_pending() {
+        let registry = Arc::new(RequestRegistry::default());
+        let pending = registry
+            .register(RequestId::new(), expectation())
+            .expect("registration succeeds");
+
+        registry.resolve(
+            error_reply_naming(pending.request_id(), Uuid::now_v7()),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+
+        assert_refused_and_left_pending(&registry, &pending, ReplyRejection::IdentityMismatch);
+    }
+
+    #[test]
+    fn an_error_reply_with_a_nil_payload_identity_is_refused_and_leaves_the_slot_pending() {
+        let registry = Arc::new(RequestRegistry::default());
+        let pending = registry
+            .register(RequestId::new(), expectation())
+            .expect("registration succeeds");
+
+        registry.resolve(
+            error_reply_naming(pending.request_id(), Uuid::nil()),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+
+        assert_refused_and_left_pending(&registry, &pending, ReplyRejection::IdentityMismatch);
+    }
+
+    #[test]
+    fn an_error_reply_with_an_undecodable_payload_is_refused_and_leaves_the_slot_pending() {
+        let registry = Arc::new(RequestRegistry::default());
+        let pending = registry
+            .register(RequestId::new(), expectation())
+            .expect("registration succeeds");
+
+        registry.resolve(
+            error_reply_with_payload(pending.request_id(), b"not json at all".to_vec()),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+
+        assert_refused_and_left_pending(
+            &registry,
+            &pending,
+            ReplyRejection::UndecodableErrorPayload,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_valid_reply_wins_after_an_error_reply_naming_another_identity() {
+        let registry = Arc::new(RequestRegistry::default());
+        let mut pending = registry
+            .register(RequestId::new(), pong_expectation())
+            .expect("registration succeeds");
+        let request_id = pending.request_id();
+
+        registry.resolve(
+            error_reply_naming(request_id, Uuid::nil()),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+        assert_eq!(
+            pending.last_rejection(),
+            Some(ReplyRejection::IdentityMismatch)
+        );
+
+        registry.resolve(
+            reply_for(request_id, Uuid::now_v7(), 42),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+
+        let (envelope, _authentication) = pending
+            .wait()
+            .await
+            .expect("the legitimate reply must still win after the refused error reply");
+        let reply: Pong = envelope.decode().expect("decode");
+        assert_eq!(reply.seq, 42);
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_valid_reply_wins_after_an_error_reply_with_an_undecodable_payload() {
+        let registry = Arc::new(RequestRegistry::default());
+        let mut pending = registry
+            .register(RequestId::new(), pong_expectation())
+            .expect("registration succeeds");
+        let request_id = pending.request_id();
+
+        registry.resolve(
+            error_reply_with_payload(request_id, b"{".to_vec()),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+        assert_eq!(
+            pending.last_rejection(),
+            Some(ReplyRejection::UndecodableErrorPayload)
+        );
+
+        registry.resolve(
+            reply_for(request_id, Uuid::now_v7(), 7),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+
+        let (envelope, _authentication) = pending
+            .wait()
+            .await
+            .expect("the legitimate reply must still win after the refused error reply");
+        let reply: Pong = envelope.decode().expect("decode");
+        assert_eq!(reply.seq, 7);
+    }
+
+    #[tokio::test]
+    async fn a_coherent_error_reply_wins_after_a_forged_one_naming_another_identity() {
+        let registry = Arc::new(RequestRegistry::default());
+        let mut pending = registry
+            .register(RequestId::new(), pong_expectation())
+            .expect("registration succeeds");
+        let request_id = pending.request_id();
+
+        registry.resolve(
+            error_reply_naming(request_id, Uuid::now_v7()),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+        registry.resolve(
+            error_reply_naming(request_id, *request_id.as_uuid()),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+
+        let (envelope, _authentication) = pending
+            .wait()
+            .await
+            .expect("the coherent error reply must resolve the call");
+        assert_eq!(
+            envelope.message_type,
+            crate::rpc_protocol::REPLY_ERROR_MESSAGE_TYPE
+        );
+        assert_eq!(registry.len(), 0);
+        assert_eq!(registry.counters().invalid, 1);
+    }
+
+    #[test]
+    fn a_coherent_error_reply_is_not_counted_as_refused() {
+        let registry = Arc::new(RequestRegistry::default());
+        let pending = registry
+            .register(RequestId::new(), expectation())
+            .expect("registration succeeds");
+        let request_id = pending.request_id();
+
+        registry.resolve(
+            error_reply_naming(request_id, *request_id.as_uuid()),
+            Ok(ReplyAuthentication::NotEnforced),
+        );
+
+        assert_eq!(registry.counters().invalid, 0);
+        assert_eq!(pending.rejected_deliveries(), 0);
     }
 }

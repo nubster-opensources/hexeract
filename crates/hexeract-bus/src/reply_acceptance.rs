@@ -3,10 +3,18 @@
 //! Kept free of the registry, the transport and the async runtime so the
 //! protocol rules can be tested on their own. The registry calls this before
 //! consuming a slot, so an invalid delivery never terminates a legitimate
-//! call. Payload decoding stays on the client side: it depends on the
-//! caller's generic reply type, which the registry does not know.
+//! call.
+//!
+//! Decoding a *nominal* reply payload stays on the client side: it depends on
+//! the caller's generic reply type, which the registry does not know. The
+//! error payload is different in kind. It is a protocol type, identical for
+//! every call, so the rule that its identity must not contradict the header
+//! can be enforced here, before a slot is consumed, rather than after.
+
+use hexeract_core::RequestId;
 
 use crate::BusEnvelope;
+use crate::remote_error::RemoteErrorPayload;
 use crate::reply_rejection_kind::ReplyRejectionKind;
 use crate::rpc_protocol::{
     PROTOCOL_VERSION, REPLY_ERROR_MESSAGE_TYPE, REPLY_STATUS_ERROR, REPLY_STATUS_HEADER,
@@ -57,6 +65,16 @@ pub enum ReplyRejection {
     /// the caller, which may log it or forward it. The detailed cause stays
     /// in the transport's own `debug!`, on the side that observed it.
     Unauthenticated,
+    /// The error payload could not be decoded at all.
+    ///
+    /// Kept apart from [`ReplyRejection::IdentityMismatch`] because the two
+    /// name different incidents: broken encoding points at a defective peer,
+    /// a renamed identity at a hostile one or at a responder bug. Unlike
+    /// [`ReplyRejection::Unauthenticated`], telling them apart builds no
+    /// oracle: the sender already knows what it sent.
+    UndecodableErrorPayload,
+    /// The error payload names an identity other than the header's.
+    IdentityMismatch,
 }
 
 impl ReplyRejection {
@@ -69,7 +87,9 @@ impl ReplyRejection {
             | ReplyRejection::UnsupportedVersion { .. }
             | ReplyRejection::MissingStatus
             | ReplyRejection::UnknownStatus
-            | ReplyRejection::UnexpectedType => ReplyRejectionKind::Invalid,
+            | ReplyRejection::UnexpectedType
+            | ReplyRejection::UndecodableErrorPayload
+            | ReplyRejection::IdentityMismatch => ReplyRejectionKind::Invalid,
         }
     }
 }
@@ -109,6 +129,41 @@ pub fn accepts(
         }
         Some(_) => Err(ReplyRejection::UnknownStatus),
         None => Err(ReplyRejection::MissingStatus),
+    }
+}
+
+/// Whether the error payload of `envelope` names `expected`.
+///
+/// The header identity is authoritative: it is what resolves the slot, and
+/// what reply authentication covers. The payload copy may only agree with it.
+/// A delivery refused here leaves the slot pending, so the legitimate reply
+/// can still arrive and win.
+///
+/// Returns `Ok(())` for any reply that is not an error: there is then no
+/// payload identity able to contradict the header. Run this after
+/// [`accepts`], which has already established that an error status carries
+/// the error message type.
+///
+/// # Errors
+///
+/// Returns [`ReplyRejection::UndecodableErrorPayload`] if the payload does
+/// not decode, or [`ReplyRejection::IdentityMismatch`] if it names another
+/// identity, including a nil one.
+pub fn accepts_error_identity(
+    envelope: &BusEnvelope,
+    expected: RequestId,
+) -> Result<(), ReplyRejection> {
+    if envelope.header(REPLY_STATUS_HEADER) != Some(REPLY_STATUS_ERROR) {
+        return Ok(());
+    }
+
+    let payload: RemoteErrorPayload = serde_json::from_slice(&envelope.payload)
+        .map_err(|_| ReplyRejection::UndecodableErrorPayload)?;
+
+    if payload.request_id == *expected.as_uuid() {
+        Ok(())
+    } else {
+        Err(ReplyRejection::IdentityMismatch)
     }
 }
 
@@ -245,6 +300,8 @@ mod tests {
             ReplyRejection::MissingStatus,
             ReplyRejection::UnknownStatus,
             ReplyRejection::UnexpectedType,
+            ReplyRejection::UndecodableErrorPayload,
+            ReplyRejection::IdentityMismatch,
         ];
 
         for rejection in shape_rejections {
@@ -254,5 +311,112 @@ mod tests {
                 "expected {rejection:?} to map to Invalid"
             );
         }
+    }
+
+    fn error_envelope_with_payload(payload: Vec<u8>) -> BusEnvelope {
+        let mut envelope = envelope(
+            REPLY_ERROR_MESSAGE_TYPE,
+            Some(PROTOCOL_VERSION),
+            Some(REPLY_STATUS_ERROR),
+        );
+        envelope.payload = payload;
+        envelope
+    }
+
+    fn error_envelope_naming(payload_identity: uuid::Uuid) -> BusEnvelope {
+        let payload = RemoteErrorPayload {
+            error_type: crate::remote_error::RemoteErrorType::Internal,
+            request_id: payload_identity,
+        };
+        error_envelope_with_payload(serde_json::to_vec(&payload).unwrap())
+    }
+
+    #[test]
+    fn an_error_payload_naming_the_expected_identity_is_accepted() {
+        let expected = RequestId::new();
+        let envelope = error_envelope_naming(*expected.as_uuid());
+
+        assert_eq!(accepts_error_identity(&envelope, expected), Ok(()));
+    }
+
+    #[test]
+    fn an_error_payload_naming_another_identity_is_refused_as_a_mismatch() {
+        let expected = RequestId::new();
+        let envelope = error_envelope_naming(uuid::Uuid::now_v7());
+
+        assert_eq!(
+            accepts_error_identity(&envelope, expected),
+            Err(ReplyRejection::IdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn a_nil_identity_in_the_error_payload_is_refused_as_a_mismatch() {
+        let expected = RequestId::new();
+        let envelope = error_envelope_naming(uuid::Uuid::nil());
+
+        assert_eq!(
+            accepts_error_identity(&envelope, expected),
+            Err(ReplyRejection::IdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn an_undecodable_error_payload_is_refused_apart_from_a_mismatch() {
+        let expected = RequestId::new();
+        let envelope = error_envelope_with_payload(b"not json at all".to_vec());
+
+        assert_eq!(
+            accepts_error_identity(&envelope, expected),
+            Err(ReplyRejection::UndecodableErrorPayload)
+        );
+    }
+
+    #[test]
+    fn an_empty_error_payload_is_refused_as_undecodable() {
+        let expected = RequestId::new();
+        let envelope = error_envelope_with_payload(Vec::new());
+
+        assert_eq!(
+            accepts_error_identity(&envelope, expected),
+            Err(ReplyRejection::UndecodableErrorPayload)
+        );
+    }
+
+    #[test]
+    fn an_error_payload_missing_its_identity_field_is_refused_as_undecodable() {
+        let expected = RequestId::new();
+        let envelope = error_envelope_with_payload(br#"{"error_type":"Internal"}"#.to_vec());
+
+        assert_eq!(
+            accepts_error_identity(&envelope, expected),
+            Err(ReplyRejection::UndecodableErrorPayload)
+        );
+    }
+
+    #[test]
+    fn an_ok_reply_passes_the_identity_check_without_its_payload_being_read() {
+        let expected = RequestId::new();
+        let mut envelope = envelope(
+            EXPECTED_REPLY,
+            Some(PROTOCOL_VERSION),
+            Some(REPLY_STATUS_OK),
+        );
+        envelope.payload = b"\xff\xfe not an error payload".to_vec();
+
+        assert_eq!(accepts_error_identity(&envelope, expected), Ok(()));
+    }
+
+    #[test]
+    fn an_ok_reply_naming_no_identity_in_its_payload_passes_the_identity_check() {
+        let expected = RequestId::new();
+        let mut envelope = envelope(
+            EXPECTED_REPLY,
+            Some(PROTOCOL_VERSION),
+            Some(REPLY_STATUS_OK),
+        );
+        envelope.payload = serde_json::to_vec(&uuid::Uuid::nil()).unwrap();
+
+        assert_eq!(accepts_error_identity(&envelope, expected), Ok(()));
     }
 }
