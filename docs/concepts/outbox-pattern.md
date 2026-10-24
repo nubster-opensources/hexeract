@@ -46,7 +46,7 @@ sequenceDiagram
 | **Atomicity** with business state | Strict. The outbox row is inserted in the caller's transaction. |
 | **Delivery** | At-least-once. Handlers must be idempotent. |
 | **Ordering per aggregate** | Optional, via `subject_id`. Events sharing a `subject_id` are polled in `event_id` order. |
-| **Multi-worker safety** | `SELECT ... FOR UPDATE SKIP LOCKED` lets an arbitrary number of workers consume the same outbox without double-dispatching. |
+| **Multi-worker safety** | `SELECT ... FOR UPDATE SKIP LOCKED` (PostgreSQL, MySQL), together with a claim and settlements fenced on `attempts`, lets an arbitrary number of workers consume the same outbox without double-dispatching. SQLite relies on the fence alone: correct, but single-writer. |
 | **Crash recovery** | PostgreSQL and MySQL release the row lock automatically on worker crash (`SELECT ... FOR UPDATE SKIP LOCKED`); the next poll picks the envelope up. SQLite uses a soft lease that expires after its configured duration before another worker can reclaim the row. |
 
 ## What an outbox is NOT

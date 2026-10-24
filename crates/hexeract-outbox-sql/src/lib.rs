@@ -24,6 +24,7 @@ compile_error!(
 /// SQL dialect differences absorbed by the backend stores.
 pub mod dialect;
 mod envelope;
+mod fence;
 #[doc(hidden)]
 pub mod identifier;
 mod pool;

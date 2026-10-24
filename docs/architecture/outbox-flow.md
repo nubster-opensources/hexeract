@@ -79,7 +79,7 @@ sequenceDiagram
 | Atomic publication | Strict: `publish_in_tx` enrols the insert in the caller's transaction. If the business tx rolls back, the event is gone. |
 | Dispatch | At-least-once. Handlers MUST be idempotent. |
 | Partial ordering by subject | Events sharing a `subject_id` are polled in `id` order; the partial index `idx_<table>_subject` keeps the lookup cheap. |
-| Multi-worker safety | `SELECT ... FOR UPDATE SKIP LOCKED` prevents double dispatch across an arbitrary number of concurrent workers. |
+| Multi-worker safety | `SELECT ... FOR UPDATE SKIP LOCKED` (PostgreSQL, MySQL), together with a claim and settlements fenced on `attempts`, prevents double dispatch across an arbitrary number of concurrent workers. SQLite relies on the fence alone: correct, but single-writer. |
 | Retry | Bounded exponential backoff with full jitter: `min(retry_max_delay, retry_base_delay x 2^n)`; defaults `retry_base_delay = 1 s`, `retry_max_delay = 300 s`. |
 | Backpressure | The worker reads at most `batch_size` rows per poll and sleeps `poll_interval` between empty polls. Sustained throughput scales horizontally by adding workers. |
 

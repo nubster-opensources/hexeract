@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -58,73 +59,106 @@ pub trait OutboxStore: Send + Sync + 'static {
         max_attempts: u32,
     ) -> Result<Vec<OutboxEnvelope>, OutboxError>;
 
-    /// Mark an envelope as successfully delivered.
+    /// Mark an envelope as successfully delivered, if the caller still owns the
+    /// claim.
+    ///
+    /// `claimed_attempt` is the attempt number this caller's [`Self::claim`]
+    /// wrote, that is `OutboxEnvelope::attempts + 1` as read from the polled
+    /// batch. The update applies only while the stored `attempts` still equals it
+    /// and the envelope is not already delivered.
+    ///
+    /// Returns `false` when no row matched: the lease was lost and a newer owner
+    /// holds the envelope. This is not an error; the caller leaves the newer
+    /// outcome untouched.
+    ///
+    /// A backend that does not override [`Self::claim`] takes no lease and has no
+    /// fence to check: it ignores `claimed_attempt` and returns `true`.
     async fn mark_delivered<'a>(
         &self,
         tx: &mut Self::Tx<'a>,
         event_id: Uuid,
-    ) -> Result<(), OutboxError>;
+        claimed_attempt: u32,
+    ) -> Result<bool, OutboxError>;
 
     /// Mark an envelope as failed, recording the error and the backoff delay
-    /// before the next retry.
+    /// before the next retry, if the caller still owns the claim.
     ///
     /// `retry_in` is the delay from *now*; the backend adds it to its own
     /// database clock when persisting `next_retry_at`, so retry scheduling is
     /// not affected by skew between the worker host and the database host.
-    /// The attempt counter is advanced by [`Self::claim`], not here.
+    ///
+    /// The attempt counter is advanced by [`Self::claim`], not here. That is
+    /// what lets `claimed_attempt` fence this call: a settlement that moved the
+    /// counter would move its own fence.
+    ///
+    /// Same fencing contract as [`Self::mark_delivered`].
     async fn mark_failed<'a>(
         &self,
         tx: &mut Self::Tx<'a>,
         event_id: Uuid,
         error: &str,
         retry_in: Duration,
-    ) -> Result<(), OutboxError>;
+        claimed_attempt: u32,
+    ) -> Result<bool, OutboxError>;
 
     /// Commit the transaction.
     async fn commit<'a>(&self, tx: Self::Tx<'a>) -> Result<(), OutboxError>;
 
-    /// Move an envelope that has exhausted its retry budget to the dead-letter store.
+    /// Move an envelope that has exhausted its retry budget to the dead-letter
+    /// store, if the caller still owns the claim.
     ///
-    /// Called by the worker after [`Self::mark_failed`] when
-    /// `attempts + 1 >= max_attempts`. The default implementation is a no-op so
-    /// backends that do not persist dead-lettered envelopes need not override it.
-    /// Called within the same transaction as `mark_failed`: both succeed or both
-    /// roll back.
+    /// Called by the worker only after [`Self::mark_failed`] has returned
+    /// `true`, within the same transaction as `mark_failed`: both succeed or
+    /// both roll back. The default implementation is a no-op returning `true`,
+    /// so backends that do not persist dead-lettered envelopes need not
+    /// override it.
     async fn mark_dead_lettered<'a>(
         &self,
         _tx: &mut Self::Tx<'a>,
         _event_id: Uuid,
         _error: &str,
-    ) -> Result<(), OutboxError> {
-        Ok(())
+        _claimed_attempt: u32,
+    ) -> Result<bool, OutboxError> {
+        Ok(true)
     }
 
-    /// Claim a batch of envelopes: advance the soft lease and consume one
-    /// retry slot.
+    /// Claim a batch of envelopes: advance the soft lease and consume one retry
+    /// slot, for the envelopes this caller still finds at the attempt count it
+    /// polled.
     ///
-    /// Called within the same transaction as [`Self::poll`], immediately
-    /// after the batch is fetched. The backend sets `next_retry_at` to its own
+    /// Called within the same transaction as [`Self::poll`], immediately after
+    /// the batch is fetched. The backend sets `next_retry_at` to its own
     /// database clock plus `lease_for` (so the lease window is immune to
     /// app/DB clock skew) and increments `attempts` by one. The worker commits
-    /// the transaction right after this call so `FOR UPDATE SKIP LOCKED`
-    /// row-level locks are released promptly. Competing workers skip envelopes
-    /// whose `next_retry_at` is in the future, so the claiming worker can
-    /// dispatch outside the lock without risking concurrent re-delivery.
+    /// the transaction right after this call so row-level locks are released
+    /// promptly. Competing workers skip envelopes whose `next_retry_at` is in
+    /// the future, so the claiming worker can dispatch outside the lock
+    /// without risking concurrent re-delivery.
     ///
-    /// Incrementing `attempts` here (rather than only on failure) is what
-    /// makes a worker crash between claim and acknowledgement safe: the
-    /// attempt is already counted, so a poison envelope eventually reaches the
-    /// dead-letter threshold instead of being redelivered forever.
+    /// Incrementing `attempts` here (rather than only on failure) is what makes
+    /// a worker crash between claim and acknowledgement safe: the attempt is
+    /// already counted, so a poison envelope eventually reaches the dead-letter
+    /// threshold instead of being redelivered forever. It is also what makes
+    /// the counter usable as a lease token, since no settlement writes it.
     ///
-    /// The default implementation is a no-op. Backends that neither lease nor
-    /// track attempts in storage need not override it.
+    /// `claims` pairs each candidate's `event_id` with the `attempts` value read
+    /// by [`Self::poll`]. The update applies to a row only while its stored
+    /// `attempts` still equals that value, so two workers that polled the same
+    /// row before either claimed it cannot both believe they hold it. This is
+    /// what `FOR UPDATE SKIP LOCKED` already guarantees on the dialects that
+    /// support it, enforced on the write instead of on the read so it holds on
+    /// every dialect.
+    ///
+    /// Returns the `event_id`s actually claimed; the caller dispatches only
+    /// those. A backend that takes no lease returns every candidate, which the
+    /// default implementation does.
     async fn claim<'a>(
         &self,
         _tx: &mut Self::Tx<'a>,
-        _event_ids: &[Uuid],
+        claims: &[(Uuid, u32)],
         _lease_for: Duration,
-    ) -> Result<(), OutboxError> {
-        Ok(())
+    ) -> Result<Vec<Uuid>, OutboxError> {
+        Ok(claims.iter().map(|(event_id, _)| *event_id).collect())
     }
 }
 
@@ -409,14 +443,27 @@ where
                 .store
                 .poll(&mut tx, self.config.batch_size, self.config.max_attempts)
                 .await?;
-            if !batch.is_empty() {
-                let ids: Vec<Uuid> = batch.iter().map(|e| e.event_id).collect();
-                self.store
-                    .claim(&mut tx, &ids, self.lease_for(ids.len()))
+            let claimed = if batch.is_empty() {
+                batch
+            } else {
+                let claims: Vec<(Uuid, u32)> =
+                    batch.iter().map(|e| (e.event_id, e.attempts)).collect();
+                let obtained = self
+                    .store
+                    .claim(&mut tx, &claims, self.lease_for(claims.len()))
                     .await?;
-            }
+                // An envelope read by the poll but not obtained by the claim
+                // belongs to another worker: it is neither dispatched nor
+                // reported, because losing that race is a normal outcome of
+                // concurrent consumers.
+                let obtained: HashSet<Uuid> = obtained.into_iter().collect();
+                batch
+                    .into_iter()
+                    .filter(|envelope| obtained.contains(&envelope.event_id))
+                    .collect()
+            };
             self.store.commit(tx).await?;
-            batch
+            claimed
         };
         let count = envelopes.len();
 
@@ -463,9 +510,13 @@ where
             Ok(()) => {
                 let mut client = self.store.acquire().await?;
                 let mut tx = self.store.begin(&mut client).await?;
-                self.store
-                    .mark_delivered(&mut tx, envelope.event_id)
+                let applied = self
+                    .store
+                    .mark_delivered(&mut tx, envelope.event_id, envelope.attempts + 1)
                     .await?;
+                if !applied {
+                    warn_lease_lost(envelope, "delivery");
+                }
                 self.store.commit(tx).await?;
             }
             Err(err) => {
@@ -479,19 +530,40 @@ where
                 let retry_in = self.config.next_retry_delay(envelope.attempts);
                 let mut client = self.store.acquire().await?;
                 let mut tx = self.store.begin(&mut client).await?;
-                self.store
-                    .mark_failed(&mut tx, envelope.event_id, &message, retry_in)
+                let recorded = self
+                    .store
+                    .mark_failed(
+                        &mut tx,
+                        envelope.event_id,
+                        &message,
+                        retry_in,
+                        envelope.attempts + 1,
+                    )
                     .await?;
-                if envelope.attempts + 1 >= self.config.max_attempts {
+                if !recorded {
+                    // Dead-lettering after a refused failure would remove an
+                    // envelope that a newer owner holds, and may already have
+                    // delivered.
+                    warn_lease_lost(envelope, "failure");
+                } else if envelope.attempts + 1 >= self.config.max_attempts {
                     tracing::error!(
                         event_id = %envelope.event_id,
                         event_type = %envelope.event_type,
                         attempts = envelope.attempts + 1,
                         "outbox envelope exhausted retry budget, moving to dead letter"
                     );
-                    self.store
-                        .mark_dead_lettered(&mut tx, envelope.event_id, &message)
+                    let moved = self
+                        .store
+                        .mark_dead_lettered(
+                            &mut tx,
+                            envelope.event_id,
+                            &message,
+                            envelope.attempts + 1,
+                        )
                         .await?;
+                    if !moved {
+                        warn_lease_lost(envelope, "dead-lettering");
+                    }
                 }
                 self.store.commit(tx).await?;
             }
@@ -547,6 +619,20 @@ where
             }
         }
     }
+}
+
+/// Report that a settlement was refused because a newer owner holds the
+/// envelope.
+///
+/// A lost lease is an operational fact, not a worker failure: the newer
+/// owner's outcome stands and the cycle carries on.
+fn warn_lease_lost(envelope: &OutboxEnvelope, settlement: &'static str) {
+    tracing::warn!(
+        event_id = %envelope.event_id,
+        event_type = %envelope.event_type,
+        settlement,
+        "outbox settlement not applied: the lease was lost to a newer owner"
+    );
 }
 
 #[cfg(test)]
@@ -784,8 +870,9 @@ mod tests {
             &self,
             _tx: &mut Self::Tx<'a>,
             _event_id: Uuid,
-        ) -> Result<(), OutboxError> {
-            Ok(())
+            _claimed_attempt: u32,
+        ) -> Result<bool, OutboxError> {
+            Ok(true)
         }
 
         async fn mark_failed<'a>(
@@ -794,8 +881,9 @@ mod tests {
             _event_id: Uuid,
             _error: &str,
             _retry_in: Duration,
-        ) -> Result<(), OutboxError> {
-            Ok(())
+            _claimed_attempt: u32,
+        ) -> Result<bool, OutboxError> {
+            Ok(true)
         }
 
         async fn commit<'a>(&self, _tx: Self::Tx<'a>) -> Result<(), OutboxError> {
@@ -959,7 +1047,8 @@ mod tests {
             &self,
             _tx: &mut Self::Tx<'a>,
             event_id: Uuid,
-        ) -> Result<(), OutboxError> {
+            _claimed_attempt: u32,
+        ) -> Result<bool, OutboxError> {
             {
                 let mut slot = self.fail_mark_delivered_for.lock().unwrap();
                 if *slot == Some(event_id) {
@@ -968,7 +1057,7 @@ mod tests {
                 }
             }
             self.delivered.lock().unwrap().push(event_id);
-            Ok(())
+            Ok(true)
         }
 
         async fn mark_failed<'a>(
@@ -977,12 +1066,13 @@ mod tests {
             event_id: Uuid,
             error: &str,
             _retry_in: Duration,
-        ) -> Result<(), OutboxError> {
+            _claimed_attempt: u32,
+        ) -> Result<bool, OutboxError> {
             self.failed
                 .lock()
                 .unwrap()
                 .push((event_id, error.to_owned()));
-            Ok(())
+            Ok(true)
         }
 
         async fn mark_dead_lettered<'a>(
@@ -990,9 +1080,10 @@ mod tests {
             _tx: &mut Self::Tx<'a>,
             event_id: Uuid,
             _error: &str,
-        ) -> Result<(), OutboxError> {
+            _claimed_attempt: u32,
+        ) -> Result<bool, OutboxError> {
             self.dead_lettered.lock().unwrap().push(event_id);
-            Ok(())
+            Ok(true)
         }
 
         async fn commit<'a>(&self, _tx: Self::Tx<'a>) -> Result<(), OutboxError> {
@@ -1002,14 +1093,15 @@ mod tests {
         async fn claim<'a>(
             &self,
             _tx: &mut Self::Tx<'a>,
-            event_ids: &[Uuid],
+            claims: &[(Uuid, u32)],
             _lease_for: Duration,
-        ) -> Result<(), OutboxError> {
+        ) -> Result<Vec<Uuid>, OutboxError> {
             if self.fail_claim.load(Ordering::Relaxed) {
                 return Err(OutboxError::Internal("claim failed".into()));
             }
-            self.claimed.lock().unwrap().extend_from_slice(event_ids);
-            Ok(())
+            let event_ids: Vec<Uuid> = claims.iter().map(|(event_id, _)| *event_id).collect();
+            self.claimed.lock().unwrap().extend_from_slice(&event_ids);
+            Ok(event_ids)
         }
     }
 
@@ -1447,5 +1539,464 @@ mod tests {
         assert_eq!(worker.lease_for(10), Duration::from_secs(300));
         // An empty batch is never claimed, but the helper must stay safe.
         assert_eq!(worker.lease_for(0), Duration::from_secs(30));
+    }
+
+    /// Writer handed to a tracing subscriber so a test can read what was logged.
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogBuffer {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+
+        /// Lines logged at warning level or above that mention `event_id`.
+        fn warning_lines_mentioning(&self, event_id: Uuid) -> usize {
+            let needle = event_id.to_string();
+            self.text()
+                .lines()
+                .filter(|line| line.contains(&needle))
+                .filter(|line| line.contains("WARN") || line.contains("ERROR"))
+                .count()
+        }
+    }
+
+    /// Capture everything the worker logs at warning level or above, for as
+    /// long as the returned guard lives. The subscriber is thread local, so it
+    /// only sees a worker driven on the test's own task.
+    fn capture_warnings() -> (LogBuffer, tracing::subscriber::DefaultGuard) {
+        let buffer = LogBuffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        (buffer, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// Store that simulates a lease lost to another worker.
+    ///
+    /// It can refuse to grant part of a claim, and it can report any
+    /// settlement as not applied, which is what a real backend returns when
+    /// the stored attempt no longer matches the caller's fence.
+    /// One call to `claim`: the candidates paired with the attempts they were polled at.
+    type ClaimRequest = Vec<(Uuid, u32)>;
+
+    #[derive(Clone)]
+    struct FencedStore {
+        pending: Arc<Mutex<Vec<OutboxEnvelope>>>,
+        granted_claims: Option<Vec<Uuid>>,
+        delivery_applies: bool,
+        failure_applies: bool,
+        dead_lettering_applies: bool,
+        claim_requests: Arc<Mutex<Vec<ClaimRequest>>>,
+        delivered_calls: Arc<Mutex<Vec<(Uuid, u32)>>>,
+        failed_calls: Arc<Mutex<Vec<(Uuid, u32)>>>,
+        dead_letter_calls: Arc<Mutex<Vec<(Uuid, u32)>>>,
+    }
+
+    impl FencedStore {
+        fn new(initial: Vec<OutboxEnvelope>) -> Self {
+            Self {
+                pending: Arc::new(Mutex::new(initial)),
+                granted_claims: None,
+                delivery_applies: true,
+                failure_applies: true,
+                dead_lettering_applies: true,
+                claim_requests: Arc::new(Mutex::new(Vec::new())),
+                delivered_calls: Arc::new(Mutex::new(Vec::new())),
+                failed_calls: Arc::new(Mutex::new(Vec::new())),
+                dead_letter_calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        /// Grant the claim only for `event_ids`: the others were won by
+        /// another worker between the poll and the claim.
+        fn granting_only(mut self, event_ids: Vec<Uuid>) -> Self {
+            self.granted_claims = Some(event_ids);
+            self
+        }
+
+        fn losing_the_delivery_lease(mut self) -> Self {
+            self.delivery_applies = false;
+            self
+        }
+
+        fn losing_the_failure_lease(mut self) -> Self {
+            self.failure_applies = false;
+            self
+        }
+
+        fn losing_the_dead_lettering_lease(mut self) -> Self {
+            self.dead_lettering_applies = false;
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OutboxStore for FencedStore {
+        type Client = MockClient;
+        type Tx<'tx> = MockTx;
+
+        async fn acquire(&self) -> Result<Self::Client, OutboxError> {
+            Ok(MockClient)
+        }
+
+        async fn begin<'a>(
+            &self,
+            _client: &'a mut Self::Client,
+        ) -> Result<Self::Tx<'a>, OutboxError> {
+            Ok(MockTx)
+        }
+
+        async fn poll<'a>(
+            &self,
+            _tx: &mut Self::Tx<'a>,
+            batch_size: usize,
+            _max_attempts: u32,
+        ) -> Result<Vec<OutboxEnvelope>, OutboxError> {
+            let mut pending = self.pending.lock().unwrap();
+            let take = batch_size.min(pending.len());
+            Ok(pending.drain(..take).collect())
+        }
+
+        async fn mark_delivered<'a>(
+            &self,
+            _tx: &mut Self::Tx<'a>,
+            event_id: Uuid,
+            claimed_attempt: u32,
+        ) -> Result<bool, OutboxError> {
+            self.delivered_calls
+                .lock()
+                .unwrap()
+                .push((event_id, claimed_attempt));
+            Ok(self.delivery_applies)
+        }
+
+        async fn mark_failed<'a>(
+            &self,
+            _tx: &mut Self::Tx<'a>,
+            event_id: Uuid,
+            _error: &str,
+            _retry_in: Duration,
+            claimed_attempt: u32,
+        ) -> Result<bool, OutboxError> {
+            self.failed_calls
+                .lock()
+                .unwrap()
+                .push((event_id, claimed_attempt));
+            Ok(self.failure_applies)
+        }
+
+        async fn mark_dead_lettered<'a>(
+            &self,
+            _tx: &mut Self::Tx<'a>,
+            event_id: Uuid,
+            _error: &str,
+            claimed_attempt: u32,
+        ) -> Result<bool, OutboxError> {
+            self.dead_letter_calls
+                .lock()
+                .unwrap()
+                .push((event_id, claimed_attempt));
+            Ok(self.dead_lettering_applies)
+        }
+
+        async fn commit<'a>(&self, _tx: Self::Tx<'a>) -> Result<(), OutboxError> {
+            Ok(())
+        }
+
+        async fn claim<'a>(
+            &self,
+            _tx: &mut Self::Tx<'a>,
+            claims: &[(Uuid, u32)],
+            _lease_for: Duration,
+        ) -> Result<Vec<Uuid>, OutboxError> {
+            self.claim_requests.lock().unwrap().push(claims.to_vec());
+            Ok(claims
+                .iter()
+                .map(|(event_id, _)| *event_id)
+                .filter(|event_id| {
+                    self.granted_claims
+                        .as_ref()
+                        .is_none_or(|granted| granted.contains(event_id))
+                })
+                .collect())
+        }
+    }
+
+    /// Run exactly one poll cycle of a worker over `store`.
+    async fn run_one_cycle(
+        store: &FencedStore,
+        handler: Arc<dyn ErasedHandler>,
+        config: OutboxWorkerConfig,
+    ) -> Result<usize, OutboxError> {
+        let worker = OutboxWorker::new(store.clone(), registry_with(vec![handler]), config);
+        worker.poll_cycle(&CancellationToken::new()).await
+    }
+
+    fn recording_handler() -> (Arc<dyn ErasedHandler>, Arc<Mutex<Vec<Uuid>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let handler: Arc<dyn ErasedHandler> = Arc::new(TypedHandler::new(RecordingHandler {
+            seen: Arc::clone(&seen),
+        }));
+        (handler, seen)
+    }
+
+    fn failing_handler() -> Arc<dyn ErasedHandler> {
+        Arc::new(TypedHandler::new(FailingHandler))
+    }
+
+    fn single_attempt_config() -> OutboxWorkerConfig {
+        OutboxWorkerConfig {
+            max_attempts: 1,
+            batch_size: 10,
+            ..OutboxWorkerConfig::default()
+        }
+    }
+
+    /// Guard for the token itself (criteria 1 to 3 rely on it): the fence the
+    /// worker presents is the attempt it polled plus the one its claim wrote.
+    #[tokio::test]
+    async fn worker_fences_with_the_polled_attempts_plus_one() {
+        let mut delivered = fresh_envelope(Uuid::from_u128(1));
+        delivered.attempts = 3;
+        let mut failed = fresh_envelope(Uuid::from_u128(2));
+        failed.attempts = 3;
+        let delivered_id = delivered.event_id;
+        let failed_id = failed.event_id;
+
+        let store = FencedStore::new(vec![delivered]);
+        let (handler, _seen) = recording_handler();
+        run_one_cycle(&store, handler, OutboxWorkerConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.claim_requests.lock().unwrap().as_slice(),
+            &[vec![(delivered_id, 3)]],
+            "claim must present the attempts value read by the poll"
+        );
+        assert_eq!(
+            store.delivered_calls.lock().unwrap().as_slice(),
+            &[(delivered_id, 4)]
+        );
+
+        let store = FencedStore::new(vec![failed]);
+        run_one_cycle(&store, failing_handler(), OutboxWorkerConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.failed_calls.lock().unwrap().as_slice(),
+            &[(failed_id, 4)]
+        );
+    }
+
+    /// Criterion 4: a `mark_failed` that reports `false` forbids
+    /// `mark_dead_lettered`. A worker whose lease expired would otherwise
+    /// dead-letter an envelope that another worker holds, and may already
+    /// have delivered.
+    #[tokio::test]
+    async fn lost_failure_settlement_forbids_dead_lettering() {
+        let envelope = fresh_envelope(Uuid::from_u128(1));
+        let store = FencedStore::new(vec![envelope]).losing_the_failure_lease();
+
+        let outcome = run_one_cycle(&store, failing_handler(), single_attempt_config()).await;
+
+        assert!(outcome.is_ok());
+        assert_eq!(
+            store.failed_calls.lock().unwrap().len(),
+            1,
+            "the failure settlement must have been attempted"
+        );
+        assert!(
+            store.dead_letter_calls.lock().unwrap().is_empty(),
+            "mark_dead_lettered must not run after mark_failed returned false"
+        );
+    }
+
+    /// Control for criterion 4: when the failure does apply, an exhausted
+    /// envelope is dead-lettered with the same fence.
+    #[tokio::test]
+    async fn applied_failure_settlement_still_dead_letters_an_exhausted_envelope() {
+        let envelope = fresh_envelope(Uuid::from_u128(1));
+        let event_id = envelope.event_id;
+        let store = FencedStore::new(vec![envelope]);
+
+        run_one_cycle(&store, failing_handler(), single_attempt_config())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.dead_letter_calls.lock().unwrap().as_slice(),
+            &[(event_id, 1)]
+        );
+    }
+
+    /// Criterion 6: an envelope read by the poll but not returned by the
+    /// claim belongs to another worker. It is not dispatched, not settled,
+    /// and not logged as a problem: that is a normal concurrent batch.
+    #[tokio::test]
+    async fn worker_does_not_dispatch_an_envelope_the_claim_did_not_return() {
+        let owned = fresh_envelope(Uuid::from_u128(1));
+        let taken = fresh_envelope(Uuid::from_u128(2));
+        let owned_id = owned.event_id;
+        let taken_id = taken.event_id;
+        let store = FencedStore::new(vec![owned, taken]).granting_only(vec![owned_id]);
+        let (handler, seen) = recording_handler();
+        let (logs, _guard) = capture_warnings();
+
+        run_one_cycle(&store, handler, OutboxWorkerConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[Uuid::from_u128(1)],
+            "only the envelope the claim returned may reach the handler"
+        );
+        assert_eq!(
+            store.delivered_calls.lock().unwrap().as_slice(),
+            &[(owned_id, 1)],
+            "only the claimed envelope may be settled"
+        );
+        assert_eq!(
+            logs.warning_lines_mentioning(taken_id),
+            0,
+            "losing a claim to another worker is not worth a warning"
+        );
+    }
+
+    /// Criterion 6, failure side: an unclaimed envelope is not settled as
+    /// failed either, whatever its handler would have done.
+    #[tokio::test]
+    async fn unclaimed_envelope_is_never_settled_as_failed() {
+        let envelope = fresh_envelope(Uuid::from_u128(1));
+        let event_id = envelope.event_id;
+        let store = FencedStore::new(vec![envelope]).granting_only(Vec::new());
+        let (logs, _guard) = capture_warnings();
+
+        let outcome = run_one_cycle(&store, failing_handler(), single_attempt_config()).await;
+
+        assert!(outcome.is_ok());
+        assert!(store.failed_calls.lock().unwrap().is_empty());
+        assert!(store.dead_letter_calls.lock().unwrap().is_empty());
+        assert_eq!(logs.warning_lines_mentioning(event_id), 0);
+    }
+
+    /// Criterion 8: a delivery that did not apply is observable through a
+    /// warning naming the envelope, is not an error, and still counts as a
+    /// processed envelope.
+    #[tokio::test]
+    async fn lost_delivery_lease_is_warned_and_counted_as_processed() {
+        let first = fresh_envelope(Uuid::from_u128(1));
+        let second = fresh_envelope(Uuid::from_u128(2));
+        let first_id = first.event_id;
+        let second_id = second.event_id;
+        let store = FencedStore::new(vec![first, second]).losing_the_delivery_lease();
+        let (handler, _seen) = recording_handler();
+        let (logs, _guard) = capture_warnings();
+
+        let outcome = run_one_cycle(&store, handler, OutboxWorkerConfig::default()).await;
+
+        assert_eq!(outcome.unwrap(), 2, "both envelopes were dequeued");
+        assert_eq!(
+            store.delivered_calls.lock().unwrap().len(),
+            2,
+            "the rest of the batch is still settled after a lost lease"
+        );
+        assert!(
+            logs.warning_lines_mentioning(first_id) >= 1,
+            "a lost delivery lease must be logged as a warning naming the envelope"
+        );
+        assert!(logs.warning_lines_mentioning(second_id) >= 1);
+    }
+
+    /// Criterion 8, failure side. The handler failure already logs one
+    /// warning for the envelope, so the lost lease must add a second.
+    #[tokio::test]
+    async fn lost_failure_lease_is_warned_and_counted_as_processed() {
+        let envelope = fresh_envelope(Uuid::from_u128(1));
+        let event_id = envelope.event_id;
+        let store = FencedStore::new(vec![envelope]).losing_the_failure_lease();
+        let (logs, _guard) = capture_warnings();
+
+        let outcome = run_one_cycle(&store, failing_handler(), OutboxWorkerConfig::default()).await;
+
+        assert_eq!(outcome.unwrap(), 1);
+        let warnings = logs
+            .text()
+            .lines()
+            .filter(|line| line.contains(&event_id.to_string()) && line.contains("WARN"))
+            .count();
+        assert!(
+            warnings >= 2,
+            "the handler failure and the lost lease must each be warned, got: {}",
+            logs.text()
+        );
+    }
+
+    /// Criterion 8, dead-letter side: the failure applied but the move to the
+    /// dead-letter store did not. The warning is distinct from the handler
+    /// failure and from the retry-budget error.
+    #[tokio::test]
+    async fn lost_dead_lettering_lease_is_warned_and_counted_as_processed() {
+        let envelope = fresh_envelope(Uuid::from_u128(1));
+        let event_id = envelope.event_id;
+        let store = FencedStore::new(vec![envelope]).losing_the_dead_lettering_lease();
+        let (logs, _guard) = capture_warnings();
+
+        let outcome = run_one_cycle(&store, failing_handler(), single_attempt_config()).await;
+
+        assert_eq!(outcome.unwrap(), 1);
+        assert_eq!(store.dead_letter_calls.lock().unwrap().len(), 1);
+        let warnings = logs
+            .text()
+            .lines()
+            .filter(|line| line.contains(&event_id.to_string()) && line.contains("WARN"))
+            .count();
+        assert!(
+            warnings >= 2,
+            "the handler failure and the lost dead-lettering lease must each be warned, got: {}",
+            logs.text()
+        );
+    }
+
+    /// Criterion 9: a store that takes no lease ignores the fence. The
+    /// default `claim` hands back every candidate whatever attempt it carries,
+    /// and the default `mark_dead_lettered` applies whatever fence it is given.
+    #[tokio::test]
+    async fn store_without_a_lease_ignores_the_fence() {
+        let store = PacingStore::new(Vec::new());
+        let mut tx = MockTx;
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+
+        let claimed = store
+            .claim(&mut tx, &[(first, 0), (second, 9)], Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(claimed, vec![first, second]);
+
+        for fence in [0, 7, u32::MAX] {
+            assert!(
+                store
+                    .mark_dead_lettered(&mut tx, first, "error", fence)
+                    .await
+                    .unwrap(),
+                "the default dead-lettering must ignore claimed_attempt {fence}"
+            );
+        }
     }
 }

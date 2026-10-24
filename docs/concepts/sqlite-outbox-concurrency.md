@@ -17,29 +17,32 @@ many workers as you need.
 ## SQLite is single-writer
 
 SQLite has no row-level `SKIP LOCKED`. It serializes writes through a single
-writer and exposes no way for one poller to claim a subset of pending rows while
-another poller claims a different subset. If two workers poll the same SQLite
-database, both can read the same pending rows before either marks them
-delivered, and the same envelope is dispatched more than once.
+writer and exposes no way for one poller to lock a subset of pending rows while
+another poller locks a different subset. If two workers poll the same SQLite
+database, both can read the same pending rows before either has claimed them.
 
-The SQLite store does implement `claim`, but only to advance the soft lease and
-count the attempt at claim time (so a worker that crashes between claim and
-acknowledgement does not redeliver a poison row forever). It is **not** a
-competing-consumer claim: without `SKIP LOCKED` there is nothing to stop a
-second poller from reading the same rows, so the single-worker rule below still
-holds.
+Correctness does not depend on the poll, though. The SQLite store's `claim`
+matches every candidate on the `attempts` value it was polled at, in a single
+conditional `UPDATE ... RETURNING` for the whole batch. Of two workers that
+polled the same row, only the first to write gets it: the second finds
+`attempts` already advanced, is not served that row, and does not dispatch it.
+Settlements (`mark_delivered`, `mark_failed` and the dead-lettering) are fenced
+the same way, so a worker whose lease was taken over cannot overwrite the newer
+owner's outcome. Several workers can therefore share one SQLite database
+without dispatching an envelope twice, as long as handlers finish within the
+lease (`dispatch_timeout`).
 
-Because of this, the SQLite backend assumes **one `OutboxWorker` per database**.
-This matches how SQLite is normally used: a single process, embedded or in
-tests, rather than a shared server fronting many workers.
+This makes SQLite fan-out **correct**, not **fast**. SQLite stays
+single-writer, so competing workers take turns on the write lock and added
+workers do not add throughput:
 
-- Run exactly one `SqliteOutboxWorkerBuilder::build()` worker against a given
-  SQLite database.
 - Configure `busy_timeout` on the pool so concurrent writes (for example a
-  publisher inserting while the worker marks rows delivered) wait for the lock
-  instead of failing with `SQLITE_BUSY`.
-- When you need competing-consumers fan-out across many workers, use the
-  PostgreSQL or MySQL backend.
+  publisher inserting while workers claim or mark rows delivered) wait for the
+  lock instead of failing with `SQLITE_BUSY`.
+- A worker that loses the race for a row simply moves on; its poll is wasted
+  work, which is the cost of having no `SKIP LOCKED`.
+- When you need throughput from many workers, use the PostgreSQL or MySQL
+  backend. The reason is performance, no longer correctness.
 
 The poll statement for SQLite therefore omits the `FOR UPDATE SKIP LOCKED`
 clause that the other two dialects emit.
