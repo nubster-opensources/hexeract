@@ -215,7 +215,9 @@ backend_scenarios!(
 /// client sets `CLIENT_FOUND_ROWS`. If the driver counted changed rows, the
 /// second call would report `false` and the worker would log a lost lease that
 /// never happened. The database clock is frozen on a single connection so the
-/// computed `next_retry_at` is identical across both calls.
+/// computed `next_retry_at` is identical across both calls. That connection is
+/// acquired once and reused, because asking a single-connection pool for a
+/// second client while the first is still held would deadlock.
 #[tokio::test]
 #[ignore = "runs in the integration workflow"]
 async fn mark_failed_with_identical_values_under_a_valid_lease_still_reports_applied() {
@@ -248,7 +250,6 @@ async fn mark_failed_with_identical_values_under_a_valid_lease_still_reports_app
     assert_eq!(claimed, vec![event_id]);
 
     for call in ["first", "second"] {
-        let mut client = store.acquire().await.expect("acquire");
         let mut tx = store.begin(&mut client).await.expect("begin");
         let applied = store
             .mark_failed(&mut tx, event_id, "same error", Duration::from_secs(60), 1)
