@@ -483,8 +483,15 @@ pub(crate) async fn publish_with_properties(
 }
 
 /// How long a scenario waits for a handler to reach an expected call count
-/// before it fails, chosen for the slowest supported runner rather than for
-/// a quiet machine.
+/// before it fails.
+///
+/// This is a safety net, not the measurement. A correct worker reaches the
+/// count long before this elapses, and no assertion reads this value: a
+/// scenario that depended on it would be timing dependent again. It is chosen
+/// for the slowest supported runner rather than for a quiet machine, because a
+/// timeout that is never reached costs nothing while one that is occasionally
+/// reached costs a rerun, and teaches whoever sees it to rerun without
+/// reading.
 pub(crate) const PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A handler call counter a scenario can await, so a test waits for the call
