@@ -12,6 +12,8 @@
     reason = "not every test binary in this crate uses every helper"
 )]
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use hexeract_bus::BusEnvelope;
@@ -31,6 +33,7 @@ use testcontainers::core::IntoContainerPort;
 use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::rabbitmq::RabbitMq;
+use tokio::sync::Notify;
 
 /// A running RabbitMQ test container, kept alive for the container's
 /// AMQP URI to stay reachable.
@@ -477,4 +480,77 @@ pub(crate) async fn publish_with_properties(
         .expect("publish must succeed")
         .await
         .expect("publish confirmation must resolve");
+}
+
+/// How long a scenario waits for a handler to reach an expected call count
+/// before it fails, chosen for the slowest supported runner rather than for
+/// a quiet machine.
+pub(crate) const PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A handler call counter a scenario can await, so a test waits for the call
+/// it cares about instead of for a duration.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CallCounter {
+    calls: Arc<AtomicUsize>,
+    progress: Arc<Notify>,
+}
+
+impl CallCounter {
+    /// A counter that has recorded nothing yet.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Calls recorded so far.
+    pub(crate) fn count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    /// Record one call and wake every scenario awaiting this counter.
+    pub(crate) fn record(&self) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.progress.notify_waiters();
+    }
+
+    /// Record one call and report how many calls preceded it.
+    ///
+    /// A handler that must behave differently on its first call branches on
+    /// this value. Reading [`Self::count`] and then calling [`Self::record`]
+    /// would be two steps, and two concurrent deliveries could both observe
+    /// the same count and both take the first-call branch.
+    pub(crate) fn record_and_count_preceding(&self) -> usize {
+        let preceding = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.progress.notify_waiters();
+        preceding
+    }
+
+    /// Wait until at least `expected` calls have been recorded.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `expected` is not reached within [`PROGRESS_TIMEOUT`],
+    /// naming the count actually seen.
+    pub(crate) async fn await_count(&self, expected: usize) {
+        let wait = async {
+            loop {
+                // Register the waiter before reading the count, so a
+                // notification fired between the two is not lost. `notified()`
+                // alone only builds the future: it does not enqueue the waiter
+                // until first polled, so `enable()` is what closes the window.
+                let notified = self.progress.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.count() >= expected {
+                    return;
+                }
+                notified.await;
+            }
+        };
+        let outcome = tokio::time::timeout(PROGRESS_TIMEOUT, wait).await;
+        assert!(
+            outcome.is_ok(),
+            "timed out after {PROGRESS_TIMEOUT:?} waiting for {expected} handler call(s), saw {}",
+            self.count()
+        );
+    }
 }

@@ -372,7 +372,7 @@ async fn ensure_topology_declares_exchange_queue_and_binding() {
 
 #[derive(Debug, Default)]
 struct RecordingHandler {
-    seen: Arc<AtomicUsize>,
+    seen: harness::CallCounter,
 }
 
 impl Handler<OrderPlaced> for RecordingHandler {
@@ -383,7 +383,7 @@ impl Handler<OrderPlaced> for RecordingHandler {
         _message: OrderPlaced,
         _ctx: &HandlerContext,
     ) -> Result<(), Self::Error> {
-        self.seen.fetch_add(1, Ordering::SeqCst);
+        self.seen.record();
         Ok(())
     }
 }
@@ -707,7 +707,7 @@ async fn a_security_rejection_is_dead_lettered_without_its_headers() {
 
 #[derive(Debug)]
 struct FailOnceHandler {
-    attempts: Arc<AtomicUsize>,
+    attempts: harness::CallCounter,
 }
 
 impl Handler<OrderPlaced> for FailOnceHandler {
@@ -718,8 +718,7 @@ impl Handler<OrderPlaced> for FailOnceHandler {
         _message: OrderPlaced,
         _ctx: &HandlerContext,
     ) -> Result<(), Self::Error> {
-        let n = self.attempts.fetch_add(1, Ordering::SeqCst);
-        if n == 0 {
+        if self.attempts.record_and_count_preceding() == 0 {
             Err(hexeract_bus::BusError::Internal(
                 "first attempt fails".to_owned(),
             ))
@@ -731,7 +730,7 @@ impl Handler<OrderPlaced> for FailOnceHandler {
 
 #[derive(Debug)]
 struct TimestampingFailingHandler {
-    attempts: Arc<AtomicUsize>,
+    attempts: harness::CallCounter,
     seen_at: Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
 }
 
@@ -743,7 +742,7 @@ impl Handler<OrderPlaced> for TimestampingFailingHandler {
         _message: OrderPlaced,
         _ctx: &HandlerContext,
     ) -> Result<(), Self::Error> {
-        self.attempts.fetch_add(1, Ordering::SeqCst);
+        self.attempts.record();
         self.seen_at
             .lock()
             .expect("timestamp mutex must not be poisoned")
@@ -755,7 +754,7 @@ impl Handler<OrderPlaced> for TimestampingFailingHandler {
 }
 
 struct PanickingHandler {
-    seen_after: Arc<AtomicUsize>,
+    seen_after: harness::CallCounter,
 }
 
 impl Handler<OrderPlaced> for PanickingHandler {
@@ -766,7 +765,7 @@ impl Handler<OrderPlaced> for PanickingHandler {
             msg.order_id != Uuid::from_u128(0),
             "deliberate panic in handler"
         );
-        self.seen_after.fetch_add(1, Ordering::SeqCst);
+        self.seen_after.record();
         Ok(())
     }
 }
@@ -781,7 +780,7 @@ impl Handler<OrderPlaced> for PanickingHandler {
 struct ConcurrencyProbeHandler {
     live: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
-    completed: Arc<AtomicUsize>,
+    completed: harness::CallCounter,
     work: Duration,
 }
 
@@ -797,7 +796,7 @@ impl Handler<OrderPlaced> for ConcurrencyProbeHandler {
         self.peak.fetch_max(current, Ordering::SeqCst);
         tokio::time::sleep(self.work).await;
         self.live.fetch_sub(1, Ordering::SeqCst);
-        self.completed.fetch_add(1, Ordering::SeqCst);
+        self.completed.record();
         Ok(())
     }
 }
@@ -891,7 +890,7 @@ async fn unacknowledged_worker_bounds_in_flight_deliveries_with_max_buffered() {
 
     let live = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
-    let completed = Arc::new(AtomicUsize::new(0));
+    let completed = harness::CallCounter::new();
     let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let worker = RabbitMqWorkerBuilder::new(consumer_conn)
         .queue(queue_name)
@@ -900,7 +899,7 @@ async fn unacknowledged_worker_bounds_in_flight_deliveries_with_max_buffered() {
         .register_handler::<OrderPlaced, _>(ConcurrencyProbeHandler {
             live: Arc::clone(&live),
             peak: Arc::clone(&peak),
-            completed: Arc::clone(&completed),
+            completed: completed.clone(),
             work: Duration::from_millis(100),
         })
         .build()
@@ -910,17 +909,11 @@ async fn unacknowledged_worker_bounds_in_flight_deliveries_with_max_buffered() {
     let cancel_for_task = cancel.clone();
     let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
 
-    // Let several batches drain so the peak has time to reach the bound.
-    for _ in 0..200 {
-        if completed.load(Ordering::SeqCst) >= MESSAGE_COUNT {
-            break;
-        }
-        assert!(
-            live.load(Ordering::SeqCst) <= MAX_BUFFERED,
-            "in-flight deliveries must never exceed max_buffered while running"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    // Let every batch drain so the peak has time to reach the bound. The
+    // bound itself is proven below by `peak`, which the handler raises with
+    // `fetch_max` on every entry: asserting on `live` here would observe a
+    // drained queue and pass whatever the worker did.
+    completed.await_count(MESSAGE_COUNT).await;
 
     cancel.cancel();
     handle
@@ -957,13 +950,11 @@ async fn worker_dispatches_envelope_and_acks_on_success() {
         .await
         .unwrap();
 
-    let seen = Arc::new(AtomicUsize::new(0));
+    let seen = harness::CallCounter::new();
     let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let worker = RabbitMqWorkerBuilder::new(consumer_conn)
         .queue(queue_name)
-        .register_handler::<OrderPlaced, _>(RecordingHandler {
-            seen: Arc::clone(&seen),
-        })
+        .register_handler::<OrderPlaced, _>(RecordingHandler { seen: seen.clone() })
         .build()
         .unwrap();
 
@@ -971,13 +962,8 @@ async fn worker_dispatches_envelope_and_acks_on_success() {
     let cancel_for_task = cancel.clone();
     let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
 
-    for _ in 0..40 {
-        if seen.load(Ordering::SeqCst) >= 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(seen.load(Ordering::SeqCst), 1);
+    seen.await_count(1).await;
+    assert_eq!(seen.count(), 1, "the handler must run exactly once");
 
     cancel.cancel();
     handle
@@ -1004,14 +990,14 @@ async fn worker_retries_on_failure_then_succeeds() {
         .await
         .unwrap();
 
-    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts = harness::CallCounter::new();
     let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let worker = RabbitMqWorkerBuilder::new(consumer_conn)
         .queue(queue_name)
         .max_attempts(5)
         .retry_delay(Duration::from_millis(200))
         .register_handler::<OrderPlaced, _>(FailOnceHandler {
-            attempts: Arc::clone(&attempts),
+            attempts: attempts.clone(),
         })
         .build()
         .unwrap();
@@ -1020,13 +1006,12 @@ async fn worker_retries_on_failure_then_succeeds() {
     let cancel_for_task = cancel.clone();
     let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
 
-    for _ in 0..60 {
-        if attempts.load(Ordering::SeqCst) >= 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    attempts.await_count(2).await;
+    assert_eq!(
+        attempts.count(),
+        2,
+        "the handler must run exactly twice: one failure, one success"
+    );
 
     cancel.cancel();
     handle.await.unwrap().unwrap();
@@ -1474,12 +1459,12 @@ async fn worker_continues_after_handler_panic() {
         .await
         .unwrap();
 
-    let seen_after = Arc::new(AtomicUsize::new(0));
+    let seen_after = harness::CallCounter::new();
     let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let worker = RabbitMqWorkerBuilder::new(consumer_conn)
         .queue(queue_name)
         .register_handler::<OrderPlaced, _>(PanickingHandler {
-            seen_after: Arc::clone(&seen_after),
+            seen_after: seen_after.clone(),
         })
         .build()
         .unwrap();
@@ -1488,12 +1473,7 @@ async fn worker_continues_after_handler_panic() {
     let cancel_for_task = cancel.clone();
     let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
 
-    for _ in 0..60 {
-        if seen_after.load(Ordering::SeqCst) >= 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    seen_after.await_count(1).await;
 
     cancel.cancel();
     handle
@@ -1502,7 +1482,7 @@ async fn worker_continues_after_handler_panic() {
         .expect("worker run returns Ok");
 
     assert_eq!(
-        seen_after.load(Ordering::SeqCst),
+        seen_after.count(),
         1,
         "worker must process the second delivery after the first handler panicked"
     );
@@ -1528,7 +1508,7 @@ async fn worker_delays_retries_and_retry_count_survives_restart() {
         .await
         .unwrap();
 
-    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts = harness::CallCounter::new();
     let seen_at = Arc::new(std::sync::Mutex::new(Vec::new()));
 
     // First worker instance: two failing attempts, spaced by the wait
@@ -1540,7 +1520,7 @@ async fn worker_delays_retries_and_retry_count_survives_restart() {
         .retry_delay(retry_delay)
         .dead_letter_routing_key(dlr_queue)
         .register_handler::<OrderPlaced, _>(TimestampingFailingHandler {
-            attempts: Arc::clone(&attempts),
+            attempts: attempts.clone(),
             seen_at: Arc::clone(&seen_at),
         })
         .build()
@@ -1549,14 +1529,9 @@ async fn worker_delays_retries_and_retry_count_survives_restart() {
     let first_cancel_for_task = first_cancel.clone();
     let first_handle = tokio::spawn(async move { first_worker.run(first_cancel_for_task).await });
 
-    for _ in 0..80 {
-        if attempts.load(Ordering::SeqCst) >= 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    attempts.await_count(2).await;
     assert_eq!(
-        attempts.load(Ordering::SeqCst),
+        attempts.count(),
         2,
         "first worker must have seen exactly two attempts"
     );
@@ -1583,7 +1558,7 @@ async fn worker_delays_retries_and_retry_count_survives_restart() {
         .retry_delay(retry_delay)
         .dead_letter_routing_key(dlr_queue)
         .register_handler::<OrderPlaced, _>(TimestampingFailingHandler {
-            attempts: Arc::clone(&attempts),
+            attempts: attempts.clone(),
             seen_at: Arc::clone(&seen_at),
         })
         .build()
@@ -1614,7 +1589,7 @@ async fn worker_delays_retries_and_retry_count_survives_restart() {
         "the poison message must reach the dead-letter queue after the restart"
     );
     assert_eq!(
-        attempts.load(Ordering::SeqCst),
+        attempts.count(),
         3,
         "the restarted worker must continue the count at attempt 3, not restart from 1"
     );
@@ -1626,6 +1601,7 @@ async fn worker_delays_retries_and_retry_count_survives_restart() {
 #[derive(Debug)]
 struct MessageIdRecordingFailingHandler {
     seen_message_ids: Arc<std::sync::Mutex<Vec<String>>>,
+    calls: harness::CallCounter,
 }
 
 impl Handler<OrderPlaced> for MessageIdRecordingFailingHandler {
@@ -1636,6 +1612,7 @@ impl Handler<OrderPlaced> for MessageIdRecordingFailingHandler {
             .lock()
             .expect("message id mutex must not be poisoned")
             .push(format!("{:?}", ctx.message_id));
+        self.calls.record();
         Err(hexeract_bus::BusError::Internal(
             "deliberate poison".to_owned(),
         ))
@@ -1671,6 +1648,7 @@ async fn message_ids_seen_across_retries(
         .unwrap();
 
     let seen_message_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let calls = harness::CallCounter::new();
     let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let worker = RabbitMqWorkerBuilder::new(consumer_conn)
         .queue(queue_name)
@@ -1679,6 +1657,7 @@ async fn message_ids_seen_across_retries(
         .dead_letter_routing_key(dlr_queue)
         .register_handler::<OrderPlaced, _>(MessageIdRecordingFailingHandler {
             seen_message_ids: Arc::clone(&seen_message_ids),
+            calls: calls.clone(),
         })
         .build()
         .unwrap();
@@ -1686,12 +1665,7 @@ async fn message_ids_seen_across_retries(
     let cancel_for_task = cancel.clone();
     let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
 
-    for _ in 0..200 {
-        if seen_message_ids.lock().expect("message id mutex").len() >= 3 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    calls.await_count(3).await;
 
     cancel.cancel();
     handle.await.unwrap().unwrap();
@@ -1949,7 +1923,7 @@ async fn manual_without_dead_letter_enables_confirms_and_retries_safely() {
         .await
         .unwrap();
 
-    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts = harness::CallCounter::new();
     let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let worker = RabbitMqWorkerBuilder::new(consumer_conn)
         .queue(queue_name)
@@ -1957,7 +1931,7 @@ async fn manual_without_dead_letter_enables_confirms_and_retries_safely() {
         .max_attempts(5)
         .retry_delay(Duration::from_millis(200))
         .register_handler::<OrderPlaced, _>(FailOnceHandler {
-            attempts: Arc::clone(&attempts),
+            attempts: attempts.clone(),
         })
         .build()
         .unwrap();
@@ -1966,14 +1940,10 @@ async fn manual_without_dead_letter_enables_confirms_and_retries_safely() {
     let cancel_for_task = cancel.clone();
     let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
 
-    for _ in 0..100 {
-        if attempts.load(Ordering::SeqCst) >= 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        attempts.load(Ordering::SeqCst) >= 2,
+    attempts.await_count(2).await;
+    assert_eq!(
+        attempts.count(),
+        2,
         "the message must be redelivered after the first failure, proving the confirmed retry copy was stored, not lost"
     );
 
