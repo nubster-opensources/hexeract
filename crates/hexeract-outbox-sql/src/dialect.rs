@@ -290,12 +290,24 @@ impl Dialect {
         )
     }
 
-    /// `UPDATE {qtable} SET delivered_at = {now} WHERE event_id = {ph}`.
+    /// `UPDATE {qtable} SET delivered_at = {now} WHERE event_id = {p1} AND attempts = {p2} AND delivered_at IS NULL`.
+    ///
+    /// The equality on `attempts` is the fence: parameter 2 is the attempt
+    /// number this caller's claim wrote, and the update applies only while the
+    /// stored counter still equals it, so a worker whose lease was taken over
+    /// cannot overwrite the newer owner's outcome. `delivered_at IS NULL`
+    /// makes the settlement idempotent against a replay by the same worker,
+    /// where the fence protects against a different one.
     pub(crate) fn mark_delivered_sql(self, table: &str) -> String {
         let qtable = self.quote_identifier(table);
         let event_id = self.placeholder(1);
+        let claimed_attempt = self.placeholder(2);
         let now = self.now_expr();
-        format!("UPDATE {qtable} SET delivered_at = {now} WHERE event_id = {event_id}")
+        format!(
+            "UPDATE {qtable} SET delivered_at = {now} \
+             WHERE event_id = {event_id} AND attempts = {claimed_attempt} \
+               AND delivered_at IS NULL"
+        )
     }
 
     /// `UPDATE {qtable} SET last_error, next_retry_at = {now + interval} ...`.
@@ -308,15 +320,22 @@ impl Dialect {
     /// per dispatch attempt by [`Self::claim_sql`] at claim time, so that a
     /// worker that crashes between claim and this call still burns one retry
     /// slot. Incrementing again here would double-count every clean failure.
+    ///
+    /// It is also what lets parameter 4, the attempt number this caller's claim
+    /// wrote, fence the update: a settlement that moved the counter would move
+    /// its own fence. The update applies only while the stored `attempts` still
+    /// equals it and the envelope is not already delivered.
     pub(crate) fn mark_failed_sql(self, table: &str) -> String {
         let qtable = self.quote_identifier(table);
         let last_error = self.placeholder(1);
         let next_retry_at = self.now_plus_interval_expr(2);
         let event_id = self.placeholder(3);
+        let claimed_attempt = self.placeholder(4);
         format!(
             "UPDATE {qtable} \
              SET last_error = {last_error}, next_retry_at = {next_retry_at} \
-             WHERE event_id = {event_id}"
+             WHERE event_id = {event_id} AND attempts = {claimed_attempt} \
+               AND delivered_at IS NULL"
         )
     }
 
@@ -432,23 +451,29 @@ impl Dialect {
         )
     }
 
-    /// `DELETE FROM {qtable} WHERE event_id = {p1}`.
+    /// `DELETE FROM {qtable} WHERE event_id = {p1} AND attempts = {p2} AND delivered_at IS NULL`.
     ///
     /// Removes the row from the main outbox table after it has been copied to
     /// the dead-letter table. Called in the same transaction as
     /// [`Self::insert_dead_letter_sql`].
+    ///
+    /// This statement carries the fence of a dead-lettering: the departure of
+    /// the row from the main table is the fact that counts, and parameter 2 is
+    /// the attempt number the caller's claim wrote. The copy into the
+    /// dead-letter table is not conditioned and is discarded when this delete
+    /// matches nothing.
     pub(crate) fn delete_from_main_sql(self, table: &str) -> String {
         let qtable = self.quote_identifier(table);
         let event_id = self.placeholder(1);
-        format!("DELETE FROM {qtable} WHERE event_id = {event_id}")
+        let claimed_attempt = self.placeholder(2);
+        format!(
+            "DELETE FROM {qtable} \
+             WHERE event_id = {event_id} AND attempts = {claimed_attempt} \
+               AND delivered_at IS NULL"
+        )
     }
 
-    /// Claim SQL for Postgres: uses `= ANY($2)` with a single UUID-array bind
-    /// so the number of bind parameters is fixed regardless of batch size,
-    /// avoiding the 65,535 bind-parameter limit inherent to an `IN`-list.
-    ///
-    /// For MySQL and SQLite a per-row `IN`-list is still generated because
-    /// neither supports the `= ANY($n)` array-bind syntax.
+    /// Claim SQL: one conditional statement for the whole batch.
     ///
     /// Sets a soft lease on the given envelopes so competing workers skip
     /// them until the lease expires, and consumes one retry slot by
@@ -462,6 +487,22 @@ impl Dialect {
     /// and acknowledgement safe: the attempt is already counted, so the
     /// envelope cannot be redelivered forever without ever reaching the
     /// dead-letter threshold.
+    ///
+    /// The statement matches each envelope on the pair `(event_id, attempts)`
+    /// the caller read when it polled. A row whose stored `attempts` has moved
+    /// since is left untouched, so two workers that read the same row before
+    /// either claimed it cannot both hold it. This is what `FOR UPDATE SKIP
+    /// LOCKED` already guarantees on the dialects that support it, enforced on
+    /// the write so it holds on every dialect, and it stays one round trip
+    /// whatever the batch size.
+    ///
+    /// Postgres binds the pairs as two parallel arrays (`$2` UUIDs, `$3`
+    /// integers), so the bind count is fixed regardless of batch size,
+    /// sidestepping the 65,535-parameter limit that an `IN`-list would hit
+    /// (#240). MySQL and SQLite bind one `(event_id, attempts)` pair per
+    /// envelope. Postgres and SQLite return the identifiers they obtained with
+    /// `RETURNING`; MySQL has no equivalent, see
+    /// [`Self::claim_candidates_sql`].
     // Every store issues a claim now (postgres/mysql for the competing-consumer
     // lease, sqlite to increment attempts); only a feature-less build leaves it
     // unused.
@@ -474,24 +515,61 @@ impl Dialect {
         let lease = self.now_plus_interval_expr(1);
         match self {
             Self::Postgres => {
-                // $2 is bound as a UUID array, so the bind count is always 2
-                // regardless of batch size, sidestepping the 65,535-parameter limit.
+                // $2 and $3 are bound as arrays, so the bind count is always 3
+                // regardless of batch size.
                 format!(
                     "UPDATE {qtable} SET next_retry_at = {lease}, attempts = attempts + 1 \
-                     WHERE event_id = ANY($2)"
+                     FROM UNNEST($2::uuid[], $3::int4[]) \
+                         AS claimed(claimed_event_id, claimed_attempts) \
+                     WHERE event_id = claimed.claimed_event_id \
+                       AND attempts = claimed.claimed_attempts \
+                     RETURNING event_id"
                 )
             }
-            Self::MySql | Self::Sqlite => {
-                let placeholders = (2..=n + 1)
-                    .map(|i| self.placeholder(i))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+            Self::MySql => {
+                let pairs = self.claim_pairs_from(2, n);
                 format!(
                     "UPDATE {qtable} SET next_retry_at = {lease}, attempts = attempts + 1 \
-                     WHERE event_id IN ({placeholders})"
+                     WHERE (event_id, attempts) IN ({pairs})"
+                )
+            }
+            Self::Sqlite => {
+                let pairs = self.claim_pairs_from(2, n);
+                format!(
+                    "UPDATE {qtable} SET next_retry_at = {lease}, attempts = attempts + 1 \
+                     WHERE (event_id, attempts) IN (VALUES {pairs}) \
+                     RETURNING event_id"
                 )
             }
         }
+    }
+
+    /// `SELECT event_id FROM {qtable} WHERE (event_id, attempts) IN (...) FOR UPDATE`.
+    ///
+    /// MySQL has no `RETURNING`, and `rows_affected` cannot say *which* rows of
+    /// a batch the claim obtained: a row another claimant took from the same
+    /// polled `attempts` carries the very value this claim would have written.
+    /// The candidates are therefore selected and locked first, in one
+    /// statement, and [`Self::claim_sql`] is then issued for exactly those, so
+    /// the identifiers returned are the ones this transaction really updated.
+    /// Placeholders start at 1 (no lease parameter).
+    #[cfg_attr(not(feature = "mysql"), allow(dead_code))]
+    pub(crate) fn claim_candidates_sql(self, table: &str, n: usize) -> String {
+        let qtable = self.quote_identifier(table);
+        let pairs = self.claim_pairs_from(1, n);
+        format!("SELECT event_id FROM {qtable} WHERE (event_id, attempts) IN ({pairs}) FOR UPDATE")
+    }
+
+    /// `(?, ?), (?, ?), ...`: `n` placeholder pairs, the first numbered `first`.
+    fn claim_pairs_from(self, first: usize, n: usize) -> String {
+        (0..n)
+            .map(|row| {
+                let event_id = self.placeholder(first + row * 2);
+                let attempts = self.placeholder(first + row * 2 + 1);
+                format!("({event_id}, {attempts})")
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -813,34 +891,37 @@ mod tests {
     }
 
     #[test]
-    fn postgres_claim_sql_uses_any_array_instead_of_in_list() {
-        // ANY($2) avoids the 65,535 bind-parameter limit that an IN-list of
-        // UUIDs would hit at large batch sizes (#240).
+    fn postgres_claim_sql_uses_parallel_arrays_instead_of_in_list() {
+        // Two array binds avoid the 65,535 bind-parameter limit that an
+        // IN-list of pairs would hit at large batch sizes (#240).
         let sql = Dialect::Postgres.claim_sql("audit_outbox", 3);
         assert!(sql.contains("UPDATE \"audit_outbox\""));
         // Lease anchored to the DB clock plus the bound interval ($1), #230.
         assert!(sql.contains("SET next_retry_at = (NOW() +"));
         assert!(sql.contains("$1"));
-        // Single array bind; no per-row placeholders ($2, $3, $4).
-        assert!(sql.contains("WHERE event_id = ANY($2)"));
-        assert!(!sql.contains("$3"));
+        // The candidates and the attempts they were polled at travel as two
+        // parallel arrays; no per-row placeholders ($4).
+        assert!(sql.contains("UNNEST($2::uuid[], $3::int4[])"));
+        assert!(sql.contains("attempts = claimed.claimed_attempts"));
+        assert!(sql.contains("RETURNING event_id"));
         assert!(!sql.contains("$4"));
         assert!(!sql.contains("WHERE event_id IN"));
     }
 
     #[test]
-    fn postgres_claim_sql_any_bind_count_is_independent_of_batch_size() {
-        // Regardless of n the Postgres claim SQL has exactly two bind
-        // parameters: $1 for the lease interval and $2 for the UUID array.
+    fn postgres_claim_sql_bind_count_is_independent_of_batch_size() {
+        // Regardless of n the Postgres claim SQL has exactly three bind
+        // parameters: $1 for the lease interval, $2 for the UUID array and $3
+        // for the array of attempts the candidates were polled at.
         for n in [1, 10, 1000] {
             let sql = Dialect::Postgres.claim_sql("audit_outbox", n);
             assert!(
-                sql.contains("ANY($2)"),
-                "n={n}: expected ANY($2), got: {sql}"
+                sql.contains("UNNEST($2::uuid[], $3::int4[])"),
+                "n={n}: expected two array binds, got: {sql}"
             );
             assert!(
-                !sql.contains("$3"),
-                "n={n}: unexpected $3 placeholder, got: {sql}"
+                !sql.contains("$4"),
+                "n={n}: unexpected $4 placeholder, got: {sql}"
             );
         }
     }
@@ -850,7 +931,8 @@ mod tests {
         let sql = Dialect::MySql.claim_sql("audit_outbox", 2);
         assert!(sql.contains("UPDATE `audit_outbox`"));
         assert!(sql.contains("SET next_retry_at = (UTC_TIMESTAMP(6) + INTERVAL ? MICROSECOND)"));
-        assert!(sql.contains("WHERE event_id IN (?, ?)"));
+        assert!(sql.contains("WHERE (event_id, attempts) IN ((?, ?), (?, ?))"));
+        assert!(!sql.contains("RETURNING"));
     }
 
     #[test]
@@ -859,7 +941,44 @@ mod tests {
         assert!(sql.contains("UPDATE \"audit_outbox\""));
         assert!(sql.contains("SET next_retry_at = strftime("));
         assert!(sql.contains("'now', ?)"));
-        assert!(sql.contains("WHERE event_id IN (?)"));
+        assert!(sql.contains("WHERE (event_id, attempts) IN (VALUES (?, ?))"));
+        assert!(sql.contains("RETURNING event_id"));
+    }
+
+    #[test]
+    fn mysql_claim_candidates_sql_selects_and_locks_the_polled_pairs() {
+        let sql = Dialect::MySql.claim_candidates_sql("audit_outbox", 2);
+        assert!(sql.starts_with("SELECT event_id FROM `audit_outbox`"));
+        assert!(sql.contains("WHERE (event_id, attempts) IN ((?, ?), (?, ?))"));
+        assert!(sql.ends_with("FOR UPDATE"));
+    }
+
+    #[test]
+    fn claim_sql_stays_one_statement_whatever_the_batch_size() {
+        for dialect in [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite] {
+            for n in [1, 50, 500] {
+                let sql = dialect.claim_sql("audit_outbox", n);
+                assert_eq!(sql.matches("UPDATE").count(), 1, "{dialect:?} n={n}");
+                assert!(!sql.contains(';'), "{dialect:?} n={n}: {sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_settlement_is_fenced_on_attempts_and_not_yet_delivered() {
+        for dialect in [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite] {
+            for sql in [
+                dialect.mark_delivered_sql("audit_outbox"),
+                dialect.mark_failed_sql("audit_outbox"),
+                dialect.delete_from_main_sql("audit_outbox"),
+            ] {
+                assert!(sql.contains("AND attempts = "), "{dialect:?}: {sql}");
+                assert!(
+                    sql.contains("AND delivered_at IS NULL"),
+                    "{dialect:?}: {sql}"
+                );
+            }
+        }
     }
 
     #[test]

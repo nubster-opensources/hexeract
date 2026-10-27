@@ -2,13 +2,20 @@
 //!
 //! # Concurrency
 //!
-//! SQLite has no `FOR UPDATE SKIP LOCKED`, so this backend assumes a
-//! **single [`OutboxWorker`](hexeract_outbox::OutboxWorker) per database**. Running several workers against
-//! the same SQLite database can dispatch an envelope more than once, because
-//! concurrent pollers may read the same pending rows before either marks them
-//! delivered. For competing-consumers fan-out across many workers, use the
-//! PostgreSQL or MySQL backend instead. Configuring `busy_timeout` on the pool
-//! is recommended so writes wait rather than fail under contention.
+//! SQLite has no `FOR UPDATE SKIP LOCKED`, so competing workers are kept apart
+//! on the write rather than on the read. A claim matches each candidate on the
+//! `attempts` value it was polled at, so of two workers that polled the same
+//! row only the first to write gets it; settling an envelope is fenced the same
+//! way, so a worker whose lease expired cannot overwrite the outcome of the one
+//! that took over. Several
+//! [`OutboxWorker`](hexeract_outbox::OutboxWorker)s may therefore share a
+//! single database without dispatching an envelope twice.
+//!
+//! That is a guarantee of correctness, not of throughput. SQLite serializes
+//! writes through one writer, so additional workers contend instead of scaling:
+//! for fan-out across many workers, the PostgreSQL or MySQL backend remains the
+//! right choice. Configuring `busy_timeout` on the pool is recommended so
+//! writes wait rather than fail under contention.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,6 +45,9 @@ use crate::DEFAULT_TABLE_NAME;
 use crate::dialect::Dialect;
 use crate::envelope::assemble_envelope;
 use crate::envelope::parse_sqlite_utc;
+use crate::fence::bindable_claims;
+use crate::fence::fence_value;
+use crate::fence::in_claim_order;
 use crate::pool::pool_error;
 use crate::validate::validate_event_type;
 use crate::validate::validate_table_name;
@@ -126,7 +136,7 @@ pub async fn ensure_schema(pool: &SqlitePool, table_name: &str) -> Result<(), Ou
 
 /// SQLite implementation of [`OutboxStore`] backed by `sqlx::SqlitePool`.
 ///
-/// See the [module documentation](self) for the single-worker concurrency model.
+/// See the [module documentation](self) for the concurrency model.
 /// Cheap to clone (the pool and the cached SQL strings are reference-counted).
 #[derive(Debug, Clone)]
 pub struct SqliteOutboxStore {
@@ -244,13 +254,16 @@ impl OutboxStore for SqliteOutboxStore {
         &self,
         tx: &mut Self::Tx<'a>,
         event_id: Uuid,
-    ) -> Result<(), OutboxError> {
-        sqlx::query(&self.mark_delivered_sql)
+        claimed_attempt: u32,
+    ) -> Result<bool, OutboxError> {
+        let claimed_attempt = fence_value(claimed_attempt)?;
+        let result = sqlx::query(&self.mark_delivered_sql)
             .bind(event_id)
+            .bind(claimed_attempt)
             .execute(&mut **tx)
             .await
             .map_err(database_error)?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     async fn mark_failed<'a>(
@@ -259,17 +272,20 @@ impl OutboxStore for SqliteOutboxStore {
         event_id: Uuid,
         error: &str,
         retry_in: Duration,
-    ) -> Result<(), OutboxError> {
+        claimed_attempt: u32,
+    ) -> Result<bool, OutboxError> {
+        let claimed_attempt = fence_value(claimed_attempt)?;
         // next_retry_at is computed as strftime('now', ?modifier) against the
         // DB clock (#230); bind the backoff as a strftime seconds modifier.
-        sqlx::query(&self.mark_failed_sql)
+        let result = sqlx::query(&self.mark_failed_sql)
             .bind(error)
             .bind(sqlite_seconds_modifier(retry_in))
             .bind(event_id)
+            .bind(claimed_attempt)
             .execute(&mut **tx)
             .await
             .map_err(database_error)?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     async fn commit<'a>(&self, tx: Self::Tx<'a>) -> Result<(), OutboxError> {
@@ -281,48 +297,69 @@ impl OutboxStore for SqliteOutboxStore {
         tx: &mut Self::Tx<'a>,
         event_id: Uuid,
         _error: &str,
-    ) -> Result<(), OutboxError> {
+        claimed_attempt: u32,
+    ) -> Result<bool, OutboxError> {
         let Some(dlq) = &self.dead_letter else {
-            return Ok(());
+            return Ok(true);
         };
+        let claimed_attempt = fence_value(claimed_attempt)?;
+        // The copy and the removal share a savepoint so that a refused
+        // dead-lettering leaves nothing in the dead-letter table: the fence
+        // is carried by the delete alone, and the copy is undone with it.
+        let mut savepoint = (&mut *tx).begin().await.map_err(database_error)?;
         sqlx::query(&dlq.insert_sql)
             .bind(event_id)
-            .execute(&mut **tx)
+            .execute(&mut *savepoint)
             .await
             .map_err(database_error)?;
-        sqlx::query(&dlq.delete_sql)
+        let removed = sqlx::query(&dlq.delete_sql)
             .bind(event_id)
-            .execute(&mut **tx)
+            .bind(claimed_attempt)
+            .execute(&mut *savepoint)
             .await
             .map_err(database_error)?;
-        Ok(())
+        if removed.rows_affected() == 0 {
+            savepoint.rollback().await.map_err(database_error)?;
+            return Ok(false);
+        }
+        savepoint.commit().await.map_err(database_error)?;
+        Ok(true)
     }
 
     /// Set the soft lease and consume one retry slot on the claimed batch.
     ///
-    /// SQLite has no `FOR UPDATE SKIP LOCKED`, so this does **not** provide a
-    /// competing-consumer claim: the store remains single-writer (see the
-    /// [module documentation](self)). The override exists so that `attempts`
-    /// is incremented at claim time on SQLite too. Without it, a worker that
-    /// crashed between claim and acknowledgement would never advance
-    /// `attempts` and would redeliver a poison row forever (#213).
+    /// SQLite has no `FOR UPDATE SKIP LOCKED`, so the poll takes no row lock.
+    /// Competing workers are kept apart by the write instead: the claim
+    /// matches every candidate on the `attempts` value it was polled at, and
+    /// of two workers that polled the same row only the first to write gets
+    /// it. The store remains single-writer, which is a limit on throughput
+    /// (see the [module documentation](self)), not on correctness. This also
+    /// increments `attempts` at claim time, so that a worker that crashed
+    /// between claim and acknowledgement does not redeliver a poison row
+    /// forever (#213).
     async fn claim<'a>(
         &self,
         tx: &mut Self::Tx<'a>,
-        event_ids: &[Uuid],
+        claims: &[(Uuid, u32)],
         lease_for: Duration,
-    ) -> Result<(), OutboxError> {
-        if event_ids.is_empty() {
-            return Ok(());
+    ) -> Result<Vec<Uuid>, OutboxError> {
+        if claims.is_empty() {
+            return Ok(Vec::new());
         }
+        let bindable = bindable_claims(claims)?;
         // Lease anchored to the DB clock via strftime('now', ?modifier) (#230).
-        let sql = DIALECT.claim_sql(&self.table_name, event_ids.len());
+        let sql = DIALECT.claim_sql(&self.table_name, bindable.len());
         let mut query = sqlx::query(&sql).bind(sqlite_seconds_modifier(lease_for));
-        for id in event_ids {
-            query = query.bind(*id);
+        for (event_id, attempts) in &bindable {
+            query = query.bind(*event_id).bind(*attempts);
         }
-        query.execute(&mut **tx).await.map_err(database_error)?;
-        Ok(())
+        let rows = query.fetch_all(&mut **tx).await.map_err(database_error)?;
+        let obtained = rows
+            .iter()
+            .map(|row| row.try_get::<Uuid, _>("event_id"))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)?;
+        Ok(in_claim_order(claims, &obtained))
     }
 }
 
@@ -444,7 +481,7 @@ impl IdempotentOutboxEnqueue for SqliteOutboxPublisher {
 
 /// Fluent builder for an [`OutboxWorker`] backed by [`SqliteOutboxStore`].
 ///
-/// See the [module documentation](self) for the single-worker concurrency model.
+/// See the [module documentation](self) for the concurrency model.
 ///
 /// # Pool sizing and acquire timeout
 ///
@@ -581,12 +618,14 @@ impl SqliteOutboxWorkerBuilder {
 
     /// Override the soft-lease duration for claimed envelopes (default 30 s).
     ///
-    /// SQLite has no `FOR UPDATE SKIP LOCKED` and therefore no
-    /// competing-consumer claim, so this store is meant for a **single
-    /// worker** (see the [module documentation](self)); running several workers
-    /// against one database can still double-dispatch. The lease is recorded on
-    /// claim alongside the attempt increment, but with a single writer it only
-    /// affects when a crashed-and-restarted worker re-picks an in-flight row.
+    /// SQLite has no `FOR UPDATE SKIP LOCKED`, but the claim is fenced on
+    /// `attempts`, so several workers can share one database without
+    /// dispatching an envelope twice (see the [module documentation](self)).
+    /// The lease is recorded on claim alongside the attempt increment; it
+    /// bounds how long a worker may hold an envelope before another can take it
+    /// over, and a settlement from a worker that has lost it is refused.
+    /// Handlers should finish within it. SQLite stays single-writer, so
+    /// additional workers do not add throughput.
     #[must_use]
     pub fn dispatch_timeout(mut self, d: Duration) -> Self {
         self.config.dispatch_timeout = d;

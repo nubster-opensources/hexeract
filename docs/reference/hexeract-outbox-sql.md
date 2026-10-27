@@ -16,7 +16,7 @@ At least one backend feature must be enabled (a compile error fires otherwise).
 
 Through the `hexeract` umbrella, these map to the `outbox-sql-postgres`, `outbox-sql-mysql` and `outbox-sql-sqlite` features, re-exported as `hexeract::outbox_sql`.
 
-The PostgreSQL schema is byte-for-byte identical to `hexeract-outbox-postgres`, so moving from the deprecated crate requires no data migration. MySQL requires **8.0.13 or later** (the schema defaults `created_at` to the `(UTC_TIMESTAMP(6))` expression). SQLite is single-writer: run exactly one worker per database. See [SQLite outbox concurrency](../concepts/sqlite-outbox-concurrency.md).
+The PostgreSQL schema is byte-for-byte identical to `hexeract-outbox-postgres`, so moving from the deprecated crate requires no data migration. MySQL requires **8.0.13 or later** (the schema defaults `created_at` to the `(UTC_TIMESTAMP(6))` expression). SQLite is single-writer: several workers can share one database without dispatching an envelope twice, but they take turns on the write lock, so added workers do not add throughput. See [SQLite outbox concurrency](../concepts/sqlite-outbox-concurrency.md).
 
 ## Public surface
 
@@ -56,7 +56,7 @@ Production deployments should run their own migration tooling against `Dialect::
 | --- | --- |
 | `PgOutboxStore::new(pool, table_name)` | Construct a store. Caches the templated SQL. Validates the table name. |
 | `with_dead_letter(dlq_table)` | Enable dead-letter persistence: exhausted envelopes are moved to `dlq_table` (INSERT + DELETE in one transaction). |
-| Implements `OutboxStore` | `poll` runs `SELECT ... [FOR UPDATE SKIP LOCKED]` per dialect; `mark_delivered`, `mark_failed`, `claim` and `mark_dead_lettered` settle envelopes. `claim` advances the soft lease and consumes one retry slot. On PostgreSQL and MySQL it is the competing-consumer lease; on SQLite it only counts attempts and records the lease (no `SKIP LOCKED`, so SQLite stays single-writer). |
+| Implements `OutboxStore` | `poll` runs `SELECT ... [FOR UPDATE SKIP LOCKED]` per dialect; `mark_delivered`, `mark_failed`, `claim` and `mark_dead_lettered` settle envelopes. `claim` advances the soft lease and consumes one retry slot, for the envelopes still at the `attempts` value they were polled at, and returns the identifiers it obtained. Each settlement is fenced on the attempt number its claim wrote and returns `false` when a newer owner holds the envelope. On every dialect `claim` is the competing-consumer lease; on SQLite it does so without `SKIP LOCKED` (correct, but SQLite stays single-writer, so it does not scale throughput). |
 
 ### Builder
 

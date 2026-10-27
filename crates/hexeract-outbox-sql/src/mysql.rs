@@ -27,6 +27,9 @@ use crate::DEFAULT_TABLE_NAME;
 use crate::dialect::Dialect;
 use crate::envelope::assemble_envelope;
 use crate::envelope::primitive_utc_to_system_time;
+use crate::fence::bindable_claims;
+use crate::fence::fence_value;
+use crate::fence::in_claim_order;
 use crate::pool::pool_error;
 use crate::validate::validate_event_type;
 use crate::validate::validate_table_name;
@@ -215,13 +218,16 @@ impl OutboxStore for MySqlOutboxStore {
         &self,
         tx: &mut Self::Tx<'a>,
         event_id: Uuid,
-    ) -> Result<(), OutboxError> {
-        sqlx::query(&self.mark_delivered_sql)
+        claimed_attempt: u32,
+    ) -> Result<bool, OutboxError> {
+        let claimed_attempt = fence_value(claimed_attempt)?;
+        let result = sqlx::query(&self.mark_delivered_sql)
             .bind(event_id)
+            .bind(claimed_attempt)
             .execute(&mut **tx)
             .await
             .map_err(database_error)?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     async fn mark_failed<'a>(
@@ -230,16 +236,19 @@ impl OutboxStore for MySqlOutboxStore {
         event_id: Uuid,
         error: &str,
         retry_in: Duration,
-    ) -> Result<(), OutboxError> {
+        claimed_attempt: u32,
+    ) -> Result<bool, OutboxError> {
+        let claimed_attempt = fence_value(claimed_attempt)?;
         // The SQL adds this many microseconds to the DB clock (#230).
-        sqlx::query(&self.mark_failed_sql)
+        let result = sqlx::query(&self.mark_failed_sql)
             .bind(error)
             .bind(duration_to_micros(retry_in))
             .bind(event_id)
+            .bind(claimed_attempt)
             .execute(&mut **tx)
             .await
             .map_err(database_error)?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     async fn commit<'a>(&self, tx: Self::Tx<'a>) -> Result<(), OutboxError> {
@@ -251,40 +260,77 @@ impl OutboxStore for MySqlOutboxStore {
         tx: &mut Self::Tx<'a>,
         event_id: Uuid,
         _error: &str,
-    ) -> Result<(), OutboxError> {
+        claimed_attempt: u32,
+    ) -> Result<bool, OutboxError> {
         let Some(dlq) = &self.dead_letter else {
-            return Ok(());
+            return Ok(true);
         };
+        let claimed_attempt = fence_value(claimed_attempt)?;
+        // The copy and the removal share a savepoint so that a refused
+        // dead-lettering leaves nothing in the dead-letter table: the fence
+        // is carried by the delete alone, and the copy is undone with it.
+        let mut savepoint = (&mut *tx).begin().await.map_err(database_error)?;
         sqlx::query(&dlq.insert_sql)
             .bind(event_id)
-            .execute(&mut **tx)
+            .execute(&mut *savepoint)
             .await
             .map_err(database_error)?;
-        sqlx::query(&dlq.delete_sql)
+        let removed = sqlx::query(&dlq.delete_sql)
             .bind(event_id)
-            .execute(&mut **tx)
+            .bind(claimed_attempt)
+            .execute(&mut *savepoint)
             .await
             .map_err(database_error)?;
-        Ok(())
+        if removed.rows_affected() == 0 {
+            savepoint.rollback().await.map_err(database_error)?;
+            return Ok(false);
+        }
+        savepoint.commit().await.map_err(database_error)?;
+        Ok(true)
     }
 
     async fn claim<'a>(
         &self,
         tx: &mut Self::Tx<'a>,
-        event_ids: &[Uuid],
+        claims: &[(Uuid, u32)],
         lease_for: Duration,
-    ) -> Result<(), OutboxError> {
-        if event_ids.is_empty() {
-            return Ok(());
+    ) -> Result<Vec<Uuid>, OutboxError> {
+        if claims.is_empty() {
+            return Ok(Vec::new());
         }
-        let sql = DIALECT.claim_sql(&self.table_name, event_ids.len());
+        let bindable = bindable_claims(claims)?;
+        // MySQL has no RETURNING and `rows_affected` cannot say which rows of
+        // the batch were obtained, so the candidates still at their polled
+        // `attempts` are selected and locked first, then updated.
+        let candidates_sql = DIALECT.claim_candidates_sql(&self.table_name, bindable.len());
+        let mut candidates = sqlx::query(&candidates_sql);
+        for (event_id, attempts) in &bindable {
+            candidates = candidates.bind(*event_id).bind(*attempts);
+        }
+        let rows = candidates
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(database_error)?;
+        let matched = rows
+            .iter()
+            .map(|row| row.try_get::<Uuid, _>("event_id"))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)?;
+        let to_update: Vec<&(Uuid, i32)> = bindable
+            .iter()
+            .filter(|(event_id, _)| matched.contains(event_id))
+            .collect();
+        if to_update.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = DIALECT.claim_sql(&self.table_name, to_update.len());
         // The SQL adds this many microseconds to the DB clock (#230).
         let mut query = sqlx::query(&sql).bind(duration_to_micros(lease_for));
-        for id in event_ids {
-            query = query.bind(*id);
+        for (event_id, attempts) in to_update {
+            query = query.bind(*event_id).bind(*attempts);
         }
         query.execute(&mut **tx).await.map_err(database_error)?;
-        Ok(())
+        Ok(in_claim_order(claims, &matched))
     }
 }
 
@@ -721,7 +767,7 @@ mod tests {
         let sql = DIALECT.claim_sql("audit_outbox", 2);
         assert!(sql.contains("UPDATE `audit_outbox`"));
         assert!(sql.contains("next_retry_at = (UTC_TIMESTAMP(6) + INTERVAL ? MICROSECOND)"));
-        assert!(sql.contains("WHERE event_id IN (?, ?)"));
+        assert!(sql.contains("WHERE (event_id, attempts) IN ((?, ?), (?, ?))"));
         assert!(sql.contains("attempts = attempts + 1"));
     }
 }

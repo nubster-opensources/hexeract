@@ -27,6 +27,9 @@ use crate::DEFAULT_TABLE_NAME;
 use crate::dialect::Dialect;
 use crate::envelope::assemble_envelope;
 use crate::envelope::to_system_time;
+use crate::fence::bindable_claims;
+use crate::fence::fence_value;
+use crate::fence::in_claim_order;
 use crate::pool::pool_error;
 use crate::validate::validate_event_type;
 use crate::validate::validate_table_name;
@@ -237,13 +240,16 @@ impl OutboxStore for PgOutboxStore {
         &self,
         tx: &mut Self::Tx<'a>,
         event_id: Uuid,
-    ) -> Result<(), OutboxError> {
-        sqlx::query(&self.mark_delivered_sql)
+        claimed_attempt: u32,
+    ) -> Result<bool, OutboxError> {
+        let claimed_attempt = fence_value(claimed_attempt)?;
+        let result = sqlx::query(&self.mark_delivered_sql)
             .bind(event_id)
+            .bind(claimed_attempt)
             .execute(&mut **tx)
             .await
             .map_err(database_error)?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     async fn mark_failed<'a>(
@@ -252,18 +258,21 @@ impl OutboxStore for PgOutboxStore {
         event_id: Uuid,
         error: &str,
         retry_in: Duration,
-    ) -> Result<(), OutboxError> {
+        claimed_attempt: u32,
+    ) -> Result<bool, OutboxError> {
+        let claimed_attempt = fence_value(claimed_attempt)?;
         // The SQL adds this many seconds to the DB clock (#230); bind as f64.
         // Capped so a Duration::MAX does not produce inf and cause Postgres to
         // reject the interval (#240).
-        sqlx::query(&self.mark_failed_sql)
+        let result = sqlx::query(&self.mark_failed_sql)
             .bind(error)
             .bind(duration_to_pg_secs(retry_in))
             .bind(event_id)
+            .bind(claimed_attempt)
             .execute(&mut **tx)
             .await
             .map_err(database_error)?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     async fn commit<'a>(&self, tx: Self::Tx<'a>) -> Result<(), OutboxError> {
@@ -275,48 +284,69 @@ impl OutboxStore for PgOutboxStore {
         tx: &mut Self::Tx<'a>,
         event_id: Uuid,
         _error: &str,
-    ) -> Result<(), OutboxError> {
+        claimed_attempt: u32,
+    ) -> Result<bool, OutboxError> {
         let Some(dlq) = &self.dead_letter else {
-            return Ok(());
+            return Ok(true);
         };
+        let claimed_attempt = fence_value(claimed_attempt)?;
+        // The copy and the removal share a savepoint so that a refused
+        // dead-lettering leaves nothing in the dead-letter table: the fence
+        // is carried by the delete alone, and the copy is undone with it.
+        let mut savepoint = (&mut *tx).begin().await.map_err(database_error)?;
         sqlx::query(&dlq.insert_sql)
             .bind(event_id)
-            .execute(&mut **tx)
+            .execute(&mut *savepoint)
             .await
             .map_err(database_error)?;
-        sqlx::query(&dlq.delete_sql)
+        let removed = sqlx::query(&dlq.delete_sql)
             .bind(event_id)
-            .execute(&mut **tx)
+            .bind(claimed_attempt)
+            .execute(&mut *savepoint)
             .await
             .map_err(database_error)?;
-        Ok(())
+        if removed.rows_affected() == 0 {
+            savepoint.rollback().await.map_err(database_error)?;
+            return Ok(false);
+        }
+        savepoint.commit().await.map_err(database_error)?;
+        Ok(true)
     }
 
     async fn claim<'a>(
         &self,
         tx: &mut Self::Tx<'a>,
-        event_ids: &[Uuid],
+        claims: &[(Uuid, u32)],
         lease_for: Duration,
-    ) -> Result<(), OutboxError> {
-        if event_ids.is_empty() {
-            return Ok(());
+    ) -> Result<Vec<Uuid>, OutboxError> {
+        if claims.is_empty() {
+            return Ok(Vec::new());
         }
-        // claim_sql for Postgres generates `= ANY($2)` so the UUID slice is
-        // bound as a single array parameter. This avoids the 65,535
-        // bind-parameter limit that a per-row IN-list would hit at large
-        // batch sizes (#240). n is passed for API consistency but is unused
-        // for Postgres (the SQL always has exactly two bind parameters).
+        let bindable = bindable_claims(claims)?;
+        let event_ids: Vec<Uuid> = bindable.iter().map(|(event_id, _)| *event_id).collect();
+        let attempts: Vec<i32> = bindable.iter().map(|(_, attempts)| *attempts).collect();
+        // claim_sql for Postgres matches the (event_id, attempts) pairs through
+        // two parallel arrays, so the SQL always has exactly three bind
+        // parameters. This avoids the 65,535 bind-parameter limit that a
+        // per-row IN-list would hit at large batch sizes (#240).
         let sql = DIALECT.claim_sql(&self.table_name, event_ids.len());
         // $1: lease interval in seconds added to the DB clock (#230).
         //     Capped so Duration::MAX does not produce inf (#240).
-        // $2: UUID array for ANY($2).
-        sqlx::query(&sql)
+        // $2: UUID array of the candidates.
+        // $3: the attempts each candidate was polled at.
+        let rows = sqlx::query(&sql)
             .bind(duration_to_pg_secs(lease_for))
-            .bind(event_ids)
-            .execute(&mut **tx)
+            .bind(&event_ids)
+            .bind(&attempts)
+            .fetch_all(&mut **tx)
             .await
             .map_err(database_error)?;
-        Ok(())
+        let obtained = rows
+            .iter()
+            .map(|row| row.try_get::<Uuid, _>("event_id"))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)?;
+        Ok(in_claim_order(claims, &obtained))
     }
 }
 
@@ -819,15 +849,15 @@ mod tests {
     }
 
     #[test]
-    fn store_claim_sql_uses_any_array_bind() {
-        // Postgres claim uses = ANY($2) so the bind count is always 2,
-        // regardless of batch size (#240).
+    fn store_claim_sql_uses_parallel_array_binds() {
+        // Postgres claim binds the candidates and their polled attempts as two
+        // arrays so the bind count is always 3, regardless of batch size (#240).
         let sql = DIALECT.claim_sql("audit_outbox", 3);
         assert!(sql.contains("UPDATE \"audit_outbox\""));
         assert!(sql.contains("next_retry_at = (NOW() +"));
         assert!(sql.contains("$1"));
-        assert!(sql.contains("WHERE event_id = ANY($2)"));
-        assert!(!sql.contains("$3"));
+        assert!(sql.contains("UNNEST($2::uuid[], $3::int4[])"));
+        assert!(!sql.contains("$4"));
         assert!(sql.contains("attempts = attempts + 1"));
     }
 

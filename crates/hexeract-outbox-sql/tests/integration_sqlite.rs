@@ -32,6 +32,7 @@ use hexeract_outbox::OutboxWorkerConfig;
 use hexeract_outbox::TypedHandler;
 use hexeract_outbox_sql::SqliteOutboxPublisher;
 use hexeract_outbox_sql::SqliteOutboxStore;
+use hexeract_outbox_sql::sqlite::ensure_dead_letter_schema;
 use hexeract_outbox_sql::sqlite::ensure_schema;
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
@@ -52,6 +53,9 @@ async fn setup() -> SqliteBackend {
         .create_if_missing(true);
     let pool = SqlitePool::connect_with(options).await.expect("connect");
     ensure_schema(&pool, TABLE).await.expect("schema apply");
+    ensure_dead_letter_schema(&pool, TABLE)
+        .await
+        .expect("dead-letter schema apply");
     SqliteBackend { _file: file, pool }
 }
 
@@ -135,6 +139,40 @@ impl Backend for SqliteBackend {
         .await
         .expect("defer retry");
     }
+
+    fn store_with_dead_letter(&self) -> Self::Store {
+        SqliteOutboxStore::new(self.pool.clone(), TABLE)
+            .expect("store")
+            .with_dead_letter("audit_outbox_dead_letter")
+            .expect("dead-letter store")
+    }
+
+    async fn dead_letter_count(&self, event_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_outbox_dead_letter WHERE event_id = ?")
+            .bind(event_id)
+            .fetch_one(&self.pool)
+            .await
+            .expect("dead letter count")
+    }
+
+    async fn last_error(&self, event_id: Uuid) -> Option<String> {
+        sqlx::query_scalar("SELECT last_error FROM audit_outbox WHERE event_id = ?")
+            .bind(event_id)
+            .fetch_one(&self.pool)
+            .await
+            .expect("last error")
+    }
+
+    async fn is_retry_deferred(&self, event_id: Uuid) -> bool {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_outbox              WHERE event_id = ? AND next_retry_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+        )
+        .bind(event_id)
+        .fetch_one(&self.pool)
+        .await
+        .expect("deferred probe");
+        count == 1
+    }
 }
 
 macro_rules! backend_scenarios {
@@ -157,6 +195,12 @@ backend_scenarios!(
     enqueue_idempotent_twice_inserts_one_row,
     idempotent_enqueue_delivered_once_by_worker,
     claim_consumes_a_retry_slot_even_without_a_clean_failure,
+    claim_serves_only_one_of_two_claimants_that_read_the_same_attempts,
+    stale_delivery_is_refused_and_leaves_the_current_owner_outcome_intact,
+    stale_failure_is_refused_and_leaves_the_current_owner_outcome_intact,
+    stale_dead_lettering_is_refused_and_leaves_the_row_in_place,
+    competing_workers_dispatch_each_event_once,
+    fence_beyond_the_integer_column_is_an_error_not_a_saturation,
 );
 
 // The two scenarios below have no equivalent on Postgres or MySQL: both store
