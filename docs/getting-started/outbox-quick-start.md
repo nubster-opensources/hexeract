@@ -26,14 +26,14 @@ uuid = { version = "1", features = ["v7"] }
 
 ## 2. Apply the canonical schema
 
-The outbox needs a single table. Generate the canonical SQL with the `hexeract` CLI and pipe it into your migration tool:
+The outbox needs a single table. Generate the canonical SQL with the `hexeract` CLI and pipe it into your migration tool. The `hexeract outbox patch`, `apply` and `check` commands target PostgreSQL only; for MySQL or SQLite, use the matching `hexeract_outbox_sql` module instead:
 
 ```sh
 cargo install hexeract-cli
 hexeract outbox patch --table audit_outbox > migrations/0042_outbox.sql
 ```
 
-For local development you can apply the schema directly against a running database (requires `--yes-i-know` to avoid surprises in production):
+For local development you can apply the schema directly against a running PostgreSQL database (requires `--yes-i-know` to avoid surprises in production):
 
 ```sh
 hexeract outbox apply --conn "postgres://user:pass@localhost/db" --table audit_outbox --yes-i-know
@@ -126,6 +126,8 @@ impl Handler<UserRegistered> for AuditWriter {
 }
 ```
 
+The worker dispatches each row to a handler you write; it does not publish to a broker by itself. Forwarding an event to the bus is therefore a handler that calls your transport, as `BusForwarder` does in the [`05_orders_to_payments` example](../../crates/hexeract-examples/examples/05_orders_to_payments.rs).
+
 Handlers must be **idempotent**: the outbox guarantees at-least-once delivery, so the same event can be dispatched more than once if a previous attempt crashed between the side effect and the database commit that marks the row as delivered.
 
 ## 6. Spawn the worker
@@ -168,4 +170,5 @@ async fn run_service(
 - [Outbox PostgreSQL schema](../reference/outbox-postgres-schema.md): canonical schema and migration tooling guidance.
 - [Outbox pattern concept](../concepts/outbox-pattern.md): the why, the guarantees, the trade-offs.
 - [Outbox MVP requirements (v0.1.0)](../design/outbox-mvp-requirements.md): the public requirements that drove v0.1.0.
+- The runnable [`examples/05_orders_to_payments.rs`](../../crates/hexeract-examples/examples/05_orders_to_payments.rs) shows the outbox-to-bus boundary: a `BusForwarder` outbox handler publishes each dispatched event to RabbitMQ, which a bus consumer then bridges into the mediator (`cargo run --example 05_orders_to_payments -p hexeract-examples`, Docker required).
 - The runnable [`examples/02_outbox_transactional.rs`](../../crates/hexeract-examples/examples/02_outbox_transactional.rs) demonstrates the full publish-to-dispatch flow against a real PostgreSQL container: `cargo run --example 02_outbox_transactional -p hexeract-examples` (Docker required).

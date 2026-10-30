@@ -8,7 +8,14 @@ A request is published to `Request::DESTINATION`, the routing key that `RabbitMq
 
 ## Reserved namespace
 
-Every header prefixed `x-hexeract-` is reserved by the framework: an application must not write one of its own. The framework does not enforce this today: nothing filters or rejects an application-supplied `x-hexeract-*` header, so a domain header sharing the prefix silently collides with the framework's own value rather than being ignored or rejected.
+Every header prefixed `x-hexeract-` is reserved by the framework: an application must not write one of its own. The framework enforces this, and it refuses rather than ignores: an application header in the reserved namespace fails with `BusError::ReservedHeaderNamespace`, so a domain header sharing the prefix never reaches the wire and never collides with the framework's own value. The prefix is `RESERVED_HEADER_PREFIX`, and `is_reserved_header` matches it ignoring ASCII case, so `X-Hexeract-Request-Id` is as reserved as its lowercase spelling.
+
+Enforcement is one check on the envelope's application headers, reached from two places:
+
+- **Construction.** `BusEnvelope::with_headers` validates before it hands back an envelope, so an application that builds its own envelope learns of the collision at that point and not later.
+- **Publication.** The RabbitMQ transport validates again as the first thing it does when encoding headers, which catches an envelope whose headers were set after construction.
+
+Rejection at publication leaves nothing published. A delivery refused for this reason on the inbound path, where it is one of the errors that force a sanitised dead-letter copy, never has its headers cloned onto that copy: the headers of an envelope the worker has just refused to trust are attacker-controlled and unverified, so republishing them would hand a downstream consumer exactly what was refused here. See [`hexeract-bus` reference: reserved header namespace](../reference/hexeract-bus.md) for the per-item rules, including `RESERVED_HEADER_PREFIX` and `is_reserved_header`.
 
 ## Headers
 
