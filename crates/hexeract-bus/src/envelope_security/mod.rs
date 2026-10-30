@@ -10,6 +10,18 @@
 //! Verification is required by default. An application that deliberately
 //! runs without it opts out explicitly, the way plaintext transport is opted
 //! into.
+//!
+//! # What a signature does not establish
+//!
+//! A valid signature proves who minted an envelope and that its covered
+//! headers and payload are unaltered. It does not prove the envelope is
+//! being seen for the first time. A captured signed envelope verifies again,
+//! indefinitely, for as long as its key is trusted: the signature covers the
+//! message, not the occasion. Nothing in this module bounds replay, and
+//! bounding it is consumer-side deduplication, which the framework does
+//! not ship yet (#447). Until it does, a consumer whose effects must not
+//! repeat has to be idempotent on its own, and signing must not be read
+//! as a substitute.
 
 /// Canonical byte representation an envelope signature is computed over.
 pub mod canonical;

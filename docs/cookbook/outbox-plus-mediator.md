@@ -72,7 +72,7 @@ impl CommandHandler<RegisterUser> for RegisterUserHandler {
 }
 ```
 
-The single transaction wraps both writes. If the commit fails, neither the user row nor the outbox row exists. If the commit succeeds, the outbox worker (running in a separate task) picks up the row in its next poll cycle and publishes it to the bus.
+The single transaction wraps both writes. If the commit fails, neither the user row nor the outbox row exists. If the commit succeeds, the outbox worker (running in a separate task) picks up the row in its next poll cycle and dispatches it to the outbox handler you registered. That handler is what publishes to the bus, if that is where the event should go: the framework does not relay outbox rows to the bus by itself (see `BusForwarder` in [`05_orders_to_payments.rs`](../../crates/hexeract-examples/examples/05_orders_to_payments.rs)).
 
 ## Why telescope rather than compose at the call site
 
@@ -125,7 +125,7 @@ async fn run(pool: PgPool) -> Result<(), Box<dyn std::error::Error>> {
 Two long-running concerns coexist:
 
 - **The mediator** dispatches synchronous commands and queries on demand from your HTTP / gRPC handler.
-- **The outbox worker** drains the table on its own schedule, decoupled from request lifecycle, publishing rows to the bus.
+- **The outbox worker** drains the table on its own schedule, decoupled from request lifecycle, dispatching each row to your outbox handler (which publishes to the bus when you write it to).
 
 The transaction in the command handler is the only synchronization point. Everything downstream is at-least-once.
 

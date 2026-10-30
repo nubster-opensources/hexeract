@@ -23,6 +23,7 @@ sequenceDiagram
     participant Caller as Use case
     participant DB as PostgreSQL
     participant Worker as OutboxWorker
+    participant Handler as Your outbox handler
     participant Broker as Side effect<br/>(broker, audit, ...)
 
     Caller->>DB: BEGIN
@@ -34,7 +35,8 @@ sequenceDiagram
     loop poll_interval
         Worker->>DB: SELECT FOR UPDATE SKIP LOCKED
         DB-->>Worker: pending envelopes
-        Worker->>Broker: handler.handle(event, ctx)
+        Worker->>Handler: handle(event, ctx)
+        Handler->>Broker: perform the side effect (publish, write, ...)
         Worker->>DB: UPDATE outbox SET delivered_at = NOW()
     end
 ```
@@ -51,7 +53,7 @@ sequenceDiagram
 
 ## What an outbox is NOT
 
-- **Not a message broker.** The outbox is a durable buffer between your business transaction and whatever side effect needs to happen. The handler is typically the bridge that actually publishes to RabbitMQ, Kafka, etc.
+- **Not a message broker.** The outbox is a durable buffer between your business transaction and whatever side effect needs to happen. The handler is typically the bridge that actually publishes to RabbitMQ, Kafka, etc.: the worker dispatches to your handler and never talks to a broker itself. The runnable [`05_orders_to_payments` example](../../crates/hexeract-examples/examples/05_orders_to_payments.rs) shows the `BusForwarder` handler doing exactly that.
 - **Not a workflow engine.** The outbox dispatches one event to one handler. Sagas, orchestration and compensation live in v0.9.0 (Durable Sagas milestone), after the v0.8 Inbox and consumer-reliability foundation.
 - **Not synchronous.** Dispatch latency is bounded by `poll_interval`, default `100 ms`. For latency-critical paths, drop the interval or scale workers horizontally.
 

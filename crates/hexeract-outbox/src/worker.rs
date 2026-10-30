@@ -91,7 +91,9 @@ pub trait OutboxStore: Send + Sync + 'static {
     /// what lets `claimed_attempt` fence this call: a settlement that moved the
     /// counter would move its own fence.
     ///
-    /// Same fencing contract as [`Self::mark_delivered`].
+    /// Same fencing contract as [`Self::mark_delivered`]. A backend that does
+    /// not override [`Self::claim`] takes no lease and has no fence to check: it
+    /// ignores `claimed_attempt` and returns `true`.
     async fn mark_failed<'a>(
         &self,
         tx: &mut Self::Tx<'a>,
@@ -112,6 +114,15 @@ pub trait OutboxStore: Send + Sync + 'static {
     /// both roll back. The default implementation is a no-op returning `true`,
     /// so backends that do not persist dead-lettered envelopes need not
     /// override it.
+    ///
+    /// A `true` return has two distinct causes. A backend that does not override
+    /// [`Self::claim`] takes no lease and has no fence to check, so it ignores
+    /// `claimed_attempt` and returns `true`. Separately, a backend that does not
+    /// persist dead-lettered envelopes returns `true` because there is nothing
+    /// to write. The second cause says nothing about the fence: a backend that
+    /// takes a lease and does persist must still apply the write only while the
+    /// stored attempt counter equals `claimed_attempt`, and return `false` when
+    /// it does not.
     async fn mark_dead_lettered<'a>(
         &self,
         _tx: &mut Self::Tx<'a>,
