@@ -1,9 +1,12 @@
 //! End-to-end pipeline: transactional outbox -> RabbitMQ bus -> CQRS mediator.
 //!
 //! An order and its `OrderPlaced` event are written in one Postgres
-//! transaction. The outbox worker relays the event to RabbitMQ; a bus
-//! consumer bridges it into a `ProcessPayment` command dispatched by the
-//! mediator. This is the whole framework wired together.
+//! transaction. The outbox worker dispatches the event to the `BusForwarder`
+//! handler below, which is the code that publishes it to RabbitMQ: the
+//! framework ships no relay of its own, so this bridge is application code
+//! and this example is where it lives. A bus consumer then brings the event
+//! into a `ProcessPayment` command dispatched by the mediator. This is the
+//! whole framework wired together.
 //!
 //! Run with (requires a running Docker daemon):
 //!

@@ -236,6 +236,49 @@ see the [production checklist](../operations/production-checklist.md).
 
 See the [worker concept](../concepts/worker.md), the [ack modes](../concepts/ack-modes.md) and the [retry policy](../concepts/retry-policy.md).
 
+### Envelope signing and verification
+
+Signing and verifying are two halves of one contract, configured independently
+and on different objects. Each half is useless alone, and the asymmetry is the
+thing to get right: a deployment that signs without verifying gains nothing at
+all, because no participant refuses an unsigned or forged envelope, while a
+deployment that verifies without signing refuses everything its peers send.
+This is why the rollout order is signing first, everywhere, then verification:
+see [Migration v0.6 to v0.7: envelope authenticity on the RabbitMQ transport](../operations/migration-v0.6-v0.7.md).
+
+| Item | Role |
+| --- | --- |
+| `OutboundEnvelopeSecurity::new(issuer, audience, keys)` | The signing half. Stamps the security headers of every envelope it covers, under an `Issuer` and an `Audience`, with keys from a `SigningKeySource`. |
+| `OutboundEnvelopeSecurity::bind_issuer_to_broker_user()` | Off by default. Also publishes the issuer as the AMQP `user-id` property, which the broker refuses unless it names the account the connection authenticated as. The deployment must therefore name that account exactly as `issuer`, and a mismatch turns every publish into a broker rejection rather than a signature failure. The signed header alone already authenticates the issuer end to end, so this is a broker-enforced binding an operator opts into, not a prerequisite. |
+| `InboundEnvelopeSecurity::new(keys, config)` | The verifying half. Checks the security headers against a `VerificationKeySource`, under an `EnvelopeSecurityConfig` carrying the `VerificationPolicy`. |
+| `RabbitMqTransport::with_outbound_envelope_security(security)` | Sign every envelope this transport publishes. |
+| `RabbitMqWorkerBuilder::envelope_security(security)` | Verify every delivery this worker consumes. |
+| `RabbitMqRequestClientConfigBuilder::outbound_envelope_security(security)` | Sign the requests this client publishes. |
+| `RabbitMqRequestClientConfigBuilder::envelope_security(security)` | Verify the replies this client receives. The request-reply path needs both: signing requests does not authenticate the replies that come back. |
+| `VerificationPolicy::Required` | The default. Refuses any envelope that is not authenticated. |
+| `VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes` | Accepts unauthenticated envelopes. Named at that length on purpose: it disables the only defence against a forged message, and is meant for local development. |
+
+A valid signature proves who minted an envelope and that its covered headers
+and payload were not altered. It does not prove the envelope is being seen for
+the first time: a captured signed message verifies again, indefinitely, for as
+long as its key is trusted. Replay is bounded by consumer-side deduplication,
+which is not shipped yet (the v0.8 inbox), so a deployment that needs
+at-most-once effects cannot rely on signing to get it.
+
+### Reply queue design
+
+A request client declares its own exclusive, auto-delete, server-named queue
+and publishes that name as its `reply_to`, rather than using the broker's
+direct reply-to pseudo-queue. The cost is one extra declaration round trip per
+connection, paid again on every reconnect. What it buys is an access-control
+story that can be reasoned about with ordinary permissions: the inbox is a real
+queue, named in the `amq.gen-` namespace the broker itself mints, so a
+responder's right to publish into it is an ordinary publish permission rather
+than a special case. It also lets the reply publisher refuse any `reply_to`
+outside that namespace, which it does: a request carrying a hand-crafted
+`reply_to` is dropped before the handler runs, and nothing is published. See
+[Request-reply: wire contract](../concepts/request-reply.md).
+
 ### Topology helpers
 
 | Item | Role |

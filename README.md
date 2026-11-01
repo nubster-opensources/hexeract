@@ -1,6 +1,6 @@
 # Hexeract
 
-> Rust messaging framework: Mediator, Bus, Outbox, Sagas, Scheduler, Request/Reply.
+> Rust messaging framework: Mediator, Bus, Outbox, Scheduler and Request/Reply (available in code, not yet released). Sagas are planned.
 
 [![crates.io](https://img.shields.io/crates/v/hexeract-outbox.svg?label=crates.io)](https://crates.io/crates/hexeract-outbox)
 [![docs.rs](https://img.shields.io/docsrs/hexeract-outbox?label=docs.rs)](https://docs.rs/hexeract-outbox)
@@ -25,7 +25,7 @@ Hexeract is sponsored by [Nubster](https://nubster.com).
 | Transactional outbox (PostgreSQL) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Worker poll loop with `SKIP LOCKED` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Fluent builder API | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `hexeract outbox` CLI | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `hexeract outbox` CLI (`patch`, `apply`, `check`: PostgreSQL only) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Bus core (`Message`, `BusEnvelope`, `Transport`, `Handler<M>`) | ⏳ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | RabbitMQ backend (`lapin` connection pool, publish, consume, retry) | ⏳ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Topology types (`Exchange`, `Queue`, `Binding`, `RoutingKey`) | ⏳ | ✅ | ✅ | ✅ | ✅ | ✅ |

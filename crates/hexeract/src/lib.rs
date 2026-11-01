@@ -3,7 +3,8 @@
 //! Hexeract is an opinionated messaging framework for Rust. It unifies
 //! in-process mediator dispatch, multi-broker bus transport, a
 //! transactional outbox and a durable scheduler in a single ergonomic
-//! crate. Sagas and request/reply are planned for future releases (see
+//! crate. Request/reply is available in the source tree but not yet released,
+//! and sagas are planned for a future release (see
 //! [the roadmap](https://github.com/nubster-opensources/hexeract/blob/main/docs/explanation/roadmap.md)).
 //!
 //! This facade re-exports every shipped sub-crate behind opt-in

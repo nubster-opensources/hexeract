@@ -125,7 +125,7 @@ For pre-built tracing and timeout middlewares, see [`hexeract-middleware` refere
 
 ## Outbox
 
-Wolverine couples the outbox to the transaction implicitly with `[Transactional]` and persistence sagas. Hexeract decouples them: you call `PgOutboxPublisher::publish_in_tx` inside your business transaction, and a worker drains the table to the bus on its own polling loop.
+Wolverine couples the outbox to the transaction implicitly with `[Transactional]` and persistence sagas. Hexeract decouples them: you call `PgOutboxPublisher::publish_in_tx` inside your business transaction, and a worker drains the table on its own polling loop, dispatching each row to a handler you write. Forwarding to the bus is that handler's job: the framework ships no typed outbox-to-bus relay today (see `BusForwarder` in [`05_orders_to_payments.rs`](../../crates/hexeract-examples/examples/05_orders_to_payments.rs)).
 
 See [Outbox quick start](../getting-started/outbox-quick-start.md) and [Outbox pattern](../concepts/outbox-pattern.md) for the runtime model.
 
@@ -145,7 +145,7 @@ async fn handle(&self, cmd: CreateUser, ctx: &HandlerContext) -> Result<u64, Hex
 }
 ```
 
-The mediator dispatches `CreateUser` to this handler. The handler runs the business transaction *and* enqueues the outgoing `UserCreated` event in the same transaction. A separate worker, started elsewhere in your service, drains the outbox table to the bus.
+The mediator dispatches `CreateUser` to this handler. The handler runs the business transaction *and* enqueues the outgoing `UserCreated` event in the same transaction. A separate worker, started elsewhere in your service, drains the outbox table and dispatches each row to an outbox handler. Publishing to the bus is something that handler does explicitly; see `BusForwarder` in [`05_orders_to_payments.rs`](../../crates/hexeract-examples/examples/05_orders_to_payments.rs) for the pattern.
 
 This split is more verbose than Wolverine's `[Transactional]` attribute, but it makes the failure semantics observable and testable: there is no magic about when the outbox row is written, because you write it.
 

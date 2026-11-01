@@ -15,3 +15,4 @@ Examples that touch Postgres or RabbitMQ start their own container through
 | `04_bus_mediator` | Bus consumer dispatching to the in-process CQRS mediator | `cargo run --example 04_bus_mediator -p hexeract-examples` | yes |
 | `05_orders_to_payments` | End-to-end: transactional outbox -> RabbitMQ -> mediator | `cargo run --example 05_orders_to_payments -p hexeract-examples` | yes |
 | `06_scheduled_reminder` | Delayed + cron schedules dispatched through the bus sink, live cancel and inspect (Postgres + RabbitMQ) | `cargo run --example 06_scheduled_reminder -p hexeract-examples` | yes |
+| `07_request_reply` | Synchronous-over-async RPC over RabbitMQ: nominal round trip, timeout, remote fault, business rejection and causal propagation (unreleased) | `cargo run --example 07_request_reply -p hexeract-examples` | yes |

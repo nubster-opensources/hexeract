@@ -18,7 +18,7 @@ Each top-level subcommand has its own set of actions documented below.
 
 ### `outbox patch`
 
-Print the canonical outbox schema SQL templated with the given table name. No network access.
+Print the canonical PostgreSQL outbox schema SQL templated with the given table name. No network access.
 
 ```bash
 hexeract outbox patch --table audit_outbox
@@ -37,7 +37,7 @@ hexeract outbox apply \
 
 ### `outbox check`
 
-Validate that the target table exists with the expected columns.
+Validate that the target table exists in a PostgreSQL database with the expected columns.
 
 ```bash
 hexeract outbox check --conn "$DATABASE_URL" --table audit_outbox

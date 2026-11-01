@@ -94,7 +94,7 @@ crates/
 ├── hexeract-scheduler-sql/
 │   └── src/{schema,mapping,statements,timestamp,validate,postgres,mysql,sqlite}.rs
 ├── hexeract-examples/
-│   └── examples/{01_command_handler,02_outbox_transactional,03_bus_pubsub,04_bus_mediator,05_orders_to_payments}.rs
+│   └── examples/{01_command_handler,02_outbox_transactional,03_bus_pubsub,04_bus_mediator,05_orders_to_payments,06_scheduled_reminder,07_request_reply}.rs
 └── hexeract-cli/
     └── src/{cli,commands/{outbox,bus,scheduler}}.rs
 ```
