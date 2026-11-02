@@ -10,7 +10,29 @@ publish = false
 workspace = true
 
 [dependencies]
-hexeract = { path = "../hexeract", version = "0.6", features = ["macros", "mediator", "scheduler"] }
+hexeract = { path = "../hexeract", version = "0.6", default-features = false }
 
 [dev-dependencies]
 tokio = { workspace = true }
+
+# One feature per public feature of the `hexeract` facade, forwarded to it. The
+# guard test in `tests/feature_guard.rs` keeps the two lists identical.
+[features]
+default = []
+core = ["hexeract/core"]
+outbox = ["hexeract/outbox"]
+outbox-sql-postgres = ["hexeract/outbox-sql-postgres"]
+outbox-sql-mysql = ["hexeract/outbox-sql-mysql"]
+outbox-sql-sqlite = ["hexeract/outbox-sql-sqlite"]
+bus = ["hexeract/bus"]
+bus-rabbitmq = ["hexeract/bus-rabbitmq"]
+mediator = ["hexeract/mediator"]
+macros = ["hexeract/macros"]
+middleware = ["hexeract/middleware"]
+scheduler = ["hexeract/scheduler"]
+scheduler-mediator = ["hexeract/scheduler-mediator"]
+scheduler-bus = ["hexeract/scheduler-bus"]
+scheduler-outbox = ["hexeract/scheduler-outbox"]
+scheduler-sql-postgres = ["hexeract/scheduler-sql-postgres"]
+scheduler-sql-mysql = ["hexeract/scheduler-sql-mysql"]
+scheduler-sql-sqlite = ["hexeract/scheduler-sql-sqlite"]

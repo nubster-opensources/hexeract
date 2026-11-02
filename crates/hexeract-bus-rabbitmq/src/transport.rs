@@ -133,6 +133,20 @@ impl RabbitMqTransportConfig {
         self
     }
 
+    /// Declare `exchange` at connection time and publish to it (default: the
+    /// AMQP default exchange).
+    #[must_use]
+    pub fn with_exchange(self, _exchange: Exchange) -> Self {
+        todo!("settled-public-surface: Building")
+    }
+
+    /// Publish without publisher confirms and without `mandatory` (default:
+    /// confirmed and mandatory).
+    #[must_use]
+    pub fn fire_and_forget(self) -> Self {
+        todo!("settled-public-surface: Building")
+    }
+
     pub(crate) fn connection_config(&self) -> &RabbitMqConnectionConfig {
         &self.connection_config
     }

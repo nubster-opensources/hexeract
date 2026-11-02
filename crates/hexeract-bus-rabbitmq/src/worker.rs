@@ -404,6 +404,17 @@ impl RabbitMqWorkerBuilder {
         self
     }
 
+    /// Declare the consumed queue (durable, not exclusive, not auto-delete)
+    /// when the worker starts, before consuming.
+    ///
+    /// A queue already declared with other arguments makes
+    /// [`RabbitMqWorker::run`] fail with the broker's `PRECONDITION_FAILED`,
+    /// surfaced as a [`BusError`].
+    #[must_use]
+    pub fn declare_queue(self) -> Self {
+        todo!("settled-public-surface: Building")
+    }
+
     /// Register a typed handler for messages of type `M`.
     ///
     /// Registering twice for the same `M::MESSAGE_TYPE` silently

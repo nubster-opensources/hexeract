@@ -2301,3 +2301,263 @@ async fn no_ack_shutdown_drains_in_flight_handlers() {
         "every in-flight no_ack handler must finish before shutdown (#338)"
     );
 }
+
+/// Whether `name` exists on the broker, probed by a passive declaration.
+///
+/// A passive declaration of a missing queue closes the channel it ran on, so
+/// every probe opens its own connection and channel.
+async fn queue_exists(uri: &str, name: &str) -> bool {
+    let Ok(connection) = Connection::connect(uri, ConnectionProperties::default()).await else {
+        return false;
+    };
+    let Ok(channel) = connection.create_channel().await else {
+        return false;
+    };
+    channel
+        .queue_declare(
+            name.into(),
+            QueueDeclareOptions {
+                passive: true,
+                ..QueueDeclareOptions::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .is_ok()
+}
+
+/// Wait, bounded by [`harness::PROGRESS_TIMEOUT`], until `name` exists.
+async fn await_queue(uri: &str, name: &str) {
+    let wait = async {
+        while !queue_exists(uri, name).await {
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::time::timeout(harness::PROGRESS_TIMEOUT, wait)
+        .await
+        .unwrap_or_else(|_| panic!("queue {name} never appeared on the broker"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn transport_config_with_exchange_declares_the_exchange_and_publishes_on_it() {
+    let broker = harness::start_rabbitmq().await;
+    let exchange = Exchange::new("settled.direct", ExchangeKind::Direct)
+        .expect("exchange must validate")
+        .durable(true)
+        .auto_delete(false);
+    let queue_name = "settled.direct.received";
+    let routing_key = "orders.placed";
+
+    let config = RabbitMqTransportConfig::default().with_exchange(exchange.clone());
+    let transport = RabbitMqTransport::new_with_transport_config(broker.uri(), &config)
+        .await
+        .expect("transport must connect and declare the exchange");
+    assert_eq!(transport.exchange(), exchange.name);
+
+    let consumer_conn = Connection::connect(broker.uri(), ConnectionProperties::default())
+        .await
+        .expect("consumer connection must open");
+    let consumer_channel = consumer_conn
+        .create_channel()
+        .await
+        .expect("consumer channel must open");
+    consumer_channel
+        .queue_declare(
+            queue_name.into(),
+            QueueDeclareOptions {
+                durable: true,
+                ..QueueDeclareOptions::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .expect("queue declare must succeed");
+    consumer_channel
+        .queue_bind(
+            queue_name.into(),
+            exchange.name.as_str().into(),
+            routing_key.into(),
+            lapin::options::QueueBindOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .expect("binding to the exchange the transport declared must succeed");
+
+    transport
+        .publish(
+            routing_key,
+            &OrderPlaced {
+                order_id: Uuid::from_u128(11),
+            },
+        )
+        .await
+        .expect("a confirmed, mandatory publish through the exchange must be routed");
+
+    let delivery = tokio::time::timeout(harness::PROGRESS_TIMEOUT, async {
+        loop {
+            let candidate = consumer_channel
+                .basic_get(queue_name.into(), BasicGetOptions::default())
+                .await
+                .expect("basic_get must succeed");
+            if let Some(delivery) = candidate {
+                return delivery;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the message must reach the queue bound to the exchange");
+    assert_eq!(
+        delivery.properties.kind().as_ref().map(ShortString::as_str),
+        Some("orders.placed")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn transport_config_fire_and_forget_publishes_without_confirmation() {
+    let broker = harness::start_rabbitmq().await;
+    let config = RabbitMqTransportConfig::default().fire_and_forget();
+    let transport = RabbitMqTransport::new_with_transport_config(broker.uri(), &config)
+        .await
+        .expect("transport must connect");
+
+    let message_id = transport
+        .publish(
+            "orders.nowhere",
+            &OrderPlaced {
+                order_id: Uuid::from_u128(12),
+            },
+        )
+        .await
+        .expect("fire-and-forget publish must not await a broker verdict");
+
+    assert_ne!(message_id, Uuid::nil());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn declare_queue_makes_the_worker_consume_a_queue_nobody_declared() {
+    let broker = harness::start_rabbitmq().await;
+    let queue_name = "worker.declared";
+    assert!(
+        !queue_exists(broker.uri(), queue_name).await,
+        "the scenario needs a queue that does not exist yet"
+    );
+
+    let seen = harness::CallCounter::new();
+    let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .declare_queue()
+        .register_handler::<OrderPlaced, _>(RecordingHandler { seen: seen.clone() })
+        .build()
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
+
+    await_queue(broker.uri(), queue_name).await;
+    let transport = RabbitMqTransport::new(broker.uri()).await.unwrap();
+    transport
+        .publish(
+            queue_name,
+            &OrderPlaced {
+                order_id: Uuid::from_u128(13),
+            },
+        )
+        .await
+        .expect("the declared queue must route the publish");
+    seen.await_count(1).await;
+    assert_eq!(seen.count(), 1, "the handler must run exactly once");
+
+    declare_durable_queue(broker.uri(), queue_name).await;
+
+    cancel.cancel();
+    handle
+        .await
+        .expect("worker task joins")
+        .expect("worker run returns Ok");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn a_worker_without_declare_queue_does_not_create_its_queue() {
+    let broker = harness::start_rabbitmq().await;
+    let queue_name = "worker.not.declared";
+
+    let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .register_handler::<OrderPlaced, _>(RecordingHandler::default())
+        .build()
+        .unwrap();
+
+    let outcome = tokio::time::timeout(
+        harness::PROGRESS_TIMEOUT,
+        worker.run(CancellationToken::new()),
+    )
+    .await
+    .expect("run must fail on a missing queue rather than wait for it");
+
+    assert!(
+        outcome.is_err(),
+        "without declare_queue the queue belongs to the operator, and a missing one fails run"
+    );
+    assert!(
+        !queue_exists(broker.uri(), queue_name).await,
+        "run must not have created the queue"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn declare_queue_against_a_queue_with_other_arguments_fails_run_without_panic() {
+    let broker = harness::start_rabbitmq().await;
+    let queue_name = "worker.declared.mismatch";
+
+    let setup_connection = Connection::connect(broker.uri(), ConnectionProperties::default())
+        .await
+        .expect("setup connection must open");
+    let setup_channel = setup_connection
+        .create_channel()
+        .await
+        .expect("setup channel must open");
+    let mut arguments = FieldTable::default();
+    arguments.insert("x-message-ttl".into(), AMQPValue::LongUInt(60_000));
+    setup_channel
+        .queue_declare(
+            queue_name.into(),
+            QueueDeclareOptions {
+                durable: true,
+                ..QueueDeclareOptions::default()
+            },
+            arguments,
+        )
+        .await
+        .expect("the pre-existing queue must declare");
+
+    let consumer_conn = RabbitMqConnection::connect(broker.uri()).await.unwrap();
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .declare_queue()
+        .register_handler::<OrderPlaced, _>(RecordingHandler::default())
+        .build()
+        .unwrap();
+
+    let outcome = tokio::time::timeout(
+        harness::PROGRESS_TIMEOUT,
+        worker.run(CancellationToken::new()),
+    )
+    .await
+    .expect("run must surface the broker's refusal rather than wait");
+
+    assert!(
+        matches!(
+            outcome,
+            Err(BusError::Transport(_) | BusError::Connection { .. })
+        ),
+        "a PRECONDITION_FAILED declaration must surface as a BusError, got {outcome:?}"
+    );
+}

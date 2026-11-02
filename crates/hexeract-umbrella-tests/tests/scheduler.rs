@@ -1,3 +1,5 @@
+#![cfg(feature = "scheduler")]
+
 //! Verifies that the `scheduler` facade feature re-exports compile and are
 //! reachable through the `hexeract` umbrella crate.
 

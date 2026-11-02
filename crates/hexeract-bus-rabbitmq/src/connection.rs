@@ -338,6 +338,23 @@ impl RabbitMqConnectionConfig {
         self
     }
 
+    /// Number of connection attempts before giving up (default
+    /// [`DEFAULT_RETRY_ATTEMPTS`]).
+    ///
+    /// Zero is treated as one: a connection is always attempted at least
+    /// once.
+    #[must_use]
+    pub fn with_retry_attempts(self, _attempts: u32) -> Self {
+        todo!("settled-public-surface: Building")
+    }
+
+    /// Delay before the second attempt, doubled on each retry up to a factor
+    /// of 256 (default [`DEFAULT_RETRY_BASE_DELAY`]).
+    #[must_use]
+    pub fn with_retry_base_delay(self, _base_delay: Duration) -> Self {
+        todo!("settled-public-surface: Building")
+    }
+
     pub(crate) fn tls_config(&self) -> OwnedTLSConfig {
         self.tls_config.clone().unwrap_or_default()
     }
@@ -1323,6 +1340,135 @@ mod tests {
             err.is_retryable_connection(),
             Some(true),
             "an unreachable broker may heal, so the give-up must classify as transient"
+        );
+    }
+
+    /// A loopback listener that accepts every connection and drops it at once,
+    /// counting the accepts. Each connection attempt the client makes is one
+    /// accept, so the count is the number of attempts, observed from the
+    /// broker side with no broker running.
+    struct AttemptCounter {
+        port: u16,
+        accepted: Arc<std::sync::atomic::AtomicUsize>,
+        should_stop: Arc<std::sync::atomic::AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl AttemptCounter {
+        fn start() -> Self {
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("loopback listener must bind");
+            listener
+                .set_nonblocking(true)
+                .expect("listener must become non-blocking");
+            let port = listener.local_addr().expect("listener has an address").port();
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let should_stop = Arc::new(AtomicBool::new(false));
+            let worker = {
+                let accepted = Arc::clone(&accepted);
+                let should_stop = Arc::clone(&should_stop);
+                std::thread::spawn(move || {
+                    while !should_stop.load(Ordering::SeqCst) {
+                        match listener.accept() {
+                            Ok((stream, _peer)) => {
+                                accepted.fetch_add(1, Ordering::SeqCst);
+                                drop(stream);
+                            }
+                            Err(_) => std::thread::sleep(Duration::from_millis(2)),
+                        }
+                    }
+                })
+            };
+            Self {
+                port,
+                accepted,
+                should_stop,
+                worker: Some(worker),
+            }
+        }
+
+        fn uri(&self) -> String {
+            format!("amqp://127.0.0.1:{}", self.port)
+        }
+
+        /// Wait, bounded, until at least `expected` attempts were accepted,
+        /// then report how many were.
+        async fn accepted_after_waiting_for(&self, expected: usize) -> usize {
+            use std::sync::atomic::Ordering;
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while self.accepted.load(Ordering::SeqCst) < expected
+                && std::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            self.accepted.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for AttemptCounter {
+        fn drop(&mut self) {
+            self.should_stop
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_retries_a_transient_failure_with_the_default_configuration() {
+        let broker = AttemptCounter::start();
+
+        let err = RabbitMqConnection::connect(&broker.uri())
+            .await
+            .expect_err("a listener that drops every connection must not yield a session");
+
+        assert!(matches!(err, BusError::Connection { .. }));
+        assert_eq!(
+            broker.accepted_after_waiting_for(5).await,
+            5,
+            "the default configuration must make DEFAULT_RETRY_ATTEMPTS (5) attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_retry_attempt_makes_a_single_connection_attempt() {
+        let broker = AttemptCounter::start();
+        let config = RabbitMqConnectionConfig::default()
+            .with_retry_attempts(1)
+            .with_retry_base_delay(Duration::from_millis(1));
+
+        let err = RabbitMqConnection::connect_with_config(&broker.uri(), &config)
+            .await
+            .expect_err("a listener that drops every connection must not yield a session");
+
+        assert!(matches!(err, BusError::Connection { .. }));
+        assert_eq!(
+            broker.accepted_after_waiting_for(1).await,
+            1,
+            "with_retry_attempts(1) must make exactly one attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_retry_attempts_is_treated_as_a_single_connection_attempt() {
+        let broker = AttemptCounter::start();
+        let config = RabbitMqConnectionConfig::default()
+            .with_retry_attempts(0)
+            .with_retry_base_delay(Duration::from_millis(1));
+
+        let err = RabbitMqConnection::connect_with_config(&broker.uri(), &config)
+            .await
+            .expect_err("a listener that drops every connection must not yield a session");
+
+        assert!(matches!(err, BusError::Connection { .. }));
+        assert_eq!(
+            broker.accepted_after_waiting_for(1).await,
+            1,
+            "with_retry_attempts(0) must still make exactly one attempt"
         );
     }
 

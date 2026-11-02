@@ -1,3 +1,5 @@
+#![cfg(all(feature = "macros", feature = "mediator"))]
+
 //! Compiles and dispatches a handler depending only on the `hexeract`
 //! umbrella crate, exercising `#[handler]` path resolution through the facade.
 

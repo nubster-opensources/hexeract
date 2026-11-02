@@ -144,6 +144,43 @@ impl Default for RabbitMqRequestClientConfig {
     }
 }
 
+impl RabbitMqRequestClientConfig {
+    /// Override the maximum number of concurrent requests awaiting a reply
+    /// (default [`DEFAULT_MAX_IN_FLIGHT`]).
+    #[must_use]
+    pub fn with_max_in_flight(self, _max_in_flight: usize) -> Self {
+        todo!("settled-public-surface: Building")
+    }
+
+    /// Use the supplied TLS and retry settings for every connection owned by
+    /// the client.
+    #[must_use]
+    pub fn with_connection_config(self, _connection_config: RabbitMqConnectionConfig) -> Self {
+        todo!("settled-public-surface: Building")
+    }
+
+    /// Bound the AMQP metadata of both legs of a request-reply call.
+    #[must_use]
+    pub fn with_metadata_limits(self, _metadata_limits: AmqpMetadataLimits) -> Self {
+        todo!("settled-public-surface: Building")
+    }
+
+    /// Verify every reply this client receives against `security`.
+    #[must_use]
+    pub fn with_envelope_security(self, _security: Arc<InboundEnvelopeSecurity>) -> Self {
+        todo!("settled-public-surface: Building")
+    }
+
+    /// Sign every request this client publishes with `security`.
+    #[must_use]
+    pub fn with_outbound_envelope_security(
+        self,
+        _security: Arc<OutboundEnvelopeSecurity>,
+    ) -> Self {
+        todo!("settled-public-surface: Building")
+    }
+}
+
 /// Builder for [`RabbitMqRequestClientConfig`].
 ///
 /// Mirrors the construction style of [`crate::RabbitMqWorkerBuilder`]: every
