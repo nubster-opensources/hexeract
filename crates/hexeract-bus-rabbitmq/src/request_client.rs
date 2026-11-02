@@ -215,7 +215,7 @@ pub async fn connect_request_client(
 
 /// Assemble a ready RabbitMQ request client with caller-selected limits.
 ///
-/// See [`RabbitMqRequestClientConfig::max_in_flight`] for the immediate
+/// See [`RabbitMqRequestClientConfig::with_max_in_flight`] for the immediate
 /// backpressure applied when too many requests are already awaiting replies.
 ///
 /// # Errors
