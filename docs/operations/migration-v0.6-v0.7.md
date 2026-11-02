@@ -249,6 +249,7 @@ affected.
 | `RabbitMqTransport::from_connection(connection, size)` | Removed from the public surface; open the transport with `new_with_config` |
 | `RabbitMqRequestClientConfigBuilder::new().max_in_flight(n).build()` | `RabbitMqRequestClientConfig::default().with_max_in_flight(n)` |
 | `RabbitMqRequestClientConfigBuilder` `.connection_config(..)`, `.metadata_limits(..)`, `.envelope_security(..)`, `.outbound_envelope_security(..)` | The same names prefixed with `with_` on `RabbitMqRequestClientConfig` |
+| Reading or assigning `config.max_in_flight`, `config.connection_config`, `config.metadata_limits`, `config.envelope_security` or `config.outbound_envelope_security` on a `RabbitMqRequestClientConfig` | The fields are private and the type is no longer `#[non_exhaustive]`: set them through the matching `with_*` method, and keep the value you set if you need it again, since the config exposes no getter |
 | `RabbitMqWorkerConfig` | No longer public; keep setting the same values through `RabbitMqWorkerBuilder` |
 
 **Retry is on by default.** `RabbitMqConnection::connect` used to make one
