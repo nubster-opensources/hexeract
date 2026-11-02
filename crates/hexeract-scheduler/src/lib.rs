@@ -36,11 +36,11 @@
 //! This crate ships no sink by default; enable the ones the target
 //! dispatch backend needs:
 //!
-//! - `bus`: enables [`BusSink`], dispatching a due occurrence onto the
+//! - `bus`: enables `BusSink`, dispatching a due occurrence onto the
 //!   message bus.
-//! - `mediator`: enables [`MediatorSink`], dispatching a due occurrence
+//! - `mediator`: enables `MediatorSink`, dispatching a due occurrence
 //!   through the in-process mediator.
-//! - `outbox`: enables [`OutboxSink`], enqueuing a due occurrence into the
+//! - `outbox`: enables `OutboxSink`, enqueuing a due occurrence into the
 //!   transactional outbox.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 

@@ -10,13 +10,13 @@ The full rustdoc lives at <https://docs.rs/hexeract-bus-rabbitmq>.
 
 | Item | Role |
 | --- | --- |
-| `RabbitMqConnection::connect(uri)` | Single-shot connect. Returns `BusError::Connection` on failure. |
-| `RabbitMqConnection::connect_with_config(uri, config)` | Single-shot connect with a private-CA or client-certificate TLS configuration. |
-| `RabbitMqConnection::connect_with_retry(uri, attempts, base_delay)` | Bounded exponential-backoff retry loop. Logs each failure at `warn`. |
-| `RabbitMqConnection::connect_with_retry_with_config(uri, attempts, base_delay, config)` | Same retry loop while retaining the TLS settings for every attempt. |
+| `RabbitMqConnection::connect(uri)` | Connect with the default configuration, retrying transient failures with bounded exponential backoff. Logs each failure at `warn`. Returns `BusError::Connection` once the attempts are spent. |
+| `RabbitMqConnection::connect_with_config(uri, config)` | Connect with a `RabbitMqConnectionConfig`: TLS settings (private CA, client certificate) and retry settings, kept for every attempt. |
+| `RabbitMqConnectionConfig::with_retry_attempts(n)` | Number of connection attempts (default `DEFAULT_RETRY_ATTEMPTS`). Zero counts as one; `1` makes a single attempt. |
+| `RabbitMqConnectionConfig::with_retry_base_delay(delay)` | Delay before the second attempt, doubled on each retry (default `DEFAULT_RETRY_BASE_DELAY`). |
 | `RabbitMqConnection::create_channel()` | Open a fresh AMQP channel. |
 | `RabbitMqConnection::with_channel(|ch| async { ... })` | Open a short-lived channel, hand it to the closure, drop on return. Used by every topology helper. |
-| `DEFAULT_RETRY_ATTEMPTS = 5`, `DEFAULT_RETRY_BASE_DELAY = 250 ms` | Defaults used by `RabbitMqTransport::new`. |
+| `DEFAULT_RETRY_ATTEMPTS = 5`, `DEFAULT_RETRY_BASE_DELAY = 250 ms` | Defaults of `RabbitMqConnectionConfig`, hence of every connect path of the crate. |
 
 ### TLS with a private CA or mTLS
 
@@ -28,6 +28,7 @@ identity enables mutual TLS when the broker requires it.
 ```rust,no_run
 use hexeract_bus_rabbitmq::{
     OwnedIdentity, OwnedTLSConfig, RabbitMqConnectionConfig, RabbitMqTransport,
+    RabbitMqTransportConfig,
 };
 
 # async fn connect() -> Result<(), Box<dyn std::error::Error>> {
@@ -42,7 +43,7 @@ let connection_config = RabbitMqConnectionConfig::default().with_tls_config(tls_
 
 let transport = RabbitMqTransport::new_with_config(
     "amqps://rabbitmq.internal:5671/%2f",
-    &connection_config,
+    &RabbitMqTransportConfig::default().with_connection_config(connection_config),
 )
 .await?;
 # drop(transport);
@@ -52,8 +53,8 @@ let transport = RabbitMqTransport::new_with_config(
 
 Load certificate material through the application's secret-management system;
 do not place private keys or PKCS#12 passwords in source control. The same
-`connection_config` is accepted by `RabbitMqTransport::with_exchange_with_config`
-and `RabbitMqRequestClientConfigBuilder::connection_config`, the latter applying
+`connection_config` is accepted by `RabbitMqTransportConfig::with_connection_config`
+and `RabbitMqRequestClientConfig::with_connection_config`, the latter applying
 it to both the publisher and reply-inbox connections.
 
 #### Prerequisite: one rustls crypto provider
@@ -118,12 +119,12 @@ rendering the credential-bearing URI.
 | Item | Role |
 | --- | --- |
 | `RabbitMqTransport::new(uri)` | Connect with retry and target the AMQP default exchange. |
-| `RabbitMqTransport::new_with_config(uri, config)` | Connect with retry and caller-selected TLS settings. |
-| `RabbitMqTransport::with_exchange(uri, exchange)` | Connect, declare a typed `Exchange`, target it. |
-| `RabbitMqTransport::with_exchange_with_config(uri, exchange, config)` | Declare and target an exchange with caller-selected TLS settings. |
-| `RabbitMqTransport::from_connection(connection, pool_size)` | Reuse an existing connection (useful when several transports share a broker session). |
-| `RabbitMqTransport::fire_and_forget()` | Switch to fire-and-forget publishing: no publisher confirm, no `mandatory` flag, `Ok` no longer proves delivery. Messages stay persistent. |
-| `RabbitMqTransport::with_metadata_limits(limits)` | Bound the metadata every subsequent publish may carry. Validation runs before a channel is acquired, so a rejected envelope never reaches the broker. |
+| `RabbitMqTransport::new_with_config(uri, &RabbitMqTransportConfig)` | Connect with every setting of the config: retry and TLS, exchange, publish mode, metadata limits, envelope signing. |
+| `RabbitMqTransportConfig::with_connection_config(config)` | TLS and retry settings of the connection the transport opens. |
+| `RabbitMqTransportConfig::with_exchange(exchange)` | Declare a typed `Exchange` at connection time and publish to it. |
+| `RabbitMqTransportConfig::fire_and_forget()` | Publish without publisher confirm and without the `mandatory` flag: `Ok` no longer proves delivery. Messages stay persistent. |
+| `RabbitMqTransportConfig::with_metadata_limits(limits)` | Bound the metadata every publish may carry. Validation runs before a channel is acquired, so a rejected envelope never reaches the broker. |
+| `RabbitMqTransportConfig::with_outbound_envelope_security(security)` | Sign every envelope the transport publishes. |
 | Implements `Transport` from `hexeract-bus` (three publish methods). | Mints `BusEnvelope`, encodes JSON, sends through `lapin::Channel::basic_publish` with `mandatory` set, awaits the publisher confirm. An unroutable routing key surfaces as `BusError::Unroutable` instead of silently dropping the message. |
 
 AMQP `BasicProperties` set on every publish: `message_id`, `correlation_id`, `content_type = "application/json"`, `type = MESSAGE_TYPE`, `delivery_mode = 2` (persistent), `timestamp` (the envelope's `published_at` in epoch seconds), optional `reply_to`, free-form `headers` (each as `LongString`).
@@ -163,12 +164,14 @@ invalid UTF-8 long string is rejected rather than silently dropped.
 Configure the same value at each owner:
 
 ```rust,ignore
-let transport = RabbitMqTransport::new(uri)
-    .await?
-    .with_metadata_limits(AmqpMetadataLimits {
+let transport = RabbitMqTransport::new_with_config(
+    uri,
+    &RabbitMqTransportConfig::default().with_metadata_limits(AmqpMetadataLimits {
         max_headers: 16,
         ..AmqpMetadataLimits::default()
-    });
+    }),
+)
+.await?;
 
 let worker = RabbitMqWorkerBuilder::new(connection)
     .queue("orders.work")
@@ -178,12 +181,10 @@ let worker = RabbitMqWorkerBuilder::new(connection)
     })
     .build()?;
 
-let config = RabbitMqRequestClientConfigBuilder::new()
-    .metadata_limits(AmqpMetadataLimits {
-        max_headers: 16,
-        ..AmqpMetadataLimits::default()
-    })
-    .build();
+let config = RabbitMqRequestClientConfig::default().with_metadata_limits(AmqpMetadataLimits {
+    max_headers: 16,
+    ..AmqpMetadataLimits::default()
+});
 ```
 
 The request-client setting reaches the publisher transport and every reply
@@ -223,6 +224,7 @@ see the [production checklist](../operations/production-checklist.md).
 | `.prefetch(n)` | Default 16. |
 | `.dead_letter_routing_key(rk)` | Routes exhausted deliveries to that routing key on the default exchange. |
 | `.metadata_limits(limits)` | Bounds the AMQP metadata of an inbound delivery. See [Metadata limits](#metadata-limits). |
+| `.declare_queue()` | Opt in: the worker declares the queue it consumes (durable, not exclusive, not auto-delete) when it starts, before consuming. Without it the queue belongs to the operator and is never declared. Against an existing queue declared with other arguments, `run` fails with a `BusError` carrying the broker's `PRECONDITION_FAILED`. |
 | `.build()?` | Returns `RabbitMqWorker`. Errors if `.queue(...)` was never set. |
 | `RabbitMqWorker::run(cancel)` | Drives the consume loop until the `CancellationToken` fires. |
 
@@ -231,7 +233,6 @@ see the [production checklist](../operations/production-checklist.md).
 | `AckMode::Manual` | Default. At-least-once. Retries per `message_id` up to `max_attempts`, then DLR or drop. |
 | `AckMode::AckOnReceive` | At-most-once. Explicit `basic_ack` on receive before the handler runs (`no_ack = false`). |
 | `AckMode::Unacknowledged` | Fire-and-forget. Consumer-side `no_ack = true`, lossy on handler failure or crash. |
-| `RabbitMqWorkerConfig` | Tunable knobs: `ack_mode`, `max_attempts`, `prefetch`, `dead_letter_routing_key`, `max_buffered: Option<usize>`, `metadata_limits`. |
 | `.max_buffered(n)` | Bounds the in-memory delivery buffer under `AckMode::Unacknowledged` (`None` = unbounded, not recommended). Has no effect under `AckMode::Manual` or `AckMode::AckOnReceive`, which are already bounded by `basic.qos` prefetch. |
 
 See the [worker concept](../concepts/worker.md), the [ack modes](../concepts/ack-modes.md) and the [retry policy](../concepts/retry-policy.md).
@@ -251,10 +252,10 @@ see [Migration v0.6 to v0.7: envelope authenticity on the RabbitMQ transport](..
 | `OutboundEnvelopeSecurity::new(issuer, audience, keys)` | The signing half. Stamps the security headers of every envelope it covers, under an `Issuer` and an `Audience`, with keys from a `SigningKeySource`. |
 | `OutboundEnvelopeSecurity::bind_issuer_to_broker_user()` | Off by default. Also publishes the issuer as the AMQP `user-id` property, which the broker refuses unless it names the account the connection authenticated as. The deployment must therefore name that account exactly as `issuer`, and a mismatch turns every publish into a broker rejection rather than a signature failure. The signed header alone already authenticates the issuer end to end, so this is a broker-enforced binding an operator opts into, not a prerequisite. |
 | `InboundEnvelopeSecurity::new(keys, config)` | The verifying half. Checks the security headers against a `VerificationKeySource`, under an `EnvelopeSecurityConfig` carrying the `VerificationPolicy`. |
-| `RabbitMqTransport::with_outbound_envelope_security(security)` | Sign every envelope this transport publishes. |
+| `RabbitMqTransportConfig::with_outbound_envelope_security(security)` | Sign every envelope the transport publishes. |
 | `RabbitMqWorkerBuilder::envelope_security(security)` | Verify every delivery this worker consumes. |
-| `RabbitMqRequestClientConfigBuilder::outbound_envelope_security(security)` | Sign the requests this client publishes. |
-| `RabbitMqRequestClientConfigBuilder::envelope_security(security)` | Verify the replies this client receives. The request-reply path needs both: signing requests does not authenticate the replies that come back. |
+| `RabbitMqRequestClientConfig::with_outbound_envelope_security(security)` | Sign the requests this client publishes. |
+| `RabbitMqRequestClientConfig::with_envelope_security(security)` | Verify the replies this client receives. The request-reply path needs both: signing requests does not authenticate the replies that come back. |
 | `VerificationPolicy::Required` | The default. Refuses any envelope that is not authenticated. |
 | `VerificationPolicy::AllowInsecureUnauthenticatedEnvelopes` | Accepts unauthenticated envelopes. Named at that length on purpose: it disables the only defence against a forged message, and is meant for local development. |
 

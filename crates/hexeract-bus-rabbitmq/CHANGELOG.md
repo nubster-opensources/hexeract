@@ -44,6 +44,18 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   `BusError::ReservedHeaderNamespace` instead of putting the header on the
   wire. Reserved keys are accepted from the wire in canonical lowercase only:
   `X-Hexeract-Request-Id` is invalid metadata, never an alias. (#448)
+- Breaking: the public surface settles on one configuration style.
+  `RabbitMqConnectionConfig` carries the retry settings
+  (`with_retry_attempts`, `with_retry_base_delay`), so `connect` now retries and
+  `connect_with_retry` and `connect_with_retry_with_config` are removed.
+  `RabbitMqTransportConfig` gains `with_exchange` and `fire_and_forget` and is
+  what `RabbitMqTransport::new_with_config` takes; `new_with_transport_config`,
+  `with_exchange` and `with_exchange_with_config` are removed and
+  `RabbitMqTransport::from_connection` is no longer public.
+  `RabbitMqRequestClientConfig` has private fields and `with_*` setters, and
+  `RabbitMqRequestClientConfigBuilder` is removed. `RabbitMqWorkerConfig` is
+  no longer public. `RabbitMqWorkerBuilder::declare_queue()` opts in to
+  declaring the consumed queue at startup.
 
 ### Fixed
 

@@ -130,7 +130,7 @@ rabbitmqctl set_permissions -p "tenant-a" "requester-svc" \
   "^$" \
   "^amq\.gen-.*$"
 
-# Requester, named-exchange transport (RabbitMqTransport::with_exchange()):
+# Requester, named-exchange transport (`RabbitMqTransportConfig::with_exchange`):
 # here the request is published to a named application exchange, so
 # `write` must instead name that exchange (or those exchanges).
 # configure/read: unchanged from above.

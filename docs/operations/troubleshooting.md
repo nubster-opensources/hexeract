@@ -39,7 +39,7 @@ Expected behaviour: at-least-once delivery permits duplicates on crash or `max_a
 | Wrong URI scheme | Use `amqps://` for a remote broker, `amqp://` for loopback; not `amqp+ssl://` |
 | `invalid amqp uri` | The URI did not parse. Percent-encode the vhost (`/` becomes `%2f`) and any reserved character in the password, and drop stray spaces. |
 | Broker not reachable | `nc -zv host 5671` to confirm; check firewall, NAT, TLS cert chain |
-| Default retry exhausted | Raise `connect_with_retry` attempts or `base_delay` when wrapping `RabbitMqConnection::connect_with_retry` directly |
+| Default retry exhausted | Raise `with_retry_attempts` or `with_retry_base_delay` on the `RabbitMqConnectionConfig` passed to `RabbitMqConnection::connect_with_config` |
 
 A cleartext refusal is permanent: it is classified non-retryable so a supervisor stops instead of reconnecting forever against a configuration no retry can fix.
 

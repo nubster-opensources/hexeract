@@ -4,7 +4,7 @@
 //! ([`OutboxStore`], [`OutboxPublisher`]) on top of `sqlx`, with one
 //! compile-time backend per Cargo feature:
 //!
-//! - `postgres` (default): [`PgOutboxStore`] / [`PgOutboxPublisher`]
+//! - `postgres` (default): `PgOutboxStore` / `PgOutboxPublisher`
 //! - `mysql`: `MySqlOutboxStore` / `MySqlOutboxPublisher`
 //! - `sqlite`: `SqliteOutboxStore` / `SqliteOutboxPublisher`
 //!

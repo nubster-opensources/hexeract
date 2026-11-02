@@ -32,6 +32,7 @@ use hexeract::bus::Queue;
 use hexeract::bus::RoutingKey;
 use hexeract::bus_rabbitmq::RabbitMqConnection;
 use hexeract::bus_rabbitmq::RabbitMqTransport;
+use hexeract::bus_rabbitmq::RabbitMqTransportConfig;
 use hexeract::bus_rabbitmq::RabbitMqWorkerBuilder;
 use hexeract::bus_rabbitmq::ensure_topology;
 use hexeract::core::HandlerContext;
@@ -217,7 +218,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let consumer_cancel = cancel.clone();
     let consumer_handle = tokio::spawn(async move { consumer.run(consumer_cancel).await });
 
-    let transport = RabbitMqTransport::with_exchange(&rabbitmq_uri, exchange).await?;
+    let transport_config = RabbitMqTransportConfig::default().with_exchange(exchange);
+    let transport = RabbitMqTransport::new_with_config(&rabbitmq_uri, &transport_config).await?;
     let scheduler = SchedulerBuilder::new(store.clone(), BusSink::new(transport))
         .poll_interval(POLL_INTERVAL)
         .build()?;

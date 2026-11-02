@@ -138,4 +138,39 @@ jobs:
       # stale output collector of rustdoc fails with ENOENT. Discarding it costs
       # a few seconds and keeps the dependency cache.
       - run: cargo clean --doc
+      # Without features, an intra-doc link to an item gated behind a feature
+      # does not resolve, which the all-features pass cannot see (#386).
+      - run: cargo doc --workspace --no-deps
       - run: cargo doc --workspace --all-features --no-deps
+
+  umbrella-features:
+    name: Facade feature (one by one)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: "1.89.0"
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: umbrella-features
+      # Each public feature of the facade must build and expose its symbols on
+      # its own, which `--all-features` hides (#480). The list is read from the
+      # manifest, so a feature added later is covered without touching this job.
+      - name: Test each facade feature on its own
+        shell: bash
+        run: |
+          features=$(awk '
+            /^\[/ { in_features = ($0 == "[features]"); next }
+            in_features && /^[A-Za-z0-9_-]+[ ]*=/ {
+              name = $1
+              sub(/=.*/, "", name)
+              if (name != "default") print name
+            }
+          ' crates/hexeract/Cargo.toml)
+          test -n "$features"
+          for feature in $features; do
+            echo "::group::hexeract-umbrella-tests --features $feature"
+            cargo test -p hexeract-umbrella-tests --no-default-features --features "$feature"
+            echo "::endgroup::"
+          done

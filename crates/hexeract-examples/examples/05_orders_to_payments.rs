@@ -38,6 +38,7 @@ use hexeract::bus::RoutingKey;
 use hexeract::bus::Transport;
 use hexeract::bus_rabbitmq::RabbitMqConnection;
 use hexeract::bus_rabbitmq::RabbitMqTransport;
+use hexeract::bus_rabbitmq::RabbitMqTransportConfig;
 use hexeract::bus_rabbitmq::RabbitMqWorkerBuilder;
 use hexeract::bus_rabbitmq::ensure_topology;
 use hexeract::core::Command;
@@ -233,7 +234,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let bus_handle = tokio::spawn(async move { bus_worker.run(bus_cancel_task).await });
 
     // Outbox worker forwarding to the bus.
-    let transport = RabbitMqTransport::with_exchange(&uri, exchange).await?;
+    let transport = RabbitMqTransport::new_with_config(
+        &uri,
+        &RabbitMqTransportConfig::default().with_exchange(exchange),
+    )
+    .await?;
     let forwarder = BusForwarder {
         transport,
         routing_key: routing_key.as_str().to_owned(),

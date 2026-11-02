@@ -230,15 +230,17 @@ pub(crate) fn is_transient(error: &lapin::Error) -> bool {
     )
 }
 
-/// Default number of attempts used by [`RabbitMqConnection::connect_with_retry`].
+/// Default number of connection attempts, used by every connect path of
+/// [`RabbitMqConnectionConfig`].
 pub const DEFAULT_RETRY_ATTEMPTS: u32 = 5;
 
-/// Default base delay used by [`RabbitMqConnection::connect_with_retry`].
+/// Default base delay between connection attempts, used by every connect path
+/// of [`RabbitMqConnectionConfig`].
 pub const DEFAULT_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 
 /// Default bound on the probe phase of the publisher connect, used by
 /// [`crate::RabbitMqTransport::new`] and
-/// [`crate::RabbitMqTransport::with_exchange`].
+/// [`crate::RabbitMqTransport::new_with_config`].
 ///
 /// Caps how long the publisher path may spend proving the broker answers
 /// before it gives up. Measured against a closed loopback port, one probe
@@ -295,10 +297,23 @@ pub const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 /// [`Self::allow_insecure_plaintext_transport`] opts out of both refusals.
 /// The host is the one lapin resolves out of the URI, never the raw text, so
 /// the check covers exactly what the dialer connects to.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RabbitMqConnectionConfig {
     tls_config: Option<OwnedTLSConfig>,
     allows_plaintext_transport: bool,
+    retry_attempts: u32,
+    retry_base_delay: Duration,
+}
+
+impl Default for RabbitMqConnectionConfig {
+    fn default() -> Self {
+        Self {
+            tls_config: None,
+            allows_plaintext_transport: false,
+            retry_attempts: DEFAULT_RETRY_ATTEMPTS,
+            retry_base_delay: DEFAULT_RETRY_BASE_DELAY,
+        }
+    }
 }
 
 impl RabbitMqConnectionConfig {
@@ -338,6 +353,25 @@ impl RabbitMqConnectionConfig {
         self
     }
 
+    /// Number of connection attempts before giving up (default
+    /// [`DEFAULT_RETRY_ATTEMPTS`]).
+    ///
+    /// Zero is treated as one: a connection is always attempted at least
+    /// once.
+    #[must_use]
+    pub fn with_retry_attempts(mut self, attempts: u32) -> Self {
+        self.retry_attempts = attempts;
+        self
+    }
+
+    /// Delay before the second attempt, doubled on each retry up to a factor
+    /// of 256 (default [`DEFAULT_RETRY_BASE_DELAY`]).
+    #[must_use]
+    pub fn with_retry_base_delay(mut self, base_delay: Duration) -> Self {
+        self.retry_base_delay = base_delay;
+        self
+    }
+
     pub(crate) fn tls_config(&self) -> OwnedTLSConfig {
         self.tls_config.clone().unwrap_or_default()
     }
@@ -368,6 +402,8 @@ impl fmt::Debug for RabbitMqConnectionConfig {
                 "allows_plaintext_transport",
                 &self.allows_plaintext_transport,
             )
+            .field("retry_attempts", &self.retry_attempts)
+            .field("retry_base_delay", &self.retry_base_delay)
             .finish_non_exhaustive()
     }
 }
@@ -495,7 +531,7 @@ async fn connect_once(
 ///
 /// # Transport
 ///
-/// Both [`Self::connect`] and [`Self::connect_with_retry`] take an AMQP
+/// Both [`Self::connect`] and [`Self::connect_with_config`] take an AMQP
 /// URI and select the transport from its scheme:
 ///
 /// - `amqp://` is plaintext AMQP 0.9.1 and offers no confidentiality.
@@ -564,11 +600,16 @@ pub struct RabbitMqConnection {
 }
 
 impl RabbitMqConnection {
-    /// Connect to the broker described by `uri`, single attempt.
+    /// Connect to the broker described by `uri` with the default
+    /// configuration, retrying transient failures.
     ///
-    /// Pass an `amqps://` URI for any broker that is not loopback: a plain
-    /// `amqp://` session sends the broker password in cleartext and is
-    /// refused before the socket opens unless the caller opted in through
+    /// Equivalent to [`Self::connect_with_config`] with
+    /// [`RabbitMqConnectionConfig::default`]: up to [`DEFAULT_RETRY_ATTEMPTS`]
+    /// attempts, the wait starting at [`DEFAULT_RETRY_BASE_DELAY`] and doubling
+    /// between attempts. Pass an `amqps://` URI for any broker that is not
+    /// loopback: a plain `amqp://` session sends the broker password in
+    /// cleartext and is refused before the socket opens unless the caller
+    /// opted in through
     /// [`RabbitMqConnectionConfig::allow_insecure_plaintext_transport`].
     /// `amqp://` remains available for local development.
     ///
@@ -580,8 +621,8 @@ impl RabbitMqConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`BusError::Connection`] if `lapin` fails to negotiate
-    /// the AMQP handshake, and a permanent (non-retryable) one if `uri`
+    /// Returns [`BusError::Connection`] after the final attempt, and a
+    /// permanent (non-retryable) one on the first, without retrying, if `uri`
     /// selects an unencrypted transport to a host outside loopback. The
     /// error never includes `uri` or its credentials: the raw `lapin` error
     /// (which can echo a malformed URI back) is dropped in favour of a
@@ -590,79 +631,18 @@ impl RabbitMqConnection {
         Self::connect_with_config(uri, &RabbitMqConnectionConfig::default()).await
     }
 
-    /// Connect to the broker once with caller-selected TLS settings.
+    /// Connect to the broker with caller-selected settings, retrying as
+    /// `config` specifies.
     ///
-    /// `config` changes the trust and client-identity material used when
-    /// `uri` selects TLS through `amqps://`; it never enables a plaintext
-    /// fallback. See [`RabbitMqConnectionConfig`] for the default trust-store
-    /// behaviour and private-CA configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns a credential-redacted [`BusError::Connection`] when the AMQP
-    /// or TLS handshake fails, and a permanent one when the transport would
-    /// carry the session in cleartext: either `config` holds TLS material
-    /// that `uri` would silently discard, or `uri` selects `amqp://` against
-    /// a host outside loopback.
-    pub async fn connect_with_config(
-        uri: &str,
-        config: &RabbitMqConnectionConfig,
-    ) -> Result<Self, BusError> {
-        ensure_transport_security(uri, config)?;
-        let inner = connect_once(uri, supervised_properties(), config)
-            .await
-            .map_err(|err| connection_error_from(uri, &err))?;
-        Ok(Self {
-            inner: Arc::new(inner),
-        })
-    }
-
-    /// Connect to the broker with a bounded exponential-backoff loop.
-    ///
-    /// Tries up to `attempts` times, doubling the wait between
-    /// attempts starting from `base_delay`. Each failing attempt is
-    /// logged via `tracing::warn`. Use an `amqps://` URI in production
-    /// for a TLS-encrypted session.
-    ///
-    /// # Security
-    ///
-    /// `uri` carries the broker credentials and must be treated as a
-    /// secret. Only the attempt counter and a credential-redacted form
-    /// of the URI are logged on failure; the raw URI and the `lapin`
-    /// error (which can echo it back) are never logged. See the
-    /// [type-level security notes](RabbitMqConnection#security).
-    ///
-    /// `attempts` is clamped to at least 1: a caller-supplied `0` would
-    /// otherwise make the loop a no-op, so it is treated as a single
-    /// attempt rather than panicking on untrusted input.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BusError::Connection`] after the final attempt, and a
-    /// permanent one on the first, without retrying, when `uri` selects an
-    /// unencrypted `amqp://` transport to a host outside loopback: no retry
-    /// can fix a configuration fault. The error never includes `uri` or its
-    /// credentials: the raw `lapin` error (which can echo a malformed URI
-    /// back, password included) is dropped in favour of a credential-redacted
-    /// message, and only the attempt counter and the redacted URI are logged.
-    pub async fn connect_with_retry(
-        uri: &str,
-        attempts: u32,
-        base_delay: Duration,
-    ) -> Result<Self, BusError> {
-        Self::connect_with_retry_with_config(
-            uri,
-            attempts,
-            base_delay,
-            &RabbitMqConnectionConfig::default(),
-        )
-        .await
-    }
-
-    /// Connect to the broker with retries and caller-selected TLS settings.
-    ///
-    /// The selected configuration is cloned for every attempt so a private CA
-    /// and client identity remain in force until the retry budget is spent.
+    /// Tries up to [`RabbitMqConnectionConfig::with_retry_attempts`] times,
+    /// doubling the wait between attempts starting from
+    /// [`RabbitMqConnectionConfig::with_retry_base_delay`]. Each failing
+    /// attempt is logged via `tracing::warn`, with only the attempt counter
+    /// and a credential-redacted form of the URI. The configuration is used
+    /// for every attempt, so a private CA and client identity remain in force
+    /// until the retry budget is spent. See [`RabbitMqConnectionConfig`] for
+    /// the default trust-store behaviour and private-CA configuration; it
+    /// never enables a plaintext fallback.
     ///
     /// # Errors
     ///
@@ -672,19 +652,17 @@ impl RabbitMqConnection {
     /// cleartext (TLS material an `amqp://` URI would discard, or `amqp://`
     /// against a host outside loopback), the latter refused before any socket
     /// opens.
-    pub async fn connect_with_retry_with_config(
+    pub async fn connect_with_config(
         uri: &str,
-        attempts: u32,
-        base_delay: Duration,
         config: &RabbitMqConnectionConfig,
     ) -> Result<Self, BusError> {
-        Self::connect_with_retry_inner(uri, attempts, base_delay, false, config).await
+        Self::connect_with_retry_inner(uri, false, config).await
     }
 
     /// Open a recovering publisher connection with caller-selected TLS
     /// settings, used by the publisher constructors.
     ///
-    /// Like [`Self::connect_with_retry`] but enables lapin auto-recovery on
+    /// Like [`Self::connect_with_config`] but enables lapin auto-recovery on
     /// the resulting connection, for the long-lived publisher path that must
     /// heal itself across a broker blip (#334).
     ///
@@ -696,19 +674,10 @@ impl RabbitMqConnection {
     /// connection error for the supervisor to act on).
     pub(crate) async fn connect_with_retry_recovering_with_config(
         uri: &str,
-        attempts: u32,
-        base_delay: Duration,
         config: &RabbitMqConnectionConfig,
     ) -> Result<Self, BusError> {
-        Self::connect_recovering_within(
-            uri,
-            attempts,
-            base_delay,
-            DEFAULT_PROBE_TIMEOUT,
-            DEFAULT_SESSION_TIMEOUT,
-            config,
-        )
-        .await
+        Self::connect_recovering_within(uri, DEFAULT_PROBE_TIMEOUT, DEFAULT_SESSION_TIMEOUT, config)
+            .await
     }
 
     /// Establish the publisher connection, giving up once the relevant bound
@@ -740,8 +709,6 @@ impl RabbitMqConnection {
     /// since a slow but healthy broker must not be cut off here.
     async fn connect_recovering_within(
         uri: &str,
-        attempts: u32,
-        base_delay: Duration,
         probe_timeout: Duration,
         session_timeout: Duration,
         config: &RabbitMqConnectionConfig,
@@ -750,7 +717,7 @@ impl RabbitMqConnection {
         // unreachable broker may heal, so it is reported as transient.
         let probe = tokio::time::timeout(
             probe_timeout,
-            Self::connect_with_retry_inner(uri, attempts, base_delay, false, config),
+            Self::connect_with_retry_inner(uri, false, config),
         )
         .await
         .map_err(|_elapsed| connection_error(uri, true))??;
@@ -758,14 +725,15 @@ impl RabbitMqConnection {
 
         let inner = tokio::time::timeout(
             session_timeout,
-            Self::connect_with_retry_inner(uri, attempts, base_delay, true, config),
+            Self::connect_with_retry_inner(uri, true, config),
         )
         .await
         .map_err(|_elapsed| connection_error(uri, true))??;
         Ok(inner)
     }
 
-    /// Shared retry loop backing both connect-with-retry variants.
+    /// Shared retry loop backing every connect path, reading the attempt count
+    /// and base delay from `config`.
     ///
     /// `recovering` selects the connection properties rebuilt on each
     /// attempt: [`recovering_properties`] enables auto-recovery for the
@@ -774,15 +742,13 @@ impl RabbitMqConnection {
     /// by value.
     async fn connect_with_retry_inner(
         uri: &str,
-        attempts: u32,
-        base_delay: Duration,
         recovering: bool,
         config: &RabbitMqConnectionConfig,
     ) -> Result<Self, BusError> {
         ensure_transport_security(uri, config)?;
-        let attempts = attempts.max(1);
-        let mut retryable = true;
-        let mut failure = "no connect attempt completed";
+        let attempts = config.retry_attempts.max(1);
+        let base_delay = config.retry_base_delay;
+        let mut last_error = None;
         for attempt in 1..=attempts {
             let properties = if recovering {
                 recovering_properties()
@@ -796,15 +762,15 @@ impl RabbitMqConnection {
                     });
                 }
                 Err(err) => {
-                    retryable = is_transient(&err);
-                    failure = failure_kind(&err);
+                    let retryable = is_transient(&err);
                     tracing::warn!(
                         attempt,
                         retryable,
-                        failure,
+                        failure = failure_kind(&err),
                         uri = %redact_uri(uri),
                         "rabbitmq connect failed"
                     );
+                    last_error = Some(connection_error_from(uri, &err));
                     // A permanent failure (bad credentials -> ACCESS_REFUSED,
                     // unsupported protocol version) fails identically on every
                     // retry: stop early instead of burning the whole budget
@@ -820,7 +786,9 @@ impl RabbitMqConnection {
                 }
             }
         }
-        Err(connection_error_with_kind(uri, retryable, failure))
+        Err(last_error.unwrap_or_else(|| {
+            connection_error_with_kind(uri, true, "no connect attempt completed")
+        }))
     }
 
     /// Open a fresh AMQP channel on the underlying connection.
@@ -1062,22 +1030,17 @@ mod tests {
     /// inbox could still downgrade silently.
     #[tokio::test]
     async fn every_retrying_connect_path_refuses_ignored_tls_material() {
-        let config = RabbitMqConnectionConfig::default().with_tls_config(mutual_tls_config());
+        let config = RabbitMqConnectionConfig::default()
+            .with_tls_config(mutual_tls_config())
+            .with_retry_base_delay(Duration::from_millis(1));
 
-        let retrying = RabbitMqConnection::connect_with_retry_with_config(
-            "amqp://127.0.0.1:1",
-            DEFAULT_RETRY_ATTEMPTS,
-            Duration::from_millis(1),
-            &config,
-        )
-        .await
-        .expect_err("the retry path must refuse ignored tls material");
+        let retrying = RabbitMqConnection::connect_with_config("amqp://127.0.0.1:1", &config)
+            .await
+            .expect_err("the retry path must refuse ignored tls material");
         assert_eq!(retrying.is_retryable_connection(), Some(false));
 
         let recovering = RabbitMqConnection::connect_with_retry_recovering_with_config(
             "amqp://127.0.0.1:1",
-            DEFAULT_RETRY_ATTEMPTS,
-            Duration::from_millis(1),
             &config,
         )
         .await
@@ -1179,21 +1142,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_with_retry_returns_connection_error_after_max_attempts() {
-        let result = RabbitMqConnection::connect_with_retry(
-            "amqp://127.0.0.1:1",
-            2,
-            Duration::from_millis(1),
-        )
-        .await;
+    async fn connect_with_config_returns_connection_error_after_max_attempts() {
+        let config = RabbitMqConnectionConfig::default()
+            .with_retry_attempts(2)
+            .with_retry_base_delay(Duration::from_millis(1));
+        let result = RabbitMqConnection::connect_with_config("amqp://127.0.0.1:1", &config).await;
         let err = result.expect_err("must fail to connect");
         assert!(matches!(err, BusError::Connection { .. }));
     }
 
     #[tokio::test]
-    async fn connect_returns_connection_error_on_unreachable_broker() {
+    async fn a_single_attempt_connect_fails_fast_on_an_unreachable_broker() {
         let started = std::time::Instant::now();
-        let err = RabbitMqConnection::connect("amqp://127.0.0.1:1")
+        let config = RabbitMqConnectionConfig::default().with_retry_attempts(1);
+        let err = RabbitMqConnection::connect_with_config("amqp://127.0.0.1:1", &config)
             .await
             .expect_err("must fail to connect");
         assert!(matches!(err, BusError::Connection { .. }));
@@ -1206,6 +1168,20 @@ mod tests {
             started.elapsed() < Duration::from_secs(10),
             "a refused connect must fail fast, took {:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_default_configuration_carries_the_default_retry_settings() {
+        let rendered = format!("{:?}", RabbitMqConnectionConfig::default());
+
+        assert!(
+            rendered.contains("retry_attempts: 5"),
+            "the debug rendering must show the attempt count, got {rendered}"
+        );
+        assert!(
+            rendered.contains("retry_base_delay: 250ms"),
+            "the debug rendering must show the base delay, got {rendered}"
         );
     }
 
@@ -1243,11 +1219,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_with_retry_never_leaks_password_in_error() {
-        let result = RabbitMqConnection::connect_with_retry(
+    async fn connect_with_config_never_leaks_password_in_error() {
+        let config = RabbitMqConnectionConfig::default()
+            .with_retry_attempts(1)
+            .with_retry_base_delay(Duration::from_millis(1));
+        let result = RabbitMqConnection::connect_with_config(
             "amqps://user:s3cr3t@127.0.0.1:1/vhost",
-            1,
-            Duration::from_millis(1),
+            &config,
         )
         .await;
         let err = result.expect_err("must fail to connect");
@@ -1266,15 +1244,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_with_retry_treats_zero_attempts_as_one() {
+    async fn connect_with_config_treats_zero_attempts_as_one() {
         // Must not panic on a caller-supplied 0; it returns a connection
         // error after a single clamped attempt against the dead broker.
-        let result = RabbitMqConnection::connect_with_retry(
-            "amqp://127.0.0.1:1",
-            0,
-            Duration::from_millis(1),
-        )
-        .await;
+        let config = RabbitMqConnectionConfig::default()
+            .with_retry_attempts(0)
+            .with_retry_base_delay(Duration::from_millis(1));
+        let result = RabbitMqConnection::connect_with_config("amqp://127.0.0.1:1", &config).await;
         assert!(matches!(result, Err(BusError::Connection { .. })));
     }
 
@@ -1288,8 +1264,6 @@ mod tests {
         let started = std::time::Instant::now();
         let err = RabbitMqConnection::connect_recovering_within(
             "amqp://127.0.0.1:1",
-            DEFAULT_RETRY_ATTEMPTS,
-            DEFAULT_RETRY_BASE_DELAY,
             probe_timeout,
             DEFAULT_SESSION_TIMEOUT,
             &RabbitMqConnectionConfig::default(),
@@ -1311,8 +1285,6 @@ mod tests {
     async fn giving_up_on_the_bound_stays_retryable() {
         let err = RabbitMqConnection::connect_recovering_within(
             "amqp://127.0.0.1:1",
-            DEFAULT_RETRY_ATTEMPTS,
-            DEFAULT_RETRY_BASE_DELAY,
             Duration::from_millis(50),
             DEFAULT_SESSION_TIMEOUT,
             &RabbitMqConnectionConfig::default(),
@@ -1323,6 +1295,138 @@ mod tests {
             err.is_retryable_connection(),
             Some(true),
             "an unreachable broker may heal, so the give-up must classify as transient"
+        );
+    }
+
+    /// A loopback listener that accepts every connection and drops it at once,
+    /// counting the accepts. Each connection attempt the client makes is one
+    /// accept, so the count is the number of attempts, observed from the
+    /// broker side with no broker running.
+    struct AttemptCounter {
+        port: u16,
+        accepted: Arc<std::sync::atomic::AtomicUsize>,
+        should_stop: Arc<std::sync::atomic::AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl AttemptCounter {
+        fn start() -> Self {
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("loopback listener must bind");
+            listener
+                .set_nonblocking(true)
+                .expect("listener must become non-blocking");
+            let port = listener
+                .local_addr()
+                .expect("listener has an address")
+                .port();
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let should_stop = Arc::new(AtomicBool::new(false));
+            let worker = {
+                let accepted = Arc::clone(&accepted);
+                let should_stop = Arc::clone(&should_stop);
+                std::thread::spawn(move || {
+                    while !should_stop.load(Ordering::SeqCst) {
+                        match listener.accept() {
+                            Ok((stream, _peer)) => {
+                                accepted.fetch_add(1, Ordering::SeqCst);
+                                drop(stream);
+                            }
+                            Err(_) => std::thread::sleep(Duration::from_millis(2)),
+                        }
+                    }
+                })
+            };
+            Self {
+                port,
+                accepted,
+                should_stop,
+                worker: Some(worker),
+            }
+        }
+
+        fn uri(&self) -> String {
+            format!("amqp://127.0.0.1:{}", self.port)
+        }
+
+        /// Wait, bounded, until at least `expected` attempts were accepted,
+        /// then report how many were.
+        async fn accepted_after_waiting_for(&self, expected: usize) -> usize {
+            use std::sync::atomic::Ordering;
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while self.accepted.load(Ordering::SeqCst) < expected
+                && std::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            self.accepted.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for AttemptCounter {
+        fn drop(&mut self) {
+            self.should_stop
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_retries_a_transient_failure_with_the_default_configuration() {
+        let broker = AttemptCounter::start();
+
+        let err = RabbitMqConnection::connect(&broker.uri())
+            .await
+            .expect_err("a listener that drops every connection must not yield a session");
+
+        assert!(matches!(err, BusError::Connection { .. }));
+        assert_eq!(
+            broker.accepted_after_waiting_for(5).await,
+            5,
+            "the default configuration must make DEFAULT_RETRY_ATTEMPTS (5) attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_retry_attempt_makes_a_single_connection_attempt() {
+        let broker = AttemptCounter::start();
+        let config = RabbitMqConnectionConfig::default()
+            .with_retry_attempts(1)
+            .with_retry_base_delay(Duration::from_millis(1));
+
+        let err = RabbitMqConnection::connect_with_config(&broker.uri(), &config)
+            .await
+            .expect_err("a listener that drops every connection must not yield a session");
+
+        assert!(matches!(err, BusError::Connection { .. }));
+        assert_eq!(
+            broker.accepted_after_waiting_for(1).await,
+            1,
+            "with_retry_attempts(1) must make exactly one attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_retry_attempts_is_treated_as_a_single_connection_attempt() {
+        let broker = AttemptCounter::start();
+        let config = RabbitMqConnectionConfig::default()
+            .with_retry_attempts(0)
+            .with_retry_base_delay(Duration::from_millis(1));
+
+        let err = RabbitMqConnection::connect_with_config(&broker.uri(), &config)
+            .await
+            .expect_err("a listener that drops every connection must not yield a session");
+
+        assert!(matches!(err, BusError::Connection { .. }));
+        assert_eq!(
+            broker.accepted_after_waiting_for(1).await,
+            1,
+            "with_retry_attempts(0) must still make exactly one attempt"
         );
     }
 

@@ -134,7 +134,8 @@ async fn run_scheduler(
     rabbitmq_uri: &str,
     exchange: hexeract::bus::Exchange,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let transport = RabbitMqTransport::with_exchange(rabbitmq_uri, exchange).await?;
+    let transport_config = RabbitMqTransportConfig::default().with_exchange(exchange);
+    let transport = RabbitMqTransport::new_with_config(rabbitmq_uri, &transport_config).await?;
     let worker = SchedulerBuilder::new(store, BusSink::new(transport))
         .poll_interval(Duration::from_millis(500))
         .build()?;

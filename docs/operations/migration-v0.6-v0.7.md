@@ -24,10 +24,14 @@ For a deliberately remote development broker that cannot offer TLS, opt in at
 the construction site:
 
 ```rust,no_run
-use hexeract_bus_rabbitmq::{RabbitMqConnectionConfig, RabbitMqTransport};
+use hexeract_bus_rabbitmq::{
+    RabbitMqConnectionConfig, RabbitMqTransport, RabbitMqTransportConfig,
+};
 
 # async fn connect() -> Result<(), hexeract_bus::BusError> {
-let config = RabbitMqConnectionConfig::default().allow_insecure_plaintext_transport();
+let config = RabbitMqTransportConfig::default().with_connection_config(
+    RabbitMqConnectionConfig::default().allow_insecure_plaintext_transport(),
+);
 let transport = RabbitMqTransport::new_with_config("amqp://dev-broker:5672", &config).await?;
 # drop(transport);
 # Ok(())
@@ -136,9 +140,11 @@ Roll out in two steps, never one:
 
 ```rust,ignore
 // Step 1: every publisher signs. Consumers still accept everything.
-let transport = RabbitMqTransport::new("amqps://broker.internal")
-    .await?
-    .with_outbound_envelope_security(Arc::clone(&outbound));
+let transport = RabbitMqTransport::new_with_config(
+    "amqps://broker.internal",
+    &RabbitMqTransportConfig::default().with_outbound_envelope_security(Arc::clone(&outbound)),
+)
+.await?;
 
 // Step 2, once every producer is signing: consumers start verifying.
 let worker = RabbitMqWorkerBuilder::new(connection)
@@ -218,3 +224,43 @@ connect.** Either add the database's certificate authority to the machine's
 trust store, or, if the connection is genuinely local or already tunnelled,
 opt out in full knowledge of the trade-off with `sslmode=disable` /
 `ssl-mode=disabled`.
+
+## RabbitMQ public surface settled on one configuration style
+
+Every setting of the `hexeract-bus-rabbitmq` constructors is now a `with_*`
+method on a config value, and each type has exactly two constructors: `x(uri)`
+with the defaults, and `x_with_config(uri, config)`. The stacked constructors
+and the separate `RabbitMqRequestClientConfigBuilder` are gone. Nothing of this
+shipped in a tagged release, so only code tracking the development branch is
+affected.
+
+| Before | After |
+| --- | --- |
+| `RabbitMqConnection::connect_with_retry(uri, n, delay)` | `connect_with_config(uri, &RabbitMqConnectionConfig::default().with_retry_attempts(n).with_retry_base_delay(delay))` |
+| `RabbitMqConnection::connect_with_retry_with_config(uri, n, delay, &config)` | `connect_with_config(uri, &config.with_retry_attempts(n).with_retry_base_delay(delay))` |
+| `connect(uri)` (one attempt) | `connect(uri)` now retries; `with_retry_attempts(1)` keeps a single attempt |
+| `RabbitMqTransport::with_exchange(uri, x)` | `new_with_config(uri, &RabbitMqTransportConfig::default().with_exchange(x))` |
+| `RabbitMqTransport::with_exchange_with_config(uri, x, &conn)` | `new_with_config(uri, &RabbitMqTransportConfig::default().with_connection_config(conn).with_exchange(x))` |
+| `RabbitMqTransport::new_with_config(uri, &conn)` | `new_with_config(uri, &RabbitMqTransportConfig::default().with_connection_config(conn))` |
+| `RabbitMqTransport::new_with_transport_config(uri, &config)` | `new_with_config(uri, &config)` |
+| `transport.fire_and_forget()` | `RabbitMqTransportConfig::default().fire_and_forget()` |
+| `transport.with_metadata_limits(limits)` | `RabbitMqTransportConfig::default().with_metadata_limits(limits)` |
+| `transport.with_outbound_envelope_security(security)` | `RabbitMqTransportConfig::default().with_outbound_envelope_security(security)` |
+| `RabbitMqTransport::from_connection(connection, size)` | Removed from the public surface; open the transport with `new_with_config` |
+| `RabbitMqRequestClientConfigBuilder::new().max_in_flight(n).build()` | `RabbitMqRequestClientConfig::default().with_max_in_flight(n)` |
+| `RabbitMqRequestClientConfigBuilder` `.connection_config(..)`, `.metadata_limits(..)`, `.envelope_security(..)`, `.outbound_envelope_security(..)` | The same names prefixed with `with_` on `RabbitMqRequestClientConfig` |
+| Reading or assigning `config.max_in_flight`, `config.connection_config`, `config.metadata_limits`, `config.envelope_security` or `config.outbound_envelope_security` on a `RabbitMqRequestClientConfig` | The fields are private and the type is no longer `#[non_exhaustive]`: set them through the matching `with_*` method, and keep the value you set if you need it again, since the config exposes no getter |
+| `RabbitMqWorkerConfig` | No longer public; keep setting the same values through `RabbitMqWorkerBuilder` |
+
+**Retry is on by default.** `RabbitMqConnection::connect` used to make one
+attempt and now makes up to five, waiting 250 ms, 500 ms, 1 s and 2 s between
+them, as `RabbitMqTransport::new` always did. A permanent failure (refused
+credentials, a rejected certificate, a cleartext transport that is refused)
+still stops at the first attempt. A caller that wants the old behaviour writes
+`RabbitMqConnectionConfig::default().with_retry_attempts(1)`.
+
+**Worker queue declaration is opt-in.** `RabbitMqWorkerBuilder::declare_queue()`
+makes the worker declare the queue it consumes (durable, not exclusive, not
+auto-delete) when it starts. Without that call nothing changes, and the queue
+stays the operator's. Against an existing queue declared with other arguments,
+`run` fails with a `BusError` carrying the broker's `PRECONDITION_FAILED`.

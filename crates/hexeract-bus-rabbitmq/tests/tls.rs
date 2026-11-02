@@ -13,8 +13,8 @@ use std::time::Duration;
 use hexeract_bus::Message;
 use hexeract_bus::Transport;
 use hexeract_bus_rabbitmq::{
-    RabbitMqConnection, RabbitMqConnectionConfig, RabbitMqRequestClientConfigBuilder,
-    RabbitMqTransport, connect_request_client_with_config,
+    RabbitMqConnection, RabbitMqConnectionConfig, RabbitMqRequestClientConfig, RabbitMqTransport,
+    RabbitMqTransportConfig, connect_request_client_with_config,
 };
 use lapin::options::BasicGetOptions;
 use lapin::options::QueueDeclareOptions;
@@ -40,9 +40,12 @@ async fn transport_and_request_client_connect_with_private_ca_and_mtls() {
     let connection_config =
         RabbitMqConnectionConfig::default().with_tls_config(harness::client_tls_config());
 
-    let transport = RabbitMqTransport::new_with_config(broker.uri(), &connection_config)
-        .await
-        .expect("transport must trust the private CA and present a client certificate");
+    let transport = RabbitMqTransport::new_with_config(
+        broker.uri(),
+        &RabbitMqTransportConfig::default().with_connection_config(connection_config.clone()),
+    )
+    .await
+    .expect("transport must trust the private CA and present a client certificate");
     drop(transport);
 
     let cancel = CancellationToken::new();
@@ -50,9 +53,7 @@ async fn transport_and_request_client_connect_with_private_ca_and_mtls() {
         broker.uri(),
         Duration::from_secs(5),
         cancel,
-        RabbitMqRequestClientConfigBuilder::new()
-            .connection_config(connection_config)
-            .build(),
+        RabbitMqRequestClientConfig::default().with_connection_config(connection_config),
     )
     .await
     .expect("request client must configure TLS on both owned connections");
@@ -125,9 +126,12 @@ async fn messages_round_trip_over_mutual_tls() {
         .expect("queue declare must succeed over mutual TLS");
 
     // The publisher side exercises the recovering connect path under mTLS.
-    let transport = RabbitMqTransport::new_with_config(broker.uri(), &connection_config)
-        .await
-        .expect("transport must connect over mutual TLS");
+    let transport = RabbitMqTransport::new_with_config(
+        broker.uri(),
+        &RabbitMqTransportConfig::default().with_connection_config(connection_config.clone()),
+    )
+    .await
+    .expect("transport must connect over mutual TLS");
     let order = OrderPlaced {
         order_id: Uuid::from_u128(531),
     };

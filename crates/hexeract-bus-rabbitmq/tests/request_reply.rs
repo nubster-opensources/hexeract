@@ -57,8 +57,10 @@ use hexeract_bus::Transport;
 use hexeract_bus_rabbitmq::AmqpMetadataLimits;
 use hexeract_bus_rabbitmq::OutboundEnvelopeSecurity;
 use hexeract_bus_rabbitmq::RabbitMqConnection;
-use hexeract_bus_rabbitmq::RabbitMqRequestClientConfigBuilder;
+use hexeract_bus_rabbitmq::RabbitMqConnectionConfig;
+use hexeract_bus_rabbitmq::RabbitMqRequestClientConfig;
 use hexeract_bus_rabbitmq::RabbitMqTransport;
+use hexeract_bus_rabbitmq::RabbitMqTransportConfig;
 use hexeract_bus_rabbitmq::RabbitMqWorkerBuilder;
 use hexeract_bus_rabbitmq::connect_request_client;
 use hexeract_bus_rabbitmq::connect_request_client_with_config;
@@ -101,14 +103,19 @@ impl Message for Pong {
     const MESSAGE_TYPE: &'static str = "tests.pong";
 }
 
+/// Default connection settings with a short base delay, so a broker that is
+/// still starting is retried quickly.
+fn fast_retry_config() -> RabbitMqConnectionConfig {
+    RabbitMqConnectionConfig::default().with_retry_base_delay(Duration::from_millis(200))
+}
+
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn reply_published_to_inbox_is_resolved() {
     let broker = harness::start_rabbitmq().await;
-    let connection =
-        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
-            .await
-            .unwrap();
+    let connection = RabbitMqConnection::connect_with_config(broker.uri(), &fast_retry_config())
+        .await
+        .unwrap();
     let consumer_channel = connection.create_channel().await.unwrap();
     let inbox = declare_reply_inbox_for_test(&consumer_channel)
         .await
@@ -204,10 +211,9 @@ async fn connection_drop_fails_in_flight_fast() {
 #[ignore = "requires Docker"]
 async fn a_reply_arriving_after_a_reconnect_drain_is_counted_late() {
     let broker = harness::start_rabbitmq().await;
-    let connection =
-        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
-            .await
-            .unwrap();
+    let connection = RabbitMqConnection::connect_with_config(broker.uri(), &fast_retry_config())
+        .await
+        .unwrap();
     let consumer_channel = connection.create_channel().await.unwrap();
     let inbox = declare_reply_inbox_for_test(&consumer_channel)
         .await
@@ -277,9 +283,7 @@ async fn request_client_config_rejects_a_second_concurrent_request_at_its_bound(
     let cancel = CancellationToken::new();
     declare_ping_queue(broker.uri(), "tests.ping").await;
 
-    let config = RabbitMqRequestClientConfigBuilder::new()
-        .max_in_flight(1)
-        .build();
+    let config = RabbitMqRequestClientConfig::default().with_max_in_flight(1);
     let client = connect_request_client_with_config(
         broker.uri(),
         Duration::from_secs(30),
@@ -371,7 +375,7 @@ async fn end_to_end_request_reply_round_trip() {
     // responder worker
     let responder_transport = Arc::new(RabbitMqTransport::new(broker.uri()).await.unwrap());
     let worker = RabbitMqWorkerBuilder::new(
-        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+        RabbitMqConnection::connect_with_config(broker.uri(), &fast_retry_config())
             .await
             .unwrap(),
     )
@@ -522,12 +526,10 @@ async fn oversized_reply_metadata_does_not_consume_slot() {
 
     // 64 bytes leaves ample room for the protocol fields (a request id is a
     // 36-byte UUID) while rejecting the 65-byte header forged below.
-    let config = RabbitMqRequestClientConfigBuilder::new()
-        .metadata_limits(AmqpMetadataLimits {
-            max_value_bytes: 64,
-            ..AmqpMetadataLimits::default()
-        })
-        .build();
+    let config = RabbitMqRequestClientConfig::default().with_metadata_limits(AmqpMetadataLimits {
+        max_value_bytes: 64,
+        ..AmqpMetadataLimits::default()
+    });
     let client = connect_request_client_with_config(
         broker.uri(),
         Duration::from_secs(10),
@@ -636,7 +638,7 @@ async fn a_handler_failure_reaches_the_caller_as_a_remote_error_not_a_timeout() 
 
     let responder_transport = Arc::new(RabbitMqTransport::new(broker.uri()).await.unwrap());
     let worker = RabbitMqWorkerBuilder::new(
-        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+        RabbitMqConnection::connect_with_config(broker.uri(), &fast_retry_config())
             .await
             .unwrap(),
     )
@@ -686,7 +688,7 @@ async fn request_without_reply_to_is_non_fatal() {
 
     let responder_transport = Arc::new(RabbitMqTransport::new(broker.uri()).await.unwrap());
     let worker = RabbitMqWorkerBuilder::new(
-        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+        RabbitMqConnection::connect_with_config(broker.uri(), &fast_retry_config())
             .await
             .unwrap(),
     )
@@ -891,7 +893,7 @@ async fn a_forged_reply_published_into_the_inbox_does_not_end_the_call() {
 
     let registry = Arc::new(RequestRegistry::default());
     let inbox_connection =
-        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+        RabbitMqConnection::connect_with_config(broker.uri(), &fast_retry_config())
             .await
             .unwrap();
     let inbox_channel = inbox_connection.create_channel().await.unwrap();
@@ -926,7 +928,7 @@ async fn a_forged_reply_published_into_the_inbox_does_not_end_the_call() {
 
     let responder_transport = Arc::new(RabbitMqTransport::new(broker.uri()).await.unwrap());
     let worker = RabbitMqWorkerBuilder::new(
-        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+        RabbitMqConnection::connect_with_config(broker.uri(), &fast_retry_config())
             .await
             .unwrap(),
     )
@@ -1027,7 +1029,7 @@ async fn a_forged_error_reply_with_a_divergent_payload_identity_does_not_end_the
 
     let registry = Arc::new(RequestRegistry::default());
     let inbox_connection =
-        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+        RabbitMqConnection::connect_with_config(broker.uri(), &fast_retry_config())
             .await
             .unwrap();
     let inbox_channel = inbox_connection.create_channel().await.unwrap();
@@ -1077,7 +1079,7 @@ async fn a_forged_error_reply_with_a_divergent_payload_identity_does_not_end_the
 
     let responder_transport = Arc::new(RabbitMqTransport::new(broker.uri()).await.unwrap());
     let worker = RabbitMqWorkerBuilder::new(
-        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+        RabbitMqConnection::connect_with_config(broker.uri(), &fast_retry_config())
             .await
             .unwrap(),
     )
@@ -1131,9 +1133,12 @@ async fn a_responder_on_an_application_exchange_still_replies_through_the_defaul
         .durable(false)
         .auto_delete(false);
     let responder_transport = Arc::new(
-        RabbitMqTransport::with_exchange(broker.uri(), app_exchange)
-            .await
-            .unwrap(),
+        RabbitMqTransport::new_with_config(
+            broker.uri(),
+            &RabbitMqTransportConfig::default().with_exchange(app_exchange),
+        )
+        .await
+        .unwrap(),
     );
 
     // Spy queue bound to the application exchange. A fanout broadcasts to
@@ -1167,7 +1172,7 @@ async fn a_responder_on_an_application_exchange_still_replies_through_the_defaul
         .expect("spy queue bind must succeed");
 
     let worker = RabbitMqWorkerBuilder::new(
-        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+        RabbitMqConnection::connect_with_config(broker.uri(), &fast_retry_config())
             .await
             .unwrap(),
     )
@@ -1319,7 +1324,7 @@ async fn a_registered_responder_counts_into_the_handle_the_caller_kept() {
     let counters = ResponderCounters::default();
     let responder_transport = Arc::new(RabbitMqTransport::new(broker.uri()).await.unwrap());
     let worker = RabbitMqWorkerBuilder::new(
-        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+        RabbitMqConnection::connect_with_config(broker.uri(), &fast_retry_config())
             .await
             .unwrap(),
     )
@@ -1456,13 +1461,15 @@ async fn a_responder_signs_its_replies() {
         signing_keys,
     ));
     let responder_transport = Arc::new(
-        RabbitMqTransport::new(broker.uri())
-            .await
-            .unwrap()
-            .with_outbound_envelope_security(security),
+        RabbitMqTransport::new_with_config(
+            broker.uri(),
+            &RabbitMqTransportConfig::default().with_outbound_envelope_security(security),
+        )
+        .await
+        .unwrap(),
     );
     let worker = RabbitMqWorkerBuilder::new(
-        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+        RabbitMqConnection::connect_with_config(broker.uri(), &fast_retry_config())
             .await
             .unwrap(),
     )
@@ -1518,7 +1525,7 @@ async fn a_responder_without_security_publishes_no_security_header() {
 
     let responder_transport = Arc::new(RabbitMqTransport::new(broker.uri()).await.unwrap());
     let worker = RabbitMqWorkerBuilder::new(
-        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+        RabbitMqConnection::connect_with_config(broker.uri(), &fast_retry_config())
             .await
             .unwrap(),
     )
@@ -1642,7 +1649,7 @@ async fn a_request_whose_deadline_expired_in_the_queue_never_reaches_the_handler
     let counters = ResponderCounters::default();
     let responder_transport = Arc::new(RabbitMqTransport::new(broker.uri()).await.unwrap());
     let worker = RabbitMqWorkerBuilder::new(
-        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+        RabbitMqConnection::connect_with_config(broker.uri(), &fast_retry_config())
             .await
             .unwrap(),
     )
@@ -1853,7 +1860,7 @@ async fn an_unroutable_reply_is_dead_lettered_without_retry() {
     let calls = Arc::new(AtomicUsize::new(0));
     let responder_transport = Arc::new(RabbitMqTransport::new(broker.uri()).await.unwrap());
     let worker = RabbitMqWorkerBuilder::new(
-        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+        RabbitMqConnection::connect_with_config(broker.uri(), &fast_retry_config())
             .await
             .unwrap(),
     )
@@ -1925,7 +1932,7 @@ async fn counters_rest_correctly_after_a_forced_reconnect_and_a_fresh_successful
 
     let responder_transport = Arc::new(RabbitMqTransport::new(broker.uri()).await.unwrap());
     let worker = RabbitMqWorkerBuilder::new(
-        RabbitMqConnection::connect_with_retry(broker.uri(), 5, Duration::from_millis(200))
+        RabbitMqConnection::connect_with_config(broker.uri(), &fast_retry_config())
             .await
             .unwrap(),
     )

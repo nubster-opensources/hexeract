@@ -9,7 +9,7 @@ Hexeract emits `tracing` events on every poll cycle, dispatch, retry and ack. Th
 | `outbox handler dispatch failed` | `hexeract-outbox` | `warn` | `event_id`, `event_type`, `error` | Handler returned `Err` in a poll cycle |
 | `outbox poll cycle error` | `hexeract-outbox` | `error` | `error` | The store returned an error during the poll cycle |
 | `dispatching outbox envelope` | `hexeract-outbox` | `debug` | `event_id`, `event_type` | About to invoke the handler |
-| `rabbitmq connect failed` | `hexeract-bus-rabbitmq` | `warn` | `attempt`, `error` | A `connect_with_retry` attempt failed |
+| `rabbitmq connect failed` | `hexeract-bus-rabbitmq` | `warn` | `attempt`, `error` | A connection attempt failed |
 | `rabbitmq consumer stream error` | `hexeract-bus-rabbitmq` | `warn` | `error` | The lapin consumer stream surfaced an error |
 | `rabbitmq delivery decode failed` | `hexeract-bus-rabbitmq` | `warn` | `error` | `delivery_to_envelope` returned `Err`, delivery `basic_nack`-ed without requeue |
 | `handler failed under AckMode::AckOnReceive, delivery already acked` | `hexeract-bus-rabbitmq` | `warn` | `message_type`, `error` | Handler returned `Err` under `AckMode::AckOnReceive` (delivery acked before the handler ran) |

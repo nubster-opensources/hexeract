@@ -65,8 +65,9 @@ use hexeract_bus::VerificationPolicy;
 use hexeract_bus_rabbitmq::InboundEnvelopeSecurity;
 use hexeract_bus_rabbitmq::OutboundEnvelopeSecurity;
 use hexeract_bus_rabbitmq::RabbitMqConnection;
-use hexeract_bus_rabbitmq::RabbitMqRequestClientConfigBuilder;
+use hexeract_bus_rabbitmq::RabbitMqRequestClientConfig;
 use hexeract_bus_rabbitmq::RabbitMqTransport;
+use hexeract_bus_rabbitmq::RabbitMqTransportConfig;
 use hexeract_bus_rabbitmq::RabbitMqWorkerBuilder;
 use hexeract_bus_rabbitmq::connect_request_client_with_config;
 use hexeract_core::HandlerContext;
@@ -566,10 +567,12 @@ async fn a_signed_envelope_survives_a_real_broker_round_trip() {
     let queue_name = "envelope-security.round-trip";
     declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let transport = RabbitMqTransport::new(broker.uri())
-        .await
-        .expect("transport must connect")
-        .with_outbound_envelope_security(outbound_security());
+    let transport = RabbitMqTransport::new_with_config(
+        broker.uri(),
+        &RabbitMqTransportConfig::default().with_outbound_envelope_security(outbound_security()),
+    )
+    .await
+    .expect("transport must connect");
 
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -926,10 +929,12 @@ async fn an_unknown_key_triggers_exactly_one_refresh_for_twenty_envelopes() {
     let dead_letter_queue = "envelope-security.unknown-key.parked";
     declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let transport = RabbitMqTransport::new(broker.uri())
-        .await
-        .expect("transport must connect")
-        .with_outbound_envelope_security(outbound_security());
+    let transport = RabbitMqTransport::new_with_config(
+        broker.uri(),
+        &RabbitMqTransportConfig::default().with_outbound_envelope_security(outbound_security()),
+    )
+    .await
+    .expect("transport must connect");
     for _ in 0..20 {
         let envelope = fixture_envelope(Uuid::now_v7(), Uuid::now_v7(), SystemTime::now());
         transport
@@ -1088,10 +1093,12 @@ async fn a_handler_learns_which_issuer_signed_the_message_it_received() {
     let queue_name = "envelope-security.publisher-identity";
     declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let transport = RabbitMqTransport::new(broker.uri())
-        .await
-        .expect("transport must connect")
-        .with_outbound_envelope_security(outbound_security());
+    let transport = RabbitMqTransport::new_with_config(
+        broker.uri(),
+        &RabbitMqTransportConfig::default().with_outbound_envelope_security(outbound_security()),
+    )
+    .await
+    .expect("transport must connect");
 
     let envelope = fixture_envelope(Uuid::now_v7(), Uuid::now_v7(), SystemTime::now());
     transport
@@ -1138,10 +1145,13 @@ async fn a_handler_learns_the_second_issuer_that_signed_a_message() {
     let queue_name = "envelope-security.publisher-identity.second-issuer";
     declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let transport = RabbitMqTransport::new(broker.uri())
-        .await
-        .expect("transport must connect")
-        .with_outbound_envelope_security(other_outbound_security());
+    let transport = RabbitMqTransport::new_with_config(
+        broker.uri(),
+        &RabbitMqTransportConfig::default()
+            .with_outbound_envelope_security(other_outbound_security()),
+    )
+    .await
+    .expect("transport must connect");
 
     let envelope = fixture_envelope(Uuid::now_v7(), Uuid::now_v7(), SystemTime::now());
     transport
@@ -1439,10 +1449,12 @@ async fn a_signed_reply_survives_the_request_reply_path() {
         responder_signing_keys,
     ));
     let responder_transport = Arc::new(
-        RabbitMqTransport::new(broker.uri())
-            .await
-            .expect("responder transport must connect")
-            .with_outbound_envelope_security(outbound),
+        RabbitMqTransport::new_with_config(
+            broker.uri(),
+            &RabbitMqTransportConfig::default().with_outbound_envelope_security(outbound),
+        )
+        .await
+        .expect("responder transport must connect"),
     );
     let worker =
         RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
@@ -1473,9 +1485,8 @@ async fn a_signed_reply_survives_the_request_reply_path() {
         .expect("valid configuration");
     let caller_security = Arc::new(InboundEnvelopeSecurity::new(caller_keys, caller_config));
 
-    let client_config = RabbitMqRequestClientConfigBuilder::new()
-        .envelope_security(caller_security)
-        .build();
+    let client_config =
+        RabbitMqRequestClientConfig::default().with_envelope_security(caller_security);
     let client = connect_request_client_with_config(
         broker.uri(),
         Duration::from_secs(10),
@@ -1507,7 +1518,7 @@ async fn a_signed_reply_survives_the_request_reply_path() {
 ///
 /// It also proves the other half of the story: the only outbound security
 /// setting reaching this client is
-/// `RabbitMqRequestClientConfigBuilder::outbound_envelope_security`, and the
+/// `RabbitMqRequestClientConfig::with_outbound_envelope_security`, and the
 /// request the responder receives still verifies. That is only possible if
 /// `connect_request_client_with_config` wires the configured security onto
 /// the transport it builds internally, since this test never touches a
@@ -1541,9 +1552,8 @@ async fn a_request_handler_learns_which_issuer_signed_the_request_it_received() 
     let worker_cancel = cancel.clone();
     let worker_handle = tokio::spawn(async move { worker.run(worker_cancel).await });
 
-    let client_config = RabbitMqRequestClientConfigBuilder::new()
-        .outbound_envelope_security(outbound_security())
-        .build();
+    let client_config =
+        RabbitMqRequestClientConfig::default().with_outbound_envelope_security(outbound_security());
     let client = connect_request_client_with_config(
         broker.uri(),
         Duration::from_secs(10),
@@ -1576,7 +1586,7 @@ async fn a_request_handler_learns_which_issuer_signed_the_request_it_received() 
 /// Without it, that test would be equally satisfied by a permissive
 /// responder accepting every request regardless of any signature, and would
 /// therefore not establish that the signature the responder verified came
-/// from `RabbitMqRequestClientConfigBuilder::outbound_envelope_security`.
+/// from `RabbitMqRequestClientConfig::with_outbound_envelope_security`.
 /// This test builds the same client through the same builder, against the
 /// same responder, differing in that one call alone, so that call is
 /// exactly, and only, what the pair measures.
@@ -1609,7 +1619,7 @@ async fn a_client_built_without_outbound_security_sends_a_request_the_responder_
     let worker_cancel = cancel.clone();
     let worker_handle = tokio::spawn(async move { worker.run(worker_cancel).await });
 
-    let client_config = RabbitMqRequestClientConfigBuilder::new().build();
+    let client_config = RabbitMqRequestClientConfig::default();
     let client = connect_request_client_with_config(
         broker.uri(),
         Duration::from_secs(3),
@@ -1678,10 +1688,12 @@ async fn a_caller_learns_which_issuer_signed_the_reply_it_received() {
         responder_signing_keys,
     ));
     let responder_transport = Arc::new(
-        RabbitMqTransport::new(broker.uri())
-            .await
-            .expect("responder transport must connect")
-            .with_outbound_envelope_security(outbound),
+        RabbitMqTransport::new_with_config(
+            broker.uri(),
+            &RabbitMqTransportConfig::default().with_outbound_envelope_security(outbound),
+        )
+        .await
+        .expect("responder transport must connect"),
     );
     let worker =
         RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
@@ -1712,9 +1724,8 @@ async fn a_caller_learns_which_issuer_signed_the_reply_it_received() {
         .expect("valid configuration");
     let caller_security = Arc::new(InboundEnvelopeSecurity::new(caller_keys, caller_config));
 
-    let client_config = RabbitMqRequestClientConfigBuilder::new()
-        .envelope_security(caller_security)
-        .build();
+    let client_config =
+        RabbitMqRequestClientConfig::default().with_envelope_security(caller_security);
     let client = connect_request_client_with_config(
         broker.uri(),
         Duration::from_secs(10),
@@ -1752,7 +1763,7 @@ async fn a_caller_learns_which_issuer_signed_the_reply_it_received() {
 /// side, since nothing would then prove a caller with no envelope security
 /// at all reports anything different. Same broker, same responder, a
 /// client built through the same
-/// [`hexeract_bus_rabbitmq::RabbitMqRequestClientConfigBuilder`], differing
+/// [`hexeract_bus_rabbitmq::RabbitMqRequestClientConfig`], differing
 /// only in that this one never calls `.envelope_security(...)`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
@@ -1783,7 +1794,7 @@ async fn a_caller_without_envelope_security_reports_nothing_enforced() {
     let worker_cancel = cancel.clone();
     let worker_handle = tokio::spawn(async move { worker.run(worker_cancel).await });
 
-    let client_config = RabbitMqRequestClientConfigBuilder::new().build();
+    let client_config = RabbitMqRequestClientConfig::default();
     let client = connect_request_client_with_config(
         broker.uri(),
         Duration::from_secs(10),
