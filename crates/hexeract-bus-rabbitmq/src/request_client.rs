@@ -3,7 +3,7 @@
 //! [`connect_request_client`] wires together an auto-recovering
 //! publisher transport ([`RabbitMqTransport::new`]) with a reply inbox
 //! consumed on a distinct, supervised connection
-//! ([`RabbitMqConnection::connect_with_retry`]). The two connections
+//! ([`RabbitMqConnection::connect_with_config`]). The two connections
 //! must stay separate: see the `reply_inbox` module docs for why
 //! lapin's native auto-recovery on the publisher side would mask a
 //! broker outage from the inbox supervisor.
@@ -39,13 +39,11 @@ use hexeract_bus::{
 use lapin::Channel;
 use tokio_util::sync::CancellationToken;
 
-use crate::connection::{
-    DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BASE_DELAY, RabbitMqConnection, RabbitMqConnectionConfig,
-};
+use crate::connection::{DEFAULT_RETRY_BASE_DELAY, RabbitMqConnection, RabbitMqConnectionConfig};
 use crate::envelope_security::{InboundEnvelopeSecurity, OutboundEnvelopeSecurity};
 use crate::metadata::AmqpMetadataLimits;
 use crate::reply_inbox::{declare_reply_inbox, run_reply_inbox_with_limits};
-use crate::transport::RabbitMqTransport;
+use crate::transport::{RabbitMqTransport, RabbitMqTransportConfig};
 use crate::worker::derive_required_envelope_fields;
 
 /// Maximum time spent closing a connection from a failed reply-inbox setup.
@@ -59,77 +57,17 @@ const FAILED_REPLY_INBOX_SETUP_CLOSE_TIMEOUT: Duration = DEFAULT_RETRY_BASE_DELA
 
 /// Tuning parameters for a RabbitMQ request client.
 ///
-/// Marked `#[non_exhaustive]` so new tuning fields can be added in a minor
-/// version: construct it through [`RabbitMqRequestClientConfigBuilder`]
-/// rather than a struct literal.
+/// Private fields, a `with_*` method per setting that consumes and returns
+/// `Self`, and an untouched value producing exactly the defaults of
+/// [`connect_request_client`]: the same construction style as
+/// [`RabbitMqConnectionConfig`] and [`crate::RabbitMqTransportConfig`].
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct RabbitMqRequestClientConfig {
-    /// Maximum number of concurrent requests awaiting a reply.
-    ///
-    /// Reaching this limit returns [`hexeract_bus::RequestError::AtCapacity`]
-    /// immediately. It is caller-side backpressure, never an added queue or
-    /// latency: callers can shed, retry, or route the rejected request using
-    /// their own policy. Rejecting is preferable to waiting for a free slot
-    /// because it keeps a saturated client distinguishable from a slow
-    /// responder: queuing would report both as latency, and the caller would
-    /// lose the one signal that tells it to shed load rather than wait.
-    ///
-    /// Zero is a legitimate setting, not a misconfiguration guard: it admits
-    /// no request at all, which turns request-reply off without stopping the
-    /// process. See [`hexeract_bus::RequestRegistry::new`].
-    pub max_in_flight: usize,
-    /// TLS settings used by the publisher and supervised reply-inbox sessions.
-    pub connection_config: RabbitMqConnectionConfig,
-    /// Bounds applied to AMQP metadata on both legs of a request-reply call.
-    ///
-    /// One value governs the publisher transport and the supervised reply
-    /// inbox, including every inbox rebuilt after a reconnect. A reply inbox
-    /// running on weaker limits than the requests it answers would be the
-    /// bypass: it is the path that feeds an RPC correlation slot.
-    pub metadata_limits: AmqpMetadataLimits,
-    /// Verification material and policy applied to every reply this client
-    /// receives.
-    ///
-    /// `None` (the default) preserves the historical behaviour: a reply
-    /// resolves its correlation slot regardless of whether it carries a
-    /// signature, and a missing `message_id`, `correlation_id` or timestamp
-    /// is minted rather than rejected (the crate-private
-    /// `RequiredEnvelopeFields::Lenient`). Configuring this under
-    /// [`hexeract_bus::VerificationPolicy::Required`] additionally switches
-    /// an unsigned reply to the stricter mode, mirroring
-    /// [`crate::RabbitMqWorkerConfig::envelope_security`] on the responder's
-    /// side. The reply inbox rebuilt after every reconnect carries the same
-    /// value, never a weaker default.
-    ///
-    /// Held behind an [`Arc`] rather than by value for the same reason as
-    /// [`crate::RabbitMqWorkerConfig::envelope_security`]:
-    /// [`hexeract_bus::EnvelopeVerifier`] carries a `Mutex` for its
-    /// key-refresh rate limit and is therefore never [`Clone`], while this
-    /// config is.
-    pub envelope_security: Option<Arc<InboundEnvelopeSecurity>>,
-
-    /// Signing material applied to every request this client publishes.
-    ///
-    /// Covers the outbound leg alone: the request as it travels to the
-    /// responder, its signature bound to the routing key actually targeted
-    /// at publication time. The inbound leg is a separate setting,
-    /// [`Self::envelope_security`], which verifies the reply the responder
-    /// signs. Neither implies the other, so a client may sign without
-    /// verifying, verify without signing, or do both.
-    ///
-    /// `None` (the default) preserves the historical behaviour word for
-    /// word: a request leaves unsigned. A responder configured under
-    /// [`hexeract_bus::VerificationPolicy::Required`] then refuses that
-    /// request before any handler runs and publishes no reply, so the call
-    /// ends in [`hexeract_bus::RequestError::Timeout`] rather than in an
-    /// error naming the signature: the caller learns that nothing answered,
-    /// never why.
-    ///
-    /// Held behind an [`Arc`] because [`OutboundEnvelopeSecurity`] is not
-    /// [`Clone`] while this config is, and so the same signing material can
-    /// back several transports without being duplicated once per key.
-    pub outbound_envelope_security: Option<Arc<OutboundEnvelopeSecurity>>,
+    max_in_flight: usize,
+    connection_config: RabbitMqConnectionConfig,
+    metadata_limits: AmqpMetadataLimits,
+    envelope_security: Option<Arc<InboundEnvelopeSecurity>>,
+    outbound_envelope_security: Option<Arc<OutboundEnvelopeSecurity>>,
 }
 
 impl Default for RabbitMqRequestClientConfig {
@@ -147,114 +85,91 @@ impl Default for RabbitMqRequestClientConfig {
 impl RabbitMqRequestClientConfig {
     /// Override the maximum number of concurrent requests awaiting a reply
     /// (default [`DEFAULT_MAX_IN_FLIGHT`]).
+    ///
+    /// Reaching this limit returns [`hexeract_bus::RequestError::AtCapacity`]
+    /// immediately. It is caller-side backpressure, never an added queue or
+    /// latency: callers can shed, retry, or route the rejected request using
+    /// their own policy. Rejecting is preferable to waiting for a free slot
+    /// because it keeps a saturated client distinguishable from a slow
+    /// responder: queuing would report both as latency, and the caller would
+    /// lose the one signal that tells it to shed load rather than wait.
+    ///
+    /// Zero is a legitimate setting, not a misconfiguration guard: it admits
+    /// no request at all, which turns request-reply off without stopping the
+    /// process. See [`hexeract_bus::RequestRegistry::new`].
     #[must_use]
-    pub fn with_max_in_flight(self, _max_in_flight: usize) -> Self {
-        todo!("settled-public-surface: Building")
+    pub fn with_max_in_flight(mut self, max_in_flight: usize) -> Self {
+        self.max_in_flight = max_in_flight;
+        self
     }
 
     /// Use the supplied TLS and retry settings for every connection owned by
     /// the client.
     #[must_use]
-    pub fn with_connection_config(self, _connection_config: RabbitMqConnectionConfig) -> Self {
-        todo!("settled-public-surface: Building")
+    pub fn with_connection_config(mut self, connection_config: RabbitMqConnectionConfig) -> Self {
+        self.connection_config = connection_config;
+        self
     }
 
     /// Bound the AMQP metadata of both legs of a request-reply call.
+    ///
+    /// One value governs the publisher transport and the supervised reply
+    /// inbox, including every inbox rebuilt after a reconnect. A reply inbox
+    /// running on weaker limits than the requests it answers would be the
+    /// bypass: it is the path that feeds an RPC correlation slot.
     #[must_use]
-    pub fn with_metadata_limits(self, _metadata_limits: AmqpMetadataLimits) -> Self {
-        todo!("settled-public-surface: Building")
+    pub fn with_metadata_limits(mut self, metadata_limits: AmqpMetadataLimits) -> Self {
+        self.metadata_limits = metadata_limits;
+        self
     }
 
     /// Verify every reply this client receives against `security`.
+    ///
+    /// Without this setting (the default) a reply resolves its correlation
+    /// slot regardless of whether it carries a signature, and a missing
+    /// `message_id`, `correlation_id` or timestamp is minted rather than
+    /// rejected. Configuring it under
+    /// [`hexeract_bus::VerificationPolicy::Required`] additionally switches
+    /// an unsigned reply to the stricter mode, mirroring the responder side
+    /// of a worker. The reply inbox rebuilt after every reconnect carries the
+    /// same value, never a weaker default.
+    ///
+    /// Held behind an [`Arc`] because [`hexeract_bus::EnvelopeVerifier`]
+    /// carries a `Mutex` for its key-refresh rate limit and is therefore
+    /// never [`Clone`], while this config is.
     #[must_use]
-    pub fn with_envelope_security(self, _security: Arc<InboundEnvelopeSecurity>) -> Self {
-        todo!("settled-public-surface: Building")
+    pub fn with_envelope_security(mut self, security: Arc<InboundEnvelopeSecurity>) -> Self {
+        self.envelope_security = Some(security);
+        self
     }
 
     /// Sign every request this client publishes with `security`.
+    ///
+    /// Covers the outbound leg alone: the request as it travels to the
+    /// responder, its signature bound to the routing key actually targeted at
+    /// publication time. The inbound leg is a separate setting,
+    /// [`Self::with_envelope_security`], which verifies the reply the
+    /// responder signs. Neither implies the other, so a client may sign
+    /// without verifying, verify without signing, or do both.
+    ///
+    /// Without this setting (the default) a request leaves unsigned. A
+    /// responder configured under
+    /// [`hexeract_bus::VerificationPolicy::Required`] then refuses that
+    /// request before any handler runs and publishes no reply, so the call
+    /// ends in [`hexeract_bus::RequestError::Timeout`] rather than in an
+    /// error naming the signature: the caller learns that nothing answered,
+    /// never why.
+    ///
+    /// Held behind an [`Arc`] because [`OutboundEnvelopeSecurity`] is not
+    /// [`Clone`] while this config is, and so the same signing material can
+    /// back several transports without being duplicated once per key.
     #[must_use]
     pub fn with_outbound_envelope_security(
-        self,
-        _security: Arc<OutboundEnvelopeSecurity>,
+        mut self,
+        security: Arc<OutboundEnvelopeSecurity>,
     ) -> Self {
-        todo!("settled-public-surface: Building")
-    }
-}
-
-/// Builder for [`RabbitMqRequestClientConfig`].
-///
-/// Mirrors the construction style of [`crate::RabbitMqWorkerBuilder`]: every
-/// setter consumes and returns the builder, and [`Self::build`] yields the
-/// configuration. An untouched builder produces exactly
-/// [`RabbitMqRequestClientConfig::default`], so naming only the settings that
-/// matter is always safe.
-#[derive(Debug, Clone, Default)]
-pub struct RabbitMqRequestClientConfigBuilder {
-    config: RabbitMqRequestClientConfig,
-}
-
-impl RabbitMqRequestClientConfigBuilder {
-    /// Build a fresh builder carrying the default tuning.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Override the maximum number of concurrent requests awaiting a reply
-    /// (default [`DEFAULT_MAX_IN_FLIGHT`]).
-    ///
-    /// See [`RabbitMqRequestClientConfig::max_in_flight`] for what reaching
-    /// the bound does, and why zero is a meaningful value.
-    #[must_use]
-    pub fn max_in_flight(mut self, max_in_flight: usize) -> Self {
-        self.config.max_in_flight = max_in_flight;
+        self.outbound_envelope_security = Some(security);
         self
-    }
-
-    /// Use the supplied TLS settings for every connection owned by the client.
-    #[must_use]
-    pub fn connection_config(mut self, connection_config: RabbitMqConnectionConfig) -> Self {
-        self.config.connection_config = connection_config;
-        self
-    }
-
-    /// Bound the AMQP metadata of both legs of a request-reply call.
-    ///
-    /// The same value reaches the publisher transport and every reply inbox
-    /// the supervisor runs, including those rebuilt after a reconnect. See
-    /// [`RabbitMqRequestClientConfig::metadata_limits`].
-    #[must_use]
-    pub fn metadata_limits(mut self, metadata_limits: AmqpMetadataLimits) -> Self {
-        self.config.metadata_limits = metadata_limits;
-        self
-    }
-
-    /// Verify every reply this client receives against `security`.
-    ///
-    /// See [`RabbitMqRequestClientConfig::envelope_security`] for the effect
-    /// a [`hexeract_bus::VerificationPolicy::Required`] policy has on how
-    /// strictly an unsigned reply's AMQP properties must be present.
-    #[must_use]
-    pub fn envelope_security(mut self, security: Arc<InboundEnvelopeSecurity>) -> Self {
-        self.config.envelope_security = Some(security);
-        self
-    }
-
-    /// Sign every request this client publishes with `security`.
-    ///
-    /// See [`RabbitMqRequestClientConfig::outbound_envelope_security`] for
-    /// what the signature covers, and for what an unsigned request costs
-    /// against a responder that requires one.
-    #[must_use]
-    pub fn outbound_envelope_security(mut self, security: Arc<OutboundEnvelopeSecurity>) -> Self {
-        self.config.outbound_envelope_security = Some(security);
-        self
-    }
-
-    /// Finish the builder into a [`RabbitMqRequestClientConfig`].
-    #[must_use]
-    pub fn build(self) -> RabbitMqRequestClientConfig {
-        self.config
     }
 }
 
@@ -317,24 +232,20 @@ pub async fn connect_request_client_with_config(
     cancel: CancellationToken,
     config: RabbitMqRequestClientConfig,
 ) -> Result<RequestClient<RabbitMqTransport>, BusError> {
-    let transport = RabbitMqTransport::new_with_config(uri, &config.connection_config)
-        .await?
+    let transport_config = RabbitMqTransportConfig::default()
+        .with_connection_config(config.connection_config.clone())
         .with_metadata_limits(config.metadata_limits);
-    let transport = Arc::new(match config.outbound_envelope_security {
-        Some(security) => transport.with_outbound_envelope_security(security),
-        None => transport,
-    });
+    let transport_config = match config.outbound_envelope_security {
+        Some(security) => transport_config.with_outbound_envelope_security(security),
+        None => transport_config,
+    };
+    let transport = Arc::new(RabbitMqTransport::new_with_config(uri, &transport_config).await?);
     let registry = Arc::new(RequestRegistry::new(config.max_in_flight));
 
     // Supervised connection for the inbox consumer: NOT the recovering
     // connection used by the publisher above.
-    let connection = RabbitMqConnection::connect_with_retry_with_config(
-        uri,
-        DEFAULT_RETRY_ATTEMPTS,
-        DEFAULT_RETRY_BASE_DELAY,
-        &config.connection_config,
-    )
-    .await?;
+    let connection =
+        RabbitMqConnection::connect_with_config(uri, &config.connection_config).await?;
     // Same contract as the reconnect path: a setup that fails after this
     // connect is live closes it before the error escapes. A caller that
     // retries this constructor while its broker is still refusing inbox
@@ -354,6 +265,7 @@ pub async fn connect_request_client_with_config(
 
     let supervisor = spawn_reply_inbox_supervisor(
         uri,
+        connection,
         (channel, inbox_name),
         Arc::clone(&registry),
         Arc::clone(&reply_inbox),
@@ -384,6 +296,11 @@ pub async fn connect_request_client_with_config(
 /// [`RequestClient`] it assembles, so `RequestClient::close` can await
 /// this task's actual termination instead of merely cancelling it.
 ///
+/// `connection` is the supervised connection `active_inbox` was opened on. The
+/// task owns it by value and keeps it until it ends, so the session outlives
+/// the channel by construction instead of by a detail of how lapin counts
+/// handles (#437).
+///
 /// `active_inbox` pairs the consuming channel with the exclusive inbox it
 /// declared, the same `ActiveInbox` value [`supervise_reply_inbox`] replaces
 /// wholesale on every reconnect.
@@ -395,6 +312,7 @@ pub async fn connect_request_client_with_config(
 )]
 fn spawn_reply_inbox_supervisor(
     uri: &str,
+    connection: RabbitMqConnection,
     active_inbox: (Channel, String),
     registry: Arc<RequestRegistry>,
     reply_inbox: Arc<Mutex<ReplyInboxState>>,
@@ -414,6 +332,7 @@ fn spawn_reply_inbox_supervisor(
     let required_fields = derive_required_envelope_fields(envelope_security.as_deref());
 
     RequestClientSupervisor::spawn(cancel, move |cancel| async move {
+        let _owned_connection = connection;
         supervise_reply_inbox(
             active_inbox,
             registry,
@@ -552,12 +471,7 @@ async fn reconnect_reply_inbox(
     connection_config: &RabbitMqConnectionConfig,
 ) -> Option<(Channel, String)> {
     let next_inbox = retry_reply_inbox_after_failures(cancel, DEFAULT_RETRY_BASE_DELAY, || async {
-        let connection = RabbitMqConnection::connect_with_retry_with_config(
-            uri,
-            DEFAULT_RETRY_ATTEMPTS,
-            DEFAULT_RETRY_BASE_DELAY,
-            connection_config,
-        )
+        let connection = RabbitMqConnection::connect_with_config(uri, connection_config)
         .await
         .map_err(|error| {
             tracing::warn!(
@@ -716,7 +630,7 @@ where
 /// Records whether a failed reconnect setup already consumed a backoff.
 #[derive(Debug, PartialEq, Eq)]
 enum ReconnectFailure {
-    /// [`RabbitMqConnection::connect_with_retry`] spent its attempt budget,
+    /// [`RabbitMqConnection::connect_with_config`] spent its attempt budget,
     /// so the wait it applied stands in for this loop's own.
     AlreadyBackedOff,
     /// The failure did not pay a connect backoff of its own: channel setup or
@@ -732,7 +646,7 @@ enum ReconnectFailure {
 
 /// Decide whether a failed connect already paid for a delay.
 ///
-/// [`RabbitMqConnection::connect_with_retry`] only spends its attempt budget
+/// [`RabbitMqConnection::connect_with_config`] only spends its attempt budget
 /// while the failure looks transient. A permanent one (refused credentials,
 /// an unsupported protocol version) breaks out on the first attempt without
 /// sleeping at all, which is deliberate: burning the budget against a broker
@@ -779,14 +693,12 @@ mod tests {
 
     #[test]
     fn request_client_builder_keeps_the_selected_connection_configuration() {
-        let config = RabbitMqRequestClientConfigBuilder::new()
-            .connection_config(RabbitMqConnectionConfig::default().with_tls_config(
-                OwnedTLSConfig {
-                    cert_chain: Some("private-ca-pem".to_owned()),
-                    identity: None,
-                },
-            ))
-            .build();
+        let config = RabbitMqRequestClientConfig::default().with_connection_config(
+            RabbitMqConnectionConfig::default().with_tls_config(OwnedTLSConfig {
+                cert_chain: Some("private-ca-pem".to_owned()),
+                identity: None,
+            }),
+        );
 
         assert!(config.connection_config.has_custom_tls_config());
     }
@@ -794,9 +706,7 @@ mod tests {
     #[test]
     fn an_untouched_builder_yields_the_default_metadata_limits() {
         assert_eq!(
-            RabbitMqRequestClientConfigBuilder::new()
-                .build()
-                .metadata_limits,
+            RabbitMqRequestClientConfig::default().metadata_limits,
             AmqpMetadataLimits::default()
         );
     }
@@ -804,8 +714,7 @@ mod tests {
     #[test]
     fn an_untouched_builder_yields_no_envelope_security() {
         assert!(
-            RabbitMqRequestClientConfigBuilder::new()
-                .build()
+            RabbitMqRequestClientConfig::default()
                 .envelope_security
                 .is_none()
         );
@@ -829,9 +738,8 @@ mod tests {
                 .expect("valid configuration"),
         ));
 
-        let carried = RabbitMqRequestClientConfigBuilder::new()
-            .envelope_security(Arc::clone(&security))
-            .build()
+        let carried = RabbitMqRequestClientConfig::default()
+            .with_envelope_security(Arc::clone(&security))
             .envelope_security
             .expect("the builder was handed an envelope security");
 
@@ -841,8 +749,7 @@ mod tests {
     #[test]
     fn an_untouched_builder_yields_no_outbound_envelope_security() {
         assert!(
-            RabbitMqRequestClientConfigBuilder::new()
-                .build()
+            RabbitMqRequestClientConfig::default()
                 .outbound_envelope_security
                 .is_none()
         );
@@ -863,9 +770,8 @@ mod tests {
             Arc::new(StaticKeySource::builder().build()) as Arc<dyn SigningKeySource>,
         ));
 
-        let carried = RabbitMqRequestClientConfigBuilder::new()
-            .outbound_envelope_security(Arc::clone(&security))
-            .build()
+        let carried = RabbitMqRequestClientConfig::default()
+            .with_outbound_envelope_security(Arc::clone(&security))
             .outbound_envelope_security
             .expect("the builder was handed an outbound envelope security");
 
@@ -879,9 +785,8 @@ mod tests {
             ..AmqpMetadataLimits::default()
         };
         assert_eq!(
-            RabbitMqRequestClientConfigBuilder::new()
-                .metadata_limits(limits)
-                .build()
+            RabbitMqRequestClientConfig::default()
+                .with_metadata_limits(limits)
                 .metadata_limits,
             limits
         );
@@ -935,9 +840,7 @@ mod tests {
     #[test]
     fn an_untouched_builder_yields_the_default_bound() {
         assert_eq!(
-            RabbitMqRequestClientConfigBuilder::new()
-                .build()
-                .max_in_flight,
+            RabbitMqRequestClientConfig::default().max_in_flight,
             DEFAULT_MAX_IN_FLIGHT
         );
     }
@@ -945,9 +848,8 @@ mod tests {
     #[test]
     fn the_builder_carries_the_selected_bound_into_the_config() {
         assert_eq!(
-            RabbitMqRequestClientConfigBuilder::new()
-                .max_in_flight(7)
-                .build()
+            RabbitMqRequestClientConfig::default()
+                .with_max_in_flight(7)
                 .max_in_flight,
             7
         );
@@ -959,9 +861,8 @@ mod tests {
     #[test]
     fn the_builder_carries_a_zero_bound_rather_than_restoring_the_default() {
         assert_eq!(
-            RabbitMqRequestClientConfigBuilder::new()
-                .max_in_flight(0)
-                .build()
+            RabbitMqRequestClientConfig::default()
+                .with_max_in_flight(0)
                 .max_in_flight,
             0
         );
@@ -1193,7 +1094,7 @@ mod tests {
         );
     }
 
-    /// [`RabbitMqConnection::connect_with_retry`] only spends its attempt
+    /// [`RabbitMqConnection::connect_with_config`] only spends its attempt
     /// budget on a transient failure. A permanent one breaks out of that
     /// budget on the first attempt without sleeping at all (#340), so
     /// reading every connect failure as "already delayed" leaves the

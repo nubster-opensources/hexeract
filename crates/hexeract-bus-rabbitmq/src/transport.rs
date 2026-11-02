@@ -18,8 +18,6 @@ use lapin::types::FieldTable;
 use lapin::types::ShortString;
 use uuid::Uuid;
 
-use crate::connection::DEFAULT_RETRY_ATTEMPTS;
-use crate::connection::DEFAULT_RETRY_BASE_DELAY;
 use crate::connection::{RabbitMqConnection, RabbitMqConnectionConfig};
 use crate::envelope_security::OutboundEnvelopeSecurity;
 use crate::metadata::AmqpMetadataLimits;
@@ -59,8 +57,9 @@ pub(crate) fn to_short_string(value: &str, field: &str) -> Result<ShortString, B
 /// [`Self::new`] constructor targets the AMQP default exchange (the
 /// empty string), which routes each message directly to the queue
 /// whose name matches the publish `routing_key`. The
-/// [`Self::with_exchange`] constructor declares and uses a typed
-/// [`Exchange`] for routing.
+/// [`RabbitMqTransportConfig::with_exchange`] setting, passed to
+/// [`Self::new_with_config`], declares and uses a typed [`Exchange`] for
+/// routing.
 ///
 /// Each publish acquires a [`lapin::Channel`] from an internal
 /// [`ChannelPool`] (default capacity `DEFAULT_POOL_MAX_SIZE`),
@@ -74,7 +73,7 @@ pub(crate) fn to_short_string(value: &str, field: &str) -> Result<ShortString, B
 /// the broker stored the message in at least one queue; an unroutable
 /// routing key surfaces as [`BusError::Unroutable`] instead of
 /// silently dropping the message. Opt out of the confirm round-trip
-/// with [`Self::fire_and_forget`].
+/// with [`RabbitMqTransportConfig::fire_and_forget`].
 #[derive(Debug)]
 pub struct RabbitMqTransport {
     pool: Arc<ChannelPool>,
@@ -83,29 +82,27 @@ pub struct RabbitMqTransport {
     envelope_security: Option<Arc<OutboundEnvelopeSecurity>>,
 }
 
-/// Composite configuration for [`RabbitMqTransport::new_with_transport_config`].
+/// Configuration for [`RabbitMqTransport::new_with_config`].
 ///
-/// The crate already exposes six `_with_config` constructors across
-/// [`RabbitMqTransport`], [`RabbitMqConnection`] and
-/// `RabbitMqRequestClientConfig`, each accepting a different slice of
-/// tuning. Rather than add a seventh that only accepts outbound envelope
-/// security, this type bundles the three settings an application supplies
-/// together (connection-level TLS settings, outbound metadata bounds, and
-/// outbound envelope security) behind the crate's one remaining
-/// `_with_config` constructor for [`RabbitMqTransport`]. Mirrors
-/// [`RabbitMqConnectionConfig`]'s construction style exactly: private
-/// fields, a `with_*` method per setting that consumes and returns `Self`,
-/// and an untouched value producing exactly the defaults of
-/// [`RabbitMqTransport::new`].
+/// Bundles every setting an application supplies when it opens a transport:
+/// the connection settings (TLS and retry), the exchange to declare, the
+/// publish mode, the outbound metadata bounds and the outbound envelope
+/// security. Private fields, a `with_*` method per setting that consumes and
+/// returns `Self`, and an untouched value producing exactly the defaults of
+/// [`RabbitMqTransport::new`]: the same construction style as
+/// [`RabbitMqConnectionConfig`].
 #[derive(Clone, Default)]
 pub struct RabbitMqTransportConfig {
     connection_config: RabbitMqConnectionConfig,
     metadata_limits: AmqpMetadataLimits,
     envelope_security: Option<Arc<OutboundEnvelopeSecurity>>,
+    exchange: Option<Exchange>,
+    is_fire_and_forget: bool,
 }
 
 impl RabbitMqTransportConfig {
-    /// Use the supplied TLS settings for the connection this transport opens.
+    /// Use the supplied connection settings (TLS and retry) for the
+    /// connection this transport opens.
     #[must_use]
     pub fn with_connection_config(mut self, connection_config: RabbitMqConnectionConfig) -> Self {
         self.connection_config = connection_config;
@@ -114,7 +111,9 @@ impl RabbitMqTransportConfig {
 
     /// Bound the AMQP metadata this transport is willing to publish.
     ///
-    /// See [`RabbitMqTransport::with_metadata_limits`].
+    /// Applies to the combined application and framework protocol headers of
+    /// every publish. Validation happens before a channel is acquired, so a
+    /// rejected envelope never reaches the broker.
     #[must_use]
     pub fn with_metadata_limits(mut self, metadata_limits: AmqpMetadataLimits) -> Self {
         self.metadata_limits = metadata_limits;
@@ -123,7 +122,9 @@ impl RabbitMqTransportConfig {
 
     /// Sign every envelope the resulting transport publishes with `security`.
     ///
-    /// See [`RabbitMqTransport::with_outbound_envelope_security`].
+    /// Each envelope is signed once for the routing key it is actually
+    /// published to, and the resulting headers are merged into the AMQP
+    /// properties alongside the application and protocol metadata.
     #[must_use]
     pub fn with_outbound_envelope_security(
         mut self,
@@ -136,15 +137,28 @@ impl RabbitMqTransportConfig {
     /// Declare `exchange` at connection time and publish to it (default: the
     /// AMQP default exchange).
     #[must_use]
-    pub fn with_exchange(self, _exchange: Exchange) -> Self {
-        todo!("settled-public-surface: Building")
+    pub fn with_exchange(mut self, exchange: Exchange) -> Self {
+        self.exchange = Some(exchange);
+        self
     }
 
     /// Publish without publisher confirms and without `mandatory` (default:
     /// confirmed and mandatory).
+    ///
+    /// A publish returns as soon as the frame is written, without waiting for
+    /// a broker acknowledgement. `Ok` no longer proves delivery, and an
+    /// unroutable routing key drops the message silently instead of raising
+    /// [`BusError::Unroutable`]. Messages are still published as persistent
+    /// (`delivery_mode` 2).
+    ///
+    /// Reserve this mode for flows where loss is acceptable and throughput
+    /// matters more than the delivery guarantee, such as metrics or
+    /// non-critical fan-out, mirroring the consume-side trade-off of
+    /// `AckMode::Unacknowledged`.
     #[must_use]
-    pub fn fire_and_forget(self) -> Self {
-        todo!("settled-public-surface: Building")
+    pub fn fire_and_forget(mut self) -> Self {
+        self.is_fire_and_forget = true;
+        self
     }
 
     pub(crate) fn connection_config(&self) -> &RabbitMqConnectionConfig {
@@ -158,43 +172,45 @@ impl RabbitMqTransportConfig {
     pub(crate) fn outbound_envelope_security(&self) -> Option<Arc<OutboundEnvelopeSecurity>> {
         self.envelope_security.clone()
     }
+
+    pub(crate) fn exchange(&self) -> Option<&Exchange> {
+        self.exchange.as_ref()
+    }
+
+    pub(crate) fn is_fire_and_forget(&self) -> bool {
+        self.is_fire_and_forget
+    }
 }
 
 impl RabbitMqTransport {
-    /// Connect to `connection_string` and target the AMQP default exchange.
+    /// Connect to `connection_string` with the default configuration and
+    /// target the AMQP default exchange.
     ///
-    /// Uses the bounded reconnect loop from
-    /// [`RabbitMqConnection::connect_with_retry`] with the crate-wide
-    /// [`DEFAULT_RETRY_ATTEMPTS`] and [`DEFAULT_RETRY_BASE_DELAY`]. The
-    /// resulting publisher connection has lapin auto-recovery enabled, so it
-    /// heals itself across a broker blip instead of failing forever (#334): a
-    /// publisher is long lived and has no supervisor to rebuild it, unlike a
+    /// Equivalent to [`Self::new_with_config`] with
+    /// [`RabbitMqTransportConfig::default`]. The resulting publisher
+    /// connection has lapin auto-recovery enabled, so it heals itself across
+    /// a broker blip instead of failing forever (#334): a publisher is long
+    /// lived and has no supervisor to rebuild it, unlike a
     /// [`crate::RabbitMqWorker`], whose supervisor owns its recovery.
     ///
     /// # Errors
     ///
-    /// Returns [`BusError::Connection`] if the broker remains
-    /// unreachable after the retry loop exits, and a permanent one, before
-    /// any socket opens, when `connection_string` selects an unencrypted
-    /// `amqp://` transport to a host outside loopback.
-    ///
-    /// Against an unreachable broker the constructor retries up to
-    /// [`DEFAULT_RETRY_ATTEMPTS`] times in each phase before giving up, or
-    /// earlier when a failure classifies as permanent (#340): first the
-    /// probe, then, once the broker has proven it answers, the real
-    /// auto-recovering session. [`DEFAULT_RETRY_ATTEMPTS`] therefore governs
-    /// the connection this function actually returns, not just the probe.
-    /// Each phase also carries a time bound for the broker that accepts a
-    /// connection and then never completes it: the probe by
-    /// [`crate::connection::DEFAULT_PROBE_TIMEOUT`], the session by
-    /// [`crate::connection::DEFAULT_SESSION_TIMEOUT`]. No path blocks
-    /// forever.
+    /// Same as [`Self::new_with_config`].
     pub async fn new(connection_string: &str) -> Result<Self, BusError> {
-        Self::new_with_config(connection_string, &RabbitMqConnectionConfig::default()).await
+        Self::new_with_config(connection_string, &RabbitMqTransportConfig::default()).await
     }
 
-    /// Connect to `connection_string` with caller-selected TLS settings and
-    /// target the AMQP default exchange.
+    /// Connect to `connection_string`, applying every setting `config`
+    /// carries.
+    ///
+    /// Connects with the retry settings of the connection configuration
+    /// ([`RabbitMqConnectionConfig::with_retry_attempts`] and
+    /// [`RabbitMqConnectionConfig::with_retry_base_delay`]), declares the
+    /// exchange when [`RabbitMqTransportConfig::with_exchange`] was set, and
+    /// builds the channel pool with or without publisher confirms according to
+    /// [`RabbitMqTransportConfig::fire_and_forget`]. The exchange is declared
+    /// as durable / auto-delete according to the flags carried by the
+    /// [`Exchange`] declaration.
     ///
     /// # Errors
     ///
@@ -204,155 +220,58 @@ impl RabbitMqTransport {
     /// holds TLS material that `connection_string` would discard, or
     /// `connection_string` selects `amqp://` against a host outside loopback.
     /// [`RabbitMqConnectionConfig::allow_insecure_plaintext_transport`] opts
-    /// out of both.
+    /// out of both. Returns [`BusError::Transport`] if the exchange
+    /// declaration is rejected (typically a mismatch with a pre-existing
+    /// exchange).
+    ///
+    /// Against an unreachable broker the constructor retries up to the
+    /// configured number of attempts in each phase before giving up, or
+    /// earlier when a failure classifies as permanent (#340): first the
+    /// probe, then, once the broker has proven it answers, the real
+    /// auto-recovering session. The retry settings therefore govern the
+    /// connection this function actually returns, not just the probe. Each
+    /// phase also carries a time bound for the broker that accepts a
+    /// connection and then never completes it: the probe by
+    /// [`crate::connection::DEFAULT_PROBE_TIMEOUT`], the session by
+    /// [`crate::connection::DEFAULT_SESSION_TIMEOUT`]. No path blocks
+    /// forever.
     pub async fn new_with_config(
-        connection_string: &str,
-        config: &RabbitMqConnectionConfig,
-    ) -> Result<Self, BusError> {
-        let connection = RabbitMqConnection::connect_with_retry_recovering_with_config(
-            connection_string,
-            DEFAULT_RETRY_ATTEMPTS,
-            DEFAULT_RETRY_BASE_DELAY,
-            config,
-        )
-        .await?;
-        let pool = Arc::new(ChannelPool::new(connection, DEFAULT_POOL_MAX_SIZE));
-        Ok(Self {
-            pool,
-            exchange: String::new(),
-            metadata_limits: AmqpMetadataLimits::default(),
-            envelope_security: None,
-        })
-    }
-
-    /// Connect to `connection_string` and target the AMQP default exchange,
-    /// applying every setting `config` carries in one call.
-    ///
-    /// Introduced so an application supplying TLS settings, metadata limits
-    /// and outbound envelope security together does not have to pick among
-    /// the crate's other `_with_config` constructors and then thread
-    /// whatever `config` covers that the chosen one does not through further
-    /// builder calls. Composed entirely from [`Self::new_with_config`],
-    /// [`Self::with_metadata_limits`] and
-    /// [`Self::with_outbound_envelope_security`]: it duplicates none of
-    /// their logic.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::new_with_config`].
-    pub async fn new_with_transport_config(
         connection_string: &str,
         config: &RabbitMqTransportConfig,
     ) -> Result<Self, BusError> {
-        let transport = Self::new_with_config(connection_string, config.connection_config())
-            .await?
-            .with_metadata_limits(config.metadata_limits());
+        let connection = RabbitMqConnection::connect_with_retry_recovering_with_config(
+            connection_string,
+            config.connection_config(),
+        )
+        .await?;
+        let exchange_name = match config.exchange() {
+            Some(exchange) => declare_exchange(&connection, exchange).await?,
+            None => String::new(),
+        };
+        let pool = ChannelPool::new(connection, DEFAULT_POOL_MAX_SIZE);
+        let pool = if config.is_fire_and_forget() {
+            pool.without_confirms()
+        } else {
+            pool
+        };
+        let transport = Self {
+            pool: Arc::new(pool),
+            exchange: exchange_name,
+            metadata_limits: AmqpMetadataLimits::default(),
+            envelope_security: None,
+        }
+        .with_metadata_limits(config.metadata_limits());
         Ok(match config.outbound_envelope_security() {
             Some(security) => transport.with_outbound_envelope_security(security),
             None => transport,
         })
     }
 
-    /// Connect to `connection_string`, declare `exchange` and target it.
-    ///
-    /// The exchange is declared as durable / auto-delete according to
-    /// the flags carried by the [`Exchange`] declaration. Subsequent
-    /// publishes on the resulting transport route through this
-    /// exchange.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BusError::Connection`] if the broker is unreachable, a
-    /// permanent one, before any socket opens, when `connection_string`
-    /// selects an unencrypted `amqp://` transport to a host outside loopback,
-    /// or [`BusError::Transport`] if the exchange declaration is
-    /// rejected (typically a mismatch with a pre-existing exchange).
-    ///
-    /// Against an unreachable broker the constructor retries up to
-    /// [`DEFAULT_RETRY_ATTEMPTS`] times in each phase before giving up, or
-    /// earlier when a failure classifies as permanent (#340): first the
-    /// probe, then, once the broker has proven it answers, the real
-    /// auto-recovering session. [`DEFAULT_RETRY_ATTEMPTS`] therefore governs
-    /// the connection this function actually returns, not just the probe.
-    /// Each phase also carries a time bound for the broker that accepts a
-    /// connection and then never completes it: the probe by
-    /// [`crate::connection::DEFAULT_PROBE_TIMEOUT`], the session by
-    /// [`crate::connection::DEFAULT_SESSION_TIMEOUT`]. No path blocks
-    /// forever.
-    pub async fn with_exchange(
-        connection_string: &str,
-        exchange: Exchange,
-    ) -> Result<Self, BusError> {
-        Self::with_exchange_with_config(
-            connection_string,
-            exchange,
-            &RabbitMqConnectionConfig::default(),
-        )
-        .await
-    }
-
-    /// Connect with caller-selected TLS settings, declare `exchange`, and use
-    /// it for subsequent publishes.
-    ///
-    /// # Errors
-    ///
-    /// Returns a credential-redacted [`BusError::Connection`] when the broker
-    /// cannot be reached within the connect bounds, and a permanent one when
-    /// the transport would carry the session in cleartext: either `config`
-    /// holds TLS material that `connection_string` would discard, or
-    /// `connection_string` selects `amqp://` against a host outside loopback.
-    /// [`RabbitMqConnectionConfig::allow_insecure_plaintext_transport`] opts
-    /// out of both.
-    /// Returns [`BusError`] when the exchange cannot be declared.
-    pub async fn with_exchange_with_config(
-        connection_string: &str,
-        exchange: Exchange,
-        config: &RabbitMqConnectionConfig,
-    ) -> Result<Self, BusError> {
-        let connection = RabbitMqConnection::connect_with_retry_recovering_with_config(
-            connection_string,
-            DEFAULT_RETRY_ATTEMPTS,
-            DEFAULT_RETRY_BASE_DELAY,
-            config,
-        )
-        .await?;
-        let exchange_kind = exchange_kind_to_lapin(exchange.kind)?;
-        let options = ExchangeDeclareOptions {
-            durable: exchange.durable,
-            auto_delete: exchange.auto_delete,
-            ..ExchangeDeclareOptions::default()
-        };
-        let exchange_name = exchange.name;
-        connection
-            .with_channel(|channel| async move {
-                let exchange_short = to_short_string(exchange_name.as_str(), "exchange name")?;
-                channel
-                    .exchange_declare(
-                        exchange_short,
-                        exchange_kind,
-                        options,
-                        FieldTable::default(),
-                    )
-                    .await
-                    .map_err(|err| BusError::Transport(Box::new(err)))?;
-                Ok(exchange_name)
-            })
-            .await
-            .map(|exchange_name| Self {
-                pool: Arc::new(ChannelPool::new(connection, DEFAULT_POOL_MAX_SIZE)),
-                exchange: exchange_name,
-                metadata_limits: AmqpMetadataLimits::default(),
-                envelope_security: None,
-            })
-    }
-
     /// Build a transport from an already-established [`RabbitMqConnection`].
     ///
-    /// Useful when several transports share the same broker session
-    /// or when the caller wants to drive the reconnect policy.
     /// Targets the AMQP default exchange.
     #[must_use]
-    pub fn from_connection(connection: RabbitMqConnection, pool_size: usize) -> Self {
+    pub(crate) fn from_connection(connection: RabbitMqConnection, pool_size: usize) -> Self {
         Self {
             pool: Arc::new(ChannelPool::new(connection, pool_size)),
             exchange: String::new(),
@@ -362,12 +281,8 @@ impl RabbitMqTransport {
     }
 
     /// Bound the AMQP metadata this transport is willing to publish.
-    ///
-    /// Applies to the combined application and framework protocol headers of
-    /// every subsequent publish. Validation happens before a channel is
-    /// acquired, so a rejected envelope never reaches the broker.
     #[must_use]
-    pub fn with_metadata_limits(mut self, metadata_limits: AmqpMetadataLimits) -> Self {
+    pub(crate) fn with_metadata_limits(mut self, metadata_limits: AmqpMetadataLimits) -> Self {
         self.metadata_limits = metadata_limits;
         self
     }
@@ -385,7 +300,7 @@ impl RabbitMqTransport {
     /// loop, and merges the resulting headers into the AMQP properties
     /// alongside the application and protocol metadata.
     #[must_use]
-    pub fn with_outbound_envelope_security(
+    pub(crate) fn with_outbound_envelope_security(
         mut self,
         security: Arc<OutboundEnvelopeSecurity>,
     ) -> Self {
@@ -399,27 +314,6 @@ impl RabbitMqTransport {
         self.envelope_security.clone()
     }
 
-    /// Switch the transport to fire-and-forget publishing.
-    ///
-    /// Disables publisher confirms and the `mandatory` flag: a publish
-    /// returns as soon as the frame is written, without waiting for a
-    /// broker acknowledgement. `Ok` no longer proves delivery, and an
-    /// unroutable routing key drops the message silently instead of
-    /// raising [`BusError::Unroutable`]. Messages are still published
-    /// as persistent (`delivery_mode` 2).
-    ///
-    /// Reserve this mode for flows where loss is acceptable and
-    /// throughput matters more than the delivery guarantee, such as
-    /// metrics or non-critical fan-out, mirroring the consume-side
-    /// trade-off of `AckMode::Unacknowledged`.
-    #[must_use]
-    pub fn fire_and_forget(mut self) -> Self {
-        let pool = ChannelPool::new(self.pool.connection().clone(), self.pool.max_size())
-            .without_confirms();
-        self.pool = Arc::new(pool);
-        self
-    }
-
     /// Borrow the [`ChannelPool`] this transport publishes through.
     #[must_use]
     pub fn pool(&self) -> &ChannelPool {
@@ -431,6 +325,41 @@ impl RabbitMqTransport {
     pub fn exchange(&self) -> &str {
         &self.exchange
     }
+}
+
+/// Declare `exchange` on a fresh channel of `connection` and return its name.
+///
+/// # Errors
+///
+/// Returns [`BusError::Transport`] if the broker rejects the declaration,
+/// and [`BusError::InvalidTopology`] if the name exceeds the AMQP
+/// short-string limit.
+async fn declare_exchange(
+    connection: &RabbitMqConnection,
+    exchange: &Exchange,
+) -> Result<String, BusError> {
+    let exchange_kind = exchange_kind_to_lapin(exchange.kind)?;
+    let options = ExchangeDeclareOptions {
+        durable: exchange.durable,
+        auto_delete: exchange.auto_delete,
+        ..ExchangeDeclareOptions::default()
+    };
+    let exchange_name = exchange.name.clone();
+    connection
+        .with_channel(|channel| async move {
+            let exchange_short = to_short_string(exchange_name.as_str(), "exchange name")?;
+            channel
+                .exchange_declare(
+                    exchange_short,
+                    exchange_kind,
+                    options,
+                    FieldTable::default(),
+                )
+                .await
+                .map_err(|err| BusError::Transport(Box::new(err)))?;
+            Ok(exchange_name)
+        })
+        .await
 }
 
 #[async_trait]
@@ -826,15 +755,15 @@ mod tests {
         assert_eq!(*properties.timestamp(), Some(expected));
     }
 
-    // The connect-failure path of `new` and `with_exchange` is covered by
-    // `connection::tests::connect_with_retry_returns_connection_error_after_max_attempts`
+    // The connect-failure path of `new_with_config` is covered by
+    // `connection::tests::connect_with_config_returns_connection_error_after_max_attempts`
     // and by `connection::tests::connect_recovering_gives_up_once_its_bound_elapses`.
-    // Both constructors only forward `connect_with_retry_recovering_with_config`
-    // through `?`, so exercising them here would re-test the same mapping.
+    // The constructor only forwards `connect_with_retry_recovering_with_config`
+    // through `?`, so exercising it here would re-test the same mapping.
 
     #[test]
     fn default_constants_are_sane() {
-        assert!(DEFAULT_RETRY_BASE_DELAY <= Duration::from_secs(1));
+        assert!(crate::connection::DEFAULT_RETRY_BASE_DELAY <= Duration::from_secs(1));
     }
 
     fn outbound_security() -> Arc<OutboundEnvelopeSecurity> {

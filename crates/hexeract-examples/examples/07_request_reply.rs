@@ -43,6 +43,7 @@ use hexeract::bus::RequestError;
 use hexeract::bus::RequestHandler;
 use hexeract::bus::RequestOptions;
 use hexeract::bus_rabbitmq::RabbitMqConnection;
+use hexeract::bus_rabbitmq::RabbitMqConnectionConfig;
 use hexeract::bus_rabbitmq::RabbitMqTransport;
 use hexeract::bus_rabbitmq::RabbitMqWorkerBuilder;
 use hexeract::bus_rabbitmq::connect_request_client;
@@ -67,8 +68,13 @@ const DIVIDE_QUEUE: &str = "examples.divide";
 const SILENCE_QUEUE: &str = "examples.silence";
 const EXPLODE_QUEUE: &str = "examples.explode";
 const RELAY_QUEUE: &str = "examples.relayed_ping";
-const RETRY_ATTEMPTS: u32 = 5;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
+
+/// Default connection settings with a short base delay, so a broker that is
+/// still starting is retried quickly.
+fn connection_config() -> RabbitMqConnectionConfig {
+    RabbitMqConnectionConfig::default().with_retry_base_delay(RETRY_BASE_DELAY)
+}
 
 /// Request answered by the `Echo` responder with the same `seq`.
 #[derive(Debug, Serialize, Deserialize)]
@@ -345,7 +351,7 @@ async fn spawn_responders(
     let echo_request_id = Arc::new(StdMutex::new(None));
     let echo_transport = Arc::new(RabbitMqTransport::new(uri).await?);
     let echo_worker = RabbitMqWorkerBuilder::new(
-        RabbitMqConnection::connect_with_retry(uri, RETRY_ATTEMPTS, RETRY_BASE_DELAY).await?,
+        RabbitMqConnection::connect_with_config(uri, &connection_config()).await?,
     )
     .queue(PING_QUEUE)
     .register_request_handler::<Ping, _>(
@@ -361,7 +367,7 @@ async fn spawn_responders(
 
     let divide_transport = Arc::new(RabbitMqTransport::new(uri).await?);
     let divide_worker = RabbitMqWorkerBuilder::new(
-        RabbitMqConnection::connect_with_retry(uri, RETRY_ATTEMPTS, RETRY_BASE_DELAY).await?,
+        RabbitMqConnection::connect_with_config(uri, &connection_config()).await?,
     )
     .queue(DIVIDE_QUEUE)
     .register_request_handler::<Divide, _>(Divider, Arc::clone(&divide_transport))
@@ -371,7 +377,7 @@ async fn spawn_responders(
 
     let explode_transport = Arc::new(RabbitMqTransport::new(uri).await?);
     let explode_worker = RabbitMqWorkerBuilder::new(
-        RabbitMqConnection::connect_with_retry(uri, RETRY_ATTEMPTS, RETRY_BASE_DELAY).await?,
+        RabbitMqConnection::connect_with_config(uri, &connection_config()).await?,
     )
     .queue(EXPLODE_QUEUE)
     .register_request_handler::<Explode, _>(Faulty, Arc::clone(&explode_transport))
@@ -392,7 +398,7 @@ async fn spawn_responders(
         Arc::new(connect_request_client(uri, Duration::from_secs(5), cancel.clone()).await?);
     let relay_reply_transport = Arc::new(RabbitMqTransport::new(uri).await?);
     let relay_worker = RabbitMqWorkerBuilder::new(
-        RabbitMqConnection::connect_with_retry(uri, RETRY_ATTEMPTS, RETRY_BASE_DELAY).await?,
+        RabbitMqConnection::connect_with_config(uri, &connection_config()).await?,
     )
     .queue(RELAY_QUEUE)
     .register_request_handler::<RelayedPing, _>(

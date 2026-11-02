@@ -32,6 +32,7 @@ use hexeract::bus::RoutingKey;
 use hexeract::bus::Transport;
 use hexeract::bus_rabbitmq::RabbitMqConnection;
 use hexeract::bus_rabbitmq::RabbitMqTransport;
+use hexeract::bus_rabbitmq::RabbitMqTransportConfig;
 use hexeract::bus_rabbitmq::RabbitMqWorkerBuilder;
 use hexeract::bus_rabbitmq::ensure_topology;
 use hexeract::core::HandlerContext;
@@ -127,7 +128,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let cancel_for_task = cancel.clone();
     let worker_handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
 
-    let publisher = RabbitMqTransport::with_exchange(&uri, exchange).await?;
+    let publisher = RabbitMqTransport::new_with_config(
+        &uri,
+        &RabbitMqTransportConfig::default().with_exchange(exchange),
+    )
+    .await?;
     let started = Instant::now();
     for i in 0..TOTAL_MESSAGES {
         let order = OrderPlaced {

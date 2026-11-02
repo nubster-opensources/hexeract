@@ -161,7 +161,7 @@ impl DeliveryDisposition {
 pub enum AckMode {
     /// Ack only when the handler returns `Ok`. Handler failures are
     /// republished to the wait queue and retried after
-    /// [`RabbitMqWorkerConfig::retry_delay`], up to `max_attempts`,
+    /// [`RabbitMqWorkerBuilder::retry_delay`], up to `max_attempts`,
     /// then routed to the dead-letter routing key if configured or
     /// dropped otherwise. At-least-once.
     Manual,
@@ -175,7 +175,7 @@ pub enum AckMode {
     /// message. Fire-and-forget.
     ///
     /// The broker applies no `QoS` bound to a `no_ack` consumer, so
-    /// [`RabbitMqWorkerConfig::prefetch`] has no effect and there is no
+    /// [`RabbitMqWorkerBuilder::prefetch`] has no effect and there is no
     /// broker-side flow control: deliveries can accumulate in the client
     /// buffer without limit. The worker skips `basic.qos` in this mode.
     Unacknowledged,
@@ -273,12 +273,10 @@ impl BoundedInFlight {
 
 /// Tuning parameters for a [`RabbitMqWorker`].
 ///
-/// Marked `#[non_exhaustive]` so new tuning fields can be added in a minor
-/// version: construct it through [`RabbitMqWorkerBuilder`] rather than a
-/// struct literal.
+/// Crate-private: an application sets these through the matching
+/// [`RabbitMqWorkerBuilder`] methods and never holds the value itself.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct RabbitMqWorkerConfig {
+pub(crate) struct RabbitMqWorkerConfig {
     /// Ack discipline applied to consumed deliveries.
     pub ack_mode: AckMode,
     /// Maximum number of attempts per delivery before giving up.
@@ -358,6 +356,10 @@ pub struct RabbitMqWorkerConfig {
     /// key-refresh rate limit and is therefore never [`Clone`], while this
     /// config is.
     pub envelope_security: Option<Arc<InboundEnvelopeSecurity>>,
+    /// Declare the consumed queue (durable, not exclusive, not auto-delete)
+    /// at startup, before consuming. `false` (the default) leaves the queue
+    /// to its operator.
+    pub should_declare_queue: bool,
 }
 
 impl Default for RabbitMqWorkerConfig {
@@ -372,12 +374,20 @@ impl Default for RabbitMqWorkerConfig {
             max_buffered: None,
             metadata_limits: AmqpMetadataLimits::default(),
             envelope_security: None,
+            should_declare_queue: false,
         }
     }
 }
 
 /// Fluent builder for [`RabbitMqWorker`], symmetric with
 /// `PgOutboxWorkerBuilder` from `hexeract-outbox-sql`.
+///
+/// This stays an object builder, unlike the `*Config` types of this crate,
+/// because it carries more than settings: it owns the live
+/// [`RabbitMqConnection`] and the registered handlers, which no `Default`
+/// value could stand in for. The naming rule follows from that split: a value
+/// of a config type is set through a `with_*` method, while a builder sets its
+/// parts through the bare name (`queue`, `prefetch`, `ack_mode`).
 pub struct RabbitMqWorkerBuilder {
     connection: RabbitMqConnection,
     queue: Option<String>,
@@ -407,12 +417,18 @@ impl RabbitMqWorkerBuilder {
     /// Declare the consumed queue (durable, not exclusive, not auto-delete)
     /// when the worker starts, before consuming.
     ///
+    /// Without this call the worker never declares the queue it consumes: the
+    /// queue belongs to the operator, who chooses its arguments (TTL, quorum,
+    /// dead-lettering), and consuming a queue that does not exist fails.
+    /// Opt in for a queue the worker may own outright.
+    ///
     /// A queue already declared with other arguments makes
     /// [`RabbitMqWorker::run`] fail with the broker's `PRECONDITION_FAILED`,
     /// surfaced as a [`BusError`].
     #[must_use]
-    pub fn declare_queue(self) -> Self {
-        todo!("settled-public-surface: Building")
+    pub fn declare_queue(mut self) -> Self {
+        self.config.should_declare_queue = true;
+        self
     }
 
     /// Register a typed handler for messages of type `M`.
@@ -525,8 +541,11 @@ impl RabbitMqWorkerBuilder {
 
     /// Override the consumer prefetch (default [`DEFAULT_PREFETCH`]).
     ///
-    /// Has no effect under [`AckMode::Unacknowledged`]; see
-    /// [`RabbitMqWorkerConfig::prefetch`].
+    /// Per-channel `basic.qos` bound on in-flight unacknowledged deliveries
+    /// under [`AckMode::Manual`] and [`AckMode::AckOnReceive`]. Has no effect
+    /// under [`AckMode::Unacknowledged`]: a `no_ack` consumer never
+    /// acknowledges, so the broker applies no bound and the worker skips the
+    /// `basic.qos` call entirely.
     #[must_use]
     pub fn prefetch(mut self, n: u16) -> Self {
         self.config.prefetch = n;
@@ -537,7 +556,7 @@ impl RabbitMqWorkerBuilder {
     /// named `routing_key`, declared by the worker at startup and fed
     /// through a mandatory, confirmed and persistent publish.
     ///
-    /// See [`RabbitMqWorkerConfig::dead_letter_routing_key`].
+    /// Without it, exhausted deliveries are dropped with a warning instead.
     #[must_use]
     pub fn dead_letter_routing_key(mut self, routing_key: impl Into<String>) -> Self {
         self.config.dead_letter_routing_key = Some(routing_key.into());
@@ -546,8 +565,10 @@ impl RabbitMqWorkerBuilder {
 
     /// Override the broker-side retry delay (default [`DEFAULT_RETRY_DELAY`]).
     ///
-    /// See [`RabbitMqWorkerConfig::retry_delay`] for the constraint on
-    /// changing the delay of an already-declared wait queue.
+    /// The delay is enforced by the TTL of the wait queue the worker declares,
+    /// and the TTL is baked into the queue arguments at declare time: changing
+    /// the value for an existing wait queue makes the declaration fail with a
+    /// broker precondition error, so delete the `<queue>.retry` queue first.
     #[must_use]
     pub fn retry_delay(mut self, delay: Duration) -> Self {
         self.config.retry_delay = delay;
@@ -557,8 +578,11 @@ impl RabbitMqWorkerBuilder {
     /// Override the maximum accepted payload size in bytes (default
     /// [`DEFAULT_MAX_PAYLOAD_BYTES`]).
     ///
-    /// See [`RabbitMqWorkerConfig::max_payload_bytes`] for the trust
-    /// boundary this cap enforces.
+    /// Broker bytes cross a trust boundary: any client allowed to publish to
+    /// the queue controls the payload, so the worker rejects an oversize
+    /// delivery before copying or deserializing it. The rejected delivery
+    /// follows the same path as an undecodable one: routed to the dead-letter
+    /// queue when one is configured, dropped with a warning otherwise.
     #[must_use]
     pub fn max_payload_bytes(mut self, bytes: usize) -> Self {
         self.config.max_payload_bytes = bytes;
@@ -567,8 +591,10 @@ impl RabbitMqWorkerBuilder {
 
     /// Bound the AMQP metadata this worker accepts from a delivery.
     ///
-    /// See [`RabbitMqWorkerConfig::metadata_limits`] for the trust boundary
-    /// this bound enforces, which [`Self::max_payload_bytes`] does not cover.
+    /// Metadata crosses the same trust boundary as the payload, and
+    /// [`Self::max_payload_bytes`] does not bound it: a tiny payload can carry
+    /// a large field table. A delivery whose metadata exceeds these limits is
+    /// rejected before any header is copied and before any typed handler runs.
     #[must_use]
     pub fn metadata_limits(mut self, limits: AmqpMetadataLimits) -> Self {
         self.config.metadata_limits = limits;
@@ -577,9 +603,10 @@ impl RabbitMqWorkerBuilder {
 
     /// Verify every inbound delivery against `security`.
     ///
-    /// See [`RabbitMqWorkerConfig::envelope_security`] for the effect a
-    /// [`hexeract_bus::VerificationPolicy::Required`] policy has on how
-    /// strictly an unsigned delivery's AMQP properties must be present.
+    /// Under a [`hexeract_bus::VerificationPolicy::Required`] policy an
+    /// unsigned delivery is additionally held to the stricter decode rule: a
+    /// missing `message_id`, `correlation_id` or timestamp is rejected rather
+    /// than minted.
     #[must_use]
     pub fn envelope_security(mut self, security: Arc<InboundEnvelopeSecurity>) -> Self {
         self.config.envelope_security = Some(security);
@@ -590,7 +617,7 @@ impl RabbitMqWorkerBuilder {
     /// [`AckMode::Unacknowledged`], simulating prefetch for a `no_ack`
     /// consumer that the broker leaves unbounded.
     ///
-    /// See [`RabbitMqWorkerConfig::max_buffered`]. Has no effect under
+    /// `Some(0)` is treated as no bound. Has no effect under
     /// the other ack modes, which already get broker-side flow control
     /// through `basic.qos`.
     #[must_use]
@@ -641,7 +668,7 @@ fn require_queue(queue: Option<String>) -> Result<String, BusError> {
 ///
 /// In [`AckMode::Manual`], a failed delivery is republished to a
 /// durable wait queue (`<queue>.retry`, declared by the worker at
-/// startup) whose per-queue TTL enforces [`RabbitMqWorkerConfig::retry_delay`]
+/// startup) whose per-queue TTL enforces [`RabbitMqWorkerBuilder::retry_delay`]
 /// and whose dead-letter route points back at the consumed queue. The
 /// retry count is read from the broker-maintained `x-death` header,
 /// so it survives worker restarts and never lives in process memory.
@@ -665,7 +692,7 @@ impl RabbitMqWorker {
     /// not fired signals a lost connection or channel and surfaces as
     /// [`BusError::Connection`], so a supervisor can rebuild and
     /// restart the worker. Only fatal setup errors (channel open,
-    /// `basic_qos`, wait and dead-letter queue declarations,
+    /// `basic_qos`, consumed, wait and dead-letter queue declarations,
     /// `confirm_select`, `basic_consume`) return immediately.
     /// Per-delivery handler failures are absorbed by the retry /
     /// ack-mode policy, and transient broker errors on settling a
@@ -686,12 +713,16 @@ impl RabbitMqWorker {
     ///
     /// ```rust,no_run
     /// # use std::time::Duration;
-    /// # use hexeract_bus_rabbitmq::{RabbitMqConnection, RabbitMqWorkerBuilder};
+    /// # use hexeract_bus_rabbitmq::{
+    /// #     RabbitMqConnection, RabbitMqConnectionConfig, RabbitMqWorkerBuilder,
+    /// # };
     /// # use tokio_util::sync::CancellationToken;
     /// # async fn supervise(uri: &str, cancel: CancellationToken) -> Result<(), hexeract_bus::BusError> {
     /// loop {
-    ///     let connection =
-    ///         RabbitMqConnection::connect_with_retry(uri, 5, Duration::from_millis(500)).await?;
+    ///     let config = RabbitMqConnectionConfig::default()
+    ///         .with_retry_attempts(5)
+    ///         .with_retry_base_delay(Duration::from_millis(500));
+    ///     let connection = RabbitMqConnection::connect_with_config(uri, &config).await?;
     ///     let worker = RabbitMqWorkerBuilder::new(connection)
     ///         .queue("orders.received")
     ///         .build()?;
@@ -723,6 +754,11 @@ impl RabbitMqWorker {
                 .basic_qos(this.config.prefetch, BasicQosOptions::default())
                 .await
                 .map_err(|err| BusError::Transport(Box::new(err)))?;
+        }
+        // Opt-in only (`RabbitMqWorkerBuilder::declare_queue`): without it the
+        // queue belongs to the operator and the worker never declares it.
+        if this.config.should_declare_queue {
+            Self::declare_consumed_queue(&channel, &this.queue).await?;
         }
         // The retry wait queue is specific to Manual mode (the only mode
         // that republishes failed deliveries for a delayed retry).
@@ -1247,7 +1283,24 @@ impl RabbitMqWorker {
     ///
     /// Declaration is idempotent for identical arguments; a different
     /// `retry_delay` makes the broker reject it with a precondition
-    /// error (see [`RabbitMqWorkerConfig::retry_delay`]).
+    /// error (see [`RabbitMqWorkerBuilder::retry_delay`]).
+    async fn declare_consumed_queue(channel: &Channel, queue: &str) -> Result<(), BusError> {
+        channel
+            .queue_declare(
+                to_short_string(queue, "queue name")?,
+                QueueDeclareOptions {
+                    durable: true,
+                    exclusive: false,
+                    auto_delete: false,
+                    ..QueueDeclareOptions::default()
+                },
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|err| BusError::Transport(Box::new(err)))?;
+        Ok(())
+    }
+
     async fn declare_retry_queue(
         channel: &Channel,
         queue: &str,

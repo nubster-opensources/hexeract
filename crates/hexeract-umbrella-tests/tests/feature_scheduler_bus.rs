@@ -8,7 +8,5 @@ use hexeract_umbrella_tests::resolve_types;
 
 #[test]
 fn scheduler_bus_feature_reexports_its_symbols() {
-    resolve_types!(
-        hexeract::scheduler::BusSink<()>,
-    );
+    resolve_types!(hexeract::scheduler::BusSink<()>,);
 }

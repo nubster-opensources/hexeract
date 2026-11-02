@@ -44,6 +44,7 @@ use hexeract_bus_rabbitmq::ChannelPool;
 use hexeract_bus_rabbitmq::InboundEnvelopeSecurity;
 use hexeract_bus_rabbitmq::OutboundEnvelopeSecurity;
 use hexeract_bus_rabbitmq::RabbitMqConnection;
+use hexeract_bus_rabbitmq::RabbitMqConnectionConfig;
 use hexeract_bus_rabbitmq::RabbitMqTransport;
 use hexeract_bus_rabbitmq::RabbitMqTransportConfig;
 use hexeract_bus_rabbitmq::RabbitMqWorkerBuilder;
@@ -181,10 +182,12 @@ async fn transport_publish_to_unroutable_routing_key_fails() {
 #[ignore = "requires Docker"]
 async fn fire_and_forget_publish_to_unroutable_routing_key_returns_ok() {
     let broker = harness::start_rabbitmq().await;
-    let transport = RabbitMqTransport::new(broker.uri())
-        .await
-        .expect("transport must connect")
-        .fire_and_forget();
+    let transport = RabbitMqTransport::new_with_config(
+        broker.uri(),
+        &RabbitMqTransportConfig::default().fire_and_forget(),
+    )
+    .await
+    .expect("transport must connect");
 
     let message_id = transport
         .publish(
@@ -844,7 +847,7 @@ async fn transport_config_settings_reach_the_connected_transport() {
         .with_metadata_limits(limits)
         .with_outbound_envelope_security(Arc::clone(&security));
 
-    let transport = RabbitMqTransport::new_with_transport_config(broker.uri(), &config)
+    let transport = RabbitMqTransport::new_with_config(broker.uri(), &config)
         .await
         .expect("transport must connect");
 
@@ -2009,7 +2012,7 @@ async fn channel_pool_bounds_live_channels_and_returns_them_under_contention() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
-async fn connect_with_retry_fails_fast_on_access_refused() {
+async fn connect_with_config_fails_fast_on_access_refused() {
     let broker = harness::start_rabbitmq().await;
     // Same host and port as the running container, deliberately wrong
     // credentials. The default image accepts guest/guest, so guest with a
@@ -2024,7 +2027,8 @@ async fn connect_with_retry_fails_fast_on_access_refused() {
     // A generous per-attempt delay: if the loop wrongly retried all five
     // attempts it would sleep ~30s (2 + 4 + 8 + 16). A permanent failure must
     // break the loop early instead of draining that budget.
-    let result = RabbitMqConnection::connect_with_retry(&bad_uri, 5, Duration::from_secs(2)).await;
+    let config = RabbitMqConnectionConfig::default().with_retry_base_delay(Duration::from_secs(2));
+    let result = RabbitMqConnection::connect_with_config(&bad_uri, &config).await;
     let elapsed = started.elapsed();
 
     let err = result.expect_err("bad credentials must fail");
@@ -2143,10 +2147,12 @@ async fn signing_happens_once_per_publication() {
         keys,
     ));
 
-    let transport = RabbitMqTransport::new(broker.uri())
-        .await
-        .expect("transport connects")
-        .with_outbound_envelope_security(security);
+    let transport = RabbitMqTransport::new_with_config(
+        broker.uri(),
+        &RabbitMqTransportConfig::default().with_outbound_envelope_security(security),
+    )
+    .await
+    .expect("transport connects");
 
     // A healthy publish is one outer call, so exactly one signature.
     transport
@@ -2350,7 +2356,7 @@ async fn transport_config_with_exchange_declares_the_exchange_and_publishes_on_i
     let routing_key = "orders.placed";
 
     let config = RabbitMqTransportConfig::default().with_exchange(exchange.clone());
-    let transport = RabbitMqTransport::new_with_transport_config(broker.uri(), &config)
+    let transport = RabbitMqTransport::new_with_config(broker.uri(), &config)
         .await
         .expect("transport must connect and declare the exchange");
     assert_eq!(transport.exchange(), exchange.name);
@@ -2419,7 +2425,7 @@ async fn transport_config_with_exchange_declares_the_exchange_and_publishes_on_i
 async fn transport_config_fire_and_forget_publishes_without_confirmation() {
     let broker = harness::start_rabbitmq().await;
     let config = RabbitMqTransportConfig::default().fire_and_forget();
-    let transport = RabbitMqTransport::new_with_transport_config(broker.uri(), &config)
+    let transport = RabbitMqTransport::new_with_config(broker.uri(), &config)
         .await
         .expect("transport must connect");
 
