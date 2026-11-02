@@ -36,3 +36,82 @@ scheduler-outbox = ["hexeract/scheduler-outbox"]
 scheduler-sql-postgres = ["hexeract/scheduler-sql-postgres"]
 scheduler-sql-mysql = ["hexeract/scheduler-sql-mysql"]
 scheduler-sql-sqlite = ["hexeract/scheduler-sql-sqlite"]
+
+# Each facade test compiles only with the features it exercises. Cargo skips a
+# test whose required features are off, instead of compiling an empty crate.
+
+[[test]]
+name = "feature_bus"
+required-features = ["bus"]
+
+[[test]]
+name = "feature_bus_rabbitmq"
+required-features = ["bus-rabbitmq"]
+
+[[test]]
+name = "feature_core"
+required-features = ["core"]
+
+[[test]]
+name = "feature_macros"
+required-features = ["macros"]
+
+[[test]]
+name = "feature_mediator"
+required-features = ["mediator"]
+
+[[test]]
+name = "feature_middleware"
+required-features = ["middleware"]
+
+[[test]]
+name = "feature_outbox"
+required-features = ["outbox"]
+
+[[test]]
+name = "feature_outbox_sql_mysql"
+required-features = ["outbox-sql-mysql"]
+
+[[test]]
+name = "feature_outbox_sql_postgres"
+required-features = ["outbox-sql-postgres"]
+
+[[test]]
+name = "feature_outbox_sql_sqlite"
+required-features = ["outbox-sql-sqlite"]
+
+[[test]]
+name = "feature_scheduler"
+required-features = ["scheduler"]
+
+[[test]]
+name = "feature_scheduler_bus"
+required-features = ["scheduler-bus"]
+
+[[test]]
+name = "feature_scheduler_mediator"
+required-features = ["scheduler-mediator"]
+
+[[test]]
+name = "feature_scheduler_outbox"
+required-features = ["scheduler-outbox"]
+
+[[test]]
+name = "feature_scheduler_sql_mysql"
+required-features = ["scheduler-sql-mysql"]
+
+[[test]]
+name = "feature_scheduler_sql_postgres"
+required-features = ["scheduler-sql-postgres"]
+
+[[test]]
+name = "feature_scheduler_sql_sqlite"
+required-features = ["scheduler-sql-sqlite"]
+
+[[test]]
+name = "scheduler"
+required-features = ["scheduler"]
+
+[[test]]
+name = "umbrella"
+required-features = ["macros", "mediator"]

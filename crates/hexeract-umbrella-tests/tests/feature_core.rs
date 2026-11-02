@@ -2,8 +2,6 @@
 //! the `hexeract` umbrella crate. A compilation is the whole check: removing a
 //! re-export, or the feature that gates it, breaks this file.
 
-#![cfg(feature = "core")]
-
 use hexeract_umbrella_tests::resolve_types;
 
 #[test]

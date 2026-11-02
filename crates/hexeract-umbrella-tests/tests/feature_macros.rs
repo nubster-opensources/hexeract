@@ -2,7 +2,6 @@
 //! the `hexeract` umbrella crate, and the code it generates must resolve its
 //! paths through the facade alone.
 
-#![cfg(feature = "macros")]
 #![allow(
     clippy::unused_async,
     reason = "the handler stays async to match the trait the macro expands to"
