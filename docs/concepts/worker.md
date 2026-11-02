@@ -102,8 +102,10 @@ Recovery belongs to the caller, because a supervisor that rebuilds everything fr
 
 ```rust
 loop {
-    let connection =
-        RabbitMqConnection::connect_with_retry(&uri, 5, Duration::from_millis(500)).await?;
+    let config = RabbitMqConnectionConfig::default()
+        .with_retry_attempts(5)
+        .with_retry_base_delay(Duration::from_millis(500));
+    let connection = RabbitMqConnection::connect_with_config(&uri, &config).await?;
     ensure_topology(&connection, &exchanges, &queues, &bindings).await?;
     let worker = RabbitMqWorkerBuilder::new(connection)
         .queue("orders.received")
