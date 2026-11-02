@@ -745,11 +745,13 @@ impl Handler<OrderPlaced> for TimestampingFailingHandler {
         _message: OrderPlaced,
         _ctx: &HandlerContext,
     ) -> Result<(), Self::Error> {
-        self.attempts.record();
+        // The timestamp is pushed before the attempt is counted: a test woken
+        // by `await_count(n)` must find n timestamps already recorded.
         self.seen_at
             .lock()
             .expect("timestamp mutex must not be poisoned")
             .push(std::time::Instant::now());
+        self.attempts.record();
         Err(hexeract_bus::BusError::Internal(
             "deliberate poison".to_owned(),
         ))
