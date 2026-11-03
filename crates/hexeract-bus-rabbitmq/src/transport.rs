@@ -412,6 +412,21 @@ impl Transport for RabbitMqTransport {
     }
 }
 
+/// Publish on `slot`, release `slot`, then await the broker confirm.
+///
+/// Generic over the slot and the two broker steps so the ordering, slot
+/// released strictly before the confirm is awaited, is unit-testable without
+/// a broker. [`publish_with_recovery`] is the only real caller.
+#[allow(dead_code, clippy::unused_async, reason = "skeleton wired in Building")]
+async fn publish_then_release<S, P, C>(slot: S, publish: P) -> Result<Confirmation, lapin::Error>
+where
+    P: AsyncFnOnce(&S) -> Result<C, lapin::Error>,
+    C: Future<Output = Result<Confirmation, lapin::Error>>,
+{
+    let _ = (slot, publish);
+    todo!("wired in Building")
+}
+
 /// Publish one already-built message, retrying once across a channel recovery.
 ///
 /// When the connection is mid auto-recovery the first publish can fail with a
@@ -564,6 +579,67 @@ mod tests {
     use serde::Serialize;
 
     use super::*;
+
+    /// Flips a flag when dropped, standing in for a pooled channel guard.
+    struct ReleaseFlag(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for ReleaseFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_then_release_frees_the_slot_before_the_confirm_is_polled() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let released = Arc::new(AtomicBool::new(false));
+        let released_when_confirm_polled = Arc::new(AtomicBool::new(false));
+        let slot = ReleaseFlag(Arc::clone(&released));
+
+        let observer_released = Arc::clone(&released);
+        let observer_result = Arc::clone(&released_when_confirm_polled);
+        let outcome = publish_then_release(slot, async move |_slot: &ReleaseFlag| {
+            Ok(async move {
+                observer_result.store(observer_released.load(Ordering::SeqCst), Ordering::SeqCst);
+                Ok(Confirmation::NotRequested)
+            })
+        })
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "criterion 9: a successful publish and confirm must return the confirmation"
+        );
+        assert!(
+            released_when_confirm_polled.load(Ordering::SeqCst),
+            "criterion 9: the slot must be released before the confirm future is polled"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_then_release_returns_the_publish_error_without_awaiting_a_confirm() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let released = Arc::new(AtomicBool::new(false));
+        let slot = ReleaseFlag(Arc::clone(&released));
+
+        let outcome = publish_then_release(slot, async |_slot: &ReleaseFlag| {
+            Err::<std::future::Ready<Result<Confirmation, lapin::Error>>, _>(lapin::Error::from(
+                lapin::ErrorKind::ChannelsLimitReached,
+            ))
+        })
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "criterion 10: a publish error must be returned as the error, with no confirm to await"
+        );
+        assert!(
+            released.load(Ordering::SeqCst),
+            "criterion 10: the slot must not outlive a failed publish"
+        );
+    }
 
     /// The wire names of the six security headers, in no particular order.
     const SECURITY_HEADER_NAMES: [&str; 6] = [

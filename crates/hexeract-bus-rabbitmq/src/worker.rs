@@ -49,6 +49,7 @@ use lapin::types::FieldTable;
 use lapin::types::ShortString;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use uuid::Uuid;
@@ -87,6 +88,10 @@ const REQUEUE_PACE: Duration = Duration::from_millis(500);
 /// finish before giving up, so a wedged handler cannot block shutdown forever
 /// (#338).
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default grace period granted to in-flight handlers once the worker is cancelled.
+#[allow(dead_code, reason = "wired in Building")]
+pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
 /// Decision taken after an attempt to settle a delivery with the broker.
 ///
@@ -250,11 +255,13 @@ impl BoundedInFlight {
     /// is never closed, so acquisition cannot fail; the error arm is
     /// mapped to a [`BusError`] to keep the consume loop alive rather than
     /// panicking.
-    async fn acquire(&self) -> Result<OwnedSemaphorePermit, BusError> {
-        Arc::clone(&self.semaphore)
-            .acquire_owned()
-            .await
-            .map_err(|err| BusError::Internal(format!("in-flight semaphore closed: {err}")))
+    #[allow(dead_code, clippy::unused_async, reason = "skeleton wired in Building")]
+    async fn acquire(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Result<Option<OwnedSemaphorePermit>, BusError> {
+        let _ = (self, cancel);
+        todo!("wired in Building")
     }
 
     /// Number of in-flight slots currently taken (bound minus available).
@@ -360,6 +367,8 @@ pub(crate) struct RabbitMqWorkerConfig {
     /// at startup, before consuming. `false` (the default) leaves the queue
     /// to its operator.
     pub should_declare_queue: bool,
+    /// Grace period granted to in-flight handlers after cancellation.
+    pub shutdown_grace: Duration,
 }
 
 impl Default for RabbitMqWorkerConfig {
@@ -375,6 +384,7 @@ impl Default for RabbitMqWorkerConfig {
             metadata_limits: AmqpMetadataLimits::default(),
             envelope_security: None,
             should_declare_queue: false,
+            shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
         }
     }
 }
@@ -626,6 +636,16 @@ impl RabbitMqWorkerBuilder {
         self
     }
 
+    /// Grace period granted to in-flight handlers after cancellation
+    /// (default [`DEFAULT_SHUTDOWN_GRACE`]). Handlers still running when it
+    /// expires are aborted and [`RabbitMqWorker::run`] returns
+    /// [`BusError::ShutdownDrainTimedOut`].
+    #[must_use]
+    pub fn shutdown_grace(mut self, grace: Duration) -> Self {
+        self.config.shutdown_grace = grace;
+        self
+    }
+
     /// Build the worker.
     ///
     /// # Errors
@@ -657,6 +677,18 @@ impl RabbitMqWorkerBuilder {
 fn require_queue(queue: Option<String>) -> Result<String, BusError> {
     queue
         .ok_or_else(|| BusError::Internal("RabbitMqWorkerBuilder requires a queue name".to_owned()))
+}
+
+/// Reject a zero `max_buffered`, the one setting that has no meaning.
+/// Twin of `require_queue`, testable without a broker.
+///
+/// # Errors
+///
+/// Returns [`BusError::Internal`] when the bound is zero.
+#[allow(dead_code, reason = "wired in Building")]
+fn require_positive_bound(max_buffered: Option<usize>) -> Result<(), BusError> {
+    let _ = max_buffered;
+    todo!("wired in Building")
 }
 
 /// Long-running consumer that dispatches deliveries to typed handlers.
@@ -846,7 +878,9 @@ impl RabbitMqWorker {
                                 // bound. The broker already removed the message
                                 // (no_ack), so a dropped task never strands an
                                 // unacked delivery and there is nothing to settle.
-                                let permit = flow_control.acquire().await?;
+                                let Some(permit) = flow_control.acquire(&cancel).await? else {
+                                    break;
+                                };
                                 let worker = Arc::clone(&this);
                                 let channel = channel.clone();
                                 tracker.spawn(async move {
@@ -867,7 +901,7 @@ impl RabbitMqWorker {
                 }
             }
         }
-        drain_in_flight(&tracker, SHUTDOWN_DRAIN_TIMEOUT).await;
+        drain_tracked_in_flight(&tracker, SHUTDOWN_DRAIN_TIMEOUT).await;
         Ok(())
     }
 
@@ -1020,7 +1054,7 @@ impl RabbitMqWorker {
             }
         };
 
-        let ctx = build_handler_context(&envelope, authentication);
+        let ctx = build_handler_context(&envelope, authentication, CancellationToken::new());
         let outcome = match self.handlers.get(envelope.message_type.as_str()) {
             Some(handler) => AssertUnwindSafe(handler.handle(&envelope, &ctx))
                 .catch_unwind()
@@ -1858,13 +1892,24 @@ pub(crate) fn wait_queue_name(queue: &str) -> String {
 /// Used at shutdown of a `no_ack` consumer: those deliveries are already
 /// removed from the broker, so a dropped in-flight task would silently lose a
 /// message. Draining lets each handler run to completion instead (#338).
-async fn drain_in_flight(tracker: &TaskTracker, timeout: Duration) {
+async fn drain_tracked_in_flight(tracker: &TaskTracker, timeout: Duration) {
     tracker.close();
     if tokio::time::timeout(timeout, tracker.wait()).await.is_err() {
         tracing::warn!(
             "rabbitmq worker shutdown drain timed out; some no_ack handlers were still in flight"
         );
     }
+}
+
+/// Wait for every task in `in_flight`, bounded by `grace`; abort the rest.
+///
+/// # Errors
+///
+/// Returns [`BusError::ShutdownDrainTimedOut`] naming the aborted count.
+#[allow(dead_code, clippy::unused_async, reason = "skeleton wired in Building")]
+async fn drain_in_flight(in_flight: &mut JoinSet<()>, grace: Duration) -> Result<(), BusError> {
+    let _ = (in_flight, grace);
+    todo!("wired in Building")
 }
 
 /// Read the broker-maintained retry count from the `x-death` header.
@@ -2172,10 +2217,13 @@ pub(crate) fn authentication_from_verification(
 /// delivery: re-parsing minted a second, different random UUID whenever
 /// a property was absent, breaking correlation between handler logs and
 /// envelope-derived logs.
+#[allow(clippy::needless_pass_by_value, reason = "token consumed in Building")]
 pub(crate) fn build_handler_context(
     envelope: &hexeract_bus::BusEnvelope,
     authentication: PublisherAuthentication,
+    cancellation: CancellationToken,
 ) -> HandlerContext {
+    let _ = cancellation;
     HandlerContext::new(
         MessageId::from(envelope.message_id),
         CorrelationId::from(envelope.correlation_id),
@@ -2549,12 +2597,21 @@ mod tests {
         assert_eq!(flow_control.in_flight(), 0);
 
         // Take both slots: in-flight reaches the bound and no more.
-        let first = flow_control.acquire().await.expect("permit one");
-        let second = flow_control.acquire().await.expect("permit two");
+        let cancel = CancellationToken::new();
+        let first = flow_control
+            .acquire(&cancel)
+            .await
+            .expect("permit one")
+            .expect("not cancelled");
+        let second = flow_control
+            .acquire(&cancel)
+            .await
+            .expect("permit two")
+            .expect("not cancelled");
         assert_eq!(flow_control.in_flight(), 2);
 
         // A third acquire must not resolve while the bound is saturated.
-        let blocked = flow_control.acquire();
+        let blocked = flow_control.acquire(&cancel);
         tokio::pin!(blocked);
         assert!(
             futures_util::poll!(blocked.as_mut()).is_pending(),
@@ -2564,7 +2621,10 @@ mod tests {
         // Free one slot: the parked acquire now resolves and the count
         // never exceeds the bound.
         drop(first);
-        let third = blocked.await.expect("third permit after a slot freed");
+        let third = blocked
+            .await
+            .expect("third permit after a slot freed")
+            .expect("not cancelled");
         assert_eq!(flow_control.in_flight(), 2);
 
         drop(second);
@@ -2715,7 +2775,11 @@ mod tests {
             RequiredEnvelopeFields::Lenient,
         )
         .expect("must decode");
-        let ctx = build_handler_context(&envelope, PublisherAuthentication::NotEnforced);
+        let ctx = build_handler_context(
+            &envelope,
+            PublisherAuthentication::NotEnforced,
+            CancellationToken::new(),
+        );
         assert_eq!(*ctx.message_id.as_uuid(), envelope.message_id);
         assert_eq!(*ctx.correlation_id.as_uuid(), envelope.correlation_id);
     }
@@ -2763,25 +2827,161 @@ mod tests {
         assert_eq!(RabbitMqWorker::requeue_pace(false), None);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn drain_in_flight_waits_for_spawned_tasks() {
         use std::sync::atomic::AtomicUsize;
-        use tokio_util::task::TaskTracker;
 
         let done = Arc::new(AtomicUsize::new(0));
-        let tracker = TaskTracker::new();
+        let mut in_flight = JoinSet::new();
         for _ in 0..8 {
             let done = Arc::clone(&done);
-            tracker.spawn(async move {
+            in_flight.spawn(async move {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 done.fetch_add(1, Ordering::SeqCst);
             });
         }
-        drain_in_flight(&tracker, Duration::from_secs(5)).await;
+        drain_in_flight(&mut in_flight, Duration::from_secs(5))
+            .await
+            .expect("criterion 3: every task finishing within the grace must drain to Ok");
         assert_eq!(
             done.load(Ordering::SeqCst),
             8,
-            "drain must wait for every in-flight no_ack handler to finish (#338)"
+            "criterion 3: drain must wait for every in-flight no_ack handler to finish (#338)"
+        );
+    }
+
+    /// Flips a flag when dropped, so a test can prove a task was aborted.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_in_flight_reports_the_abandoned_count_when_the_grace_expires() {
+        let grace = Duration::from_secs(2);
+        let mut in_flight = JoinSet::new();
+        in_flight.spawn(std::future::pending::<()>());
+
+        let outcome = drain_in_flight(&mut in_flight, grace).await;
+
+        match outcome {
+            Err(BusError::ShutdownDrainTimedOut {
+                abandoned,
+                grace: reported,
+            }) => {
+                assert_eq!(
+                    abandoned, 1,
+                    "criterion 4: the never-finishing task must be counted as abandoned"
+                );
+                assert_eq!(
+                    reported, grace,
+                    "criterion 4: the error must carry the grace it was given"
+                );
+            }
+            other => panic!(
+                "criterion 4: an expired drain must return ShutdownDrainTimedOut, got {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_in_flight_aborts_the_tasks_it_abandons() {
+        let was_dropped = Arc::new(AtomicBool::new(false));
+        let mut in_flight = JoinSet::new();
+        let guard = DropFlag(Arc::clone(&was_dropped));
+        in_flight.spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+
+        let _ = drain_in_flight(&mut in_flight, Duration::from_secs(2)).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            was_dropped.load(Ordering::SeqCst),
+            "criterion 4: a task abandoned by the drain must be aborted, not left running"
+        );
+    }
+
+    #[test]
+    fn require_positive_bound_rejects_zero() {
+        let err = require_positive_bound(Some(0))
+            .expect_err("criterion 1: a zero max_buffered has no meaning and must be refused");
+
+        assert!(
+            matches!(err, BusError::Internal(_)),
+            "criterion 1: a zero bound is a caller bug and must surface as Internal, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn require_positive_bound_accepts_one_and_unset() {
+        require_positive_bound(Some(1))
+            .expect("criterion 1: a bound of one is the smallest valid bound");
+        require_positive_bound(None)
+            .expect("criterion 1: an unset bound means unbounded and must be accepted");
+    }
+
+    #[test]
+    fn handler_context_cancellation_follows_the_token_it_was_given() {
+        let parent = CancellationToken::new();
+        let props = BasicProperties::default().with_type("orders.placed".into());
+        let envelope = delivery_to_envelope(
+            &props,
+            b"{}",
+            DEFAULT_MAX_PAYLOAD_BYTES,
+            AmqpMetadataLimits::default(),
+            RequiredEnvelopeFields::Lenient,
+        )
+        .expect("must decode");
+        let ctx = build_handler_context(
+            &envelope,
+            PublisherAuthentication::NotEnforced,
+            parent.child_token(),
+        );
+        assert!(
+            !ctx.is_cancelled(),
+            "criterion 2: the context must not start cancelled"
+        );
+
+        parent.cancel();
+
+        assert!(
+            ctx.is_cancelled(),
+            "criterion 2: cancelling the parent must cancel ctx.cancellation"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_in_flight_acquire_returns_none_once_cancelled_with_no_free_permit() {
+        let flow_control = BoundedInFlight::new(1);
+        let cancel = CancellationToken::new();
+        let _held = flow_control
+            .acquire(&cancel)
+            .await
+            .expect("first permit")
+            .expect("not cancelled");
+
+        let waiting = flow_control.acquire(&cancel);
+        tokio::pin!(waiting);
+        assert!(
+            futures_util::poll!(waiting.as_mut()).is_pending(),
+            "criterion 5: with no free permit the acquire must park"
+        );
+        cancel.cancel();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("criterion 5: cancellation must release a parked acquire promptly")
+            .expect("criterion 5: cancellation is not an error");
+        assert!(
+            outcome.is_none(),
+            "criterion 5: a cancelled acquire must yield None, not a permit"
         );
     }
 
@@ -3065,7 +3265,11 @@ mod tests {
             RequiredEnvelopeFields::Lenient,
         )
         .expect("must decode");
-        let ctx = build_handler_context(&envelope, PublisherAuthentication::NotEnforced);
+        let ctx = build_handler_context(
+            &envelope,
+            PublisherAuthentication::NotEnforced,
+            CancellationToken::new(),
+        );
         assert_eq!(*ctx.message_id.as_uuid(), message_id);
         assert_eq!(*ctx.correlation_id.as_uuid(), correlation_id);
     }
@@ -3081,7 +3285,11 @@ mod tests {
             RequiredEnvelopeFields::Lenient,
         )
         .expect("must decode");
-        let ctx = build_handler_context(&envelope, PublisherAuthentication::NotEnforced);
+        let ctx = build_handler_context(
+            &envelope,
+            PublisherAuthentication::NotEnforced,
+            CancellationToken::new(),
+        );
         assert_ne!(*ctx.message_id.as_uuid(), Uuid::nil());
         assert_ne!(*ctx.correlation_id.as_uuid(), Uuid::nil());
     }
