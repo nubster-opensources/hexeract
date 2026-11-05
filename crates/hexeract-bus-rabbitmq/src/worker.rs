@@ -1993,9 +1993,19 @@ async fn drain_in_flight(in_flight: &mut JoinSet<()>, grace: Duration) -> Result
     if drained.is_ok() {
         return Ok(());
     }
-    let abandoned = in_flight.len();
+    // Count the tasks the abort actually stopped: one that finished at the
+    // deadline but was not yet joined completed its work and is not abandoned.
     in_flight.abort_all();
-    while in_flight.join_next().await.is_some() {}
+    let mut abandoned = 0;
+    while let Some(joined) = in_flight.join_next().await {
+        match joined {
+            Err(err) if err.is_cancelled() => abandoned += 1,
+            other => report_join_failure(other),
+        }
+    }
+    if abandoned == 0 {
+        return Ok(());
+    }
     tracing::warn!(
         abandoned,
         ?grace,
