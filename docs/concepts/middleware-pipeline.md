@@ -50,7 +50,7 @@ TracingMiddleware: entering
 TracingMiddleware: completed (with elapsed_ms) or failed (with error)
 ```
 
-The recommended order is `Tracing` first, then `Timeout`. With this order, the tracing span observes the full lifetime of the dispatch. With the inverse order, `TracingMiddleware` sits inside `TimeoutMiddleware`: the span still opens and "entering" is emitted, but when the timeout fires the inner future is dropped, so the "completed" or "failed" exit events are never emitted.
+The recommended order is `Tracing` first, then `Timeout`. With this order, the tracing span observes the full lifetime of the dispatch. With the inverse order, `TracingMiddleware` sits inside `TimeoutMiddleware`: the span still opens and "entering" is emitted, but when the timeout fires the inner future is dropped once the grace period ends, so the "completed" or "failed" exit events are never emitted.
 
 ## Building your own
 
@@ -147,7 +147,7 @@ Handlers with long cooperative sections can also poll `ctx.is_cancelled()` thems
 Hexeract ships two built-ins in `hexeract-middleware` (feature `middleware` on the umbrella crate):
 
 - **`TracingMiddleware`** opens a `tracing::Span` per dispatch and emits structured events (`entering`, `completed`, `failed`). Level is configurable through `with_level`; defaults to `INFO`. Failures always log at `ERROR` regardless of configured level.
-- **`TimeoutMiddleware`** wraps the inner pipeline in `tokio::time::timeout`. On expiration returns `HexeractError::Timeout { type_name, duration, .. }`.
+- **`TimeoutMiddleware`** races the inner pipeline against a timer. On expiration it fires `ctx.cancellation`, keeps polling the handler for a grace period (1 second by default, `with_grace` to change it) so it can observe the cancellation and clean up, then drops it and returns `HexeractError::Timeout { type_name, duration, .. }`. The result is a `Timeout` even when the handler finishes during the grace period. A handler that blocks its thread never yields, so the timer cannot fire on a single-threaded runtime: move blocking work to `tokio::task::spawn_blocking`.
 
 See [`hexeract-middleware` reference](../reference/hexeract-middleware.md) for the exact API surface.
 

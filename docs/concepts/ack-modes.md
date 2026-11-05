@@ -73,7 +73,7 @@ Prefer `AckOnReceive` over `Unacknowledged` when you want at-most-once but still
 
 ## Unacknowledged: fire-and-forget
 
-In `AckMode::Unacknowledged`, the consumer is opened with `no_ack = true`. The broker considers a delivery acknowledged the moment it leaves the queue and never expects an ack or nack. This is the highest-throughput mode, but any handler failure or crash loses the message, and prefetch does not apply.
+In `AckMode::Unacknowledged`, the consumer is opened with `no_ack = true`. The broker considers a delivery acknowledged the moment it leaves the queue and never expects an ack or nack. This is the highest-throughput mode, but any handler failure or crash loses the message, and prefetch does not apply. It stays at-most-once even with a managed shutdown: the worker waits for in-flight handlers within the shutdown grace period and aborts the rest, and the message an aborted handler was working on is gone for good.
 
 ```mermaid
 sequenceDiagram
