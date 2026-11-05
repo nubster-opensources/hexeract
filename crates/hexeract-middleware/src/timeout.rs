@@ -12,12 +12,31 @@ pub const DEFAULT_TIMEOUT_GRACE: Duration = Duration::from_secs(1);
 /// than the configured duration.
 ///
 /// On expiration, returns [`HexeractError::Timeout`] carrying the envelope
-/// type name and the configured duration. Cancellation honors tokio's
-/// cooperative semantics: the inner future is dropped at the next await
-/// point, which lets `Drop` implementations run their cleanup.
+/// type name and the configured duration.
+///
+/// # Cancellation order
+///
+/// When the duration elapses the middleware proceeds in three steps:
+///
+/// 1. it fires `ctx.cancellation`, so a handler that selects on it sees the
+///    deadline;
+/// 2. it keeps polling the handler for the grace period
+///    ([`DEFAULT_TIMEOUT_GRACE`] unless changed with [`Self::with_grace`]), so
+///    the handler can observe the cancellation and clean up;
+/// 3. it drops the handler's future, whether or not it finished, which lets
+///    `Drop` implementations run their cleanup.
+///
+/// The result is [`HexeractError::Timeout`] in every case, even when the
+/// handler completes during the grace period: the deadline was missed, and
+/// the grace exists for cleanup, not to recover the result.
+///
+/// # Blocking handlers
+///
+/// A handler that blocks its thread never yields to the runtime, so the timer
+/// cannot fire on a single-threaded runtime and the deadline is not enforced.
+/// Move blocking work to `tokio::task::spawn_blocking`.
 pub struct TimeoutMiddleware {
     duration: Duration,
-    #[allow(dead_code, reason = "wired in Building")]
     grace: Duration,
 }
 
@@ -34,7 +53,8 @@ impl TimeoutMiddleware {
     }
 
     /// Time the handler keeps being polled after `ctx.cancellation` fires, so
-    /// it can observe it and clean up. Zero drops it right after cancelling.
+    /// it can observe it and clean up (default [`DEFAULT_TIMEOUT_GRACE`]). Zero
+    /// drops it right after cancelling.
     #[must_use]
     pub fn with_grace(mut self, grace: Duration) -> Self {
         self.grace = grace;
@@ -49,10 +69,16 @@ impl Middleware for TimeoutMiddleware {
         ctx: &HandlerContext,
         next: Next,
     ) -> Result<BoxOutput, HexeractError> {
-        match tokio::time::timeout(self.duration, next.run(envelope, ctx)).await {
-            Ok(result) => result,
-            Err(_elapsed) => {
+        let inner = next.run(envelope, ctx);
+        tokio::pin!(inner);
+        tokio::select! {
+            biased;
+            result = &mut inner => result,
+            () = tokio::time::sleep(self.duration) => {
                 ctx.cancellation.cancel();
+                if !self.grace.is_zero() {
+                    let _ = tokio::time::timeout(self.grace, &mut inner).await;
+                }
                 Err(HexeractError::timeout(envelope.type_name(), self.duration))
             }
         }
