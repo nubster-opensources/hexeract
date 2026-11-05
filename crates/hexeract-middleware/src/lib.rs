@@ -32,5 +32,6 @@
 mod timeout;
 mod tracing;
 
+pub use timeout::DEFAULT_TIMEOUT_GRACE;
 pub use timeout::TimeoutMiddleware;
 pub use tracing::TracingMiddleware;

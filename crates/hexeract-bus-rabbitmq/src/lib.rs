@@ -73,6 +73,7 @@ pub use topology::ensure_topology;
 pub use transport::RabbitMqTransport;
 pub use transport::RabbitMqTransportConfig;
 pub use worker::AckMode;
+pub use worker::DEFAULT_SHUTDOWN_GRACE;
 pub use worker::RabbitMqWorker;
 pub use worker::RabbitMqWorkerBuilder;
 

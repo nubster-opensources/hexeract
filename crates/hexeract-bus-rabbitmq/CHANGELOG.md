@@ -9,6 +9,11 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Added
 
+- `RabbitMqWorkerBuilder::shutdown_grace` and `DEFAULT_SHUTDOWN_GRACE` (30
+  seconds), the time in-flight handlers get after cancellation. Handlers still
+  running when it expires are aborted and `RabbitMqWorker::run` returns the new
+  `hexeract_bus::BusError::ShutdownDrainTimedOut { abandoned, grace }`, which is
+  not a connection failure. (#425)
 - The reply inbox now reports the identity it verified instead of discarding it: the principal established when a reply's signature is checked reaches the waiting caller as a `hexeract_bus::ReplyAuthentication`, readable through `RequestClient::request_authenticated`. A client with no envelope security reports `NotEnforced`, which is the historical behaviour made visible rather than a change of it. Rejection is unaffected: a reply that fails verification still never reaches a correlation slot. (#551)
 - Exclusive, auto-delete, server-named reply inbox (`declare_reply_inbox` / `run_reply_inbox`) consumed on a connection distinct from the auto-recovering publisher, routing every delivery to a `hexeract_bus::RequestRegistry` by request id, read from the `x-hexeract-request-id` header. (#400)
 - `connect_request_client`, assembling a ready-to-use `RequestClient<RabbitMqTransport>`: an auto-recovering publisher transport plus a supervised reply inbox whose background task drains in-flight requests, reconnects and re-declares a fresh inbox on broker loss. On loss, the supervisor marks the inbox `Reconnecting` **before** it drains the registry, never after: that order is what makes a call registering after the drain observe the reconnect instead of a stale ready inbox it would wait out its whole timeout against. (#400)
@@ -36,6 +41,26 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Changed
 
+- **Breaking behaviour change.** `RabbitMqWorkerBuilder::max_buffered(0)` is
+  refused: `build()` returns `BusError::Internal` instead of treating zero as
+  "no bound". Migration: omit the `max_buffered` call for a `no_ack` consumer
+  without a bound. (#425)
+- **Breaking behaviour change.** `RabbitMqWorker::run` returns `Ok(())` only
+  when every in-flight handler finished within the shutdown grace period, and
+  `BusError::ShutdownDrainTimedOut` otherwise; it used to return `Ok(())` and
+  leave the tasks running. When `run` exits on a lost connection it drains the
+  in-flight handlers for the same grace period without cancelling them, then
+  returns the original connection error. A worker parked on a full
+  `max_buffered` bound leaves it as soon as the token fires. Migration: a
+  supervisor that restarts the worker on any error must first test
+  `cancel.is_cancelled()`, as the example in the `run` documentation shows.
+  `AckMode::Unacknowledged` remains at-most-once. (#425)
+- **Breaking behaviour change.** `ctx.cancellation` in a worker handler is now
+  a child of the token passed to `run`, for every ack mode, so a handler that
+  selects on it observes the shutdown. It used to be a fresh token. A handler
+  that selects on it exits earlier, and under `AckMode::Manual` an error
+  returned because of the cancellation goes through the retry path, which keeps
+  at-least-once. (#425)
 - Breaking: `BusError::Connection` is now a struct variant `{ source, retryable }`.
   Build it with `BusError::connection(source, retryable)` and read the transience
   classification with `BusError::is_retryable_connection()`.
@@ -59,6 +84,12 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Fixed
 
+- Concurrent publications share the channel pool: the pooled channel is
+  released as soon as the publish is sent and the confirm is awaited on a clone
+  of the channel, instead of holding the channel for the whole round trip.
+  Recovery after a failed confirm is unchanged. (#344)
+- The `no_ack` shutdown test waits for the handlers to start with a rendezvous
+  instead of polling a counter. (#525)
 - A small payload can no longer smuggle unbounded metadata past the worker's
   resource bounds: `max_payload_bytes` never covered the AMQP field table, so
   a tiny message could still carry a large one, which the worker cloned into a

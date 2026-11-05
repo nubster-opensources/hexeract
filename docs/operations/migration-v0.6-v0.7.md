@@ -264,3 +264,14 @@ makes the worker declare the queue it consumes (durable, not exclusive, not
 auto-delete) when it starts. Without that call nothing changes, and the queue
 stays the operator's. Against an existing queue declared with other arguments,
 `run` fails with a `BusError` carrying the broker's `PRECONDITION_FAILED`.
+
+## Worker shutdown, handler cancellation and timeout grace
+
+Four changes harden the runtime. Each is observable, and each has a one-line migration.
+
+- `max_buffered(0)` is refused. `RabbitMqWorkerBuilder::build` returns `BusError::Internal` when the bound is zero, instead of silently treating it as "no bound". Remove the call to get an unbounded `no_ack` consumer.
+- `RabbitMqWorker::run` can return the new `BusError::ShutdownDrainTimedOut { abandoned, grace }`. When the token is cancelled, `run` waits for the in-flight `no_ack` handlers for the grace period (30 seconds by default, `RabbitMqWorkerBuilder::shutdown_grace` to change it), aborts the ones still running, and reports how many it aborted. It used to return `Ok(())` and leave them running. A supervisor that restarts on any error must first test `cancel.is_cancelled()`, as the example in the `run` documentation does. When `run` exits on a lost connection it now drains the in-flight handlers for the same grace period before returning the connection error.
+- `ctx.cancellation` inside a worker handler now fires at shutdown. It used to be a fresh token unrelated to the worker's. A handler that selects on it exits earlier, and under `AckMode::Manual` its delivery goes through the retry path.
+- `TimeoutMiddleware` cancels the handler, then keeps polling it for a grace period (1 second by default) before dropping it, so a handler that selects on `ctx.cancellation` actually observes the timeout. It returns `HexeractError::Timeout` either way. `TimeoutMiddleware::with_grace(Duration::ZERO)` restores the previous drop timing, with cancellation fired first.
+
+The publish path also frees its pooled channel before it awaits the broker confirm, so concurrent publications now share the channel pool instead of queueing behind one confirm each.
