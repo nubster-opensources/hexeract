@@ -2481,6 +2481,94 @@ async fn cancellation_frees_a_worker_parked_on_a_full_in_flight_bound() {
     );
 }
 
+/// A handler that holds its work until the scenario releases it, so the
+/// scenario decides when the handler finishes instead of a clock.
+#[derive(Debug)]
+struct GatedHandler {
+    started: harness::CallCounter,
+    done: harness::CallCounter,
+    release: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl Handler<OrderPlaced> for GatedHandler {
+    type Error = hexeract_bus::BusError;
+
+    async fn handle(
+        &self,
+        _message: OrderPlaced,
+        _ctx: &HandlerContext,
+    ) -> Result<(), Self::Error> {
+        self.started.record();
+        let _permit = self
+            .release
+            .acquire()
+            .await
+            .expect("the release semaphore is never closed");
+        self.done.record();
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker"]
+async fn lost_connection_drains_in_flight_handlers_before_run_returns_the_connection_error() {
+    let broker = harness::start_rabbitmq().await;
+    let queue_name = "noack.connection.lost";
+    declare_temporary_queue(broker.uri(), queue_name).await;
+    let in_flight = 2usize;
+    publish_orders(broker.uri(), queue_name, in_flight).await;
+
+    let started = harness::CallCounter::new();
+    let done = harness::CallCounter::new();
+    let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let consumer_conn = RabbitMqConnection::connect(broker.uri())
+        .await
+        .expect("consumer connects");
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .ack_mode(AckMode::Unacknowledged)
+        .max_buffered(in_flight)
+        .register_handler::<OrderPlaced, _>(GatedHandler {
+            started: started.clone(),
+            done: done.clone(),
+            release: std::sync::Arc::clone(&release),
+        })
+        .build()
+        .expect("worker builds");
+
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let mut handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
+
+    started.await_count(in_flight).await;
+    broker.stop_gracefully().await;
+
+    // The broker is gone and the handlers are still working: run must be
+    // draining them, not returning. A run that exits here abandoned them.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), &mut handle)
+            .await
+            .is_err(),
+        "criterion 20: run returned while handlers were still in flight"
+    );
+
+    release.add_permits(in_flight);
+    let outcome = tokio::time::timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("criterion 20: run must return once the handlers finished")
+        .expect("worker task joins");
+
+    assert_eq!(
+        done.count(),
+        in_flight,
+        "criterion 20: every in-flight handler must have finished before run returned"
+    );
+    assert!(
+        matches!(outcome, Err(BusError::Connection { .. })),
+        "criterion 20: the original connection error must be returned, got {outcome:?}"
+    );
+}
+
 /// Whether `name` exists on the broker, probed by a passive declaration.
 ///
 /// A passive declaration of a missing queue closes the channel it ran on, so
