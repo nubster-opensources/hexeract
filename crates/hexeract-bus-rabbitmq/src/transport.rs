@@ -24,6 +24,7 @@ use crate::metadata::AmqpMetadataLimits;
 use crate::metadata::encode_headers;
 use crate::pool::ChannelPool;
 use crate::pool::DEFAULT_POOL_MAX_SIZE;
+use crate::pool::PooledChannel;
 
 /// MIME type used for the JSON payloads carried by [`BusEnvelope`].
 const JSON_CONTENT_TYPE: &str = "application/json";
@@ -417,14 +418,30 @@ impl Transport for RabbitMqTransport {
 /// Generic over the slot and the two broker steps so the ordering, slot
 /// released strictly before the confirm is awaited, is unit-testable without
 /// a broker. [`publish_with_recovery`] is the only real caller.
-#[allow(dead_code, clippy::unused_async, reason = "skeleton wired in Building")]
 async fn publish_then_release<S, P, C>(slot: S, publish: P) -> Result<Confirmation, lapin::Error>
 where
     P: AsyncFnOnce(&S) -> Result<C, lapin::Error>,
     C: Future<Output = Result<Confirmation, lapin::Error>>,
 {
-    let _ = (slot, publish);
-    todo!("wired in Building")
+    let confirm = publish(&slot).await?;
+    drop(slot);
+    confirm.await
+}
+
+/// Pin the publish step's signature to be general over both lifetimes of the
+/// slot it receives.
+///
+/// Inference alone gives the closure one fixed pool lifetime, which the
+/// compiler then rejects as "not general enough" when it proves the surrounding
+/// future `Send`. Passing the closure through this identity function states
+/// the signature it already satisfies.
+fn general_over_slot_lifetimes<F>(publish: F) -> F
+where
+    F: for<'slot, 'pool> AsyncFnOnce(
+        &'slot PooledChannel<'pool>,
+    ) -> Result<lapin::PublisherConfirm, lapin::Error>,
+{
+    publish
 }
 
 /// Publish one already-built message, retrying once across a channel recovery.
@@ -455,9 +472,13 @@ async fn publish_with_recovery(
     let mut recovered = false;
     loop {
         let pooled = pool.acquire().await?;
-        let outcome = async {
-            pooled
-                .channel()
+        // `Channel` is a cheap handle onto the same channel: keeping a clone
+        // lets the pooled slot go back to the pool before the confirm is
+        // awaited (#344), while `wait_for_recovery` stays possible after a
+        // failed confirm.
+        let channel = pooled.channel().clone();
+        let publish = general_over_slot_lifetimes(async |slot| {
+            slot.channel()
                 .basic_publish(
                     exchange.clone(),
                     routing_key.clone(),
@@ -468,17 +489,16 @@ async fn publish_with_recovery(
                     payload,
                     properties.clone(),
                 )
-                .await?
                 .await
-        }
-        .await;
+        });
+        let outcome = publish_then_release(pooled, publish).await;
         match outcome {
             Ok(confirmation) => return Ok(confirmation),
             Err(err) => {
                 if recovered {
                     return Err(BusError::Transport(Box::new(err)));
                 }
-                match pooled.channel().wait_for_recovery(err).await {
+                match channel.wait_for_recovery(err).await {
                     // Recovered: loop once more on a freshly acquired channel.
                     // Falling through to the end of the loop body re-enters the
                     // attempt, so no explicit continue.
