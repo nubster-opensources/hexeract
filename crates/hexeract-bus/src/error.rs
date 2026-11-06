@@ -135,6 +135,18 @@ pub enum BusError {
         reply_code: u16,
     },
 
+    /// The worker's shutdown drain did not complete within its grace period.
+    /// The remaining in-flight handlers were aborted, so their work may be
+    /// partial. Not a connection failure: a supervisor must not treat it as
+    /// a reason to restart.
+    #[error("shutdown drain timed out after {grace:?}, {abandoned} handler(s) aborted")]
+    ShutdownDrainTimedOut {
+        /// Number of in-flight handlers aborted when the grace period expired.
+        abandoned: usize,
+        /// Grace period the drain was given.
+        grace: std::time::Duration,
+    },
+
     /// The worker consumed an envelope whose `message_type` has no registered handler.
     #[error("no handler registered for message type `{message_type}`")]
     MissingHandler {

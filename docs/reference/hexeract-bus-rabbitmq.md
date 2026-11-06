@@ -233,7 +233,8 @@ see the [production checklist](../operations/production-checklist.md).
 | `AckMode::Manual` | Default. At-least-once. Retries per `message_id` up to `max_attempts`, then DLR or drop. |
 | `AckMode::AckOnReceive` | At-most-once. Explicit `basic_ack` on receive before the handler runs (`no_ack = false`). |
 | `AckMode::Unacknowledged` | Fire-and-forget. Consumer-side `no_ack = true`, lossy on handler failure or crash. |
-| `.max_buffered(n)` | Bounds the in-memory delivery buffer under `AckMode::Unacknowledged` (`None` = unbounded, not recommended). Has no effect under `AckMode::Manual` or `AckMode::AckOnReceive`, which are already bounded by `basic.qos` prefetch. |
+| `.shutdown_grace(duration)` | Grace period granted to in-flight handlers after cancellation (default 30 s). Handlers still running when it expires are aborted and `run` returns `BusError::ShutdownDrainTimedOut`. |
+| `.max_buffered(n)` | Bounds the in-memory delivery buffer under `AckMode::Unacknowledged`; `n` must be at least 1 and `build()` rejects zero (omit the call for an unbounded consumer, not recommended). Has no effect under `AckMode::Manual` or `AckMode::AckOnReceive`, which are already bounded by `basic.qos` prefetch. |
 
 See the [worker concept](../concepts/worker.md), the [ack modes](../concepts/ack-modes.md) and the [retry policy](../concepts/retry-policy.md).
 

@@ -46,7 +46,8 @@ impl RemoteErrorType {
             | BusError::ReplyUndeliverable { .. } => Self::Unavailable,
             BusError::Internal(_)
             | BusError::MissingHandler { .. }
-            | BusError::InvalidTopology { .. } => Self::Internal,
+            | BusError::InvalidTopology { .. }
+            | BusError::ShutdownDrainTimedOut { .. } => Self::Internal,
         }
     }
 }

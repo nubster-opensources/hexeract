@@ -86,8 +86,12 @@ Both workers honour cooperative cancellation:
 
 1. Caller flips the `CancellationToken`.
 2. `OutboxWorker` finishes the current poll cycle (commits the transaction or rolls back) and exits the loop.
-3. `RabbitMqWorker` lets the in-flight delivery resolve through the handler, sends the ack or nack, then exits the consume loop.
-4. `run` returns `Ok(())` and the `JoinHandle` resolves.
+3. `RabbitMqWorker` stops consuming. A handler dispatched inline (an acknowledged mode, or `no_ack` without `max_buffered`) resolves through the handler, the worker sends the ack or nack, then exits the consume loop. The `no_ack` handlers it spawned (bounded by `max_buffered`) are drained for at most the shutdown grace period, 30 seconds by default, tunable with `shutdown_grace`.
+4. `run` returns `Ok(())` when every handler finished in time, and the `JoinHandle` resolves. Handlers still running when the grace period expires are aborted and `run` returns `BusError::ShutdownDrainTimedOut`.
+
+Every delivery receives a child of the worker's token as `ctx.cancellation`, so a handler that selects on it sees the shutdown and can give up its work inside the grace period. Under `AckMode::Manual`, a handler that returns an error because it was cancelled follows the retry path, so the delivery is not lost. `AckMode::Unacknowledged` stays at-most-once even with a managed shutdown: the message an aborted handler was working on is already gone from the broker.
+
+A worker parked on a full `max_buffered` bound stops waiting for a slot as soon as the token fires and moves on to the drain.
 
 A worker that crashes (panic or unwrap) bubbles the panic to the `JoinHandle`. Wrap your handler logic in `Result::Err` mapping rather than panicking.
 
@@ -95,8 +99,9 @@ A worker that crashes (panic or unwrap) bubbles the panic to the `JoinHandle`. W
 
 `RabbitMqWorker` never reconnects on its own. The contract of `run` makes the two exit paths unambiguous:
 
-- `Ok(())` is returned for a cooperative cancellation, and nothing else.
-- `BusError::Connection` is returned when the consumer stream ends while the token has not fired: the connection or channel is gone and the worker cannot recover it.
+- `Ok(())` is returned for a cooperative cancellation where every in-flight handler finished within the grace period, and nothing else.
+- `BusError::Connection` is returned when the consumer stream ends while the token has not fired: the connection or channel is gone and the worker cannot recover it. The in-flight `no_ack` handlers are still drained for the grace period first, without being cancelled, and the connection error is returned afterwards.
+- `BusError::ShutdownDrainTimedOut` is returned when handlers were still running once the grace period expired; they were aborted. It is not a connection failure: a supervisor whose token is cancelled should stop instead of restarting, as the loop below does.
 
 Recovery belongs to the caller, because a supervisor that rebuilds everything from scratch has no partial state to reconcile. Each iteration of the loop below reconnects with backoff, re-applies the application topology, and re-creates the worker, which re-declares the wait and dead-letter queues, re-enables publisher confirms and re-subscribes the consumer:
 

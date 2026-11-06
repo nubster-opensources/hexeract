@@ -48,12 +48,15 @@ pub struct TimeoutMiddleware { /* ... */ }
 
 impl TimeoutMiddleware {
     pub fn new(duration: std::time::Duration) -> Self;
+    pub fn with_grace(self, grace: std::time::Duration) -> Self;
 }
+
+pub const DEFAULT_TIMEOUT_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl Middleware for TimeoutMiddleware { /* ... */ }
 ```
 
-Wraps the inner pipeline in `tokio::time::timeout`. On expiration returns `HexeractError::Timeout { type_name, duration, .. }`.
+Races the inner pipeline against a timer. On expiration it fires `ctx.cancellation`, keeps polling the handler for the grace period (`DEFAULT_TIMEOUT_GRACE` unless changed with `with_grace`) so it can observe the cancellation and clean up, then drops it and returns `HexeractError::Timeout { type_name, duration, .. }`. The result is a `Timeout` even when the handler finishes during the grace period: the deadline was missed, and the grace is for cleanup. `with_grace(Duration::ZERO)` cancels and drops straight away. A handler that blocks its thread never yields to the runtime, so move blocking work to `tokio::task::spawn_blocking`.
 
 **Cancellation semantics.** When the timeout fires, the inner future is dropped at its next await point. `Drop` implementations in the inner future run normally; partial state should be guarded by RAII if your handler mutates external resources.
 

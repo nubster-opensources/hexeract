@@ -2214,8 +2214,8 @@ async fn signing_happens_once_per_publication() {
 
 #[derive(Debug)]
 struct SlowCountingHandler {
-    started: Arc<AtomicUsize>,
-    done: Arc<AtomicUsize>,
+    started: harness::CallCounter,
+    done: harness::CallCounter,
 }
 
 impl Handler<OrderPlaced> for SlowCountingHandler {
@@ -2226,27 +2226,19 @@ impl Handler<OrderPlaced> for SlowCountingHandler {
         _message: OrderPlaced,
         _ctx: &HandlerContext,
     ) -> Result<(), Self::Error> {
-        self.started.fetch_add(1, Ordering::SeqCst);
+        self.started.record();
         tokio::time::sleep(Duration::from_millis(300)).await;
-        self.done.fetch_add(1, Ordering::SeqCst);
+        self.done.record();
         Ok(())
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Docker"]
-async fn no_ack_shutdown_drains_in_flight_handlers() {
-    let broker = harness::start_rabbitmq().await;
-    let queue_name = "noack.drain";
-    declare_temporary_queue(broker.uri(), queue_name).await;
-
-    let started = Arc::new(AtomicUsize::new(0));
-    let done = Arc::new(AtomicUsize::new(0));
-    let transport = RabbitMqTransport::new(broker.uri())
+/// Publish `count` orders to the default exchange, routed to `queue_name`.
+async fn publish_orders(uri: &str, queue_name: &str, count: usize) {
+    let transport = RabbitMqTransport::new(uri)
         .await
         .expect("transport connects");
-    let batch = 4usize;
-    for _ in 0..batch {
+    for _ in 0..count {
         transport
             .publish(
                 queue_name,
@@ -2257,6 +2249,19 @@ async fn no_ack_shutdown_drains_in_flight_handlers() {
             .await
             .expect("publish succeeds");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker"]
+async fn no_ack_shutdown_drains_in_flight_handlers() {
+    let broker = harness::start_rabbitmq().await;
+    let queue_name = "noack.drain";
+    declare_temporary_queue(broker.uri(), queue_name).await;
+
+    let started = harness::CallCounter::new();
+    let done = harness::CallCounter::new();
+    let batch = 4usize;
+    publish_orders(broker.uri(), queue_name, batch).await;
 
     let consumer_conn = RabbitMqConnection::connect(broker.uri())
         .await
@@ -2266,8 +2271,8 @@ async fn no_ack_shutdown_drains_in_flight_handlers() {
         .ack_mode(AckMode::Unacknowledged)
         .max_buffered(batch)
         .register_handler::<OrderPlaced, _>(SlowCountingHandler {
-            started: Arc::clone(&started),
-            done: Arc::clone(&done),
+            started: started.clone(),
+            done: done.clone(),
         })
         .build()
         .expect("worker builds");
@@ -2276,25 +2281,9 @@ async fn no_ack_shutdown_drains_in_flight_handlers() {
     let cancel_for_task = cancel.clone();
     let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
 
-    // Cancel only once every delivery is actually inside its (slow)
-    // handler. A fixed sleep here was a bet on how fast the broker
-    // delivers `batch` messages: lose that bet on a loaded runner and the
-    // worker stops consuming with a delivery never dispatched, leaving
-    // fewer handlers in flight than the assertion below expects. The test
-    // then fails on its own race rather than on a defect in the drain.
-    // Scrutinizing `started` makes the precondition this test claims, a
-    // full batch in flight, one it actually establishes.
-    let mut attempts = 0;
-    while started.load(Ordering::SeqCst) < batch {
-        attempts += 1;
-        assert!(
-            attempts < 250,
-            "only {} of {batch} deliveries reached a handler within 5s, so the worker \
-             never had a full in-flight batch to drain",
-            started.load(Ordering::SeqCst)
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    // Cancel only once every delivery is actually inside its (slow) handler:
+    // the rendezvous is the handler reaching `batch`, never a duration.
+    started.await_count(batch).await;
     cancel.cancel();
 
     tokio::time::timeout(Duration::from_secs(10), handle)
@@ -2304,9 +2293,279 @@ async fn no_ack_shutdown_drains_in_flight_handlers() {
         .expect("worker run returns Ok");
 
     assert_eq!(
-        done.load(Ordering::SeqCst),
+        done.count(),
         batch,
-        "every in-flight no_ack handler must finish before shutdown (#338)"
+        "criterion 11: every in-flight no_ack handler must finish before shutdown (#338, #525)"
+    );
+}
+
+/// A handler whose simulated work is long but which gives it up as soon as
+/// `ctx.cancellation` fires.
+#[derive(Debug)]
+struct CooperativeHandler {
+    started: harness::CallCounter,
+    observed_cancellation: harness::CallCounter,
+}
+
+impl Handler<OrderPlaced> for CooperativeHandler {
+    type Error = hexeract_bus::BusError;
+
+    async fn handle(&self, _message: OrderPlaced, ctx: &HandlerContext) -> Result<(), Self::Error> {
+        self.started.record();
+        tokio::select! {
+            () = ctx.cancellation.cancelled() => self.observed_cancellation.record(),
+            () = tokio::time::sleep(Duration::from_secs(3600)) => {}
+        }
+        Ok(())
+    }
+}
+
+/// A handler that never returns and never looks at `ctx.cancellation`.
+#[derive(Debug)]
+struct DeafHandler {
+    started: harness::CallCounter,
+}
+
+impl Handler<OrderPlaced> for DeafHandler {
+    type Error = hexeract_bus::BusError;
+
+    async fn handle(
+        &self,
+        _message: OrderPlaced,
+        _ctx: &HandlerContext,
+    ) -> Result<(), Self::Error> {
+        self.started.record();
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker"]
+async fn no_ack_handler_observes_shutdown_through_ctx_cancellation_and_run_returns_ok() {
+    let broker = harness::start_rabbitmq().await;
+    let queue_name = "noack.cooperative";
+    declare_temporary_queue(broker.uri(), queue_name).await;
+    publish_orders(broker.uri(), queue_name, 1).await;
+
+    let started = harness::CallCounter::new();
+    let observed_cancellation = harness::CallCounter::new();
+    let consumer_conn = RabbitMqConnection::connect(broker.uri())
+        .await
+        .expect("consumer connects");
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .ack_mode(AckMode::Unacknowledged)
+        .max_buffered(1)
+        .register_handler::<OrderPlaced, _>(CooperativeHandler {
+            started: started.clone(),
+            observed_cancellation: observed_cancellation.clone(),
+        })
+        .build()
+        .expect("worker builds");
+
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
+
+    started.await_count(1).await;
+    cancel.cancel();
+
+    // The simulated work lasts an hour: returning inside this deadline proves
+    // the handler saw the cancellation instead of being waited for.
+    tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("criterion 12: run must not wait for the handler's simulated work")
+        .expect("worker task joins")
+        .expect("criterion 12: run returns Ok when every handler finished in the grace");
+
+    assert_eq!(
+        observed_cancellation.count(),
+        1,
+        "criterion 12: the handler must observe the shutdown through ctx.cancellation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker"]
+async fn no_ack_handler_ignoring_cancellation_makes_run_report_the_aborted_count() {
+    let broker = harness::start_rabbitmq().await;
+    let queue_name = "noack.deaf";
+    declare_temporary_queue(broker.uri(), queue_name).await;
+    let in_flight = 2usize;
+    publish_orders(broker.uri(), queue_name, in_flight).await;
+
+    let started = harness::CallCounter::new();
+    let consumer_conn = RabbitMqConnection::connect(broker.uri())
+        .await
+        .expect("consumer connects");
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .ack_mode(AckMode::Unacknowledged)
+        .max_buffered(in_flight)
+        .shutdown_grace(Duration::from_millis(500))
+        .register_handler::<OrderPlaced, _>(DeafHandler {
+            started: started.clone(),
+        })
+        .build()
+        .expect("worker builds");
+
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
+
+    started.await_count(in_flight).await;
+    cancel.cancel();
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("criterion 13: run must exit once the grace expires")
+        .expect("worker task joins");
+
+    match outcome {
+        Err(BusError::ShutdownDrainTimedOut { abandoned, grace }) => {
+            assert_eq!(
+                abandoned, in_flight,
+                "criterion 13: abandoned must equal the number of handlers in flight"
+            );
+            assert_eq!(
+                grace,
+                Duration::from_millis(500),
+                "criterion 13: the error must carry the configured grace"
+            );
+        }
+        other => panic!("criterion 13: expected ShutdownDrainTimedOut, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker"]
+async fn cancellation_frees_a_worker_parked_on_a_full_in_flight_bound() {
+    let broker = harness::start_rabbitmq().await;
+    let queue_name = "noack.parked";
+    declare_temporary_queue(broker.uri(), queue_name).await;
+    publish_orders(broker.uri(), queue_name, 2).await;
+
+    let started = harness::CallCounter::new();
+    let consumer_conn = RabbitMqConnection::connect(broker.uri())
+        .await
+        .expect("consumer connects");
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .ack_mode(AckMode::Unacknowledged)
+        .max_buffered(1)
+        .shutdown_grace(Duration::from_millis(500))
+        .register_handler::<OrderPlaced, _>(DeafHandler {
+            started: started.clone(),
+        })
+        .build()
+        .expect("worker builds");
+
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
+
+    // The one permit is taken by a handler that never returns; the second
+    // delivery leaves the worker parked on the permit.
+    started.await_count(1).await;
+    cancel.cancel();
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("criterion 14: cancellation must free a worker parked on the in-flight bound")
+        .expect("worker task joins");
+
+    assert!(
+        matches!(outcome, Err(BusError::ShutdownDrainTimedOut { .. })),
+        "criterion 14: the stuck handler is aborted after the grace, got {outcome:?}"
+    );
+}
+
+/// A handler that holds its work until the scenario releases it, so the
+/// scenario decides when the handler finishes instead of a clock.
+#[derive(Debug)]
+struct GatedHandler {
+    started: harness::CallCounter,
+    done: harness::CallCounter,
+    release: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl Handler<OrderPlaced> for GatedHandler {
+    type Error = hexeract_bus::BusError;
+
+    async fn handle(
+        &self,
+        _message: OrderPlaced,
+        _ctx: &HandlerContext,
+    ) -> Result<(), Self::Error> {
+        self.started.record();
+        let _permit = self
+            .release
+            .acquire()
+            .await
+            .expect("the release semaphore is never closed");
+        self.done.record();
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker"]
+async fn lost_connection_drains_in_flight_handlers_before_run_returns_the_connection_error() {
+    let broker = harness::start_rabbitmq().await;
+    let queue_name = "noack.connection.lost";
+    declare_temporary_queue(broker.uri(), queue_name).await;
+    let in_flight = 2usize;
+    publish_orders(broker.uri(), queue_name, in_flight).await;
+
+    let started = harness::CallCounter::new();
+    let done = harness::CallCounter::new();
+    let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let consumer_conn = RabbitMqConnection::connect(broker.uri())
+        .await
+        .expect("consumer connects");
+    let worker = RabbitMqWorkerBuilder::new(consumer_conn)
+        .queue(queue_name)
+        .ack_mode(AckMode::Unacknowledged)
+        .max_buffered(in_flight)
+        .register_handler::<OrderPlaced, _>(GatedHandler {
+            started: started.clone(),
+            done: done.clone(),
+            release: std::sync::Arc::clone(&release),
+        })
+        .build()
+        .expect("worker builds");
+
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let mut handle = tokio::spawn(async move { worker.run(cancel_for_task).await });
+
+    started.await_count(in_flight).await;
+    broker.stop_gracefully().await;
+
+    // The broker is gone and the handlers are still working: run must be
+    // draining them, not returning. A run that exits here abandoned them.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), &mut handle)
+            .await
+            .is_err(),
+        "criterion 20: run returned while handlers were still in flight"
+    );
+
+    release.add_permits(in_flight);
+    let outcome = tokio::time::timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("criterion 20: run must return once the handlers finished")
+        .expect("worker task joins");
+
+    assert_eq!(
+        done.count(),
+        in_flight,
+        "criterion 20: every in-flight handler must have finished before run returned"
+    );
+    assert!(
+        matches!(outcome, Err(BusError::Connection { .. })),
+        "criterion 20: the original connection error must be returned, got {outcome:?}"
     );
 }
 
