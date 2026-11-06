@@ -11,7 +11,10 @@ yanked = "deny"
 # password once during the MySQL handshake, not as a repeatable decryption
 # oracle, and the transport is secured via TLS. Revisit when RustCrypto ships
 # a constant-time fix.
-ignore = ["RUSTSEC-2023-0071"]
+# RUSTSEC-2026-0440 (`astral-tokio-tar` unmaintained): pulled by `testcontainers`
+# through dev-dependencies only, with no known vulnerability and no release free
+# of it yet. Remove once issue #628 is resolved.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0440"]
 
 [bans]
 multiple-versions = "warn"
