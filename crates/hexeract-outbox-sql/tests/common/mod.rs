@@ -519,13 +519,13 @@ where
     );
 }
 
-/// Two workers polling the same table dispatch each event exactly once.
+/// Smoke test: two real workers draining one table dispatch each event once.
 ///
-/// Every dialect instantiates it. The guarantee comes from the claim, which
-/// only serves a row to the worker that still finds it at the attempt count it
-/// polled, so it holds on SQLite as well as where `FOR UPDATE SKIP LOCKED`
-/// narrows the window further.
-pub(crate) async fn competing_workers_dispatch_each_event_once<B: Backend>(backend: &B)
+/// Not a safety proof: it observes whatever interleaving the scheduler
+/// produced, and stayed green against a claim without its `attempts` guard
+/// (#611). The guard is proven by
+/// [`claim_serves_only_one_of_two_claimants_that_read_the_same_attempts`].
+pub(crate) async fn competing_workers_smoke_dispatch_each_event_once<B: Backend>(backend: &B)
 where
     for<'tx> <B::Store as OutboxStore>::Tx<'tx>: Send,
 {

@@ -561,3 +561,20 @@ impl CallCounter {
         );
     }
 }
+
+/// Wait until `condition` holds, polling it, for state that has no signal of
+/// its own (a production counter read through a snapshot).
+///
+/// A safety net, not the measurement: the caller asserts the exact value right
+/// after. Prefer [`CallCounter::await_count`] whenever the test owns the state.
+///
+/// # Panics
+///
+/// Panics when `condition` still fails after [`PROGRESS_TIMEOUT`], naming
+/// `awaited`.
+// The inert skeleton body awaits nothing yet.
+#[allow(clippy::unused_async)]
+pub(crate) async fn await_condition(awaited: &str, condition: impl FnMut() -> bool) {
+    let _ = (awaited, condition);
+    todo!()
+}

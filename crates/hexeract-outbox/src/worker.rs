@@ -1583,18 +1583,16 @@ mod tests {
         }
     }
 
-    /// Capture everything the worker logs at warning level or above, for as
-    /// long as the returned guard lives. The subscriber is thread local, so it
-    /// only sees a worker driven on the test's own task.
-    fn capture_warnings() -> (LogBuffer, tracing::subscriber::DefaultGuard) {
-        let buffer = LogBuffer::default();
-        let writer = buffer.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        (buffer, tracing::subscriber::set_default(subscriber))
+    /// Removes the calling thread's active capture when it goes out of scope.
+    // Not constructed until `capture_warnings` has a body.
+    #[allow(dead_code)]
+    struct CaptureGuard;
+
+    /// Capture every warning the current thread logs, for as long as the guard
+    /// lives. The subscriber is process-wide and installed once, so a callsite
+    /// registered by another test thread keeps its interest (#624).
+    fn capture_warnings() -> (LogBuffer, CaptureGuard) {
+        todo!()
     }
 
     /// Store that simulates a lease lost to another worker.
