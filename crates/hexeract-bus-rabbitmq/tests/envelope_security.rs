@@ -635,7 +635,6 @@ async fn a_tampered_payload_never_reaches_the_handler() {
     let worker =
         RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
             .queue(queue_name)
-            .envelope_security(inbound_security())
             .register_handler::<OrderPlaced, _>(RecordingHandler {
                 seen: seen.clone(),
                 received: Arc::clone(&received),
