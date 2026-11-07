@@ -147,7 +147,6 @@ impl Handler<OrderPlaced> for RecordingHandler {
 #[derive(Debug, Default)]
 struct AuthenticationRecordingHandler {
     seen: harness::CallCounter,
-    received: Arc<Mutex<Vec<Uuid>>>,
     observed_authentication: Arc<Mutex<Option<PublisherAuthentication>>>,
 }
 
@@ -157,10 +156,6 @@ impl Handler<OrderPlaced> for AuthenticationRecordingHandler {
     async fn handle(&self, _message: OrderPlaced, ctx: &HandlerContext) -> Result<(), Self::Error> {
         *self.observed_authentication.lock().expect("not poisoned") =
             Some(ctx.authentication.clone());
-        self.received
-            .lock()
-            .expect("not poisoned")
-            .push(*ctx.message_id.as_uuid());
         self.seen.record();
         Ok(())
     }
@@ -732,7 +727,8 @@ async fn an_envelope_signed_for_another_audience_is_rejected() {
     assert_eq!(
         *received.lock().expect("not poisoned"),
         [sentinel],
-        "an envelope signed for an audience this worker does not accept must never reach the          handler, even though its signature is otherwise perfectly valid"
+        "an envelope signed for an audience this worker does not accept must never reach the \
+         handler, even though its signature is otherwise perfectly valid"
     );
     assert_queue_empty(broker.uri(), queue_name).await;
 
@@ -793,7 +789,8 @@ async fn an_envelope_published_on_another_routing_key_is_rejected() {
     assert_eq!(
         *received.lock().expect("not poisoned"),
         [sentinel],
-        "an envelope signed for another destination but delivered here must never reach the          handler, or a message could be rerouted onto a queue it was never signed for"
+        "an envelope signed for another destination but delivered here must never reach the \
+         handler, or a message could be rerouted onto a queue it was never signed for"
     );
     assert_queue_empty(broker.uri(), queue_name).await;
 
@@ -923,7 +920,9 @@ async fn an_unsigned_envelope_is_accepted_under_the_named_derogation() {
     assert_eq!(
         *received.lock().expect("not poisoned"),
         [sentinel],
-        "an unsigned envelope must be accepted under the named derogation, and a present but          broken signature must still be rejected, even under the derogation that allows an          absent one"
+        "an unsigned envelope must be accepted under the named derogation, and a present but \
+         broken signature must still be rejected, even under the derogation that allows an \
+         absent one"
     );
     assert_queue_empty(broker.uri(), queue_name).await;
 
@@ -1225,7 +1224,6 @@ async fn a_waived_unsigned_envelope_is_reported_as_waived_not_unenforced() {
             .envelope_security(inbound_security_allowing_unsigned())
             .register_handler::<OrderPlaced, _>(AuthenticationRecordingHandler {
                 seen: seen.clone(),
-                received: Arc::default(),
                 observed_authentication: Arc::clone(&observed_authentication),
             })
             .build()
@@ -1283,7 +1281,6 @@ async fn a_worker_without_envelope_security_reports_nothing_enforced() {
             .queue(queue_name)
             .register_handler::<OrderPlaced, _>(AuthenticationRecordingHandler {
                 seen: seen.clone(),
-                received: Arc::default(),
                 observed_authentication: Arc::clone(&observed_authentication),
             })
             .build()

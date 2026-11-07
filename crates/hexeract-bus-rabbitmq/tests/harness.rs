@@ -572,9 +572,18 @@ impl CallCounter {
 ///
 /// Panics when `condition` still fails after [`PROGRESS_TIMEOUT`], naming
 /// `awaited`.
-// The inert skeleton body awaits nothing yet.
-#[allow(clippy::unused_async)]
-pub(crate) async fn await_condition(awaited: &str, condition: impl FnMut() -> bool) {
-    let _ = (awaited, condition);
-    todo!()
+pub(crate) async fn await_condition(awaited: &str, mut condition: impl FnMut() -> bool) {
+    let outcome = tokio::time::timeout(PROGRESS_TIMEOUT, async {
+        loop {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        outcome.is_ok(),
+        "timed out after {PROGRESS_TIMEOUT:?} waiting for {awaited}"
+    );
 }
