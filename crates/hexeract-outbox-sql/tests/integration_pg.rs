@@ -199,6 +199,6 @@ backend_scenarios!(
     stale_delivery_is_refused_and_leaves_the_current_owner_outcome_intact,
     stale_failure_is_refused_and_leaves_the_current_owner_outcome_intact,
     stale_dead_lettering_is_refused_and_leaves_the_row_in_place,
-    competing_workers_dispatch_each_event_once,
+    competing_workers_smoke_dispatch_each_event_once,
     fence_beyond_the_integer_column_is_an_error_not_a_saturation,
 );

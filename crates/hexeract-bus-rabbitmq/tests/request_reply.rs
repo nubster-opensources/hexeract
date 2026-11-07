@@ -14,9 +14,8 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use std::time::Instant;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -254,17 +253,10 @@ async fn a_reply_arriving_after_a_reconnect_drain_is_counted_late() {
     );
     harness::publish_to_default_exchange(&publish_channel, &inbox, &reply).await;
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if registry.counters().late >= 1 {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the late reply was never counted within the budget"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    harness::await_condition("the late reply to be counted", || {
+        registry.counters().late >= 1
+    })
+    .await;
 
     assert_eq!(
         registry.counters().orphaned,
@@ -800,22 +792,16 @@ impl Transport for RecordingTransport {
     }
 }
 
-/// Poll `transport` for the request id it recorded, bounded rather than a
-/// fixed sleep so a slow agent gets more wall time instead of a flaky
-/// false failure, matching the idiom used elsewhere in this file.
+/// Wait for `transport` to record a request id, and return the first one it
+/// recorded.
 async fn wait_for_recorded_request_id(transport: &RecordingTransport) -> String {
-    let mut attempts = 0;
-    loop {
-        if let Some(request_id) = transport.last_request_id() {
-            return request_id;
-        }
-        attempts += 1;
-        assert!(
-            attempts < 100,
-            "no request id was recorded after 100 attempts"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    let mut recorded = None;
+    harness::await_condition("the transport to record a request id", || {
+        recorded = transport.last_request_id();
+        recorded.is_some()
+    })
+    .await;
+    recorded.expect("the wait returned only once an id was recorded")
 }
 
 /// Publish a forged reply straight into `inbox`, on `channel`, through the
@@ -1354,19 +1340,12 @@ async fn a_registered_responder_counts_into_the_handle_the_caller_kept() {
     );
     publish_request_to_queue(&publisher_channel, "tests.ping", &request).await;
 
-    let mut attempts = 0;
-    let snapshot = loop {
-        let snapshot = counters.snapshot();
-        if snapshot.invalid_reply_to > 0 {
-            break snapshot;
-        }
-        attempts += 1;
-        assert!(
-            attempts < 100,
-            "the handle the caller kept never saw the rejection the responder made"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+    harness::await_condition(
+        "the handle the caller kept to see the rejection the responder made",
+        || counters.snapshot().invalid_reply_to > 0,
+    )
+    .await;
+    let snapshot = counters.snapshot();
     assert_eq!(snapshot.invalid_reply_to, 1);
     assert_eq!(
         snapshot.invalid_request_id, 0,
@@ -1567,14 +1546,14 @@ async fn a_responder_without_security_publishes_no_security_header() {
 /// Echo handler that records whether its body ever ran, so a test can prove
 /// a guard stopped dispatch rather than merely suppressing the reply.
 struct RecordingEcho {
-    ran: Arc<AtomicBool>,
+    ran: harness::CallCounter,
 }
 
 impl RequestHandler<Ping> for RecordingEcho {
     type Error = BusError;
 
     async fn handle(&self, request: Ping, _ctx: &RequestContext<'_>) -> Result<Pong, BusError> {
-        self.ran.store(true, Ordering::Relaxed);
+        self.ran.record();
         Ok(Pong { seq: request.seq })
     }
 }
@@ -1645,7 +1624,7 @@ async fn a_request_whose_deadline_expired_in_the_queue_never_reaches_the_handler
 
     declare_ping_queue(broker.uri(), queue).await;
 
-    let ran = Arc::new(AtomicBool::new(false));
+    let ran = harness::CallCounter::new();
     let counters = ResponderCounters::default();
     let responder_transport = Arc::new(RabbitMqTransport::new(broker.uri()).await.unwrap());
     let worker = RabbitMqWorkerBuilder::new(
@@ -1655,9 +1634,7 @@ async fn a_request_whose_deadline_expired_in_the_queue_never_reaches_the_handler
     )
     .queue(queue)
     .register_request_handler_with_counters::<Ping, _>(
-        RecordingEcho {
-            ran: Arc::clone(&ran),
-        },
+        RecordingEcho { ran: ran.clone() },
         Arc::clone(&responder_transport),
         counters.clone(),
     )
@@ -1687,49 +1664,30 @@ async fn a_request_whose_deadline_expired_in_the_queue_never_reaches_the_handler
         BusEnvelope::new(Uuid::now_v7(), &Ping { seq: 5 }).expect("request encodes");
     publish_ping_with_deadline(&channel, queue, &expired_envelope, now_millis - 60_000).await;
 
-    let mut attempts = 0;
-    loop {
-        if counters.snapshot().expired_deadline > 0 {
-            break;
-        }
-        attempts += 1;
-        assert!(
-            attempts < 100,
-            "the expired request was never refused by the deadline guard"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    harness::await_condition("the deadline guard to refuse the expired request", || {
+        counters.snapshot().expired_deadline > 0
+    })
+    .await;
     assert_eq!(
         counters.snapshot().expired_deadline,
         1,
         "exactly the expired request must be counted as refused for an elapsed deadline"
     );
-    assert!(
-        !ran.load(Ordering::Relaxed),
+    assert_eq!(
+        ran.count(),
+        0,
         "a request whose deadline expired in the queue must never reach the handler"
     );
 
     // Positive control: the same forging, the same queue, the same worker,
     // published on the same channel, but a deadline thirty seconds ahead
-    // rather than sixty seconds behind. `ran` is reset first so this
-    // publish's own effect on it can be observed cleanly.
-    ran.store(false, Ordering::Relaxed);
+    // rather than sixty seconds behind. `ran` is still at zero here, so the
+    // control's own call is the first one it can record.
     let live_envelope =
         BusEnvelope::new(Uuid::now_v7(), &Ping { seq: 6 }).expect("request encodes");
     publish_ping_with_deadline(&channel, queue, &live_envelope, now_millis + 30_000).await;
 
-    let mut attempts = 0;
-    loop {
-        if ran.load(Ordering::Relaxed) {
-            break;
-        }
-        attempts += 1;
-        assert!(
-            attempts < 100,
-            "the live control never reached the handler, so it did not control anything"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    ran.await_count(1).await;
     assert_eq!(
         counters.snapshot().expired_deadline,
         1,

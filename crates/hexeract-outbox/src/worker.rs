@@ -651,11 +651,14 @@ mod tests {
     use super::*;
     use serde::Deserialize;
     use serde::Serialize;
+    use std::cell::RefCell;
     use std::sync::Mutex;
+    use std::sync::OnceLock;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use tokio::sync::Notify;
+    use tracing_subscriber::fmt::MakeWriter;
 
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
     struct UserRegistered {
@@ -1583,18 +1586,68 @@ mod tests {
         }
     }
 
-    /// Capture everything the worker logs at warning level or above, for as
-    /// long as the returned guard lives. The subscriber is thread local, so it
-    /// only sees a worker driven on the test's own task.
-    fn capture_warnings() -> (LogBuffer, tracing::subscriber::DefaultGuard) {
+    thread_local! {
+        /// The buffer this thread's warnings are written to, when a test is capturing.
+        static ACTIVE_CAPTURE: RefCell<Option<LogBuffer>> = const { RefCell::new(None) };
+    }
+
+    /// Process-wide subscriber, installed on the first capture.
+    static GLOBAL_SUBSCRIBER: OnceLock<()> = OnceLock::new();
+
+    /// Routes each write to the buffer of the thread that logged, and drops it
+    /// when that thread is not capturing.
+    struct ThreadWriter;
+
+    impl std::io::Write for ThreadWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            ACTIVE_CAPTURE.with(|active| match active.borrow_mut().as_mut() {
+                Some(buffer) => buffer.write(bytes),
+                None => Ok(bytes.len()),
+            })
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for ThreadWriter {
+        type Writer = ThreadWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            ThreadWriter
+        }
+    }
+
+    /// Removes the calling thread's active capture when it goes out of scope.
+    struct CaptureGuard;
+
+    impl Drop for CaptureGuard {
+        fn drop(&mut self) {
+            ACTIVE_CAPTURE.with(|active| *active.borrow_mut() = None);
+        }
+    }
+
+    /// Capture every warning the current thread logs, for as long as the guard
+    /// lives. The subscriber is process-wide and installed once, so a callsite
+    /// registered by another test thread keeps its interest (#624).
+    fn capture_warnings() -> (LogBuffer, CaptureGuard) {
+        GLOBAL_SUBSCRIBER.get_or_init(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .with_writer(ThreadWriter)
+                .finish();
+            // Only ever fails if something else claimed the global
+            // subscriber first, in which case this binary's captures would
+            // stay empty and say so through failing assertions.
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            tracing::callsite::rebuild_interest_cache();
+        });
+
         let buffer = LogBuffer::default();
-        let writer = buffer.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        (buffer, tracing::subscriber::set_default(subscriber))
+        ACTIVE_CAPTURE.with(|active| *active.borrow_mut() = Some(buffer.clone()));
+        (buffer, CaptureGuard)
     }
 
     /// Store that simulates a lease lost to another worker.

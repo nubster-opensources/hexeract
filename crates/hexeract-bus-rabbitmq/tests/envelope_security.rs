@@ -114,7 +114,8 @@ const FIXTURE_PAYLOAD: &[u8] = b"{\"order_id\":\"00000000-0000-0000-0000-0000000
 /// established, never a value the test itself wrote on both sides.
 #[derive(Debug, Default)]
 struct RecordingHandler {
-    seen: Arc<AtomicUsize>,
+    seen: harness::CallCounter,
+    received: Arc<Mutex<Vec<Uuid>>>,
     observed_issuer: Arc<Mutex<Option<String>>>,
 }
 
@@ -126,7 +127,11 @@ impl Handler<OrderPlaced> for RecordingHandler {
             *self.observed_issuer.lock().expect("not poisoned") =
                 Some(identity.issuer().to_owned());
         }
-        self.seen.fetch_add(1, Ordering::SeqCst);
+        self.received
+            .lock()
+            .expect("not poisoned")
+            .push(*ctx.message_id.as_uuid());
+        self.seen.record();
         Ok(())
     }
 }
@@ -141,7 +146,7 @@ impl Handler<OrderPlaced> for RecordingHandler {
 /// issuer-only observation could make.
 #[derive(Debug, Default)]
 struct AuthenticationRecordingHandler {
-    seen: Arc<AtomicUsize>,
+    seen: harness::CallCounter,
     observed_authentication: Arc<Mutex<Option<PublisherAuthentication>>>,
 }
 
@@ -151,7 +156,7 @@ impl Handler<OrderPlaced> for AuthenticationRecordingHandler {
     async fn handle(&self, _message: OrderPlaced, ctx: &HandlerContext) -> Result<(), Self::Error> {
         *self.observed_authentication.lock().expect("not poisoned") =
             Some(ctx.authentication.clone());
-        self.seen.fetch_add(1, Ordering::SeqCst);
+        self.seen.record();
         Ok(())
     }
 }
@@ -390,12 +395,15 @@ fn properties_for(
 ///
 /// The two destinations coincide for a legitimate publish and differ only in
 /// [`an_envelope_published_on_another_routing_key_is_rejected`].
+///
+/// Returns the `message_id` the envelope carries, so a scenario can tell which
+/// publish a handler call came from.
 async fn publish_signed(
     channel: &Channel,
     signed_destination: &str,
     routing_key: &str,
     audience: &Audience,
-) {
+) -> Uuid {
     let message_id = Uuid::now_v7();
     let correlation_id = Uuid::now_v7();
     let published_at = SystemTime::now();
@@ -403,6 +411,7 @@ async fn publish_signed(
     let headers = sign_as(&envelope, signed_destination, audience);
     let properties = properties_for(message_id, correlation_id, published_at, Some(&headers));
     harness::publish_with_properties(channel, routing_key, properties, FIXTURE_PAYLOAD).await;
+    message_id
 }
 
 // -------------------------------------------------- broker-side helpers
@@ -432,17 +441,6 @@ async fn declare_temporary_queue(uri: &str, name: &str) {
         )
         .await
         .expect("queue declare must succeed");
-}
-
-/// Poll `counter` until it reaches `target`, giving up silently after
-/// `attempts` polls so the caller's own assertion reports the failure.
-async fn wait_until_at_least(counter: &AtomicUsize, target: usize, attempts: usize) {
-    for _ in 0..attempts {
-        if counter.load(Ordering::SeqCst) >= target {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 }
 
 /// Assert `queue` holds no message: a security rejection must never leave a
@@ -595,13 +593,14 @@ async fn a_signed_envelope_survives_a_real_broker_round_trip() {
         .await
         .expect("publish must succeed");
 
-    let seen = Arc::new(AtomicUsize::new(0));
+    let seen = harness::CallCounter::new();
     let worker =
         RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
             .queue(queue_name)
             .envelope_security(inbound_security())
             .register_handler::<OrderPlaced, _>(RecordingHandler {
-                seen: Arc::clone(&seen),
+                seen: seen.clone(),
+                received: Arc::default(),
                 observed_issuer: Arc::new(Mutex::new(None)),
             })
             .build()
@@ -610,9 +609,9 @@ async fn a_signed_envelope_survives_a_real_broker_round_trip() {
     let worker_cancel = cancel.clone();
     let handle = tokio::spawn(async move { worker.run(worker_cancel).await });
 
-    wait_until_at_least(&seen, 1, 60).await;
+    seen.await_count(1).await;
     assert_eq!(
-        seen.load(Ordering::SeqCst),
+        seen.count(),
         1,
         "a signature computed over sub-second precision must still verify once the AMQP \
          `timestamp` property has truncated `published_at` to the second on the way back"
@@ -631,13 +630,15 @@ async fn a_tampered_payload_never_reaches_the_handler() {
     let queue_name = "envelope-security.tampered-payload";
     declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let seen = Arc::new(AtomicUsize::new(0));
+    let seen = harness::CallCounter::new();
+    let received = Arc::new(Mutex::new(Vec::new()));
     let worker =
         RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
             .queue(queue_name)
             .envelope_security(inbound_security())
             .register_handler::<OrderPlaced, _>(RecordingHandler {
-                seen: Arc::clone(&seen),
+                seen: seen.clone(),
+                received: Arc::clone(&received),
                 observed_issuer: Arc::new(Mutex::new(None)),
             })
             .build()
@@ -649,13 +650,11 @@ async fn a_tampered_payload_never_reaches_the_handler() {
     let publisher = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let publisher_channel = publisher.create_channel().await.unwrap();
 
-    // Positive control: signed and published untampered, in the exact same
-    // conditions as the forged delivery below.
-    publish_signed(&publisher_channel, queue_name, queue_name, &audience()).await;
-
     // Same signature, a different payload on the wire. The signature covers
     // a digest of the payload, so one changed byte after signing must
-    // invalidate it.
+    // invalidate it. Published first: the worker consumes one delivery at a
+    // time, in order, so once the sentinel below has reached the handler this
+    // one has already been judged.
     let message_id = Uuid::now_v7();
     let correlation_id = Uuid::now_v7();
     let published_at = SystemTime::now();
@@ -671,11 +670,14 @@ async fn a_tampered_payload_never_reaches_the_handler() {
     )
     .await;
 
-    wait_until_at_least(&seen, 1, 60).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Sentinel: signed and published untampered, in the exact same
+    // conditions as the forged delivery above.
+    let sentinel = publish_signed(&publisher_channel, queue_name, queue_name, &audience()).await;
+
+    seen.await_count(1).await;
     assert_eq!(
-        seen.load(Ordering::SeqCst),
-        1,
+        *received.lock().expect("not poisoned"),
+        [sentinel],
         "only the untampered envelope may reach the handler"
     );
     assert_queue_empty(broker.uri(), queue_name).await;
@@ -693,13 +695,15 @@ async fn an_envelope_signed_for_another_audience_is_rejected() {
     let queue_name = "envelope-security.wrong-audience";
     declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let seen = Arc::new(AtomicUsize::new(0));
+    let seen = harness::CallCounter::new();
+    let received = Arc::new(Mutex::new(Vec::new()));
     let worker =
         RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
             .queue(queue_name)
             .envelope_security(inbound_security())
             .register_handler::<OrderPlaced, _>(RecordingHandler {
-                seen: Arc::clone(&seen),
+                seen: seen.clone(),
+                received: Arc::clone(&received),
                 observed_issuer: Arc::new(Mutex::new(None)),
             })
             .build()
@@ -711,16 +715,18 @@ async fn an_envelope_signed_for_another_audience_is_rejected() {
     let publisher = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let publisher_channel = publisher.create_channel().await.unwrap();
 
-    publish_signed(&publisher_channel, queue_name, queue_name, &audience()).await;
-
+    // Published first: the worker consumes one delivery at a time, in order,
+    // so once the sentinel below has reached the handler this one has already
+    // been judged.
     let stranger = Audience::new("attacker-service").expect("valid audience");
     publish_signed(&publisher_channel, queue_name, queue_name, &stranger).await;
 
-    wait_until_at_least(&seen, 1, 60).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let sentinel = publish_signed(&publisher_channel, queue_name, queue_name, &audience()).await;
+
+    seen.await_count(1).await;
     assert_eq!(
-        seen.load(Ordering::SeqCst),
-        1,
+        *received.lock().expect("not poisoned"),
+        [sentinel],
         "an envelope signed for an audience this worker does not accept must never reach the \
          handler, even though its signature is otherwise perfectly valid"
     );
@@ -739,13 +745,15 @@ async fn an_envelope_published_on_another_routing_key_is_rejected() {
     let queue_name = "envelope-security.actual-destination";
     declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let seen = Arc::new(AtomicUsize::new(0));
+    let seen = harness::CallCounter::new();
+    let received = Arc::new(Mutex::new(Vec::new()));
     let worker =
         RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
             .queue(queue_name)
             .envelope_security(inbound_security())
             .register_handler::<OrderPlaced, _>(RecordingHandler {
-                seen: Arc::clone(&seen),
+                seen: seen.clone(),
+                received: Arc::clone(&received),
                 observed_issuer: Arc::new(Mutex::new(None)),
             })
             .build()
@@ -757,16 +765,14 @@ async fn an_envelope_published_on_another_routing_key_is_rejected() {
     let publisher = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let publisher_channel = publisher.create_channel().await.unwrap();
 
-    // Signed for, and published on, the queue the worker actually consumes:
-    // must be accepted.
-    publish_signed(&publisher_channel, queue_name, queue_name, &audience()).await;
-
     // Signed for an entirely different destination, but published on this
     // worker's own routing key. The canonical representation must bind to
     // the destination observed at delivery, never to the value the
     // `x-hexeract-destination` header announces: reading that header back
     // here instead would make this envelope verify as if it had been
-    // legitimately sent to this queue.
+    // legitimately sent to this queue. Published first: the worker consumes
+    // one delivery at a time, in order, so once the sentinel below has
+    // reached the handler this one has already been judged.
     publish_signed(
         &publisher_channel,
         "envelope-security.decoy-destination",
@@ -775,11 +781,14 @@ async fn an_envelope_published_on_another_routing_key_is_rejected() {
     )
     .await;
 
-    wait_until_at_least(&seen, 1, 60).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Sentinel: signed for, and published on, the queue the worker actually
+    // consumes: must be accepted.
+    let sentinel = publish_signed(&publisher_channel, queue_name, queue_name, &audience()).await;
+
+    seen.await_count(1).await;
     assert_eq!(
-        seen.load(Ordering::SeqCst),
-        1,
+        *received.lock().expect("not poisoned"),
+        [sentinel],
         "an envelope signed for another destination but delivered here must never reach the \
          handler, or a message could be rerouted onto a queue it was never signed for"
     );
@@ -798,13 +807,15 @@ async fn an_unsigned_envelope_is_rejected_when_the_policy_requires_one() {
     let queue_name = "envelope-security.unsigned-required";
     declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let seen = Arc::new(AtomicUsize::new(0));
+    let seen = harness::CallCounter::new();
+    let received = Arc::new(Mutex::new(Vec::new()));
     let worker =
         RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
             .queue(queue_name)
             .envelope_security(inbound_security())
             .register_handler::<OrderPlaced, _>(RecordingHandler {
-                seen: Arc::clone(&seen),
+                seen: seen.clone(),
+                received: Arc::clone(&received),
                 observed_issuer: Arc::new(Mutex::new(None)),
             })
             .build()
@@ -816,8 +827,9 @@ async fn an_unsigned_envelope_is_rejected_when_the_policy_requires_one() {
     let publisher = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let publisher_channel = publisher.create_channel().await.unwrap();
 
-    publish_signed(&publisher_channel, queue_name, queue_name, &audience()).await;
-
+    // Published first: the worker consumes one delivery at a time, in order,
+    // so once the sentinel below has reached the handler this one has already
+    // been judged.
     let message_id = Uuid::now_v7();
     let correlation_id = Uuid::now_v7();
     let published_at = SystemTime::now();
@@ -825,11 +837,12 @@ async fn an_unsigned_envelope_is_rejected_when_the_policy_requires_one() {
     harness::publish_with_properties(&publisher_channel, queue_name, properties, FIXTURE_PAYLOAD)
         .await;
 
-    wait_until_at_least(&seen, 1, 60).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let sentinel = publish_signed(&publisher_channel, queue_name, queue_name, &audience()).await;
+
+    seen.await_count(1).await;
     assert_eq!(
-        seen.load(Ordering::SeqCst),
-        1,
+        *received.lock().expect("not poisoned"),
+        [sentinel],
         "an unsigned envelope must never reach the handler under a Required policy"
     );
     assert_queue_empty(broker.uri(), queue_name).await;
@@ -845,13 +858,15 @@ async fn an_unsigned_envelope_is_accepted_under_the_named_derogation() {
     let queue_name = "envelope-security.unsigned-allowed";
     declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let seen = Arc::new(AtomicUsize::new(0));
+    let seen = harness::CallCounter::new();
+    let received = Arc::new(Mutex::new(Vec::new()));
     let worker =
         RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
             .queue(queue_name)
             .envelope_security(inbound_security_allowing_unsigned())
             .register_handler::<OrderPlaced, _>(RecordingHandler {
-                seen: Arc::clone(&seen),
+                seen: seen.clone(),
+                received: Arc::clone(&received),
                 observed_issuer: Arc::new(Mutex::new(None)),
             })
             .build()
@@ -863,25 +878,12 @@ async fn an_unsigned_envelope_is_accepted_under_the_named_derogation() {
     let publisher = RabbitMqConnection::connect(broker.uri()).await.unwrap();
     let publisher_channel = publisher.create_channel().await.unwrap();
 
-    // No signature at all: the derogation accepts the absence of one.
-    let message_id = Uuid::now_v7();
-    let correlation_id = Uuid::now_v7();
-    let published_at = SystemTime::now();
-    let properties = properties_for(message_id, correlation_id, published_at, None);
-    harness::publish_with_properties(&publisher_channel, queue_name, properties, FIXTURE_PAYLOAD)
-        .await;
-
-    wait_until_at_least(&seen, 1, 60).await;
-    assert_eq!(
-        seen.load(Ordering::SeqCst),
-        1,
-        "an unsigned envelope must be accepted under the named derogation"
-    );
-
     // A signature that IS present but broken. The derogation covers the
     // absence of a signature, never a present-but-invalid one: a broken
     // signature must still be rejected exactly as it would be under the
-    // Required policy.
+    // Required policy. Published first: the worker consumes one delivery at
+    // a time, in order, so once the sentinel below has reached the handler
+    // this one has already been judged.
     let tampered_message_id = Uuid::now_v7();
     let tampered_correlation_id = Uuid::now_v7();
     let tampered_published_at = SystemTime::now();
@@ -906,12 +908,21 @@ async fn an_unsigned_envelope_is_accepted_under_the_named_derogation() {
     )
     .await;
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Sentinel: no signature at all, which the derogation accepts.
+    let sentinel = Uuid::now_v7();
+    let correlation_id = Uuid::now_v7();
+    let published_at = SystemTime::now();
+    let properties = properties_for(sentinel, correlation_id, published_at, None);
+    harness::publish_with_properties(&publisher_channel, queue_name, properties, FIXTURE_PAYLOAD)
+        .await;
+
+    seen.await_count(1).await;
     assert_eq!(
-        seen.load(Ordering::SeqCst),
-        1,
-        "a present but broken signature must still be rejected, even under the derogation that \
-         allows an absent one"
+        *received.lock().expect("not poisoned"),
+        [sentinel],
+        "an unsigned envelope must be accepted under the named derogation, and a present but \
+         broken signature must still be rejected, even under the derogation that allows an \
+         absent one"
     );
     assert_queue_empty(broker.uri(), queue_name).await;
 
@@ -953,14 +964,15 @@ async fn an_unknown_key_triggers_exactly_one_refresh_for_twenty_envelopes() {
         .expect("valid configuration");
     let security = Arc::new(InboundEnvelopeSecurity::new(keys, config));
 
-    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts = harness::CallCounter::new();
     let worker =
         RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
             .queue(queue_name)
             .dead_letter_routing_key(dead_letter_queue)
             .envelope_security(security)
             .register_handler::<OrderPlaced, _>(RecordingHandler {
-                seen: Arc::clone(&attempts),
+                seen: attempts.clone(),
+                received: Arc::default(),
                 observed_issuer: Arc::new(Mutex::new(None)),
             })
             .build()
@@ -975,7 +987,7 @@ async fn an_unknown_key_triggers_exactly_one_refresh_for_twenty_envelopes() {
         "every envelope whose key never resolves must be dead-lettered, none dropped or stuck"
     );
     assert_eq!(
-        attempts.load(Ordering::SeqCst),
+        attempts.count(),
         0,
         "a delivery whose key never resolves must never reach the handler"
     );
@@ -1000,14 +1012,15 @@ async fn a_rejected_envelope_lands_in_the_dead_letter_queue_without_its_headers(
     let dead_letter_queue = "envelope-security.quarantine.parked";
     declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let seen = Arc::new(AtomicUsize::new(0));
+    let seen = harness::CallCounter::new();
     let worker =
         RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
             .queue(queue_name)
             .dead_letter_routing_key(dead_letter_queue)
             .envelope_security(inbound_security())
             .register_handler::<OrderPlaced, _>(RecordingHandler {
-                seen: Arc::clone(&seen),
+                seen: seen.clone(),
+                received: Arc::default(),
                 observed_issuer: Arc::new(Mutex::new(None)),
             })
             .build()
@@ -1023,9 +1036,9 @@ async fn a_rejected_envelope_lands_in_the_dead_letter_queue_without_its_headers(
     // reach the handler, proving the quarantine below is specific to the
     // forged delivery, not some unrelated failure mode.
     publish_signed(&publisher_channel, queue_name, queue_name, &audience()).await;
-    wait_until_at_least(&seen, 1, 60).await;
+    seen.await_count(1).await;
     assert_eq!(
-        seen.load(Ordering::SeqCst),
+        seen.count(),
         1,
         "the legitimate envelope must reach the handler"
     );
@@ -1053,7 +1066,7 @@ async fn a_rejected_envelope_lands_in_the_dead_letter_queue_without_its_headers(
         .expect("a rejected envelope must be routed to the dead-letter queue");
 
     assert_eq!(
-        seen.load(Ordering::SeqCst),
+        seen.count(),
         1,
         "the forged envelope must never reach the handler"
     );
@@ -1106,14 +1119,15 @@ async fn a_handler_learns_which_issuer_signed_the_message_it_received() {
         .await
         .expect("publish must succeed");
 
-    let seen = Arc::new(AtomicUsize::new(0));
+    let seen = harness::CallCounter::new();
     let observed_issuer = Arc::new(Mutex::new(None));
     let worker =
         RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
             .queue(queue_name)
             .envelope_security(inbound_security())
             .register_handler::<OrderPlaced, _>(RecordingHandler {
-                seen: Arc::clone(&seen),
+                seen: seen.clone(),
+                received: Arc::default(),
                 observed_issuer: Arc::clone(&observed_issuer),
             })
             .build()
@@ -1122,7 +1136,7 @@ async fn a_handler_learns_which_issuer_signed_the_message_it_received() {
     let worker_cancel = cancel.clone();
     let handle = tokio::spawn(async move { worker.run(worker_cancel).await });
 
-    wait_until_at_least(&seen, 1, 60).await;
+    seen.await_count(1).await;
     assert_eq!(
         observed_issuer.lock().expect("not poisoned").as_deref(),
         Some("billing-service"),
@@ -1159,14 +1173,15 @@ async fn a_handler_learns_the_second_issuer_that_signed_a_message() {
         .await
         .expect("publish must succeed");
 
-    let seen = Arc::new(AtomicUsize::new(0));
+    let seen = harness::CallCounter::new();
     let observed_issuer = Arc::new(Mutex::new(None));
     let worker =
         RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
             .queue(queue_name)
             .envelope_security(inbound_security_trusting_both_issuers())
             .register_handler::<OrderPlaced, _>(RecordingHandler {
-                seen: Arc::clone(&seen),
+                seen: seen.clone(),
+                received: Arc::default(),
                 observed_issuer: Arc::clone(&observed_issuer),
             })
             .build()
@@ -1175,7 +1190,7 @@ async fn a_handler_learns_the_second_issuer_that_signed_a_message() {
     let worker_cancel = cancel.clone();
     let handle = tokio::spawn(async move { worker.run(worker_cancel).await });
 
-    wait_until_at_least(&seen, 1, 60).await;
+    seen.await_count(1).await;
     assert_eq!(
         observed_issuer.lock().expect("not poisoned").as_deref(),
         Some("shipping-service"),
@@ -1201,14 +1216,14 @@ async fn a_waived_unsigned_envelope_is_reported_as_waived_not_unenforced() {
     let queue_name = "envelope-security.publisher-identity.waived";
     declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let seen = Arc::new(AtomicUsize::new(0));
+    let seen = harness::CallCounter::new();
     let observed_authentication = Arc::new(Mutex::new(None));
     let worker =
         RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
             .queue(queue_name)
             .envelope_security(inbound_security_allowing_unsigned())
             .register_handler::<OrderPlaced, _>(AuthenticationRecordingHandler {
-                seen: Arc::clone(&seen),
+                seen: seen.clone(),
                 observed_authentication: Arc::clone(&observed_authentication),
             })
             .build()
@@ -1228,7 +1243,7 @@ async fn a_waived_unsigned_envelope_is_reported_as_waived_not_unenforced() {
     harness::publish_with_properties(&publisher_channel, queue_name, properties, FIXTURE_PAYLOAD)
         .await;
 
-    wait_until_at_least(&seen, 1, 60).await;
+    seen.await_count(1).await;
     assert_eq!(
         observed_authentication
             .lock()
@@ -1259,13 +1274,13 @@ async fn a_worker_without_envelope_security_reports_nothing_enforced() {
     let queue_name = "envelope-security.publisher-identity.not-enforced";
     declare_temporary_queue(broker.uri(), queue_name).await;
 
-    let seen = Arc::new(AtomicUsize::new(0));
+    let seen = harness::CallCounter::new();
     let observed_authentication = Arc::new(Mutex::new(None));
     let worker =
         RabbitMqWorkerBuilder::new(RabbitMqConnection::connect(broker.uri()).await.unwrap())
             .queue(queue_name)
             .register_handler::<OrderPlaced, _>(AuthenticationRecordingHandler {
-                seen: Arc::clone(&seen),
+                seen: seen.clone(),
                 observed_authentication: Arc::clone(&observed_authentication),
             })
             .build()
@@ -1284,7 +1299,7 @@ async fn a_worker_without_envelope_security_reports_nothing_enforced() {
     harness::publish_with_properties(&publisher_channel, queue_name, properties, FIXTURE_PAYLOAD)
         .await;
 
-    wait_until_at_least(&seen, 1, 60).await;
+    seen.await_count(1).await;
     assert_eq!(
         observed_authentication
             .lock()
