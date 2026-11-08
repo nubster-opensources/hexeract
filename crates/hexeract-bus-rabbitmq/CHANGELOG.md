@@ -41,6 +41,7 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Changed
 
+- The Docker-backed integration suite now runs against RabbitMQ 4.4, a supported release line, instead of 3.8.22, which reached end of life in July 2022. Test queues are declared durable, since RabbitMQ 4.3 and later refuse a queue that is neither durable nor exclusive. (#536)
 - **Breaking behaviour change.** `RabbitMqWorkerBuilder::max_buffered(0)` is
   refused: `build()` returns `BusError::Internal` instead of treating zero as
   "no bound". Migration: omit the `max_buffered` call for a `no_ack` consumer
