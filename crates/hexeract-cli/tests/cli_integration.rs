@@ -24,9 +24,11 @@ use lapin::types::FieldTable;
 use lapin::types::ShortString;
 use predicates::str::contains;
 use tempfile::NamedTempFile;
+use testcontainers::GenericImage;
+use testcontainers::core::IntoContainerPort;
+use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
-use testcontainers_modules::rabbitmq::RabbitMq;
 
 #[test]
 fn patch_prints_canonical_schema_to_stdout() {
@@ -91,7 +93,7 @@ auto_delete = true
 
 [[queues]]
 name = "cli.orders.received"
-durable = false
+durable = true
 auto_delete = true
 
 [[bindings]]
@@ -100,8 +102,17 @@ exchange = "cli.orders.exchange"
 routing_key = "cli.orders.*"
 "#;
 
-async fn start_rabbit() -> (testcontainers::ContainerAsync<RabbitMq>, String) {
-    let container = RabbitMq::default()
+/// The RabbitMQ image the CLI integration tests run against.
+///
+/// An exact tag, never a floating one: a run must not change verdict without a
+/// commit. The readiness wait is a prefix of the broker's own startup line, so
+/// it does not depend on how many plugins the image enables.
+const BROKER_IMAGE_TAG: &str = "4.4.0";
+
+async fn start_rabbit() -> (testcontainers::ContainerAsync<GenericImage>, String) {
+    let container = GenericImage::new("rabbitmq", BROKER_IMAGE_TAG)
+        .with_exposed_port(5672.tcp())
+        .with_wait_for(WaitFor::message_on_stdout("Server startup complete"))
         .start()
         .await
         .expect("rabbitmq container must start");
@@ -134,7 +145,7 @@ async fn publish_peek_message(
         .queue_declare(
             ShortString::from(queue_name),
             QueueDeclareOptions {
-                durable: false,
+                durable: true,
                 auto_delete: false,
                 ..QueueDeclareOptions::default()
             },
@@ -218,7 +229,7 @@ async fn bus_purge_then_peek_reports_empty_queue() {
         .queue_declare(
             ShortString::from(queue_name),
             QueueDeclareOptions {
-                durable: false,
+                durable: true,
                 auto_delete: false,
                 ..QueueDeclareOptions::default()
             },
@@ -324,7 +335,7 @@ async fn bus_peek_count_n_returns_n_distinct_messages() {
         .queue_declare(
             ShortString::from(queue_name),
             QueueDeclareOptions {
-                durable: false,
+                durable: true,
                 auto_delete: false,
                 ..QueueDeclareOptions::default()
             },
