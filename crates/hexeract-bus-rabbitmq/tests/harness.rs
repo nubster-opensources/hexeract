@@ -561,3 +561,29 @@ impl CallCounter {
         );
     }
 }
+
+/// Wait until `condition` holds, polling it, for state that has no signal of
+/// its own (a production counter read through a snapshot).
+///
+/// A safety net, not the measurement: the caller asserts the exact value right
+/// after. Prefer [`CallCounter::await_count`] whenever the test owns the state.
+///
+/// # Panics
+///
+/// Panics when `condition` still fails after [`PROGRESS_TIMEOUT`], naming
+/// `awaited`.
+pub(crate) async fn await_condition(awaited: &str, mut condition: impl FnMut() -> bool) {
+    let outcome = tokio::time::timeout(PROGRESS_TIMEOUT, async {
+        loop {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        outcome.is_ok(),
+        "timed out after {PROGRESS_TIMEOUT:?} waiting for {awaited}"
+    );
+}

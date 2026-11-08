@@ -1677,10 +1677,11 @@ async fn message_ids_seen_across_retries(
     seen_message_ids.lock().expect("message id mutex").clone()
 }
 
-fn assert_identity_is_stable(seen_message_ids: &[String]) {
-    assert!(
-        seen_message_ids.len() >= 2,
-        "the handler must have run at least twice, saw {seen_message_ids:?}"
+fn assert_identity_is_stable(seen_message_ids: &[String], expected_calls: usize) {
+    assert_eq!(
+        seen_message_ids.len(),
+        expected_calls,
+        "the handler must have run exactly {expected_calls} times, saw {seen_message_ids:?}"
     );
     assert!(
         seen_message_ids.iter().all(|id| id == &seen_message_ids[0]),
@@ -1698,7 +1699,7 @@ async fn retry_preserves_generated_message_id_when_property_is_absent() {
     )
     .await;
 
-    assert_identity_is_stable(&seen);
+    assert_identity_is_stable(&seen, 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1713,7 +1714,7 @@ async fn retry_preserves_generated_message_id_when_property_is_unparseable() {
     )
     .await;
 
-    assert_identity_is_stable(&seen);
+    assert_identity_is_stable(&seen, 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
