@@ -72,6 +72,10 @@ pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 /// that holds failed deliveries until their retry delay expires.
 pub const RETRY_QUEUE_SUFFIX: &str = ".retry";
 
+/// Header the worker stamps on every retry copy: the number of attempts
+/// that have failed so far, as an AMQP `long-long-int`.
+pub const RETRY_ATTEMPT_HEADER: &str = "x-hexeract-retry-attempt";
+
 /// Default broker-side delay before a failed delivery is retried.
 pub const DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(5);
 
@@ -2067,6 +2071,30 @@ pub(crate) fn death_count(props: &BasicProperties, wait_queue: &str) -> u32 {
     0
 }
 
+/// Failed attempts so far: the larger of the worker header and the
+/// `x-death` expired count of the wait queue, clamped as in #218.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn failed_attempt_count(props: &BasicProperties, wait_queue: &str) -> u32 {
+    let _ = (props, wait_queue);
+    todo!()
+}
+
+/// Value of [`RETRY_ATTEMPT_HEADER`]; 0 when absent or not a long-long-int,
+/// negatives clamped to 0, saturating at `u32::MAX`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn retry_attempt_count(props: &BasicProperties) -> u32 {
+    let _ = props;
+    todo!()
+}
+
+/// Copy of `properties` whose table carries `attempt` under
+/// [`RETRY_ATTEMPT_HEADER`], overwriting any forged value, every other entry kept.
+#[cfg_attr(not(test), allow(dead_code))]
+fn with_retry_attempt(properties: BasicProperties, attempt: u32) -> BasicProperties {
+    let _ = (properties, attempt);
+    todo!()
+}
+
 /// How strictly the AMQP properties covered by a signature must be present.
 ///
 /// The policy only ever governs an *unsigned* delivery: a signed one always
@@ -3902,6 +3930,148 @@ mod tests {
             x_death_entry("orders.retry", "expired", 3),
         ]);
         assert_eq!(death_count(&props, "orders.retry"), 3);
+    }
+
+    fn properties_with_worker_header(value: AMQPValue) -> BasicProperties {
+        let mut headers = FieldTable::default();
+        headers.insert(ShortString::from(RETRY_ATTEMPT_HEADER), value);
+        BasicProperties::default().with_headers(headers)
+    }
+
+    #[test]
+    fn retry_attempt_count_returns_zero_without_the_header() {
+        let props = BasicProperties::default();
+        assert_eq!(
+            retry_attempt_count(&props),
+            0,
+            "a first delivery has no worker header"
+        );
+    }
+
+    #[test]
+    fn retry_attempt_count_reads_the_worker_header() {
+        let props = properties_with_worker_header(AMQPValue::LongLongInt(2));
+        assert_eq!(
+            retry_attempt_count(&props),
+            2,
+            "the header value is the failed attempt count"
+        );
+    }
+
+    #[test]
+    fn retry_attempt_count_clamps_a_forged_negative_and_saturates() {
+        let negative = properties_with_worker_header(AMQPValue::LongLongInt(-5));
+        assert_eq!(
+            retry_attempt_count(&negative),
+            0,
+            "a forged negative must clamp to 0, not wrap to u32::MAX"
+        );
+        let huge = properties_with_worker_header(AMQPValue::LongLongInt(i64::MAX));
+        assert_eq!(
+            retry_attempt_count(&huge),
+            u32::MAX,
+            "a huge value must saturate at u32::MAX"
+        );
+    }
+
+    #[test]
+    fn retry_attempt_count_ignores_a_header_of_another_type() {
+        let props = properties_with_worker_header(AMQPValue::LongString("99".into()));
+        assert_eq!(
+            retry_attempt_count(&props),
+            0,
+            "only a long-long-int is a counter"
+        );
+    }
+
+    #[test]
+    fn failed_attempt_count_takes_the_larger_of_header_and_x_death() {
+        let mut header_larger =
+            x_death_properties(vec![x_death_entry("orders.retry", "expired", 1)]);
+        let mut table = header_larger.headers().clone().expect("x-death table");
+        table.insert(
+            ShortString::from(RETRY_ATTEMPT_HEADER),
+            AMQPValue::LongLongInt(3),
+        );
+        header_larger = header_larger.with_headers(table);
+        assert_eq!(
+            failed_attempt_count(&header_larger, "orders.retry"),
+            3,
+            "the worker header (3) outranks the x-death count (1)"
+        );
+
+        let mut x_death_larger =
+            x_death_properties(vec![x_death_entry("orders.retry", "expired", 4)]);
+        let mut table = x_death_larger.headers().clone().expect("x-death table");
+        table.insert(
+            ShortString::from(RETRY_ATTEMPT_HEADER),
+            AMQPValue::LongLongInt(1),
+        );
+        x_death_larger = x_death_larger.with_headers(table);
+        assert_eq!(
+            failed_attempt_count(&x_death_larger, "orders.retry"),
+            4,
+            "the x-death count (4) outranks the worker header (1)"
+        );
+    }
+
+    #[test]
+    fn with_retry_attempt_overwrites_a_forged_value_and_keeps_other_headers() {
+        let mut headers = FieldTable::default();
+        headers.insert(
+            ShortString::from(RETRY_ATTEMPT_HEADER),
+            AMQPValue::LongLongInt(999),
+        );
+        headers.insert(
+            ShortString::from("x-death"),
+            AMQPValue::FieldArray(vec![AMQPValue::LongString("history".into())].into()),
+        );
+        headers.insert(
+            ShortString::from("tenant"),
+            AMQPValue::LongString("acme".into()),
+        );
+        let props = BasicProperties::default().with_headers(headers);
+
+        let copy = with_retry_attempt(props, 2);
+
+        let table = copy.headers().clone().expect("the copy keeps a table");
+        assert_eq!(
+            table.inner().get(RETRY_ATTEMPT_HEADER),
+            Some(&AMQPValue::LongLongInt(2)),
+            "the forged 999 must be overwritten by the worker value"
+        );
+        assert_eq!(
+            table.inner().get("x-death"),
+            Some(&AMQPValue::FieldArray(
+                vec![AMQPValue::LongString("history".into())].into()
+            )),
+            "x-death must be kept unchanged"
+        );
+        assert_eq!(
+            table.inner().get("tenant"),
+            Some(&AMQPValue::LongString("acme".into())),
+            "unrelated headers must be kept unchanged"
+        );
+    }
+
+    #[test]
+    fn retry_copy_carries_the_failed_attempt_and_the_effective_identity() {
+        let props = BasicProperties::default().with_type("orders.placed".into());
+        let envelope = lenient_envelope(&props);
+
+        let copy = with_retry_attempt(properties_with_effective_identity(&props, &envelope), 2);
+
+        let table = copy.headers().clone().expect("the copy carries a table");
+        assert_eq!(
+            table.inner().get(RETRY_ATTEMPT_HEADER),
+            Some(&AMQPValue::LongLongInt(2)),
+            "the retry copy must carry the failed attempt count"
+        );
+        assert_eq!(
+            copy.message_id().as_ref().map(ShortString::as_str),
+            Some(envelope.message_id.to_string().as_str()),
+            "the retry copy must carry the effective message id"
+        );
     }
 
     mod verify_before_settlement {
