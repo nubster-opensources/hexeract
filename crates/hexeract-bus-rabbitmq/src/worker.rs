@@ -731,8 +731,12 @@ fn require_positive_bound(max_buffered: Option<usize>) -> Result<(), BusError> {
 /// durable wait queue (`<queue>.retry`, declared by the worker at
 /// startup) whose per-queue TTL enforces [`RabbitMqWorkerBuilder::retry_delay`]
 /// and whose dead-letter route points back at the consumed queue. The
-/// retry count is read from the broker-maintained `x-death` header,
-/// so it survives worker restarts and never lives in process memory.
+/// retry count travels in the [`RETRY_ATTEMPT_HEADER`] header the
+/// worker stamps on every retry copy, with the broker-maintained
+/// `x-death` count as a fallback (the larger of the two wins), so it
+/// survives worker restarts and never lives in process memory. The
+/// worker owns the count because RabbitMQ 4.x, and 3.13.0 to 3.13.2,
+/// no longer interpret the `x-death` header a client republishes.
 /// Once the count reaches `max_attempts` the delivery is published
 /// to the configured dead-letter queue, declared by the worker at
 /// startup and written with a mandatory, confirmed and persistent
@@ -1217,10 +1221,12 @@ impl RabbitMqWorker {
             }
             Err(err) => {
                 let wait_queue = wait_queue_name(&self.queue);
-                // `x-death` is attacker-influenced; clamp the saturating
-                // add so a forged count near `u32::MAX` cannot overflow
-                // (panic in debug, wrap to 0 then retry forever in release).
-                let current = death_count(&delivery.properties, &wait_queue).saturating_add(1);
+                // The retry header and `x-death` are attacker-influenced;
+                // clamp the saturating add so a forged count near
+                // `u32::MAX` cannot overflow (panic in debug, wrap to 0
+                // then retry forever in release).
+                let current =
+                    failed_attempt_count(&delivery.properties, &wait_queue).saturating_add(1);
                 // A permanent delivery failure (no handler registered, or a
                 // reply the broker could never deliver) can never succeed on
                 // redelivery: retrying it through the wait queue only burns
@@ -1246,7 +1252,7 @@ impl RabbitMqWorker {
                 }
                 match route {
                     FailureRoute::Retry => {
-                        self.schedule_retry(channel, delivery, envelope, &wait_queue)
+                        self.schedule_retry(channel, delivery, envelope, &wait_queue, current)
                             .await
                     }
                     FailureRoute::DeadLetter { attempts } => {
@@ -1268,10 +1274,13 @@ impl RabbitMqWorker {
         delivery: &Delivery,
         envelope: &hexeract_bus::BusEnvelope,
         wait_queue: &str,
+        attempt: u32,
     ) -> DeliveryDisposition {
         Self::retry_core(
             move || async move {
-                let published = Self::publish_to_wait_queue(channel, delivery, envelope, wait_queue).await;
+                let published =
+                    Self::publish_to_wait_queue(channel, delivery, envelope, wait_queue, attempt)
+                        .await;
                 if let Err(err) = &published {
                     tracing::warn!(
                         message_id = %envelope.message_id,
@@ -1740,6 +1749,7 @@ impl RabbitMqWorker {
         delivery: &Delivery,
         envelope: &hexeract_bus::BusEnvelope,
         wait_queue: &str,
+        attempt: u32,
     ) -> Result<(), BusError> {
         let routing_key = to_short_string(wait_queue, "wait queue name")?;
         let confirmation = channel
@@ -1751,8 +1761,11 @@ impl RabbitMqWorker {
                     ..BasicPublishOptions::default()
                 },
                 &delivery.data,
-                properties_with_effective_identity(&delivery.properties, envelope)
-                    .with_delivery_mode(2),
+                with_retry_attempt(
+                    properties_with_effective_identity(&delivery.properties, envelope),
+                    attempt,
+                )
+                .with_delivery_mode(2),
             )
             .await
             .map_err(|err| BusError::Transport(Box::new(err)))?
@@ -1876,7 +1889,7 @@ fn route_failure(error: &BusError, attempt: u32, max_attempts: u32) -> FailureRo
 ///
 /// The broker's own `x-death` history goes with the rest of the table, so a
 /// quarantined copy replayed from the dead-letter queue starts its retry count
-/// from zero (see [`death_count`]). That is the intended trade: the history is
+/// from zero (see [`failed_attempt_count`]). That is the intended trade: the history is
 /// attacker-supplied metadata like any other entry, and a replayed message
 /// whose metadata is still invalid is refused again before a handler runs, so
 /// a reset counter cannot turn into an unbounded retry loop.
@@ -1937,8 +1950,9 @@ fn properties_without_headers(properties: &BasicProperties) -> BasicProperties {
 /// the envelope already holds the value parsed from that same property.
 ///
 /// Everything else is preserved, the field table above all. That table
-/// carries the broker's `x-death` history and therefore the retry count
-/// [`death_count`] reads, so this deliberately clones rather than
+/// carries the broker's `x-death` history, the fallback source of the retry
+/// count (see [`failed_attempt_count`]), and the base the worker header is
+/// written onto (see [`with_retry_attempt`]), so this deliberately clones rather than
 /// rebuilding field by field the way [`properties_without_headers`] does:
 /// that function ends on `with_headers(FieldTable::default())`, which is
 /// the right trade for a quarantined copy and would turn a retry bounded
@@ -2073,26 +2087,33 @@ pub(crate) fn death_count(props: &BasicProperties, wait_queue: &str) -> u32 {
 
 /// Failed attempts so far: the larger of the worker header and the
 /// `x-death` expired count of the wait queue, clamped as in #218.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn failed_attempt_count(props: &BasicProperties, wait_queue: &str) -> u32 {
-    let _ = (props, wait_queue);
-    todo!()
+    death_count(props, wait_queue).max(retry_attempt_count(props))
 }
 
 /// Value of [`RETRY_ATTEMPT_HEADER`]; 0 when absent or not a long-long-int,
 /// negatives clamped to 0, saturating at `u32::MAX`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn retry_attempt_count(props: &BasicProperties) -> u32 {
-    let _ = props;
-    todo!()
+    let Some(headers) = props.headers().as_ref() else {
+        return 0;
+    };
+    match headers.inner().get(RETRY_ATTEMPT_HEADER) {
+        // The header is an ordinary one any producer can forge: clamp a
+        // negative to 0 before the conversion, as `death_count` does.
+        Some(AMQPValue::LongLongInt(count)) => u32::try_from((*count).max(0)).unwrap_or(u32::MAX),
+        _ => 0,
+    }
 }
 
 /// Copy of `properties` whose table carries `attempt` under
 /// [`RETRY_ATTEMPT_HEADER`], overwriting any forged value, every other entry kept.
-#[cfg_attr(not(test), allow(dead_code))]
 fn with_retry_attempt(properties: BasicProperties, attempt: u32) -> BasicProperties {
-    let _ = (properties, attempt);
-    todo!()
+    let mut table = properties.headers().clone().unwrap_or_default();
+    table.insert(
+        ShortString::from(RETRY_ATTEMPT_HEADER),
+        AMQPValue::LongLongInt(i64::from(attempt)),
+    );
+    properties.with_headers(table)
 }
 
 /// How strictly the AMQP properties covered by a signature must be present.
