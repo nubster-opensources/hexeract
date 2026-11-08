@@ -38,11 +38,11 @@ use hexeract::bus_rabbitmq::ensure_topology;
 use hexeract::core::HandlerContext;
 use serde::Deserialize;
 use serde::Serialize;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::rabbitmq::RabbitMq;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
+
+mod support;
 
 const TOTAL_MESSAGES: usize = 5;
 const LATENCY_BUDGET: Duration = Duration::from_secs(5);
@@ -86,17 +86,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     tracing::info!("starting rabbitmq container");
-    let container = RabbitMq::default().start().await?;
-    let host = container.get_host().await?;
-    let port = container.get_host_port_ipv4(5672).await?;
-    let uri = format!("amqp://{host}:{port}");
+    let (_container, uri) = support::start_rabbitmq_broker().await?;
     tracing::info!(%uri, "rabbitmq ready");
 
     let exchange = Exchange::new("orders.exchange", ExchangeKind::Topic)?
         .durable(false)
         .auto_delete(true);
     let queue = Queue::new("orders.received")?
-        .durable(false)
+        .durable(true)
         .auto_delete(true);
     let routing_key = RoutingKey::new("orders.placed")?;
     let binding = Binding::new(&queue.name, &exchange.name, routing_key.clone())?;

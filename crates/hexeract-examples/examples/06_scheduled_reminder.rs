@@ -54,10 +54,11 @@ use sqlx::PgPool;
 use testcontainers::ContainerAsync;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
-use testcontainers_modules::rabbitmq::RabbitMq;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
+
+mod support;
 
 const TABLE: &str = "scheduled_messages";
 const ROUTING_KEY: &str = "reminders.due";
@@ -155,22 +156,13 @@ async fn setup_postgres() -> Result<(ContainerAsync<Postgres>, PgScheduleStore),
     Ok((container, store))
 }
 
-/// Start a RabbitMQ container and return its AMQP connection uri.
-async fn setup_rabbit() -> Result<(ContainerAsync<RabbitMq>, String), Box<dyn Error>> {
-    let container = RabbitMq::default().start().await?;
-    let host = container.get_host().await?;
-    let port = container.get_host_port_ipv4(5672).await?;
-    let uri = format!("amqp://{host}:{port}");
-    Ok((container, uri))
-}
-
 /// Declare the reminders exchange, queue and binding on the running broker.
 async fn declare_topology(rabbitmq_uri: &str) -> Result<(Exchange, Queue), Box<dyn Error>> {
     let exchange = Exchange::new("reminders.exchange", ExchangeKind::Topic)?
         .durable(false)
         .auto_delete(true);
     let queue = Queue::new("reminders.received")?
-        .durable(false)
+        .durable(true)
         .auto_delete(true);
     let routing_key = RoutingKey::new(ROUTING_KEY)?;
     let binding = Binding::new(&queue.name, &exchange.name, routing_key.clone())?;
@@ -203,7 +195,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (_postgres, store) = setup_postgres().await?;
     tracing::info!(table = TABLE, "schedule store ready");
 
-    let (_rabbitmq, rabbitmq_uri) = setup_rabbit().await?;
+    let (_rabbitmq, rabbitmq_uri) = support::start_rabbitmq_broker().await?;
     let (exchange, queue) = declare_topology(&rabbitmq_uri).await?;
 
     let seen = Arc::new(Mutex::new(HashSet::new()));

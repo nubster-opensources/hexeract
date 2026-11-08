@@ -1610,7 +1610,6 @@ dependencies = [
  "serde",
  "serde_json",
  "testcontainers",
- "testcontainers-modules",
  "thiserror",
  "tokio",
  "tokio-util",

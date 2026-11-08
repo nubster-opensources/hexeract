@@ -44,11 +44,10 @@ use hexeract::mediator::Mediator;
 use hexeract::mediator::MediatorBuilder;
 use serde::Deserialize;
 use serde::Serialize;
-use testcontainers::ContainerAsync;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::rabbitmq::RabbitMq;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+mod support;
 
 const PROCESSED_BUDGET: Duration = Duration::from_secs(5);
 
@@ -117,25 +116,17 @@ impl BusHandler<OrderPlaced> for PaymentBridge {
     }
 }
 
-async fn setup_rabbit() -> Result<(ContainerAsync<RabbitMq>, String), Box<dyn Error>> {
-    let container = RabbitMq::default().start().await?;
-    let host = container.get_host().await?;
-    let port = container.get_host_port_ipv4(5672).await?;
-    let uri = format!("amqp://{host}:{port}");
-    Ok((container, uri))
-}
-
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt::init();
 
-    let (_rabbit, uri) = setup_rabbit().await?;
+    let (_rabbit, uri) = support::start_rabbitmq_broker().await?;
 
     let exchange = Exchange::new("orders.exchange", ExchangeKind::Topic)?
         .durable(false)
         .auto_delete(true);
     let queue = Queue::new("orders.received")?
-        .durable(false)
+        .durable(true)
         .auto_delete(true);
     let routing_key = RoutingKey::new("orders.placed")?;
     let binding = Binding::new(&queue.name, &exchange.name, routing_key.clone())?;

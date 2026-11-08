@@ -50,12 +50,11 @@ use hexeract::bus_rabbitmq::connect_request_client;
 use hexeract::bus_rabbitmq::declare_queue;
 use serde::Deserialize;
 use serde::Serialize;
-use testcontainers::ContainerAsync;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::rabbitmq::RabbitMq;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
+
+mod support;
 
 // `RabbitMqTransport` publishes on the default exchange, which only ever
 // routes a message to the queue whose name equals the routing key. The
@@ -275,15 +274,6 @@ impl RequestHandler<RelayedPing> for Relay {
             .await
             .map_err(|error| BusError::Internal(error.to_string()))
     }
-}
-
-/// Start a RabbitMQ container and return its AMQP connection uri.
-async fn setup_rabbit() -> Result<(ContainerAsync<RabbitMq>, String), Box<dyn Error>> {
-    let container = RabbitMq::default().start().await?;
-    let host = container.get_host().await?;
-    let port = container.get_host_port_ipv4(5672).await?;
-    let uri = format!("amqp://{host}:{port}");
-    Ok((container, uri))
 }
 
 /// Declare a durable, non-exclusive queue so a request routed to it is
@@ -593,7 +583,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .init();
 
-    let (_rabbitmq, uri) = setup_rabbit().await?;
+    let (_rabbitmq, uri) = support::start_rabbitmq_broker().await?;
     declare_all_request_queues(&uri).await?;
 
     let cancel = CancellationToken::new();
