@@ -51,7 +51,7 @@ Because the count travels with the message, it survives worker restarts and is s
 1. **Wait queue arguments are frozen at declare time.** The TTL is baked into the `<queue>.retry` arguments, so changing `retry_delay` for an existing wait queue makes the declaration fail with a broker precondition error. Delete the wait queue first (or keep the delay stable per queue).
 2. **Duplicates are possible.** If the ack of the original fails after the retry copy reached the wait queue, the broker redelivers the original and both copies eventually run. This is inherent to at-least-once delivery; handlers must be idempotent.
 3. **The delay is uniform per queue.** Every retry of every message on a given queue waits the same `retry_delay`; per-message TTLs are deliberately avoided because RabbitMQ only expires the head of a queue (head-of-line blocking).
-4. **A replayed dead-letter keeps its header.** The copy parked in the dead-letter queue still carries `x-hexeract-retry-attempt`, so a message replayed from it starts with an exhausted budget. Remove the header (`worker::RETRY_ATTEMPT_HEADER`) before replaying to give the message a fresh budget.
+4. **A replayed dead-letter keeps its header.** The copy parked in the dead-letter queue still carries `x-hexeract-retry-attempt`, so a message replayed from it gets a single attempt: its first failure parks it again. Remove the header (`worker::RETRY_ATTEMPT_HEADER`) before replaying to give the message a fresh budget.
 
 ## Dead-letter queue
 
