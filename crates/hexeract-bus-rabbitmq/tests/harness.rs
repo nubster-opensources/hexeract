@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use hexeract_bus::BusEnvelope;
-use hexeract_bus_rabbitmq::{OwnedIdentity, OwnedTLSConfig};
+use hexeract_bus_rabbitmq::{OwnedIdentity, OwnedTLSConfig, RabbitMqConnectionConfig};
 use lapin::BasicProperties;
 use lapin::Channel;
 use lapin::options::BasicPublishOptions;
@@ -410,6 +410,12 @@ pub(crate) fn client_tls_config() -> OwnedTLSConfig {
         }),
         cert_chain: Some(include_str!("fixtures/tls/ca.pem").to_owned()),
     }
+}
+
+/// Connection configuration that trusts the fixture CA but presents no client
+/// certificate, for proving the broker refuses an anonymous TLS client.
+pub(crate) fn tls_config_without_client_identity() -> RabbitMqConnectionConfig {
+    todo!("trust the fixture CA and present no client identity")
 }
 
 /// Publish `envelope` to `routing_key` on the default exchange.

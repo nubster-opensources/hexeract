@@ -17,8 +17,12 @@ use lapin::BasicProperties;
 use lapin::Channel;
 use lapin::Connection;
 use lapin::ConnectionProperties;
+use lapin::ErrorKind;
 use lapin::options::BasicPublishOptions;
 use lapin::options::QueueDeclareOptions;
+use lapin::protocol::AMQPError;
+use lapin::protocol::AMQPErrorKind;
+use lapin::protocol::AMQPSoftError;
 use lapin::types::FieldTable;
 
 mod harness; // reuse the crate's testcontainers helper
@@ -65,24 +69,61 @@ async fn declare_reply_inbox(channel: &Channel) -> Result<String, lapin::Error> 
     Ok(declare_ok.name().to_string())
 }
 
+/// The soft AMQP error a broker answered with, if the failure is one.
+fn soft_error_of(error: &lapin::Error) -> Option<AMQPSoftError> {
+    let _ = error;
+    todo!("extract the soft AMQP error carried by a protocol error")
+}
+
+#[test]
+fn a_soft_access_refused_protocol_error_is_recognised_as_such() {
+    let error = lapin::Error::from(ErrorKind::ProtocolError(AMQPError::new(
+        AMQPErrorKind::Soft(AMQPSoftError::ACCESSREFUSED),
+        "ACCESS_REFUSED - queue name 'amq.gen-attacker' contains reserved prefix 'amq.*'".into(),
+    )));
+
+    assert_eq!(
+        soft_error_of(&error),
+        Some(AMQPSoftError::ACCESSREFUSED),
+        "the reserved prefix test is only meaningful if the refusal code is read off the error"
+    );
+}
+
+#[test]
+fn a_failure_that_is_not_a_protocol_error_carries_no_soft_error() {
+    let error = lapin::Error::from(ErrorKind::ChannelsLimitReached);
+
+    assert_eq!(
+        soft_error_of(&error),
+        None,
+        "only a broker answer carries an AMQP error code; any other failure must read as none"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn a_client_cannot_declare_a_queue_under_the_reserved_prefix() {
     let broker = start_broker().await;
     let (_connection, channel) = open_channel(&broker).await;
 
-    let outcome = channel
+    let error = channel
         .queue_declare(
             "amq.gen-attacker".into(),
-            QueueDeclareOptions::default(),
+            QueueDeclareOptions {
+                durable: true,
+                ..QueueDeclareOptions::default()
+            },
             FieldTable::default(),
         )
-        .await;
+        .await
+        .expect_err("the broker must refuse a queue under the reserved prefix");
 
-    assert!(
-        outcome.is_err(),
+    assert_eq!(
+        soft_error_of(&error),
+        Some(AMQPSoftError::ACCESSREFUSED),
         "the reply destination policy assumes the amq. prefix is reserved to the broker; \
-         if this ever succeeds, ReplyDestination::parse is not a sufficient control"
+         if this ever succeeds, ReplyDestination::parse is not a sufficient control. The queue \
+         is durable so that only the reserved prefix can explain the refusal"
     );
 }
 

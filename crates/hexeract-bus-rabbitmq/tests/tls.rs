@@ -91,6 +91,28 @@ async fn connecting_without_the_private_ca_is_refused_permanently() {
     );
 }
 
+/// The mutual half of mTLS: a client that trusts the broker but presents no
+/// certificate must be refused, because the broker demands a peer certificate.
+///
+/// Only the refusal is asserted. Whether it classifies as transient or
+/// permanent is measured separately and deliberately not pinned here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker"]
+async fn connecting_without_a_client_certificate_is_refused() {
+    let broker = harness::start_tls_rabbitmq().await;
+
+    let outcome = RabbitMqConnection::connect_with_config(
+        broker.uri(),
+        &harness::tls_config_without_client_identity(),
+    )
+    .await;
+
+    assert!(
+        outcome.is_err(),
+        "the broker requires a peer certificate (fail_if_no_peer_cert), so a client \n         that presents none must not obtain a connection"
+    );
+}
+
 /// Presenting a client certificate is not the same as having a working
 /// session. This moves a real message across the mutually authenticated
 /// connection, so a regression that breaks the session after the handshake
