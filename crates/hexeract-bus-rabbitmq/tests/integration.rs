@@ -96,7 +96,7 @@ async fn transport_publishes_through_default_exchange_and_consumer_reads_it_back
         .queue_declare(
             queue_name.into(),
             QueueDeclareOptions {
-                durable: false,
+                durable: true,
                 exclusive: false,
                 auto_delete: true,
                 ..QueueDeclareOptions::default()
@@ -219,7 +219,7 @@ async fn publish_with_correlation_id_propagates_to_amqp_properties() {
         .queue_declare(
             queue_name.into(),
             QueueDeclareOptions {
-                durable: false,
+                durable: true,
                 exclusive: false,
                 auto_delete: true,
                 ..QueueDeclareOptions::default()
@@ -285,7 +285,7 @@ async fn ensure_topology_declares_exchange_queue_and_binding() {
         .auto_delete(true);
     let queue = Queue::new("topology.orders.received")
         .expect("queue must validate")
-        .durable(false)
+        .durable(true)
         .auto_delete(true);
     let routing_key = RoutingKey::new("orders.created").expect("routing key must validate");
     let binding = Binding::new(&queue.name, &exchange.name, routing_key.clone())
@@ -818,7 +818,7 @@ async fn declare_temporary_queue(uri: &str, name: &str) {
         .queue_declare(
             name.into(),
             QueueDeclareOptions {
-                durable: false,
+                durable: true,
                 exclusive: false,
                 auto_delete: false,
                 ..QueueDeclareOptions::default()
@@ -1734,7 +1734,7 @@ async fn publish_raw_round_trips_with_supplied_message_id() {
         .queue_declare(
             queue_name.into(),
             QueueDeclareOptions {
-                durable: false,
+                durable: true,
                 exclusive: false,
                 auto_delete: true,
                 ..QueueDeclareOptions::default()

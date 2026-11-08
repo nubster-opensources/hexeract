@@ -109,7 +109,8 @@ async fn connecting_without_a_client_certificate_is_refused() {
 
     assert!(
         outcome.is_err(),
-        "the broker requires a peer certificate (fail_if_no_peer_cert), so a client \n         that presents none must not obtain a connection"
+        "the broker requires a peer certificate (fail_if_no_peer_cert), so a client \
+         that presents none must not obtain a connection"
     );
 }
 
@@ -137,7 +138,7 @@ async fn messages_round_trip_over_mutual_tls() {
         .queue_declare(
             queue_name.into(),
             QueueDeclareOptions {
-                durable: false,
+                durable: true,
                 exclusive: false,
                 auto_delete: true,
                 ..QueueDeclareOptions::default()

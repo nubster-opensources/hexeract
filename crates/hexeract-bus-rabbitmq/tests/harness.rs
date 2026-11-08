@@ -32,13 +32,21 @@ use testcontainers::ImageExt;
 use testcontainers::core::IntoContainerPort;
 use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::rabbitmq::RabbitMq;
 use tokio::sync::Notify;
+
+/// The broker image every Docker test of this crate runs against.
+///
+/// An exact tag, never a floating one: a run must not change verdict without a
+/// commit. A supported release line (4.4, community support until 2027-07-31).
+pub(crate) const BROKER_IMAGE: &str = "rabbitmq";
+
+/// The tag of [`BROKER_IMAGE`] every Docker test of this crate runs against.
+pub(crate) const BROKER_IMAGE_TAG: &str = "4.4.0";
 
 /// A running RabbitMQ test container, kept alive for the container's
 /// AMQP URI to stay reachable.
 pub(crate) struct RunningBroker {
-    container: ContainerAsync<RabbitMq>,
+    container: ContainerAsync<GenericImage>,
     host: String,
     port: u16,
     uri: String,
@@ -205,6 +213,16 @@ pub(crate) async fn start_until_ready<T>(
     );
 }
 
+/// A plaintext broker image whose readiness the start policy reads from its log.
+///
+/// `WaitFor::seconds` hands the container back straight away, so the start
+/// policy, not testcontainers, decides when the broker is ready.
+fn plaintext_broker_image() -> GenericImage {
+    GenericImage::new(BROKER_IMAGE, BROKER_IMAGE_TAG)
+        .with_exposed_port(5672.tcp())
+        .with_wait_for(WaitFor::seconds(1))
+}
+
 /// Start a fresh RabbitMQ container and resolve its AMQP URI.
 ///
 /// The only place in this crate that builds a plaintext broker. Every test
@@ -216,13 +234,13 @@ pub(crate) async fn start_rabbitmq() -> RunningBroker {
         BROKER_START_ATTEMPTS,
         BROKER_BOOT_BUDGET,
         async || {
-            RabbitMq::default()
+            plaintext_broker_image()
                 .start()
                 .await
                 .expect("rabbitmq container must start")
         },
-        async |container: &ContainerAsync<RabbitMq>| broker_log_reports_ready(container).await,
-        async |container: &ContainerAsync<RabbitMq>| container_streams(container).await,
+        async |container: &ContainerAsync<GenericImage>| broker_log_reports_ready(container).await,
+        async |container: &ContainerAsync<GenericImage>| container_streams(container).await,
     )
     .await;
     let host = container
@@ -261,17 +279,14 @@ fn install_test_crypto_provider() {
 
 /// Start a broker that serves only AMQPS and requires mutual TLS.
 pub(crate) async fn start_tls_rabbitmq() -> RunningTlsBroker {
-    // `loopback_users = none` restores a default this file overwrites. The
-    // official image ships its own `rabbitmq.conf` so that `guest` can log in
-    // from outside the container; copying ours over it takes that away, and
-    // `guest` reverts to loopback-only. The connection then arrives from the
-    // Docker gateway, is refused with ACCESS_REFUSED, and the failure looks
-    // like a TLS problem while TLS in fact succeeded.
+    // Overwriting `rabbitmq.conf` costs nothing. Since 3.9 the official image
+    // keeps `loopback_users.guest = false` (so that `guest` can log in from
+    // outside the container) and `log.console = true` in
+    // `/etc/rabbitmq/conf.d/10-defaults.conf`, which this file leaves alone.
+    // Before 3.9 they lived in `rabbitmq.conf` itself and had to be restated.
     const RABBITMQ_TLS_CONFIG: &str = r"
 listeners.tcp = none
 listeners.ssl.default = 5671
-
-loopback_users = none
 
 ssl_options.cacertfile = /etc/rabbitmq/tls/ca.pem
 ssl_options.certfile = /etc/rabbitmq/tls/server.pem
@@ -292,7 +307,7 @@ ssl_options.fail_if_no_peer_cert = true
         BROKER_START_ATTEMPTS,
         BROKER_BOOT_BUDGET,
         async || {
-            GenericImage::new("rabbitmq", "3.8.22-management")
+            GenericImage::new(BROKER_IMAGE, BROKER_IMAGE_TAG)
                 .with_exposed_port(5671.tcp())
                 .with_wait_for(WaitFor::seconds(1))
                 .with_copy_to(
@@ -415,7 +430,10 @@ pub(crate) fn client_tls_config() -> OwnedTLSConfig {
 /// Connection configuration that trusts the fixture CA but presents no client
 /// certificate, for proving the broker refuses an anonymous TLS client.
 pub(crate) fn tls_config_without_client_identity() -> RabbitMqConnectionConfig {
-    todo!("trust the fixture CA and present no client identity")
+    RabbitMqConnectionConfig::default().with_tls_config(OwnedTLSConfig {
+        identity: None,
+        cert_chain: Some(include_str!("fixtures/tls/ca.pem").to_owned()),
+    })
 }
 
 /// Publish `envelope` to `routing_key` on the default exchange.

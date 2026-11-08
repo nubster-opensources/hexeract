@@ -432,7 +432,7 @@ async fn declare_temporary_queue(uri: &str, name: &str) {
         .queue_declare(
             name.into(),
             QueueDeclareOptions {
-                durable: false,
+                durable: true,
                 exclusive: false,
                 auto_delete: false,
                 ..QueueDeclareOptions::default()

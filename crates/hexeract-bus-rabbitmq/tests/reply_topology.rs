@@ -71,8 +71,13 @@ async fn declare_reply_inbox(channel: &Channel) -> Result<String, lapin::Error> 
 
 /// The soft AMQP error a broker answered with, if the failure is one.
 fn soft_error_of(error: &lapin::Error) -> Option<AMQPSoftError> {
-    let _ = error;
-    todo!("extract the soft AMQP error carried by a protocol error")
+    match error.kind() {
+        ErrorKind::ProtocolError(protocol_error) => match protocol_error.kind() {
+            AMQPErrorKind::Soft(soft_error) => Some(soft_error.clone()),
+            AMQPErrorKind::Hard(_) => None,
+        },
+        _ => None,
+    }
 }
 
 #[test]

@@ -34,7 +34,6 @@ ed25519-dalek = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 serde = { workspace = true }
 testcontainers = { workspace = true }
-testcontainers-modules = { workspace = true, features = ["rabbitmq"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tracing-subscriber = { workspace = true }
 tracing-test = { workspace = true }
