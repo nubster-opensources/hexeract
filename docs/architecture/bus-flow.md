@@ -35,7 +35,7 @@ sequenceDiagram
     else Handler Err & attempts < max
         Worker->>Broker: basic_publish(wait queue, payload, props)
         Worker->>Broker: basic_ack(delivery_tag)
-        Note over Broker: Wait queue TTL expires, the broker<br/>dead-letters the message back to the queue<br/>and increments x-death
+        Note over Broker: Wait queue TTL expires, the broker<br/>dead-letters the message back to the queue<br/>with the worker retry header kept
     else Handler Err & attempts == max
         Worker->>Broker: basic_publish(dead-letter queue,<br/>mandatory, persistent, payload)
         Broker-->>Worker: publisher confirm
@@ -54,7 +54,7 @@ flowchart TD
     ack_mode{AckMode?}
     dispatch[/Dispatch to handler/]
     handler_ok{Handler<br/>Ok?}
-    attempts{x-death + 1<br/>< max?}
+    attempts{failed count + 1<br/>< max?}
     dlr{DLR<br/>configured?}
     dlr_poison{DLR<br/>configured?}
     ack[basic_ack]
@@ -93,9 +93,9 @@ flowchart TD
 | Delivery decode | `worker::delivery_to_envelope` |
 | Handler context build | `worker::build_handler_context` |
 | Dispatch | `ErasedHandler::handle` (via `TypedHandler<M, H>`) |
-| Retry accounting | `x-death` header read by `worker::death_count` |
+| Retry accounting | `worker::RETRY_ATTEMPT_HEADER` written by the worker, `x-death` as fallback, read by `worker::failed_attempt_count` |
 | Retry scheduling | `RabbitMqWorker::schedule_retry` (wait queue declared at startup) |
 | Dead-letter routing | `RabbitMqWorker::handle_exhausted` (queue declared at startup, confirmed publish) |
 | Poison routing | `RabbitMqWorker::handle_poison` (oversize or undecodable deliveries, same confirmed publish) |
 
-For the full retry state machine and the durable accounting via `x-death`, see the [retry policy](../concepts/retry-policy.md).
+For the full retry state machine and the durable accounting via the worker retry header, see the [retry policy](../concepts/retry-policy.md).

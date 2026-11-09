@@ -89,6 +89,14 @@ Request-reply is available in code on this branch but not yet released; see [`do
 - `hexeract-bus-rabbitmq`: the `no_ack` shutdown test waits for the handlers to start with a rendezvous instead of polling a counter. (#525)
 - `hexeract-bus-rabbitmq`: a message keeps one `message_id` and one `correlation_id` across retry attempts. A delivery without a parseable UUID in either property (an unsigned message from a foreign producer) had a fresh identifier minted on every attempt, which broke correlation, trace continuity and any handler idempotency keyed on `message_id`. The identifier minted on the first attempt is now written onto the copy published to the wait queue, while a property that already holds a parseable UUID is republished byte for byte and the broker's `x-death` history is untouched, so `max_attempts` still bounds the retries. A `basic_nack` with `requeue: true` still redelivers the original message, whose properties cannot be modified, so that path keeps an unstable identity. (#427)
 - `hexeract-mediator`: `Mediator::publish` and `publish_with_correlation_id` now isolate a panic in a notification handler or in a middleware of its chain. The panic used to unwind through the fan-out and abort the whole publish, so the sibling handlers' failures were lost and the caller saw a panic instead of an error. It is now recorded as a `NotificationFailure` carrying the new `HexeractError::HandlerPanicked { payload }`, in registration order, and the publish returns `PublishFailed` as for any other handler failure. A middleware holding mutable state shared across the handlers of one fan-out stays outside the guarantee, and under `panic = "abort"` the process still terminates. `send` and `query` are unchanged.
+- `hexeract-bus-rabbitmq`: the worker counts retries with a header it owns,
+  `x-hexeract-retry-attempt` (`worker::RETRY_ATTEMPT_HEADER`), read back as the
+  larger of that header and the broker `x-death` count. RabbitMQ 4.x, and
+  3.13.0 to 3.13.2, no longer interpret the `x-death` header a client
+  republishes, so a handler that always failed was retried without end and the
+  message never reached the dead-letter queue. No queue changes its arguments
+  or type. A message replayed from the dead-letter queue keeps the header;
+  remove it to give the message a fresh retry budget. (#631)
 
 ### Security
 

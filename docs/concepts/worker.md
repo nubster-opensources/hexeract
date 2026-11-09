@@ -127,6 +127,6 @@ loop {
 }
 ```
 
-Redeliveries across reconnects are covered by the at-least-once semantics above: unacked deliveries return to the queue when the connection drops and the retry budget keeps travelling in the `x-death` header, so a restarted worker resumes the count instead of starting over.
+Redeliveries across reconnects are covered by the at-least-once semantics above: unacked deliveries return to the queue when the connection drops and the retry budget keeps travelling in the `x-hexeract-retry-attempt` header (with `x-death` as a fallback), so a restarted worker resumes the count instead of starting over.
 
 On the publish side, `RabbitMqTransport` recovers rather than failing fast: the connection enables lapin auto-recovery, so it transparently reconnects on a broker blip and replays the topology on the new connection. A publish issued during the reconnect window is retried once across the recovered channel, so a transient outage does not surface as a publish failure. A publish still surfaces `BusError::Connection` or `BusError::Transport` when the broker is durably unreachable or the recovery times out. Wrap publishes with the outbox layer when the application needs an at-least-once guarantee that survives a process crash, not just a broker blip.

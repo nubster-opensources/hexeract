@@ -153,7 +153,7 @@ The framework's own `x-hexeract-*` protocol headers count toward the same
 budget as application headers, so an application that fills its header budget
 fails its own publish rather than silently dropping protocol metadata. The
 defaults leave ample room for trace context, tenancy metadata, the RPC wire
-fields and RabbitMQ's normal `x-death` history.
+fields, the worker `x-hexeract-retry-attempt` header and RabbitMQ's normal `x-death` history.
 
 Inbound accounting measures the whole decoded value, including nested arrays
 and tables, walked iteratively so attacker-controlled nesting cannot consume

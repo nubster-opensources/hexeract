@@ -1551,8 +1551,10 @@ async fn worker_delays_retries_and_retry_count_survives_restart() {
 
     // Restart: drop the first worker while the delivery sits in the
     // wait queue, then consume with a fresh instance. The retry count
-    // travels in the broker-maintained x-death header, so the third
-    // attempt must exhaust the budget instead of starting over.
+    // travels in the header the worker stamps on every retry copy (x-death
+    // is only a fallback, RabbitMQ 4.x no longer interprets a republished
+    // one), so the third attempt must exhaust the budget instead of
+    // starting over.
     first_cancel.cancel();
     first_handle.await.unwrap().unwrap();
 
